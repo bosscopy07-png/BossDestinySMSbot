@@ -1,0 +1,38 @@
+{
+  "name": "otp-sms-bot",
+  "version": "1.0.0",
+  "description": "Production-grade OTP SMS service with Telegram bot",
+  "type": "module",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "nodemon src/app.js",
+    "test": "node --test tests/**/*.test.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "express": "^4.19.2",
+    "mongoose": "^8.3.2",
+    "ioredis": "^5.4.1",
+    "twilio": "^5.0.4",
+    "@vonage/server-sdk": "^3.14.0",
+    "ethers": "^6.12.1",
+    "winston": "^3.13.0",
+    "winston-daily-rotate-file": "^5.0.0",
+    "dotenv": "^16.4.5",
+    "express-rate-limit": "^7.2.0",
+    "helmet": "^7.1.0",
+    "cors": "^2.8.5",
+    "joi": "^17.13.1",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "node-cron": "^3.0.3",
+    "axios": "^1.6.8"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
