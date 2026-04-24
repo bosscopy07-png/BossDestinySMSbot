@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: otp-bot
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    depends_on:
+      - mongo
+      - redis
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - otp-network
+
+  mongo:
+    image: mongo:7
+    container_name: otp-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - otp-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: otp-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - otp-network
+
+volumes:
+  mongo-data:
+  redis-data:
+
+networks:
+  otp-network:
+    driver: bridge
