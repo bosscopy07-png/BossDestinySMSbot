@@ -1,6 +1,7 @@
+
 import { ethers } from 'ethers';
 import { User, Transaction } from '../../models/index.js';
-import { generateId, validateAddress } from '../../utils/helpers.js';
+import { generateId } from '../../utils/helpers.js';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
 
@@ -8,11 +9,11 @@ class WalletService {
     constructor() {
         this.masterAddress = null;
         this.decimals = 18;
-        this.derivationIndex = 0;
         this.provider = null;
         this.masterWallet = null;
         this.usdtContract = null;
         this.isReady = false;
+        this.lastCheckedBlock = 0;
 
         this.usdtAbi = [
             'function balanceOf(address) view returns (uint256)',
@@ -61,6 +62,9 @@ class WalletService {
                 this.masterAddress = this.masterWallet.address;
                 this.isReady = true;
 
+                // Start from current block - 1000 for initial scan
+                this.lastCheckedBlock = await this.provider.getBlockNumber() - 1000;
+
                 logger.info('Wallet service initialized', {
                     masterAddress: this.masterAddress,
                     rpc: rpcUrl.replace(/\/\/.*@/, '//***@')
@@ -98,211 +102,225 @@ class WalletService {
 
     checkReady() {
         if (!this.isReady) {
-            throw new Error('WALLET_NOT_READY — blockchain connection unavailable. Check RPC URL or try again later.');
+            throw new Error('WALLET_NOT_READY — blockchain connection unavailable');
         }
     }
 
-    async generateDepositAddress(userId) {
-        try {
-            const user = await User.findOne({ userId });
-            if (user && user.depositAddress) {
-                return user.depositAddress;
-            }
+    // ========== DEPOSIT SYSTEM ==========
 
-            const index = await this.getNextDerivationIndex();
-            const derivedWallet = this.deriveAddress(index);
-            
-            await User.updateOne(
-                { userId },
-                {
-                    $set: {
-                        depositAddress: derivedWallet.address,
-                        depositIndex: index
-                    }
-                },
-                { upsert: true }
-            );
+    async getDepositInfo(userId) {
+        const user = await User.findOne({ userId });
+        
+        // Generate unique amount for tracking (e.g., $5.001234)
+        const baseAmount = user?.pendingDeposit || 10.00;
+        const trackingAmount = this.generateTrackingAmount(baseAmount, userId);
 
-            logger.info('Deposit address generated', {
-                userId,
-                address: derivedWallet.address,
-                index
-            });
+        await User.updateOne(
+            { userId },
+            { 
+                $set: { 
+                    depositAddress: this.masterAddress,
+                    depositTrackingAmount: trackingAmount,
+                    depositPending: true,
+                    depositRequestedAt: new Date()
+                } 
+            },
+            { upsert: true }
+        );
 
-            return derivedWallet.address;
-
-        } catch (error) {
-            logger.error('Failed to generate deposit address', {
-                userId,
-                error: error.message
-            });
-            throw error;
-        }
+        return {
+            address: this.masterAddress,
+            amount: trackingAmount,
+            network: 'BSC (BEP-20)',
+            token: 'USDT',
+            userId: userId
+        };
     }
 
-    deriveAddress(index) {
-        const masterKey = this.masterWallet.privateKey;
-        const indexBytes = ethers.toBeHex(index, 32);
-        const combined = ethers.concat([
-            ethers.getBytes(masterKey),
-            ethers.getBytes(indexBytes)
-        ]);
-        const childPrivateKey = ethers.keccak256(combined);
-        return new ethers.Wallet(childPrivateKey);
+    // Generate unique amount by adding small fraction based on userId
+    // e.g., user 12345 + $10.00 = $10.0012345
+    generateTrackingAmount(baseAmount, userId) {
+        const userSuffix = parseInt(userId.toString().slice(-5)) / 1000000;
+        const trackingAmount = baseAmount + userSuffix;
+        return parseFloat(trackingAmount.toFixed(6));
     }
 
-    async getNextDerivationIndex() {
-        const lastUser = await User.findOne({ depositIndex: { $ne: null } })
-            .sort({ depositIndex: -1 });
-        return lastUser ? lastUser.depositIndex + 1 : 0;
+    // Extract base amount from tracking amount
+    getBaseAmount(trackingAmount) {
+        return Math.floor(trackingAmount);
     }
 
-    async checkDeposit(userId) {
+    // ========== MASTER ADDRESS DEPOSIT CHECKING ==========
+
+    async checkAllDeposits() {
         this.checkReady();
 
         try {
-            const user = await User.findOne({ userId });
-            if (!user || !user.depositAddress) {
-                return { found: false, message: 'No deposit address found' };
-            }
-
-            const balance = await this.usdtContract.balanceOf(user.depositAddress);
-            const formattedBalance = ethers.formatUnits(balance, this.decimals);
-
-            const pendingTx = await Transaction.findOne({
-                userId,
-                type: 'DEPOSIT',
-                status: { $in: ['PENDING', 'CONFIRMING'] }
-            }).sort({ createdAt: -1 });
-
             const latestBlock = await this.provider.getBlockNumber();
-
-            if (pendingTx && pendingTx.blockchain?.txHash) {
-                const receipt = await this.provider.getTransactionReceipt(
-                    pendingTx.blockchain.txHash
-                );
-
-                if (receipt) {
-                    const confirmations = latestBlock - receipt.blockNumber;
-
-                    if (confirmations >= config.blockchain.blockConfirmations) {
-                        await this.confirmDeposit(pendingTx, confirmations);
-                        return {
-                            found: true,
-                            status: 'CONFIRMED',
-                            amount: pendingTx.amount,
-                            txHash: pendingTx.blockchain.txHash
-                        };
-                    } else {
-                        await Transaction.updateOne(
-                            { txId: pendingTx.txId },
-                            {
-                                $set: {
-                                    status: 'CONFIRMING',
-                                    'blockchain.confirmations': confirmations
-                                }
-                            }
-                        );
-                        return {
-                            found: true,
-                            status: 'CONFIRMING',
-                            confirmations,
-                            required: config.blockchain.blockConfirmations
-                        };
-                    }
-                }
+            
+            if (latestBlock <= this.lastCheckedBlock) {
+                return [];
             }
 
-            const filter = this.usdtContract.filters.Transfer(null, user.depositAddress);
+            const filter = this.usdtContract.filters.Transfer(null, this.masterAddress);
             const events = await this.usdtContract.queryFilter(
                 filter,
-                latestBlock - 1000,
+                this.lastCheckedBlock,
                 latestBlock
             );
 
-            if (events.length > 0) {
-                const latestEvent = events[events.length - 1];
-                const amount = ethers.formatUnits(latestEvent.args.value, this.decimals);
-                const txHash = latestEvent.transactionHash;
+            const processedDeposits = [];
 
-                const existing = await Transaction.findOne({
-                    'blockchain.txHash': txHash
-                });
-
-                if (!existing) {
-                    await Transaction.create({
-                        txId: generateId(),
-                        userId,
-                        type: 'DEPOSIT',
-                        amount: parseFloat(amount),
-                        currency: 'USDT',
-                        status: 'CONFIRMING',
-                        blockchain: {
-                            txHash,
-                            blockNumber: latestEvent.blockNumber,
-                            confirmations: 0,
-                            fromAddress: latestEvent.args.from,
-                            toAddress: user.depositAddress,
-                            token: 'USDT',
-                            amountCrypto: amount
-                        }
+            for (const event of events) {
+                try {
+                    const result = await this.processDepositEvent(event);
+                    if (result) processedDeposits.push(result);
+                } catch (error) {
+                    logger.error('Failed to process deposit event', {
+                        txHash: event.transactionHash,
+                        error: error.message
                     });
-
-                    return {
-                        found: true,
-                        status: 'CONFIRMING',
-                        amount: parseFloat(amount),
-                        txHash
-                    };
                 }
             }
 
-            return { found: false, balance: formattedBalance };
+            this.lastCheckedBlock = latestBlock + 1;
+            return processedDeposits;
 
         } catch (error) {
-            logger.error('Deposit check failed', { userId, error: error.message });
+            logger.error('Deposit check failed', { error: error.message });
             throw error;
         }
     }
 
-    async confirmDeposit(transaction, confirmations) {
-        try {
-            await Transaction.updateOne(
-                { txId: transaction.txId },
-                {
-                    $set: {
-                        status: 'COMPLETED',
-                        'blockchain.confirmations': confirmations
-                    }
-                }
-            );
+    async processDepositEvent(event) {
+        const fromAddress = event.args.from;
+        const toAddress = event.args.to;
+        const amountRaw = event.args.value;
+        const amount = parseFloat(ethers.formatUnits(amountRaw, this.decimals));
+        const txHash = event.transactionHash;
+        const blockNumber = event.blockNumber;
 
-            await User.updateOne(
-                { userId: transaction.userId },
-                {
-                    $inc: {
-                        balance: transaction.amount,
-                        totalDeposited: transaction.amount
-                    }
-                }
-            );
-
-            await this.processReferralDeposit(transaction.userId, transaction.amount);
-
-            logger.info('Deposit confirmed and credited', {
-                userId: transaction.userId,
-                amount: transaction.amount,
-                txHash: transaction.blockchain.txHash
-            });
-
-        } catch (error) {
-            logger.error('Failed to confirm deposit', {
-                txId: transaction.txId,
-                error: error.message
-            });
-            throw error;
+        // Skip if not to master address
+        if (toAddress.toLowerCase() !== this.masterAddress.toLowerCase()) {
+            return null;
         }
+
+        // Check if already processed
+        const existing = await Transaction.findOne({ 'blockchain.txHash': txHash });
+        if (existing) return null;
+
+        // Find user by tracking amount or registered wallet
+        let user = await User.findOne({ 
+            $or: [
+                { depositTrackingAmount: amount },
+                { registeredWallet: fromAddress.toLowerCase() }
+            ],
+            depositPending: true
+        });
+
+        // If no exact match, try fuzzy match (within $0.01)
+        if (!user) {
+            user = await User.findOne({
+                depositPending: true,
+                depositTrackingAmount: { 
+                    $gte: amount - 0.01, 
+                    $lte: amount + 0.01 
+                }
+            });
+        }
+
+        if (!user) {
+            logger.warn('Deposit received but no matching user found', {
+                from: fromAddress,
+                amount,
+                txHash
+            });
+            return null;
+        }
+
+        // Create deposit transaction
+        const tx = await Transaction.create({
+            txId: generateId(),
+            userId: user.userId,
+            type: 'DEPOSIT',
+            amount: amount,
+            currency: 'USDT',
+            status: 'CONFIRMING',
+            blockchain: {
+                txHash,
+                blockNumber,
+                confirmations: 0,
+                fromAddress,
+                toAddress,
+                token: 'USDT',
+                amountCrypto: amount.toString()
+            }
+        });
+
+        // Credit user balance immediately (small amounts, trust-based)
+        await User.updateOne(
+            { userId: user.userId },
+            {
+                $inc: { 
+                    balance: amount,
+                    totalDeposited: amount
+                },
+                $set: {
+                    depositPending: false,
+                    depositTrackingAmount: null,
+                    lastDepositAt: new Date(),
+                    registeredWallet: fromAddress.toLowerCase()
+                }
+            }
+        );
+
+        // Process referral
+        await this.processReferralDeposit(user.userId, amount);
+
+        logger.info('Deposit detected and credited', {
+            userId: user.userId,
+            amount,
+            txHash,
+            from: fromAddress
+        });
+
+        return {
+            userId: user.userId,
+            amount,
+            txHash,
+            status: 'CREDITED'
+        };
     }
+
+    // Single user deposit check (for manual trigger)
+    async checkDeposit(userId) {
+        this.checkReady();
+
+        const user = await User.findOne({ userId });
+        if (!user) {
+            return { found: false, message: 'User not found' };
+        }
+
+        // Run full scan
+        const results = await this.checkAllDeposits();
+        const userDeposit = results.find(r => r.userId === userId);
+
+        if (userDeposit) {
+            return {
+                found: true,
+                status: 'CREDITED',
+                amount: userDeposit.amount,
+                txHash: userDeposit.txHash
+            };
+        }
+
+        return { 
+            found: false, 
+            message: 'No pending deposit found. Send USDT to the address shown.' 
+        };
+    }
+
+    // ========== REFERRAL SYSTEM ==========
 
     async processReferralDeposit(userId, amount) {
         try {
@@ -360,6 +378,8 @@ class WalletService {
             logger.error('Referral processing failed', { userId, error: error.message });
         }
     }
+
+    // ========== FUND MANAGEMENT ==========
 
     async lockFunds(userId, amount, purpose) {
         const txId = generateId();
@@ -535,13 +555,7 @@ class WalletService {
         }
     }
 
-    async getDepositAddress(userId) {
-        const user = await User.findOne({ userId });
-        if (user && user.depositAddress) {
-            return user.depositAddress;
-        }
-        return await this.generateDepositAddress(userId);
-    }
+    // ========== MASTER WALLET INFO ==========
 
     getMasterAddress() {
         return this.masterAddress || 'WALLET_NOT_READY';
@@ -562,6 +576,25 @@ class WalletService {
             logger.error('Failed to get master balance', { error: error.message });
             throw new Error('BALANCE_CHECK_FAILED — ' + error.message);
         }
+    }
+
+    // ========== BACKGROUND SCANNER ==========
+
+    startDepositScanner(intervalMs = 30000) {
+        if (!this.isReady) {
+            logger.warn('Cannot start scanner — wallet not ready');
+            return;
+        }
+
+        logger.info('Starting deposit scanner', { interval: intervalMs });
+
+        setInterval(async () => {
+            try {
+                await this.checkAllDeposits();
+            } catch (error) {
+                logger.error('Deposit scanner error', { error: error.message });
+            }
+        }, intervalMs);
     }
 }
 
