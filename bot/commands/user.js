@@ -1,4 +1,5 @@
 import { Markup } from 'telegraf';
+import QRCode from 'qrcode';
 import { User, Session, Transaction } from '../../models/index.js';
 import { formatCurrency, generateReferralCode, isNewDay } from '../../utils/helpers.js';
 import config from '../../config/env.js';
@@ -29,11 +30,14 @@ class UserCommands {
         this.bot.action('referral', this.handleReferral.bind(this));
         this.bot.action('stats', this.handleStats.bind(this));
         this.bot.action('settings', this.handleSettings.bind(this));
+        this.bot.action('check_deposit', this.handleCheckDeposit.bind(this));
+        this.bot.action('deposit_qr', this.handleDepositQR.bind(this));
+        this.bot.action(/copy_(.+)/, this.handleCopyAddress.bind(this));
     }
 
     async handleStart(ctx) {
         const userId = ctx.from.id.toString();
-        const user = ctx.state.user;
+        let user = ctx.state.user;
 
         // Handle referral
         const startPayload = ctx.startPayload;
@@ -50,6 +54,9 @@ class UserCommands {
 
 You'll get a bonus on your first deposit.
                 `);
+                
+                // Refresh user data
+                user = await User.findOne({ userId });
             }
         }
 
@@ -59,6 +66,7 @@ You'll get a bonus on your first deposit.
                 { userId },
                 { $set: { freeUsedToday: 0, freeResetDate: new Date() } }
             );
+            user.freeUsedToday = 0;
         }
 
         const welcomeMessage = `
@@ -66,10 +74,10 @@ You'll get a bonus on your first deposit.
 
 Get verification codes instantly for any service.
 
-${user.isVipActive() ? '👑 VIP Active\n' : ''}
-💰 Balance: ${formatCurrency(user.balance)}
-📦 Bundle: ${user.bundleRemaining} OTPs
-🆓 Free Today: ${3 - (user.freeUsedToday || 0)}/3
+${user.isVipActive?.() ? '👑 VIP Active\n' : ''}
+💰 Balance: ${formatCurrency(user.balance || 0)}
+📦 Bundle: ${user.bundleRemaining || 0} OTPs
+🆓 Free Today: ${Math.max(0, 3 - (user.freeUsedToday || 0))}/3
 
 Choose your mode or deposit to get started:
         `;
@@ -97,15 +105,15 @@ Choose your mode or deposit to get started:
     }
 
     async handleMenu(ctx) {
-        const user = ctx.state.user;
+        const user = ctx.state.user || await User.findOne({ userId: ctx.from.id.toString() });
 
         const menuText = `
 📱 Main Menu
 
-💰 Balance: ${formatCurrency(user.balance)}
-📦 Bundle: ${user.bundleRemaining} OTPs
-🆓 Free Today: ${3 - (user.freeUsedToday || 0)}/3
-${user.isVipActive() ? `👑 VIP Until: ${user.vipExpiry.toLocaleDateString()}\n` : ''}
+💰 Balance: ${formatCurrency(user.balance || 0)}
+📦 Bundle: ${user.bundleRemaining || 0} OTPs
+🆓 Free Today: ${Math.max(0, 3 - (user.freeUsedToday || 0))}/3
+${user.isVipActive?.() ? `👑 VIP Until: ${user.vipExpiry?.toLocaleDateString()}\n` : ''}
 
 What would you like to do?
         `;
@@ -126,36 +134,39 @@ What would you like to do?
             [Markup.button.callback('❓ Help', 'help')]
         ]);
 
-        await ctx.editMessageText(menuText, keyboard).catch(() => {
-            ctx.reply(menuText, keyboard);
-        });
+        try {
+            await ctx.editMessageText(menuText, keyboard);
+        } catch {
+            await ctx.reply(menuText, keyboard);
+        }
     }
 
     async handleBalance(ctx) {
-        const user = ctx.state.user;
+        const userId = ctx.from.id.toString();
+        const user = ctx.state.user || await User.findOne({ userId });
 
         // Get pending deposits
         const pendingDeposit = await Transaction.findOne({
             userId: user.userId,
-            type: { $in: ['DEPOSIT', 'DEPOSIT_CONFIRMING'] },
+            type: 'DEPOSIT',
             status: { $in: ['PENDING', 'CONFIRMING'] }
         });
 
         const message = `
 💰 Your Balance
 
-Available: ${formatCurrency(user.getAvailableBalance())}
-Locked: ${formatCurrency(user.lockedBalance)}
-Total Deposited: ${formatCurrency(user.totalDeposited)}
-Total Spent: ${formatCurrency(user.totalSpent)}
+Available: ${formatCurrency((user.balance || 0) - (user.lockedBalance || 0))}
+Locked: ${formatCurrency(user.lockedBalance || 0)}
+Total Deposited: ${formatCurrency(user.totalDeposited || 0)}
+Total Spent: ${formatCurrency(user.totalSpent || 0)}
 
-📦 Bundle OTPs: ${user.bundleRemaining}
-${user.isVipActive() ? `👑 VIP Until: ${user.vipExpiry.toLocaleDateString()}` : '👑 VIP: Inactive'}
+📦 Bundle OTPs: ${user.bundleRemaining || 0}
+${user.isVipActive?.() ? `👑 VIP Until: ${user.vipExpiry?.toLocaleDateString()}` : '👑 VIP: Inactive'}
 
 ${pendingDeposit ? `⏳ Pending Deposit: ${formatCurrency(pendingDeposit.amount)}` : ''}
 
-💳 Deposit Address:
-\`${user.depositAddress || 'Generate one with /deposit'}\`
+💳 Deposit to:
+\`${this.walletService.getMasterAddress()}\`
         `;
 
         const keyboard = Markup.inlineKeyboard([
@@ -171,27 +182,29 @@ ${pendingDeposit ? `⏳ Pending Deposit: ${formatCurrency(pendingDeposit.amount)
         const userId = ctx.from.id.toString();
 
         try {
-            // Generate or get deposit address
-            const address = await this.walletService.getDepositAddress(userId);
+            // Generate deposit info with tracking amount
+            const depositInfo = await this.walletService.getDepositInfo(userId);
 
             const message = `
 💳 Deposit Funds
 
-Send USDT (BEP-20) to your unique address:
+Send **exactly** this amount of USDT (BEP-20):
 
-\`${address}\`
+Amount: \`$${depositInfo.amount}\`
+Address: \`${depositInfo.address}\`
+Network: ${depositInfo.network}
 
-⚠️ Important:
-• Only send USDT on BSC (BEP-20)
-• Minimum deposit: $0.50
-• Requires ${config.blockchain.blockConfirmations} confirmations
-• Funds are non-refundable
+⚠️ IMPORTANT:
+• Send ONLY USDT on BSC (BEP-20)
+• Send EXACTLY $${depositInfo.amount} — this identifies your deposit
+• Minimum: $0.50
+• Requires ${config.blockchain?.blockConfirmations || 12} confirmations
 
-Your deposit will be credited automatically once confirmed.
+⏱ Funds credited automatically in 1-2 minutes.
             `;
 
             const keyboard = Markup.inlineKeyboard([
-                [Markup.button.callback('📋 Copy Address', `copy_${address}`)],
+                [Markup.button.callback('📱 Show QR Code', 'deposit_qr')],
                 [Markup.button.callback('🔄 Check Deposit', 'check_deposit')],
                 [Markup.button.callback('🔙 Back', 'menu')]
             ]);
@@ -200,8 +213,83 @@ Your deposit will be credited automatically once confirmed.
 
         } catch (error) {
             logger.error('Deposit handler error', { userId, error: error.message });
-            await ctx.reply('❌ Error generating deposit address. Please try again.');
+            await ctx.reply('❌ Error generating deposit. Please try again later.');
         }
+    }
+
+    async handleDepositQR(ctx) {
+        const userId = ctx.from.id.toString();
+
+        try {
+            const user = await User.findOne({ userId });
+            if (!user || !user.depositTrackingAmount) {
+                return ctx.answerCbQuery('Please click Deposit first');
+            }
+
+            const masterAddress = this.walletService.getMasterAddress();
+            
+            // Generate QR code with payment URI
+            const paymentUri = `ethereum:${masterAddress}?amount=${user.depositTrackingAmount}&token=USDT`;
+            const qrBuffer = await QRCode.toBuffer(paymentUri);
+
+            await ctx.answerCbQuery('Generating QR...');
+            
+            await ctx.replyWithPhoto(
+                { source: qrBuffer },
+                {
+                    caption: `📱 Scan to deposit $${user.depositTrackingAmount} USDT\n\nAddress: \`${masterAddress}\``,
+                    parse_mode: 'Markdown'
+                }
+            );
+
+        } catch (error) {
+            logger.error('QR generation failed', { userId, error: error.message });
+            await ctx.answerCbQuery('❌ Failed to generate QR');
+        }
+    }
+
+    async handleCheckDeposit(ctx) {
+        const userId = ctx.from.id.toString();
+
+        try {
+            await ctx.answerCbQuery('Checking deposits...');
+
+            const result = await this.walletService.checkDeposit(userId);
+
+            if (result.found) {
+                await ctx.reply(`
+✅ Deposit Found!
+
+Amount: ${formatCurrency(result.amount)}
+Status: ${result.status}
+TX: \`${result.txHash}\`
+
+Your balance has been updated.
+                `, { parse_mode: 'Markdown' });
+            } else {
+                await ctx.reply(`
+⏳ No deposit found yet.
+
+Make sure you:
+1. Sent to: \`${this.walletService.getMasterAddress()}\`
+2. Sent exactly the shown amount
+3. Used BSC (BEP-20) network
+
+Click 🔄 Check Deposit again in 1 minute.
+                `, { parse_mode: 'Markdown' });
+            }
+
+        } catch (error) {
+            logger.error('Check deposit failed', { userId, error: error.message });
+            await ctx.answerCbQuery('❌ Check failed');
+            await ctx.reply('❌ Error checking deposit. Please try again.');
+        }
+    }
+
+    async handleCopyAddress(ctx) {
+        // Telegram handles copy automatically when user taps the code block
+        // This just acknowledges the callback
+        await ctx.answerCbQuery('Address copied! Paste it in your wallet.');
     }
 
     async handleHistory(ctx) {
@@ -214,15 +302,15 @@ Your deposit will be credited automatically once confirmed.
         let message = '📜 Recent Transactions\n\n';
 
         if (transactions.length === 0) {
-            message += 'No transactions yet.';
+            message += 'No transactions yet. Deposit to get started!';
         } else {
             transactions.forEach((tx, index) => {
                 const icon = tx.amount > 0 ? '➕' : '➖';
-                const type = tx.type.replace(/_/g, ' ');
+                const type = tx.type?.replace(/_/g, ' ') || 'Unknown';
                 message += `${index + 1}. ${icon} ${type}\n`;
-                message += `   Amount: ${formatCurrency(Math.abs(tx.amount))}\n`;
+                message += `   Amount: ${formatCurrency(Math.abs(tx.amount || 0))}\n`;
                 message += `   Status: ${tx.status}\n`;
-                message += `   Date: ${tx.createdAt.toLocaleDateString()}\n\n`;
+                message += `   Date: ${tx.createdAt?.toLocaleDateString() || 'Unknown'}\n\n`;
             });
         }
 
@@ -235,8 +323,8 @@ Your deposit will be credited automatically once confirmed.
     }
 
     async handleReferral(ctx) {
-        const user = ctx.state.user;
-        const botUsername = ctx.botInfo.username;
+        const user = ctx.state.user || await User.findOne({ userId: ctx.from.id.toString() });
+        const botUsername = ctx.botInfo?.username || 'your_bot';
 
         const referralLink = `https://t.me/${botUsername}?start=${user.referralCode}`;
 
@@ -245,11 +333,11 @@ Your deposit will be credited automatically once confirmed.
 
 Your Code: \`${user.referralCode}\`
 
-Share your link and earn ${(config.referral.percentage * 100).toFixed(0)}% of your referrals' deposits!
+Share your link and earn ${((config.referral?.percentage || 0.05) * 100).toFixed(0)}% of your referrals' deposits!
 
 📊 Your Stats:
-• Referrals: ${user.referralCount}
-• Total Earnings: ${formatCurrency(user.referralEarnings)}
+• Referrals: ${user.referralCount || 0}
+• Total Earnings: ${formatCurrency(user.referralEarnings || 0)}
 • Pending Approval: ${formatCurrency(user.referralRewardsPending || 0)}
 
 🔗 Your Link:
@@ -276,9 +364,10 @@ Share your link and earn ${(config.referral.percentage * 100).toFixed(0)}% of yo
             ? ((successful / totalRequests) * 100).toFixed(1) 
             : 0;
 
-        const avgWaitTime = sessions
-            .filter(s => s.endTime && s.startTime)
-            .reduce((acc, s) => acc + (s.endTime - s.startTime), 0) / (successful || 1);
+        const completedSessions = sessions.filter(s => s.endTime && s.startTime);
+        const avgWaitTime = completedSessions.length > 0
+            ? completedSessions.reduce((acc, s) => acc + (s.endTime - s.startTime), 0) / completedSessions.length
+            : 0;
 
         const message = `
 📊 Your Statistics
@@ -293,11 +382,11 @@ Share your link and earn ${(config.referral.percentage * 100).toFixed(0)}% of yo
 • Avg Wait Time: ${(avgWaitTime / 1000).toFixed(1)}s
 
 💰 Financial:
-• Total Deposited: ${formatCurrency(ctx.state.user.totalDeposited)}
-• Total Spent: ${formatCurrency(ctx.state.user.totalSpent)}
-• Current Balance: ${formatCurrency(ctx.state.user.balance)}
+• Total Deposited: ${formatCurrency(ctx.state.user?.totalDeposited || 0)}
+• Total Spent: ${formatCurrency(ctx.state.user?.totalSpent || 0)}
+• Current Balance: ${formatCurrency(ctx.state.user?.balance || 0)}
 
-📅 Member Since: ${ctx.state.user.createdAt.toLocaleDateString()}
+📅 Member Since: ${ctx.state.user?.createdAt?.toLocaleDateString() || 'Unknown'}
         `;
 
         await ctx.reply(message, Markup.inlineKeyboard([
@@ -306,7 +395,7 @@ Share your link and earn ${(config.referral.percentage * 100).toFixed(0)}% of yo
     }
 
     async handleSettings(ctx) {
-        const user = ctx.state.user;
+        const user = ctx.state.user || await User.findOne({ userId: ctx.from.id.toString() });
 
         const message = `
 ⚙️ Settings
@@ -342,5 +431,4 @@ Toggle settings below:
 }
 
 export default UserCommands;
-
- 
+                                                           
