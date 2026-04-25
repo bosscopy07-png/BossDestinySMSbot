@@ -6,11 +6,11 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install --only=production
 
-# Copy ALL source code
+# Force cache bust - copy source LAST
 COPY . .
 
-# Verify structure
-RUN ls -la
+# Verify files exist
+RUN ls -la app.js || (echo "ERROR: app.js not found" && exit 1)
 
 # Create logs directory
 RUN mkdir -p logs
