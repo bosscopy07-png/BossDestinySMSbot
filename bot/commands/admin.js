@@ -583,4 +583,286 @@ To update, use:
     }
 
     async handleSettingsVip(ctx) {
-        await ctx.
+        await ctx.reply(`
+👑 VIP Configuration
+
+Current:
+• Price: ${formatCurrency(config.prices?.vipSubscription || 5.00)}
+• Duration: ${config.prices?.vipDuration || 30} days
+
+To update, use:
+/setvip price <amount>
+/setvip days <number>
+        `, Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'admin_settings')]
+        ]));
+    }
+
+    async handleSettingsFree(ctx) {
+        await ctx.reply(`
+🆓 Free OTP Limits
+
+Current:
+• Daily per user: ${config.limits?.freeDaily || 3}
+• Per number: ${config.limits?.freePerNumber || 1}
+
+To update, use:
+/setfree daily <number>
+/setfree pernumber <number>
+        `, Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'admin_settings')]
+        ]));
+    }
+
+    async handleSettingsProviders(ctx) {
+        await ctx.reply(`
+⚡ Provider Settings
+
+Toggle providers on/off:
+/toggleprovider twilio
+/toggleprovider telnyx
+/toggleprovider cheappanel
+/toggleprovider freepublic
+
+Current status shown in main settings menu.
+        `, Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'admin_settings')]
+        ]));
+    }
+
+    async handleSettingsMaintenance(ctx) {
+        const current = config.maintenance || false;
+        config.maintenance = !current;
+
+        await ctx.reply(`
+🛠 Maintenance Mode ${!current ? 'ENABLED' : 'DISABLED'}
+
+Users will ${!current ? 'see a maintenance message' : 'have normal access'}.
+        `, Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'admin_settings')]
+        ]));
+
+        logger.info('Maintenance mode toggled', {
+            admin: ctx.from.id,
+            enabled: !current
+        });
+    }
+
+    async handleSystem(ctx) {
+        const masterBalance = await walletService.getMasterBalance();
+
+        const message = `
+⚙️ System Status
+
+🖥 Server: Online
+💾 Database: Connected
+⏱ Uptime: ${process.uptime()}s
+
+💎 Master Wallet:
+• Address: \`${walletService.getMasterAddress()}\`
+• USDT: ${masterBalance.usdt}
+• BNB: ${masterBalance.bnb}
+
+📊 Memory: ${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB
+        `;
+
+        await ctx.reply(message, { parse_mode: 'Markdown' });
+    }
+
+    async handleLogs(ctx) {
+        const logs = await AdminLog.find()
+            .sort({ timestamp: -1 })
+            .limit(20);
+
+        let message = '📋 Admin Logs (Last 20)\n\n';
+
+        for (const log of logs) {
+            message += `
+[${log.timestamp.toLocaleString()}]
+👤 ${log.adminId} → ${log.action}
+🎯 ${log.targetUserId || 'N/A'}
+📄 ${JSON.stringify(log.details).substring(0, 100)}
+            `;
+        }
+
+        await ctx.reply(message);
+    }
+
+    async handleApproveReferral(ctx) {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            return ctx.reply('Usage: /approve_referral <tx_id>');
+        }
+
+        const txId = args[1];
+        const tx = await Transaction.findOne({ txId, type: 'REFERRAL_REWARD', status: 'PENDING' });
+
+        if (!tx) {
+            return ctx.reply('❌ Referral transaction not found or already processed.');
+        }
+
+        // Credit referrer
+        await User.updateOne(
+            { userId: tx.userId },
+            { $inc: { balance: tx.amount } }
+        );
+
+        await Transaction.updateOne(
+            { txId },
+            {
+                $set: {
+                    status: 'COMPLETED',
+                    approvedBy: ctx.from.id.toString(),
+                    approvedAt: new Date()
+                }
+            }
+        );
+
+        await ctx.reply(`✅ Referral reward ${formatCurrency(tx.amount)} approved for user ${tx.userId}`);
+
+        // Notify referrer
+        await ctx.telegram.sendMessage(tx.userId, `
+🎁 Referral Reward Approved!
+
+Amount: ${formatCurrency(tx.amount)}
+Status: Credited to your balance
+
+Thank you for referring users!
+        `);
+    }
+
+    async handleMasterBalance(ctx) {
+        const balance = await walletService.getMasterBalance();
+        
+        await ctx.reply(`
+💎 Master Wallet Balance
+
+Address: \`${walletService.getMasterAddress()}\`
+
+USDT: ${balance.usdt}
+BNB: ${balance.bnb}
+
+This is your revenue wallet.
+        `, { parse_mode: 'Markdown' });
+    }
+
+    async handleWithdrawProfits(ctx) {
+        await ctx.reply(`
+💸 Withdraw Profits
+
+To withdraw, send USDT from your master wallet manually or use your wallet app.
+
+Master Address: \`${walletService.getMasterAddress()}\`
+
+⚠️ Always keep some BNB for gas fees.
+        `, { parse_mode: 'Markdown' });
+    }
+
+    // Helper methods
+    async getSystemStats() {
+        const now = new Date();
+        const dayAgo = new Date(now - 24 * 60 * 60 * 1000);
+
+        const [
+            totalUsers,
+            payingUsers,
+            vipUsers,
+            activeToday,
+            otpStats,
+            masterBalance
+        ] = await Promise.all([
+            User.countDocuments(),
+            User.countDocuments({ balance: { $gt: 0 } }),
+            User.countDocuments({ vipExpiry: { $gt: now } }),
+            User.countDocuments({ lastActive: { $gte: dayAgo } }),
+            Session.aggregate([
+                { $match: { startTime: { $gte: dayAgo } } },
+                {
+                    $group: {
+                        _id: null,
+                        total: { $sum: 1 },
+                        success: { $sum: { $cond: [{ $eq: ['$status', 'RECEIVED'] }, 1, 0] } },
+                        failed: { $sum: { $cond: [{ $eq: ['$status', 'TIMEOUT'] }, 1, 0] } }
+                    }
+                }
+            ]),
+            walletService.getMasterBalance().catch(() => ({ usdt: '0', bnb: '0' }))
+        ]);
+
+        const stats = otpStats[0] || { total: 0, success: 0, failed: 0 };
+
+        return {
+            totalUsers,
+            payingUsers,
+            vipUsers,
+            activeToday,
+            otpRequests24h: stats.total,
+            otpSuccess24h: stats.success,
+            otpFailed24h: stats.failed,
+            successRate24h: stats.total > 0 ? ((stats.success / stats.total) * 100).toFixed(1) : 0,
+            revenue24h: await this.calculateRevenue(dayAgo),
+            revenue7d: await this.calculateRevenue(new Date(now - 7 * 24 * 60 * 60 * 1000)),
+            revenue30d: await this.calculateRevenue(new Date(now - 30 * 24 * 60 * 60 * 1000)),
+            masterBalance: parseFloat(masterBalance.usdt) || 0,
+            uptime: `${Math.floor(process.uptime() / 3600)}h ${Math.floor((process.uptime() % 3600) / 60)}m`
+        };
+    }
+
+    async calculateRevenue(since) {
+        const result = await Transaction.aggregate([
+            {
+                $match: {
+                    type: { $in: ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION'] },
+                    status: 'COMPLETED',
+                    createdAt: { $gte: since }
+                }
+            },
+            { $group: { _id: null, total: { $sum: '$amount' } } }
+        ]);
+        return Math.abs(result[0]?.total || 0);
+    }
+
+    async getRevenueByMode(since) {
+        const results = await Transaction.aggregate([
+            {
+                $match: {
+                    type: { $in: ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION'] },
+                    status: 'COMPLETED',
+                    createdAt: { $gte: since }
+                }
+            },
+            {
+                $group: {
+                    _id: '$type',
+                    total: { $sum: { $abs: '$amount' } }
+                }
+            }
+        ]);
+
+        return results.map(r => `• ${r._id}: ${formatCurrency(r.total)}`).join('\n') || 'No data';
+    }
+
+    async getRevenueByService(since) {
+        const results = await Session.aggregate([
+            {
+                $match: {
+                    status: 'RECEIVED',
+                    startTime: { $gte: since }
+                }
+            },
+            {
+                $group: {
+                    _id: '$service',
+                    count: { $sum: 1 },
+                    revenue: { $sum: '$cost' }
+                }
+            },
+            { $sort: { revenue: -1 } },
+            { $limit: 5 }
+        ]);
+
+        return results.map(r => `• ${r._id}: ${formatCurrency(r.revenue)} (${r.count} OTPs)`).join('\n') || 'No data';
+    }
+}
+
+export default AdminCommands;
