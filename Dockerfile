@@ -6,8 +6,11 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install --only=production
 
-# Copy source
+# Copy ALL source code (including src/)
 COPY . .
+
+# Verify src exists (debug)
+RUN ls -la src/ || echo "WARNING: src/ not found"
 
 # Create logs directory
 RUN mkdir -p logs
