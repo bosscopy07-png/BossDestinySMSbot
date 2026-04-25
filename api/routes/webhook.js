@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import express, { Router } from 'express';
 import sessionManager from '../../services/otp/index.js';
 import logger from '../../utils/logger.js';
 
