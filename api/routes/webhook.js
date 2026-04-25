@@ -1,4 +1,4 @@
- import { Router } from 'express';
+import { Router } from 'express';
 import sessionManager from '../../services/otp/index.js';
 import logger from '../../utils/logger.js';
 
@@ -23,7 +23,6 @@ router.post('/twilio', express.urlencoded({ extended: false }), async (req, res)
         });
 
         if (session) {
-            // Extract OTP from message
             const otpMatch = Body.match(/\b\d{4,8}\b/);
             if (otpMatch) {
                 await sessionManager.deliverOTP(session, otpMatch[0]);
@@ -41,9 +40,18 @@ router.post('/twilio', express.urlencoded({ extended: false }), async (req, res)
 // Vonage webhook for delivery status
 router.post('/vonage', async (req, res) => {
     try {
-        const { msisdn, to, messageId, status, err-code } = req.body;
+        // ✅ FIXED: Use bracket notation for hyphenated keys
+        const msisdn = req.body.msisdn;
+        const to = req.body.to;
+        const messageId = req.body.messageId;
+        const status = req.body.status;
+        const errCode = req.body['err-code']; // ← FIXED HERE
 
-        logger.info('Vonage webhook', { messageId, status, errCode: err-code });
+        logger.info('Vonage webhook', { 
+            messageId, 
+            status, 
+            errCode // ← use camelCase variable
+        });
 
         res.sendStatus(200);
 
@@ -60,12 +68,10 @@ router.post('/blockchain', async (req, res) => {
 
         logger.info('Blockchain webhook', { address, txHash, amount, confirmations });
 
-        // Find user by deposit address
         const { User } = await import('../../models/index.js');
         const user = await User.findOne({ depositAddress: address });
 
         if (user) {
-            // Trigger deposit check
             const { default: WalletService } = await import('../../services/wallet/index.js');
             const walletService = new WalletService();
             await walletService.checkDeposit(user.userId);
