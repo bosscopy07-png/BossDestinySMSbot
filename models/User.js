@@ -1,7 +1,7 @@
 import mongoose from 'mongoose';
-import { generateReferralCode } from '../utils/helpers.js';
 
 const userSchema = new mongoose.Schema({
+    // Existing fields (keep what you already have)
     userId: {
         type: String,
         required: true,
@@ -20,62 +20,13 @@ const userSchema = new mongoose.Schema({
         type: String,
         default: null
     },
-    
-    // Balance & Credits
     balance: {
         type: Number,
-        default: 0,
-        min: 0
+        default: 0
     },
     lockedBalance: {
         type: Number,
-        default: 0,
-        min: 0
-    },
-    bundleRemaining: {
-        type: Number,
-        default: 0,
-        min: 0
-    },
-    
-    // VIP Status
-    vipExpiry: {
-        type: Date,
-        default: null
-    },
-    vipDailyUsed: {
-        type: Number,
         default: 0
-    },
-    vipDailyReset: {
-        type: Date,
-        default: null
-    },
-    
-    // Mode & Limits
-    mode: {
-        type: String,
-        enum: ['FREE', 'CHEAP', 'VIP'],
-        default: 'FREE'
-    },
-    freeUsedToday: {
-        type: Number,
-        default: 0
-    },
-    freeResetDate: {
-        type: Date,
-        default: null
-    },
-    
-    // Blockchain
-    depositAddress: {
-        type: String,
-        default: null,
-        index: true
-    },
-    depositIndex: {
-        type: Number,
-        default: null
     },
     totalDeposited: {
         type: Number,
@@ -85,8 +36,39 @@ const userSchema = new mongoose.Schema({
         type: Number,
         default: 0
     },
-    
-    // Referral
+    bundleRemaining: {
+        type: Number,
+        default: 0
+    },
+    vipExpiry: {
+        type: Date,
+        default: null
+    },
+    freeUsedToday: {
+        type: Number,
+        default: 0
+    },
+    freeResetDate: {
+        type: Date,
+        default: null
+    },
+    mode: {
+        type: String,
+        enum: ['FREE', 'CHEAP', 'VIP'],
+        default: 'FREE'
+    },
+    isBlacklisted: {
+        type: Boolean,
+        default: false
+    },
+    blacklistReason: {
+        type: String,
+        default: null
+    },
+    blacklistDate: {
+        type: Date,
+        default: null
+    },
     referralCode: {
         type: String,
         unique: true,
@@ -94,8 +76,7 @@ const userSchema = new mongoose.Schema({
     },
     referredBy: {
         type: String,
-        default: null,
-        index: true
+        default: null
     },
     referralCount: {
         type: Number,
@@ -109,60 +90,59 @@ const userSchema = new mongoose.Schema({
         type: Number,
         default: 0
     },
-    
-    // Security
-    isBlacklisted: {
-        type: Boolean,
-        default: false
-    },
-    blacklistReason: {
-        type: String,
-        default: null
-    },
-    blacklistDate: {
+    lastActive: {
         type: Date,
-        default: null
-    },
-    
-    // Preferences
-    preferredCountry: {
-        type: String,
-        default: 'US'
+        default: Date.now
     },
     privacyEnabled: {
         type: Boolean,
-        default: false
+        default: true
     },
     notificationsEnabled: {
         type: Boolean,
         default: true
     },
-    language: {
+    preferredCountry: {
         type: String,
-        default: 'en'
+        default: 'US'
     },
     
-    // Metadata
-    ipAddress: {
+    // ========== NEW DEPOSIT FIELDS ==========
+    depositAddress: {
         type: String,
+        default: null        // Always master address
+    },
+    depositTrackingAmount: {
+        type: Number,
+        default: null        // Unique amount for matching (e.g., 10.001234)
+    },
+    depositPending: {
+        type: Boolean,
+        default: false       // Waiting for deposit?
+    },
+    depositRequestedAt: {
+        type: Date,
         default: null
     },
-    lastActive: {
-        type: Date,
-        default: Date.now
+    registeredWallet: {
+        type: String,
+        default: null        // Wallet address they sent from
     },
-    createdAt: {
+    lastDepositAt: {
         type: Date,
-        default: Date.now
+        default: null
     }
+    // =======================================
+
 }, {
     timestamps: true
 });
 
 // Indexes
-userSchema.index({ isBlacklisted: 1, lastActive: -1 });
-userSchema.index({ vipExpiry: 1 }, { sparse: true });
+userSchema.index({ referralCode: 1 });
 userSchema.index({ referredBy: 1 });
+userSchema.index({ isBlacklisted: 1 });
+userSchema.index({ lastActive: -1 });
 
 // Methods
 userSchema.methods.isVipActive = function() {
@@ -170,29 +150,18 @@ userSchema.methods.isVipActive = function() {
 };
 
 userSchema.methods.getAvailableBalance = function() {
-    return this.balance - this.lockedBalance;
+    return (this.balance || 0) - (this.lockedBalance || 0);
 };
 
-userSchema.methods.canUseFree = function() {
-    if (isNewDay(this.freeResetDate)) {
-        this.freeUsedToday = 0;
-        this.freeResetDate = new Date();
-    }
-    return this.freeUsedToday < 3; // FREE_DAILY_LIMIT from config
+// Static method to generate referral code
+userSchema.statics.generateReferralCode = function() {
+    return Math.random().toString(36).substring(2, 8).toUpperCase();
 };
 
-userSchema.methods.canUseVip = function() {
-    if (!this.isVipActive()) return false;
-    if (isNewDay(this.vipDailyReset)) {
-        this.vipDailyUsed = 0;
-        this.vipDailyReset = new Date();
-    }
-    return this.vipDailyUsed < 50; // VIP_DAILY_LIMIT from config
-};
-
+// Pre-save hook to generate referral code
 userSchema.pre('save', function(next) {
     if (!this.referralCode) {
-        this.referralCode = generateReferralCode(this.userId);
+        this.referralCode = Math.random().toString(36).substring(2, 8).toUpperCase();
     }
     next();
 });
