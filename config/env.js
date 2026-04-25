@@ -16,9 +16,9 @@ const envSchema = Joi.object({
     TWILIO_SID: Joi.string().required(),
     TWILIO_AUTH_TOKEN: Joi.string().required(),
     TWILIO_PHONE_NUMBER: Joi.string().required(),
-    VONAGE_API_KEY: Joi.string().required(),
-    VONAGE_API_SECRET: Joi.string().required(),
-    VONAGE_PHONE_NUMBER: Joi.string().required(),
+    TELNYX_API_KEY: Joi.string().required(),
+    TELNYX_PHONE_NUMBER: Joi.string().required(),
+    TELNYX_MESSAGING_PROFILE_ID: Joi.string().allow('').optional(),
     CHEAP_PANEL_API_KEY: Joi.string().required(),
     CHEAP_PANEL_BASE_URL: Joi.string().uri().required(),
     MASTER_PRIVATE_KEY: Joi.string().pattern(/^0x[a-fA-F0-9]{64}$/).required(),
@@ -62,10 +62,10 @@ export const config = {
         authToken: envVars.TWILIO_AUTH_TOKEN,
         phoneNumber: envVars.TWILIO_PHONE_NUMBER
     },
-    vonage: {
-        apiKey: envVars.VONAGE_API_KEY,
-        apiSecret: envVars.VONAGE_API_SECRET,
-        phoneNumber: envVars.VONAGE_PHONE_NUMBER
+    telnyx: {
+        apiKey: envVars.TELNYX_API_KEY,
+        phoneNumber: envVars.TELNYX_PHONE_NUMBER,
+        messagingProfileId: envVars.TELNYX_MESSAGING_PROFILE_ID || null
     },
     cheapPanel: {
         apiKey: envVars.CHEAP_PANEL_API_KEY,
