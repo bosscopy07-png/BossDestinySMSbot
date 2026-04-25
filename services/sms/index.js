@@ -1,5 +1,5 @@
 import TwilioProvider from './TwilioProvider.js';
-import VonageProvider from './VonageProvider.js';
+import TelnyxProvider from './TelnyxProvider.js';
 import CheapPanelProvider from './CheapPanelProvider.js';
 import FreeProvider from './FreeProvider.js';
 import logger from '../../utils/logger.js';
@@ -13,7 +13,7 @@ class SMSProviderManager {
     initializeProviders() {
         // Register all providers
         this.providers.set('TWILIO', new TwilioProvider());
-        this.providers.set('VONAGE', new VonageProvider());
+        this.providers.set('TELNYX', new TelnyxProvider());
         this.providers.set('CHEAP_PANEL', new CheapPanelProvider());
         this.providers.set('FREE_PUBLIC', new FreeProvider());
 
@@ -25,8 +25,8 @@ class SMSProviderManager {
     async getProviderForTier(tier, country = 'US', preferredProvider = null) {
         const tierMap = {
             'FREE': ['FREE_PUBLIC'],
-            'CHEAP': ['CHEAP_PANEL', 'VONAGE', 'TWILIO'],
-            'VIP': ['TWILIO', 'VONAGE']
+            'CHEAP': ['CHEAP_PANEL', 'TELNYX', 'TWILIO'],
+            'VIP': ['TELNYX', 'TWILIO']
         };
 
         const providerNames = tierMap[tier] || tierMap['CHEAP'];
@@ -83,7 +83,7 @@ class SMSProviderManager {
             return await provider.checkSMS(identifier); // phoneNumber
         }
 
-        // For Twilio/Vonage, you'd check via their APIs or webhooks
+        // For Twilio/Telnyx, you'd check via their APIs or webhooks
         return { success: false, status: 'CHECK_NOT_SUPPORTED' };
     }
 
@@ -130,5 +130,3 @@ class SMSProviderManager {
 }
 
 export default SMSProviderManager;
-
- 
