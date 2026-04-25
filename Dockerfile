@@ -9,8 +9,8 @@ RUN npm install --only=production
 # Copy ALL source code
 COPY . .
 
-# Verify structure (debug - check what actually exists)
-RUN ls -la && echo "---" && ls -la *.js 2>/dev/null || echo "No .js files in root"
+# Verify structure
+RUN ls -la
 
 # Create logs directory
 RUN mkdir -p logs
