@@ -34,6 +34,22 @@ class AdminCommands {
         this.bot.action('admin_logs', this.requireAdmin, this.handleLogs.bind(this));
         this.bot.action('admin_broadcast', this.requireAdmin, this.handleBroadcastMenu.bind(this));
         this.bot.action('admin_settings', this.requireAdmin, this.handleSettings.bind(this));
+
+        // Broadcast submenu handlers
+        this.bot.action('broadcast_all', this.requireAdmin, this.handleBroadcastAll.bind(this));
+        this.bot.action('broadcast_vip', this.requireAdmin, this.handleBroadcastVip.bind(this));
+        this.bot.action('broadcast_paying', this.requireAdmin, this.handleBroadcastPaying.bind(this));
+        this.bot.action('broadcast_recent', this.requireAdmin, this.handleBroadcastRecent.bind(this));
+
+        // Settings submenu handlers
+        this.bot.action('settings_prices', this.requireAdmin, this.handleSettingsPrices.bind(this));
+        this.bot.action('settings_vip', this.requireAdmin, this.handleSettingsVip.bind(this));
+        this.bot.action('settings_free', this.requireAdmin, this.handleSettingsFree.bind(this));
+        this.bot.action('settings_providers', this.requireAdmin, this.handleSettingsProviders.bind(this));
+        this.bot.action('settings_maintenance', this.requireAdmin, this.handleSettingsMaintenance.bind(this));
+
+        // Pagination handlers
+        this.bot.action(/admin_users_(\d+)/, this.requireAdmin, this.handleUsers.bind(this));
     }
 
     get requireAdmin() {
@@ -104,7 +120,8 @@ class AdminCommands {
     }
 
     async handleUsers(ctx) {
-        const page = ctx.match ? parseInt(ctx.match[1]) || 1 : 1;
+        const match = ctx.match ? ctx.match[1] : null;
+        const page = match ? parseInt(match) || 1 : 1;
         const perPage = 10;
 
         const users = await User.find()
@@ -116,7 +133,7 @@ class AdminCommands {
 
         for (const user of users) {
             const status = user.isBlacklisted ? '🔴' :
-                          user.isVipActive() ? '👑' :
+                          user.isVipActive?.() ? '👑' :
                           user.balance > 0 ? '💰' : '🆓';
 
             message += `
@@ -167,13 +184,13 @@ Last Active: ${user.lastActive?.toLocaleDateString() || 'Never'}
 👤 Name: ${user.firstName || ''} ${user.lastName || ''}
 📱 Username: @${user.username || 'N/A'}
 💰 Balance: ${formatCurrency(user.balance)}
-📦 Bundle: ${user.bundleRemaining} OTPs
-👑 VIP: ${user.isVipActive() ? `Until ${user.vipExpiry.toLocaleDateString()}` : 'Inactive'}
-🆓 Free Used Today: ${user.freeUsedToday}/3
+📦 Bundle: ${user.bundleRemaining || 0} OTPs
+👑 VIP: ${user.isVipActive?.() ? `Until ${user.vipExpiry?.toLocaleDateString()}` : 'Inactive'}
+🆓 Free Used Today: ${user.freeUsedToday || 0}/3
 📊 Mode: ${user.mode}
 
 🚫 Status: ${user.isBlacklisted ? `BLACKLISTED (${user.blacklistReason})` : 'Active'}
-📅 Joined: ${user.createdAt.toLocaleDateString()}
+📅 Joined: ${user.createdAt?.toLocaleDateString() || 'Unknown'}
 
 Recent Sessions: ${sessions.length}
 Recent Transactions: ${transactions.length}
@@ -402,222 +419,168 @@ OTP Bot Team
         await ctx.reply(`📢 Broadcast complete.\n✅ Sent: ${sent}\n❌ Failed: ${failed}`);
     }
 
-    async handleSystem(ctx) {
-        const masterBalance = await walletService.getMasterBalance();
+    // ========== BROADCAST MENU ==========
+    async handleBroadcastMenu(ctx) {
+        const stats = await this.getBroadcastStats();
 
-        const message = `
-⚙️ System Status
-
-🖥 Server: Online
-💾 Database: Connected
-⏱ Uptime: ${process.uptime()}s
-
-💎 Master Wallet:
-• Address: \`${walletService.getMasterAddress()}\`
-• USDT: ${masterBalance.usdt}
-• BNB: ${master.bnb}
-
-📊 Memory: ${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB
-        `;
-
-        await ctx.reply(message, { parse_mode: 'Markdown' });
-    }
-
-    async handleLogs(ctx) {
-        const logs = await AdminLog.find()
-            .sort({ timestamp: -1 })
-            .limit(20);
-
-        let message = '📋 Admin Logs (Last 20)\n\n';
-
-        for (const log of logs) {
-            message += `
-[${log.timestamp.toLocaleString()}]
-👤 ${log.adminId} → ${log.action}
-🎯 ${log.targetUserId || 'N/A'}
-📄 ${JSON.stringify(log.details).substring(0, 100)}
-            `;
-        }
-
-        await ctx.reply(message);
-    }
-
-    async handleApproveReferral(ctx) {
-        const args = ctx.message.text.split(' ');
-        if (args.length < 2) {
-            return ctx.reply('Usage: /approve_referral <tx_id>');
-        }
-
-        const txId = args[1];
-        const tx = await Transaction.findOne({ txId, type: 'REFERRAL_REWARD', status: 'PENDING' });
-
-        if (!tx) {
-            return ctx.reply('❌ Referral transaction not found or already processed.');
-        }
-
-        // Credit referrer
-        await User.updateOne(
-            { userId: tx.userId },
-            { $inc: { balance: tx.amount } }
-        );
-
-        await Transaction.updateOne(
-            { txId },
-            {
-                $set: {
-                    status: 'COMPLETED',
-                    approvedBy: ctx.from.id.toString(),
-                    approvedAt: new Date()
-                }
-            }
-        );
-
-        await ctx.reply(`✅ Referral reward ${formatCurrency(tx.amount)} approved for user ${tx.userId}`);
-
-        // Notify referrer
-        await ctx.telegram.sendMessage(tx.userId, `
-🎁 Referral Reward Approved!
-
-Amount: ${formatCurrency(tx.amount)}
-Status: Credited to your balance
-
-Thank you for referring users!
-        `);
-    }
-
-    async handleMasterBalance(ctx) {
-        const balance = await walletService.getMasterBalance();
-        
         await ctx.reply(`
-💎 Master Wallet Balance
+📢 Broadcast Menu
 
-Address: \`${walletService.getMasterAddress()}\`
+👥 Total Users: ${stats.total}
+👑 VIP Users: ${stats.vip}
+💰 Paying Users: ${stats.paying}
+🆕 Joined (7d): ${stats.recent}
 
-USDT: ${balance.usdt}
-BNB: ${balance.bnb}
-
-This is your revenue wallet.
-        `, { parse_mode: 'Markdown' });
+Select target audience:
+        `, Markup.inlineKeyboard([
+            [Markup.button.callback('📨 All Users', 'broadcast_all')],
+            [Markup.button.callback('👑 VIP Only', 'broadcast_vip')],
+            [Markup.button.callback('💰 Paying Users', 'broadcast_paying')],
+            [Markup.button.callback('🆕 Recent (7d)', 'broadcast_recent')],
+            [Markup.button.callback('🔙 Back', 'admin')]
+        ]));
     }
 
-    async handleWithdrawProfits(ctx) {
-        await ctx.reply(`
-💸 Withdraw Profits
-
-To withdraw, send USDT from your master wallet manually or use your wallet app.
-
-Master Address: \`${walletService.getMasterAddress()}\`
-
-⚠️ Always keep some BNB for gas fees.
-        `, { parse_mode: 'Markdown' });
-    }
-
-    // Helper methods
-    async getSystemStats() {
+    async getBroadcastStats() {
         const now = new Date();
-        const dayAgo = new Date(now - 24 * 60 * 60 * 1000);
+        const weekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
 
-        const [
-            totalUsers,
-            payingUsers,
-            vipUsers,
-            activeToday,
-            otpStats,
-            masterBalance
-        ] = await Promise.all([
-            User.countDocuments(),
-            User.countDocuments({ balance: { $gt: 0 } }),
-            User.countDocuments({ vipExpiry: { $gt: now } }),
-            User.countDocuments({ lastActive: { $gte: dayAgo } }),
-            Session.aggregate([
-                { $match: { startTime: { $gte: dayAgo } } },
-                {
-                    $group: {
-                        _id: null,
-                        total: { $sum: 1 },
-                        success: { $sum: { $cond: [{ $eq: ['$status', 'RECEIVED'] }, 1, 0] } },
-                        failed: { $sum: { $cond: [{ $eq: ['$status', 'TIMEOUT'] }, 1, 0] } }
-                    }
-                }
-            ]),
-            walletService.getMasterBalance().catch(() => ({ usdt: '0', bnb: '0' }))
+        const [total, vip, paying, recent] = await Promise.all([
+            User.countDocuments({ isBlacklisted: false }),
+            User.countDocuments({ isBlacklisted: false, vipExpiry: { $gt: now } }),
+            User.countDocuments({ isBlacklisted: false, balance: { $gt: 0 } }),
+            User.countDocuments({ isBlacklisted: false, createdAt: { $gte: weekAgo } })
         ]);
 
-        const stats = otpStats[0] || { total: 0, success: 0, failed: 0 };
+        return { total, vip, paying, recent };
+    }
 
+    async executeBroadcast(ctx, filter, label) {
+        await ctx.answerCbQuery(`Broadcasting to ${label}...`);
+
+        const users = await User.find({ isBlacklisted: false, ...filter });
+        let sent = 0;
+        let failed = 0;
+
+        // Ask for message if not in session
+        if (!ctx.session?.broadcastMessage) {
+            ctx.session = ctx.session || {};
+            ctx.session.broadcastTarget = label;
+            ctx.session.broadcastFilter = filter;
+            return ctx.reply('✍️ Send the message you want to broadcast:');
+        }
+
+        const message = ctx.session.broadcastMessage;
+        delete ctx.session.broadcastMessage;
+        delete ctx.session.broadcastTarget;
+        delete ctx.session.broadcastFilter;
+
+        for (const user of users) {
+            try {
+                await ctx.telegram.sendMessage(user.userId, `
+📢 ${label}
+
+${message}
+
+---
+OTP Bot Team
+                `);
+                sent++;
+            } catch (error) {
+                failed++;
+                logger.warn('Broadcast failed for user', { userId: user.userId, error: error.message });
+            }
+        }
+
+        await ctx.reply(`📢 Broadcast to ${label} complete.\n✅ Sent: ${sent}\n❌ Failed: ${failed}`);
+    }
+
+    async handleBroadcastAll(ctx) {
+        await this.executeBroadcast(ctx, {}, 'All Users');
+    }
+
+    async handleBroadcastVip(ctx) {
+        const now = new Date();
+        await this.executeBroadcast(ctx, { vipExpiry: { $gt: now } }, 'VIP Users');
+    }
+
+    async handleBroadcastPaying(ctx) {
+        await this.executeBroadcast(ctx, { balance: { $gt: 0 } }, 'Paying Users');
+    }
+
+    async handleBroadcastRecent(ctx) {
+        const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        await this.executeBroadcast(ctx, { createdAt: { $gte: weekAgo } }, 'Recent Users');
+    }
+
+    // ========== SETTINGS MENU ==========
+    async handleSettings(ctx) {
+        const settings = await this.getCurrentSettings();
+
+        await ctx.reply(`
+🔧 Admin Settings
+
+💰 OTP Prices:
+• Cheap OTP: ${formatCurrency(settings.cheapOtpPrice)}
+• VIP OTP: ${formatCurrency(settings.vipOtpPrice)}
+
+👑 VIP Subscription:
+• Price: ${formatCurrency(settings.vipPrice)}
+• Duration: ${settings.vipDuration} days
+
+🆓 Free Limits:
+• Daily: ${settings.freeDaily} OTPs
+• Per Number: ${settings.freePerNumber}
+
+⚡ Providers:
+• Twilio: ${settings.twilioEnabled ? '✅' : '❌'}
+• Telnyx: ${settings.telnyxEnabled ? '✅' : '❌'}
+• Cheap Panel: ${settings.cheapPanelEnabled ? '✅' : '❌'}
+• Free Public: ${settings.freePublicEnabled ? '✅' : '❌'}
+
+🛠 Maintenance: ${settings.maintenanceMode ? '🔴 ON' : '🟢 OFF'}
+        `, Markup.inlineKeyboard([
+            [Markup.button.callback('💰 OTP Prices', 'settings_prices')],
+            [Markup.button.callback('👑 VIP Config', 'settings_vip')],
+            [Markup.button.callback('🆓 Free Limits', 'settings_free')],
+            [Markup.button.callback('⚡ Providers', 'settings_providers')],
+            [Markup.button.callback('🛠 Maintenance', 'settings_maintenance')],
+            [Markup.button.callback('🔙 Back', 'admin')]
+        ]));
+    }
+
+    async getCurrentSettings() {
+        // Read from config or return defaults
         return {
-            totalUsers,
-            payingUsers,
-            vipUsers,
-            activeToday,
-            otpRequests24h: stats.total,
-            otpSuccess24h: stats.success,
-            otpFailed24h: stats.failed,
-            successRate24h: stats.total > 0 ? ((stats.success / stats.total) * 100).toFixed(1) : 0,
-            revenue24h: await this.calculateRevenue(dayAgo),
-            revenue7d: await this.calculateRevenue(new Date(now - 7 * 24 * 60 * 60 * 1000)),
-            revenue30d: await this.calculateRevenue(new Date(now - 30 * 24 * 60 * 60 * 1000)),
-            masterBalance: parseFloat(masterBalance.usdt),
-            uptime: `${Math.floor(process.uptime() / 3600)}h ${Math.floor((process.uptime() % 3600) / 60)}m`
+            cheapOtpPrice: config.prices?.cheapOtp || 0.50,
+            vipOtpPrice: config.prices?.vipOtp || 0.30,
+            vipPrice: config.prices?.vipSubscription || 5.00,
+            vipDuration: config.prices?.vipDuration || 30,
+            freeDaily: config.limits?.freeDaily || 3,
+            freePerNumber: config.limits?.freePerNumber || 1,
+            twilioEnabled: config.providers?.twilio !== false,
+            telnyxEnabled: config.providers?.telnyx !== false,
+            cheapPanelEnabled: config.providers?.cheapPanel !== false,
+            freePublicEnabled: config.providers?.freePublic !== false,
+            maintenanceMode: config.maintenance || false
         };
     }
 
-    async calculateRevenue(since) {
-        const result = await Transaction.aggregate([
-            {
-                $match: {
-                    type: { $in: ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION'] },
-                    status: 'COMPLETED',
-                    createdAt: { $gte: since }
-                }
-            },
-            { $group: { _id: null, total: { $sum: '$amount' } } }
-        ]);
-        return Math.abs(result[0]?.total || 0);
+    async handleSettingsPrices(ctx) {
+        await ctx.reply(`
+💰 Update OTP Prices
+
+Current:
+• Cheap OTP: ${formatCurrency(config.prices?.cheapOtp || 0.50)}
+• VIP OTP: ${formatCurrency(config.prices?.vipOtp || 0.30)}
+
+To update, use:
+/setprice cheap <amount>
+/setprice vip <amount>
+        `, Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'admin_settings')]
+        ]));
     }
 
-    async getRevenueByMode(since) {
-        const results = await Transaction.aggregate([
-            {
-                $match: {
-                    type: { $in: ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION'] },
-                    status: 'COMPLETED',
-                    createdAt: { $gte: since }
-                }
-            },
-            {
-                $group: {
-                    _id: '$type',
-                    total: { $sum: { $abs: '$amount' } }
-                }
-            }
-        ]);
-
-        return results.map(r => `• ${r._id}: ${formatCurrency(r.total)}`).join('\n') || 'No data';
-    }
-
-    async getRevenueByService(since) {
-        const results = await Session.aggregate([
-            {
-                $match: {
-                    status: 'RECEIVED',
-                    startTime: { $gte: since }
-                }
-            },
-            {
-                $group: {
-                    _id: '$service',
-                    count: { $sum: 1 },
-                    revenue: { $sum: '$cost' }
-                }
-            },
-            { $sort: { revenue: -1 } },
-            { $limit: 5 }
-        ]);
-
-        return results.map(r => `• ${r._id}: ${formatCurrency(r.revenue)} (${r.count} OTPs)`).join('\n') || 'No data';
-    }
-}
-
-export default AdminCommands;
- 
+    async handleSettingsVip(ctx) {
+        await ctx.
