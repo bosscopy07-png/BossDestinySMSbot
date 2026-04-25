@@ -6,11 +6,11 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install --only=production
 
-# Copy ALL source code (including src/)
+# Copy ALL source code
 COPY . .
 
-# Verify src exists (debug)
-RUN ls -la src/ || echo "WARNING: src/ not found"
+# Verify structure (debug - check what actually exists)
+RUN ls -la && echo "---" && ls -la *.js 2>/dev/null || echo "No .js files in root"
 
 # Create logs directory
 RUN mkdir -p logs
