@@ -10,35 +10,46 @@ import WalletService from '../services/wallet/index.js';
 
 class TelegramBot {
     constructor() {
+        console.log('🔧 [DEBUG] TelegramBot constructor starting...');
+        
+        // Validate bot token first
+        if (!config.bot?.token) {
+            console.error('❌ [DEBUG] BOT_TOKEN is missing!');
+            throw new Error('BOT_TOKEN not configured');
+        }
+        console.log('✅ [DEBUG] BOT_TOKEN is set');
+
         this.bot = new Telegraf(config.bot.token);
+        console.log('✅ [DEBUG] Telegraf instance created');
+
         this.walletService = new WalletService();
+        console.log('✅ [DEBUG] WalletService initialized');
+
         this.setupMiddleware();
+        console.log('✅ [DEBUG] Middleware setup complete');
+
         this.setupCommands();
+        console.log('✅ [DEBUG] Commands setup complete');
+
         this.setupErrorHandling();
+        console.log('✅ [DEBUG] Error handling setup complete');
     }
 
     setupMiddleware() {
-        // Session middleware
         this.bot.use(telegrafSession());
-
-        // Rate limiting
         this.bot.use(rateLimit({
             window: 60,
             max: 30,
             keyPrefix: 'bot_ratelimit'
         }));
-
-        // Auth middleware for all commands
         this.bot.use(requireAuth);
     }
 
     setupCommands() {
-        // Initialize command handlers
         new UserCommands(this.bot, this.walletService);
         new OTPCommands(this.bot);
         new AdminCommands(this.bot);
 
-        // Global callbacks
         this.bot.action('menu', async (ctx) => {
             const userCmd = new UserCommands(this.bot, this.walletService);
             await userCmd.handleMenu(ctx);
@@ -62,10 +73,8 @@ Admin Only:
             `);
         });
 
-        // Handle text messages (service input)
         this.bot.on('text', async (ctx) => {
-            // Handle any text-based flows here
-            // Currently all flows use inline keyboards
+            // Handle text-based flows
         });
     }
 
@@ -76,26 +85,29 @@ Admin Only:
                 stack: err.stack,
                 update: ctx.updateType
             });
-
             ctx.reply('❌ An error occurred. Please try again or contact support.').catch(() => {});
         });
 
-        // Graceful shutdown
         process.once('SIGINT', () => this.bot.stop('SIGINT'));
         process.once('SIGTERM', () => this.bot.stop('SIGTERM'));
     }
 
     async launch() {
+        console.log('🚀 [DEBUG] launch() called');
+        
         try {
-            // Set webhook or start polling
             if (process.env.WEBHOOK_URL) {
+                console.log('🔧 [DEBUG] Using webhook mode');
                 await this.bot.telegram.setWebhook(`${process.env.WEBHOOK_URL}/webhook`);
                 logger.info('Webhook set', { url: process.env.WEBHOOK_URL });
             } else {
+                console.log('🔧 [DEBUG] Using polling mode');
                 await this.bot.launch();
+                console.log('✅ [DEBUG] bot.launch() succeeded');
                 logger.info('Bot started in polling mode');
             }
         } catch (error) {
+            console.error('❌ [DEBUG] Failed to launch bot:', error.message);
             logger.error('Failed to launch bot', { error: error.message });
             throw error;
         }
@@ -107,4 +119,3 @@ Admin Only:
 }
 
 export default TelegramBot;
- 
