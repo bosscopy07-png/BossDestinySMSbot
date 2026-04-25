@@ -6,10 +6,14 @@ import config from '../../config/env.js';
 
 class WalletService {
     constructor() {
-        // Initialize master wallet from private key
-        this.provider = new ethers.JsonRpcProvider(config.blockchain.rpc);
-        this.masterWallet = new ethers.Wallet(config.blockchain.masterPrivateKey, this.provider);
-        
+        this.masterAddress = null;
+        this.decimals = 18;
+        this.derivationIndex = 0;
+        this.provider = null;
+        this.masterWallet = null;
+        this.usdtContract = null;
+        this.isReady = false;
+
         // USDT Contract ABI (minimal for transfers and balance checks)
         this.usdtAbi = [
             'function balanceOf(address) view returns (uint256)',
@@ -17,29 +21,71 @@ class WalletService {
             'function decimals() view returns (uint8)',
             'event Transfer(address indexed from, address indexed to, uint256 value)'
         ];
-        
-        this.usdtContract = new ethers.Contract(
-            config.blockchain.usdtContract,
-            this.usdtAbi,
-            this.masterWallet
-        );
-        
-        this.decimals = 18; // Will be fetched from contract
-        this.derivationIndex = 0;
-        
-        logger.info('Wallet service initialized', {
-            masterAddress: this.masterWallet.address
-        });
-        
-        this.initializeDecimals();
+
+        this.initialize();
+    }
+
+    async initialize() {
+        try {
+            // Initialize provider with retry logic
+            this.provider = new ethers.JsonRpcProvider(config.blockchain.rpc, undefined, {
+                staticNetwork: true,
+                batchMaxCount: 1
+            });
+
+            // Test connection before creating wallet
+            await this.provider.getNetwork();
+            
+            this.masterWallet = new ethers.Wallet(
+                config.blockchain.masterPrivateKey, 
+                this.provider
+            );
+            
+            this.usdtContract = new ethers.Contract(
+                config.blockchain.usdtContract,
+                this.usdtAbi,
+                this.masterWallet
+            );
+
+            this.masterAddress = this.masterWallet.address;
+            this.isReady = true;
+
+            logger.info('Wallet service initialized', {
+                masterAddress: this.masterAddress,
+                rpc: config.blockchain.rpc.replace(/\/\/.*@/, '//***@') // hide credentials in logs
+            });
+
+            await this.initializeDecimals();
+
+        } catch (error) {
+            logger.error('Wallet service initialization failed — running in degraded mode', { 
+                error: error.message,
+                rpc: config.blockchain.rpc.replace(/\/\/.*@/, '//***@')
+            });
+            
+            // Still create wallet offline for address derivation
+            this.masterWallet = new ethers.Wallet(config.blockchain.masterPrivateKey);
+            this.masterAddress = this.masterWallet.address;
+            this.isReady = false;
+        }
     }
 
     async initializeDecimals() {
+        if (!this.isReady) return;
+        
         try {
             this.decimals = await this.usdtContract.decimals();
+            logger.info('USDT decimals fetched', { decimals: this.decimals });
         } catch (error) {
-            logger.error('Failed to get USDT decimals', { error: error.message });
+            logger.error('Failed to get USDT decimals, using default 18', { error: error.message });
             this.decimals = 18;
+        }
+    }
+
+    // Check if wallet is ready before operations
+    checkReady() {
+        if (!this.isReady) {
+            throw new Error('WALLET_NOT_READY — blockchain connection unavailable. Check RPC URL or try again later.');
         }
     }
 
@@ -51,11 +97,9 @@ class WalletService {
                 return user.depositAddress;
             }
 
-            // Derive address from master key using user index
             const index = await this.getNextDerivationIndex();
             const path = `m/44'/60'/0'/0/${index}`;
             
-            // Create HD node from master private key
             const masterNode = ethers.HDNodeWallet.fromPhrase(
                 await this.masterWallet.mnemonic?.phrase || '',
                 '',
@@ -64,7 +108,6 @@ class WalletService {
             
             const derivedWallet = masterNode.derivePath(path);
             
-            // Save to user
             await User.updateOne(
                 { userId },
                 {
@@ -102,28 +145,26 @@ class WalletService {
 
     // Monitor blockchain for deposits to user address
     async checkDeposit(userId) {
+        this.checkReady();
+
         try {
             const user = await User.findOne({ userId });
             if (!user || !user.depositAddress) {
                 return { found: false, message: 'No deposit address found' };
             }
 
-            // Get USDT balance of user's deposit address
             const balance = await this.usdtContract.balanceOf(user.depositAddress);
             const formattedBalance = ethers.formatUnits(balance, this.decimals);
 
-            // Check if there's a pending transaction for this user
             const pendingTx = await Transaction.findOne({
                 userId,
                 type: 'DEPOSIT',
                 status: { $in: ['PENDING', 'CONFIRMING'] }
             }).sort({ createdAt: -1 });
 
-            // Get latest block number
             const latestBlock = await this.provider.getBlockNumber();
 
             if (pendingTx && pendingTx.blockchain?.txHash) {
-                // Check confirmations
                 const receipt = await this.provider.getTransactionReceipt(
                     pendingTx.blockchain.txHash
                 );
@@ -132,7 +173,6 @@ class WalletService {
                     const confirmations = latestBlock - receipt.blockNumber;
 
                     if (confirmations >= config.blockchain.blockConfirmations) {
-                        // Deposit confirmed
                         await this.confirmDeposit(pendingTx, confirmations);
                         return {
                             found: true,
@@ -141,7 +181,6 @@ class WalletService {
                             txHash: pendingTx.blockchain.txHash
                         };
                     } else {
-                        // Still confirming
                         await Transaction.updateOne(
                             { txId: pendingTx.txId },
                             {
@@ -161,32 +200,24 @@ class WalletService {
                 }
             }
 
-            // Check for new deposits by looking at Transfer events
-            const filter = this.usdtContract.filters.Transfer(
-                null, // from any address
-                user.depositAddress
-            );
-
+            const filter = this.usdtContract.filters.Transfer(null, user.depositAddress);
             const events = await this.usdtContract.queryFilter(
                 filter,
-                latestBlock - 1000, // Look back 1000 blocks
+                latestBlock - 1000,
                 latestBlock
             );
 
             if (events.length > 0) {
-                // Process the most recent event
                 const latestEvent = events[events.length - 1];
                 const amount = ethers.formatUnits(latestEvent.args.value, this.decimals);
                 const txHash = latestEvent.transactionHash;
 
-                // Check if already processed
                 const existing = await Transaction.findOne({
                     'blockchain.txHash': txHash
                 });
 
                 if (!existing) {
-                    // Create new deposit transaction
-                    const tx = await Transaction.create({
+                    await Transaction.create({
                         txId: generateId(),
                         userId,
                         type: 'DEPOSIT',
@@ -223,7 +254,6 @@ class WalletService {
 
     async confirmDeposit(transaction, confirmations) {
         try {
-            // Update transaction
             await Transaction.updateOne(
                 { txId: transaction.txId },
                 {
@@ -234,7 +264,6 @@ class WalletService {
                 }
             );
 
-            // Credit user balance
             await User.updateOne(
                 { userId: transaction.userId },
                 {
@@ -245,7 +274,6 @@ class WalletService {
                 }
             );
 
-            // Check for referral reward
             await this.processReferralDeposit(transaction.userId, transaction.amount);
 
             logger.info('Deposit confirmed and credited', {
@@ -271,11 +299,9 @@ class WalletService {
             const referrer = await User.findOne({ referralCode: user.referredBy });
             if (!referrer) return;
 
-            // Check if minimum deposit met
             const minDeposit = config.referral.minDeposit;
             if (amount < minDeposit) return;
 
-            // Check if already rewarded for this referral
             const existingReward = await Transaction.findOne({
                 userId: referrer.userId,
                 type: 'REFERRAL_REWARD',
@@ -284,10 +310,8 @@ class WalletService {
 
             if (existingReward) return;
 
-            // Calculate reward (percentage of deposit)
             const rewardAmount = amount * config.referral.percentage;
 
-            // Create pending reward transaction (requires admin approval)
             await Transaction.create({
                 txId: generateId(),
                 userId: referrer.userId,
@@ -303,7 +327,6 @@ class WalletService {
                 }
             });
 
-            // Update referrer stats
             await User.updateOne(
                 { userId: referrer.userId },
                 {
@@ -325,17 +348,15 @@ class WalletService {
         }
     }
 
-    // Lock funds before providing service
     async lockFunds(userId, amount, purpose) {
         const txId = generateId();
 
         try {
             const user = await User.findOne({ userId });
-            if (!user || user.getAvailableBalance() < amount) {
+            if (!user || (user.balance - (user.lockedBalance || 0)) < amount) {
                 throw new Error('INSUFFICIENT_FUNDS');
             }
 
-            // Create hold transaction
             await Transaction.create({
                 txId,
                 userId,
@@ -346,14 +367,9 @@ class WalletService {
                 metadata: { purpose, lockedAt: new Date() }
             });
 
-            // Lock balance
             await User.updateOne(
                 { userId },
-                {
-                    $inc: {
-                        lockedBalance: amount
-                    }
-                }
+                { $inc: { lockedBalance: amount } }
             );
 
             logger.info('Funds locked', { userId, amount, purpose, txId });
@@ -366,7 +382,6 @@ class WalletService {
         }
     }
 
-    // Capture locked funds (service delivered)
     async captureFunds(txId, userId) {
         try {
             const tx = await Transaction.findOne({ txId, userId });
@@ -376,7 +391,6 @@ class WalletService {
 
             const amount = Math.abs(tx.amount);
 
-            // Update transaction
             await Transaction.updateOne(
                 { txId },
                 {
@@ -387,7 +401,6 @@ class WalletService {
                 }
             );
 
-            // Move from locked to spent
             await User.updateOne(
                 { userId },
                 {
@@ -408,7 +421,6 @@ class WalletService {
         }
     }
 
-    // Release locked funds (service failed)
     async releaseFunds(txId, userId, reason) {
         try {
             const tx = await Transaction.findOne({ txId, userId });
@@ -418,7 +430,6 @@ class WalletService {
 
             const amount = Math.abs(tx.amount);
 
-            // Update transaction as refund
             await Transaction.updateOne(
                 { txId },
                 {
@@ -431,14 +442,9 @@ class WalletService {
                 }
             );
 
-            // Return to available balance
             await User.updateOne(
                 { userId },
-                {
-                    $inc: {
-                        lockedBalance: -amount
-                    }
-                }
+                { $inc: { lockedBalance: -amount } }
             );
 
             logger.info('Funds released', { userId, amount, reason, txId });
@@ -451,7 +457,6 @@ class WalletService {
         }
     }
 
-    // Admin: Add balance manually
     async addBalance(userId, amount, adminId, reason) {
         const txId = generateId();
 
@@ -482,7 +487,6 @@ class WalletService {
         }
     }
 
-    // Admin: Deduct balance
     async deductBalance(userId, amount, adminId, reason) {
         const txId = generateId();
 
@@ -518,7 +522,6 @@ class WalletService {
         }
     }
 
-    // Get user's deposit address
     async getDepositAddress(userId) {
         const user = await User.findOne({ userId });
         if (user && user.depositAddress) {
@@ -527,13 +530,13 @@ class WalletService {
         return await this.generateDepositAddress(userId);
     }
 
-    // Get master wallet address (for admin)
     getMasterAddress() {
-        return this.masterWallet.address;
+        return this.masterAddress || 'WALLET_NOT_READY';
     }
 
-    // Get master wallet balance
     async getMasterBalance() {
+        this.checkReady();
+
         try {
             const bnbBalance = await this.provider.getBalance(this.masterWallet.address);
             const usdtBalance = await this.usdtContract.balanceOf(this.masterWallet.address);
@@ -544,11 +547,10 @@ class WalletService {
             };
         } catch (error) {
             logger.error('Failed to get master balance', { error: error.message });
-            throw error;
+            throw new Error('BALANCE_CHECK_FAILED — ' + error.message);
         }
     }
 }
 
 export default WalletService;
-
-
+                        
