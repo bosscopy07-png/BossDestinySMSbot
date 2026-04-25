@@ -102,6 +102,6 @@ const numberSchema = new mongoose.Schema({
 numberSchema.index({ tier: 1, country: 1, status: 1 });
 numberSchema.index({ status: 1, lastUsed: 1 });
 
-const Number = mongoose.model('Number', numberSchema);
+const NumberModel = mongoose.model('Number', numberSchema);
 
-export default Number;
+export default NumberModel;
