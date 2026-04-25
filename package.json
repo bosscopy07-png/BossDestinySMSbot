@@ -10,6 +10,7 @@
     "test": "node --test tests/**/*.test.js"
   },
   "dependencies": {
+    "@vonage/server-sdk": "^3.14.0",
     "axios": "^1.6.8",
     "bcryptjs": "^2.4.3",
     "cheerio": "^1.0.0-rc.12",
@@ -26,7 +27,6 @@
     "node-cron": "^3.0.3",
     "telegraf": "^4.16.3",
     "twilio": "^5.0.4",
-    "vonage": "^3.14.0",
     "winston": "^3.13.0",
     "winston-daily-rotate-file": "^5.0.0"
   },
