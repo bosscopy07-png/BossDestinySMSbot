@@ -14,7 +14,6 @@ class WalletService {
         this.usdtContract = null;
         this.isReady = false;
 
-        // USDT Contract ABI (minimal for transfers and balance checks)
         this.usdtAbi = [
             'function balanceOf(address) view returns (uint256)',
             'function transfer(address, uint256) returns (bool)',
@@ -26,48 +25,63 @@ class WalletService {
     }
 
     async initialize() {
-        try {
-            // Initialize provider with retry logic
-            this.provider = new ethers.JsonRpcProvider(config.blockchain.rpc, undefined, {
-                staticNetwork: true,
-                batchMaxCount: 1
-            });
+        const rpcEndpoints = [
+            config.blockchain.rpc,
+            'https://rpc.ankr.com/bsc',
+            'https://bsc-dataseed.binance.org/',
+            'https://bsc-dataseed1.defibit.io/',
+            'https://bsc-dataseed1.ninicoin.io/'
+        ].filter((url, i, self) => self.indexOf(url) === i);
 
-            // Test connection before creating wallet
-            await this.provider.getNetwork();
-            
-            this.masterWallet = new ethers.Wallet(
-                config.blockchain.masterPrivateKey, 
-                this.provider
-            );
-            
-            this.usdtContract = new ethers.Contract(
-                config.blockchain.usdtContract,
-                this.usdtAbi,
-                this.masterWallet
-            );
+        for (const rpcUrl of rpcEndpoints) {
+            try {
+                this.provider = new ethers.JsonRpcProvider(rpcUrl, undefined, {
+                    staticNetwork: true,
+                    batchMaxCount: 1
+                });
 
-            this.masterAddress = this.masterWallet.address;
-            this.isReady = true;
+                const testPromise = this.provider.getNetwork();
+                const timeoutPromise = new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error('RPC_TIMEOUT')), 5000)
+                );
+                
+                await Promise.race([testPromise, timeoutPromise]);
 
-            logger.info('Wallet service initialized', {
-                masterAddress: this.masterAddress,
-                rpc: config.blockchain.rpc.replace(/\/\/.*@/, '//***@') // hide credentials in logs
-            });
+                this.masterWallet = new ethers.Wallet(
+                    config.blockchain.masterPrivateKey, 
+                    this.provider
+                );
+                
+                this.usdtContract = new ethers.Contract(
+                    config.blockchain.usdtContract,
+                    this.usdtAbi,
+                    this.masterWallet
+                );
 
-            await this.initializeDecimals();
+                this.masterAddress = this.masterWallet.address;
+                this.isReady = true;
 
-        } catch (error) {
-            logger.error('Wallet service initialization failed — running in degraded mode', { 
-                error: error.message,
-                rpc: config.blockchain.rpc.replace(/\/\/.*@/, '//***@')
-            });
-            
-            // Still create wallet offline for address derivation
-            this.masterWallet = new ethers.Wallet(config.blockchain.masterPrivateKey);
-            this.masterAddress = this.masterWallet.address;
-            this.isReady = false;
+                logger.info('Wallet service initialized', {
+                    masterAddress: this.masterAddress,
+                    rpc: rpcUrl.replace(/\/\/.*@/, '//***@')
+                });
+
+                await this.initializeDecimals();
+                return;
+
+            } catch (error) {
+                logger.warn('RPC failed, trying next...', { 
+                    rpc: rpcUrl.replace(/\/\/.*@/, '//***@'),
+                    error: error.message 
+                });
+                this.provider = null;
+            }
         }
+
+        logger.error('All RPC endpoints failed — running in degraded mode');
+        this.masterWallet = new ethers.Wallet(config.blockchain.masterPrivateKey);
+        this.masterAddress = this.masterWallet.address;
+        this.isReady = false;
     }
 
     async initializeDecimals() {
@@ -82,14 +96,12 @@ class WalletService {
         }
     }
 
-    // Check if wallet is ready before operations
     checkReady() {
         if (!this.isReady) {
             throw new Error('WALLET_NOT_READY — blockchain connection unavailable. Check RPC URL or try again later.');
         }
     }
 
-    // Generate unique deposit address for user using HD wallet derivation
     async generateDepositAddress(userId) {
         try {
             const user = await User.findOne({ userId });
@@ -98,15 +110,7 @@ class WalletService {
             }
 
             const index = await this.getNextDerivationIndex();
-            const path = `m/44'/60'/0'/0/${index}`;
-            
-            const masterNode = ethers.HDNodeWallet.fromPhrase(
-                await this.masterWallet.mnemonic?.phrase || '',
-                '',
-                "m/44'/60'/0'/0"
-            );
-            
-            const derivedWallet = masterNode.derivePath(path);
+            const derivedWallet = this.deriveAddress(index);
             
             await User.updateOne(
                 { userId },
@@ -136,14 +140,23 @@ class WalletService {
         }
     }
 
+    deriveAddress(index) {
+        const masterKey = this.masterWallet.privateKey;
+        const indexBytes = ethers.toBeHex(index, 32);
+        const combined = ethers.concat([
+            ethers.getBytes(masterKey),
+            ethers.getBytes(indexBytes)
+        ]);
+        const childPrivateKey = ethers.keccak256(combined);
+        return new ethers.Wallet(childPrivateKey);
+    }
+
     async getNextDerivationIndex() {
         const lastUser = await User.findOne({ depositIndex: { $ne: null } })
             .sort({ depositIndex: -1 });
-        
         return lastUser ? lastUser.depositIndex + 1 : 0;
     }
 
-    // Monitor blockchain for deposits to user address
     async checkDeposit(userId) {
         this.checkReady();
 
@@ -553,4 +566,4 @@ class WalletService {
 }
 
 export default WalletService;
-                        
+                
