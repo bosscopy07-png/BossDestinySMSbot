@@ -6,7 +6,7 @@ import Joi from 'joi';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-dotenv.config({ path: join(__dirname, '../../.env') });
+dotenv.config({ path: join(__dirname, '../.env') });
 
 const envSchema = Joi.object({
     BOT_TOKEN: Joi.string().required(),
