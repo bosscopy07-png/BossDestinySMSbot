@@ -4,60 +4,51 @@ import TelegramBot from './bot/index.js';
 import { startServer } from './api/index.js';
 import CronJobs from './cron/index.js';
 
+// Catch ALL errors immediately
+process.on('uncaughtException', (error) => {
+    console.error('💥 UNCAUGHT:', error.message);
+    console.error(error.stack);
+    process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+    console.error('💥 UNHANDLED:', reason);
+    process.exit(1);
+});
+
 const startApp = async () => {
-    console.log('🟢 [DEBUG] startApp() called');
-    
     try {
-        // Connect to database
-        console.log('🔧 [DEBUG] Connecting to database...');
-        await connectDatabase();
-        console.log('✅ [DEBUG] Database connected');
-
-        // Start Telegram bot
-        console.log('🔧 [DEBUG] Creating TelegramBot...');
-        const bot = new TelegramBot();
-        console.log('✅ [DEBUG] TelegramBot created');
+        console.log('🟢 Starting app...');
         
-        console.log('🔧 [DEBUG] Launching bot...');
+        console.log('🔧 Connecting DB...');
+        await connectDatabase();
+        console.log('✅ DB connected');
+
+        console.log('🔧 Creating bot...');
+        const bot = new TelegramBot();
+        console.log('✅ Bot created');
+
+        console.log('🔧 Launching bot...');
         await bot.launch();
-        console.log('✅ [DEBUG] Bot launched');
+        console.log('✅ Bot launched - should be responding now');
 
-        // Start API server
-        console.log('🔧 [DEBUG] Starting API server...');
+        console.log('🔧 Starting API...');
         await startServer(config.server.port);
-        console.log('✅ [DEBUG] API server started');
+        console.log('✅ API started');
 
-        // Start cron jobs
-        console.log('🔧 [DEBUG] Starting cron jobs...');
+        console.log('🔧 Starting cron...');
         const cronJobs = new CronJobs();
         cronJobs.start();
-        console.log('✅ [DEBUG] Cron jobs started');
+        console.log('✅ Cron started');
 
-        logger.info('Application started successfully', {
-            env: config.server.env,
-            port: config.server.port
-        });
+        logger.info('Application started successfully');
 
     } catch (error) {
-        console.error('💥 [DEBUG] startApp() FAILED:', error.message);
+        console.error('💥 startApp FAILED:', error.message);
         console.error(error.stack);
         logger.error('Failed to start application', { error: error.message });
         process.exit(1);
     }
 };
 
-// Handle uncaught errors
-process.on('uncaughtException', (error) => {
-    console.error('💥 [DEBUG] UNCAUGHT EXCEPTION:', error.message);
-    console.error(error.stack);
-    logger.error('Uncaught exception', { error: error.message, stack: error.stack });
-    process.exit(1);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('💥 [DEBUG] UNHANDLED REJECTION:', reason);
-    logger.error('Unhandled rejection', { reason, promise });
-});
-
-console.log('🟢 [DEBUG] Script loaded, calling startApp()...');
 startApp();
