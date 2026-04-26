@@ -14,6 +14,7 @@ class WalletService {
         this.isReady = false;
         this.lastCheckedBlock = 0;
         this.scanInterval = null;
+        this.initializationPromise = null;
 
         this.usdtAbi = [
             'function balanceOf(address) view returns (uint256)',
@@ -22,17 +23,17 @@ class WalletService {
             'event Transfer(address indexed from, address indexed to, uint256 value)'
         ];
 
-        this.initialize();
+        this.initializationPromise = this.initialize();
     }
 
     async initialize() {
         const rpcEndpoints = [
-            config.blockchain.rpc,
+            config.blockchain?.rpc,
             'https://rpc.ankr.com/bsc',
             'https://bsc-dataseed.binance.org/',
             'https://bsc-dataseed1.defibit.io/',
             'https://bsc-dataseed1.ninicoin.io/'
-        ].filter((url, i, self) => self.indexOf(url) === i);
+        ].filter((url, i, self) => url && self.indexOf(url) === i);
 
         for (const rpcUrl of rpcEndpoints) {
             try {
@@ -49,12 +50,12 @@ class WalletService {
                 await Promise.race([testPromise, timeoutPromise]);
 
                 this.masterWallet = new ethers.Wallet(
-                    config.blockchain.masterPrivateKey, 
+                    config.blockchain?.masterPrivateKey, 
                     this.provider
                 );
                 
                 this.usdtContract = new ethers.Contract(
-                    config.blockchain.usdtContract,
+                    config.blockchain?.usdtContract,
                     this.usdtAbi,
                     this.masterWallet
                 );
@@ -78,7 +79,7 @@ class WalletService {
 
             } catch (error) {
                 logger.warn('RPC failed, trying next...', { 
-                    rpc: rpcUrl.replace(/\/\/.*@/, '//***@'),
+                    rpc: rpcUrl?.replace(/\/\/.*@/, '//***@'),
                     error: error.message 
                 });
                 this.provider = null;
@@ -86,7 +87,7 @@ class WalletService {
         }
 
         logger.error('All RPC endpoints failed — running in degraded mode');
-        this.masterWallet = new ethers.Wallet(config.blockchain.masterPrivateKey);
+        this.masterWallet = new ethers.Wallet(config.blockchain?.masterPrivateKey);
         this.masterAddress = this.masterWallet.address;
         this.isReady = false;
     }
@@ -103,6 +104,15 @@ class WalletService {
         }
     }
 
+    async ensureReady() {
+        if (this.initializationPromise) {
+            await this.initializationPromise;
+        }
+        if (!this.isReady) {
+            throw new Error('WALLET_NOT_READY — blockchain connection unavailable. Check RPC URL or try again later.');
+        }
+    }
+
     checkReady() {
         if (!this.isReady) {
             throw new Error('WALLET_NOT_READY — blockchain connection unavailable. Check RPC URL or try again later.');
@@ -112,6 +122,8 @@ class WalletService {
     // ========== DEPOSIT SYSTEM ==========
 
     async getDepositInfo(userId, requestedAmount = 10) {
+        await this.ensureReady();
+
         const minDeposit = 0.50;
         let amount = parseFloat(requestedAmount);
         
@@ -152,7 +164,7 @@ class WalletService {
     // ========== MASTER ADDRESS DEPOSIT CHECKING ==========
 
     async checkAllDeposits() {
-        this.checkReady();
+        await this.ensureReady();
 
         try {
             const latestBlock = await this.provider.getBlockNumber();
@@ -298,7 +310,7 @@ class WalletService {
     }
 
     async checkDeposit(userId) {
-        this.checkReady();
+        await this.ensureReady();
 
         const user = await User.findOne({ userId });
         if (!user) {
@@ -333,7 +345,7 @@ class WalletService {
             const referrer = await User.findOne({ referralCode: user.referredBy });
             if (!referrer) return;
 
-            const minDeposit = config.referral.minDeposit;
+            const minDeposit = config.referral?.minDeposit ?? 5;
             if (amount < minDeposit) return;
 
             const existingReward = await Transaction.findOne({
@@ -344,7 +356,7 @@ class WalletService {
 
             if (existingReward) return;
 
-            const rewardAmount = amount * config.referral.percentage;
+            const rewardAmount = amount * (config.referral?.percentage ?? 0.05);
 
             await Transaction.create({
                 txId: generateId(),
@@ -356,7 +368,7 @@ class WalletService {
                 metadata: {
                     referredUserId: userId,
                     depositAmount: amount,
-                    percentage: config.referral.percentage,
+                    percentage: config.referral?.percentage ?? 0.05,
                     requiresApproval: true
                 }
             });
@@ -572,7 +584,7 @@ class WalletService {
     }
 
     async getMasterBalance() {
-        this.checkReady();
+        await this.ensureReady();
 
         try {
             const bnbBalance = await this.provider.getBalance(this.masterWallet.address);
@@ -609,6 +621,9 @@ class WalletService {
                 logger.error('Deposit scanner error', { error: error.message });
             }
         }, intervalMs);
+
+        // Prevent unhandled rejection on process exit
+        this.scanInterval.unref?.();
     }
 
     stopDepositScanner() {
@@ -618,7 +633,16 @@ class WalletService {
             logger.info('Deposit scanner stopped');
         }
     }
+
+    // ========== GRACEFUL SHUTDOWN ==========
+
+    async disconnect() {
+        this.stopDepositScanner();
+        this.provider?.removeAllListeners?.();
+        this.provider = null;
+        this.isReady = false;
+        logger.info('Wallet service disconnected');
+    }
 }
 
-export default WalletService;
-        
+export 
