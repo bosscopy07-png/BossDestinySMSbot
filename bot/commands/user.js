@@ -33,6 +33,23 @@ class UserCommands {
         this.bot.action('check_deposit', this.handleCheckDeposit.bind(this));
         this.bot.action('deposit_qr', this.handleDepositQR.bind(this));
         this.bot.action(/copy_(.+)/, this.handleCopyAddress.bind(this));
+        
+        // Preset amount handlers
+        this.bot.action('deposit_5', (ctx) => this.handlePresetDeposit(ctx, 5));
+        this.bot.action('deposit_10', (ctx) => this.handlePresetDeposit(ctx, 10));
+        this.bot.action('deposit_20', (ctx) => this.handlePresetDeposit(ctx, 20));
+        this.bot.action('deposit_50', (ctx) => this.handlePresetDeposit(ctx, 50));
+        this.bot.action('deposit_100', (ctx) => this.handlePresetDeposit(ctx, 100));
+        this.bot.action('deposit_custom', this.handleCustomDeposit.bind(this));
+        
+        // Text handler for custom amount
+        this.bot.on('text', async (ctx, next) => {
+            if (ctx.session?.awaitingDepositAmount) {
+                ctx.session.awaitingDepositAmount = false;
+                return this.handleDepositAmountInput(ctx);
+            }
+            return next();
+        });
     }
 
     async handleStart(ctx) {
@@ -55,7 +72,6 @@ class UserCommands {
 You'll get a bonus on your first deposit.
                 `);
                 
-                // Refresh user data
                 user = await User.findOne({ userId });
             }
         }
@@ -145,7 +161,6 @@ What would you like to do?
         const userId = ctx.from.id.toString();
         const user = ctx.state.user || await User.findOne({ userId });
 
-        // Get pending deposits
         const pendingDeposit = await Transaction.findOne({
             userId: user.userId,
             type: 'DEPOSIT',
@@ -166,7 +181,7 @@ ${user.isVipActive?.() ? `👑 VIP Until: ${user.vipExpiry?.toLocaleDateString()
 ${pendingDeposit ? `⏳ Pending Deposit: ${formatCurrency(pendingDeposit.amount)}` : ''}
 
 💳 Deposit to:
-\`${this.walletService.getMasterAddress()}\`
+`${this.walletService.getMasterAddress()}`
         `;
 
         const keyboard = Markup.inlineKeyboard([
@@ -178,15 +193,91 @@ ${pendingDeposit ? `⏳ Pending Deposit: ${formatCurrency(pendingDeposit.amount)
         await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
     }
 
+    // ========== DEPOSIT FLOW ==========
+
     async handleDeposit(ctx) {
         const userId = ctx.from.id.toString();
 
         try {
-            // Generate deposit info with tracking amount
-            const depositInfo = await this.walletService.getDepositInfo(userId);
+            await ctx.reply(`
+💳 Select Deposit Amount
+
+Choose how much USDT you want to deposit:
+            `, Markup.inlineKeyboard([
+                [
+                    Markup.button.callback('$5', 'deposit_5'),
+                    Markup.button.callback('$10', 'deposit_10'),
+                    Markup.button.callback('$20', 'deposit_20')
+                ],
+                [
+                    Markup.button.callback('$50', 'deposit_50'),
+                    Markup.button.callback('$100', 'deposit_100')
+                ],
+                [Markup.button.callback('✏️ Custom Amount', 'deposit_custom')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]));
+
+        } catch (error) {
+            logger.error('Deposit handler error', { userId, error: error.message });
+            await ctx.reply('❌ Error. Please try /deposit again.');
+        }
+    }
+
+    async handlePresetDeposit(ctx, amount) {
+        const userId = ctx.from.id.toString();
+        
+        try {
+            await ctx.answerCbQuery(`Generating $${amount} deposit...`);
+            await this.showDepositDetails(ctx, userId, amount);
+        } catch (error) {
+            logger.error('Preset deposit error', { userId, amount, error: error.message });
+            await ctx.answerCbQuery('❌ Error');
+        }
+    }
+
+    async handleCustomDeposit(ctx) {
+        const userId = ctx.from.id.toString();
+        
+        try {
+            ctx.session = ctx.session || {};
+            ctx.session.awaitingDepositAmount = true;
+            
+            await ctx.answerCbQuery('Enter custom amount');
+            await ctx.reply(`
+💳 Custom Deposit
+
+Send the amount you want to deposit (in USD):
+
+Examples:
+• 5 (for $5)
+• 10.50 (for $10.50)
+• 25 (for $25)
+
+Minimum: $0.50
+            `);
+        } catch (error) {
+            logger.error('Custom deposit error', { userId, error: error.message });
+        }
+    }
+
+    async handleDepositAmountInput(ctx) {
+        const userId = ctx.from.id.toString();
+        const text = ctx.message.text.trim().replace(/[^0-9.]/g, '');
+        const amount = parseFloat(text);
+
+        if (isNaN(amount) || amount < 0.50) {
+            return ctx.reply('❌ Invalid amount. Minimum is $0.50. Try /deposit again.');
+        }
+
+        await this.showDepositDetails(ctx, userId, amount);
+    }
+
+    async showDepositDetails(ctx, userId, amount) {
+        try {
+            const depositInfo = await this.walletService.getDepositInfo(userId, amount);
 
             const message = `
-💳 Deposit Funds
+💳 Deposit $${depositInfo.baseAmount}
 
 Send **exactly** this amount of USDT (BEP-20):
 
@@ -196,9 +287,8 @@ Network: ${depositInfo.network}
 
 ⚠️ IMPORTANT:
 • Send ONLY USDT on BSC (BEP-20)
-• Send EXACTLY $${depositInfo.amount} — this identifies your deposit
-• Minimum: $0.50
-• Requires ${config.blockchain?.blockConfirmations || 12} confirmations
+• Send EXACTLY $${depositInfo.amount}
+• This exact amount identifies your deposit
 
 ⏱ Funds credited automatically in 1-2 minutes.
             `;
@@ -212,8 +302,8 @@ Network: ${depositInfo.network}
             await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
 
         } catch (error) {
-            logger.error('Deposit handler error', { userId, error: error.message });
-            await ctx.reply('❌ Error generating deposit. Please try again later.');
+            logger.error('Show deposit details error', { userId, error: error.message });
+            await ctx.reply('❌ Error generating deposit. Please try again.');
         }
     }
 
@@ -223,21 +313,27 @@ Network: ${depositInfo.network}
         try {
             const user = await User.findOne({ userId });
             if (!user || !user.depositTrackingAmount) {
-                return ctx.answerCbQuery('Please click Deposit first');
+                return ctx.answerCbQuery('Click Deposit first');
             }
 
             const masterAddress = this.walletService.getMasterAddress();
-            
-            // Generate QR code with payment URI
             const paymentUri = `ethereum:${masterAddress}?amount=${user.depositTrackingAmount}&token=USDT`;
-            const qrBuffer = await QRCode.toBuffer(paymentUri);
-
+            
             await ctx.answerCbQuery('Generating QR...');
             
+            const qrBuffer = await QRCode.toBuffer(paymentUri, {
+                width: 400,
+                margin: 2,
+                color: {
+                    dark: '#000000',
+                    light: '#FFFFFF'
+                }
+            });
+
             await ctx.replyWithPhoto(
                 { source: qrBuffer },
                 {
-                    caption: `📱 Scan to deposit $${user.depositTrackingAmount} USDT\n\nAddress: \`${masterAddress}\``,
+                    caption: `📱 Scan to deposit $${user.depositTrackingAmount} USDT\n\nAddress: \`${masterAddress}\`\n\n⚠️ Send EXACTLY $${user.depositTrackingAmount}`,
                     parse_mode: 'Markdown'
                 }
             );
@@ -252,7 +348,7 @@ Network: ${depositInfo.network}
         const userId = ctx.from.id.toString();
 
         try {
-            await ctx.answerCbQuery('Checking deposits...');
+            await ctx.answerCbQuery('Checking...');
 
             const result = await this.walletService.checkDeposit(userId);
 
@@ -275,22 +371,22 @@ Make sure you:
 2. Sent exactly the shown amount
 3. Used BSC (BEP-20) network
 
-Click 🔄 Check Deposit again in 1 minute.
+Check again in 1 minute.
                 `, { parse_mode: 'Markdown' });
             }
 
         } catch (error) {
             logger.error('Check deposit failed', { userId, error: error.message });
             await ctx.answerCbQuery('❌ Check failed');
-            await ctx.reply('❌ Error checking deposit. Please try again.');
+            await ctx.reply('❌ Error checking deposit. Try again later.');
         }
     }
 
     async handleCopyAddress(ctx) {
-        // Telegram handles copy automatically when user taps the code block
-        // This just acknowledges the callback
-        await ctx.answerCbQuery('Address copied! Paste it in your wallet.');
+        await ctx.answerCbQuery('Tap and hold the address above to copy it!');
     }
+
+    // ========== OTHER HANDLERS ==========
 
     async handleHistory(ctx) {
         const userId = ctx.from.id.toString();
@@ -431,4 +527,4 @@ Toggle settings below:
 }
 
 export default UserCommands;
-                                                           
+        
