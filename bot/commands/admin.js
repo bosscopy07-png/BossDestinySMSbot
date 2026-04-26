@@ -502,7 +502,6 @@ Select target audience:
 
         return { total, vip, paying, recent };
     }
-
         async executeBroadcast(ctx, filter, label, forcedMessage = null) {
         try {
             await ctx.answerCbQuery?.(`Broadcasting to ${label}...`);
@@ -973,3 +972,4 @@ Master Address: \\`${this.walletService.getMasterAddress()}\\`
 }
 
 export default AdminCommands;
+            
