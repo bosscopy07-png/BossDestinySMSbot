@@ -687,7 +687,7 @@ class UserCommands {
         try {
             const message = 'SwiftSupport - Customer Service\n\n' +
                 'Need help? Our support team is here for you!\n\n' +
-                'Contact: swiftsupport\n' +
+                'Contact: swiftsmssupport\n' +
                 'Response Time: Usually within 5 minutes\n\n' +
                 'Common Issues:\n' +
                 '- Deposit not showing? -> Use /check_deposit\n' +
@@ -699,7 +699,7 @@ class UserCommands {
             const keyboard = {
                 reply_markup: {
                     inline_keyboard: [
-                        [{ text: 'Chat Support', url: 'https://t.me/swiftsupport' }],
+                        [{ text: 'Chat Support', url: 'https://t.me/swiftsmssupport' }],
                         [{ text: 'Back', callback_data: 'menu' }]
                     ]
                 }
