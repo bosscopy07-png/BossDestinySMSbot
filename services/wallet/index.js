@@ -1,4 +1,3 @@
-
 import { ethers } from 'ethers';
 import { User, Transaction } from '../../models/index.js';
 import { generateId } from '../../utils/helpers.js';
@@ -14,6 +13,7 @@ class WalletService {
         this.usdtContract = null;
         this.isReady = false;
         this.lastCheckedBlock = 0;
+        this.scanInterval = null;
 
         this.usdtAbi = [
             'function balanceOf(address) view returns (uint256)',
@@ -62,8 +62,11 @@ class WalletService {
                 this.masterAddress = this.masterWallet.address;
                 this.isReady = true;
 
-                // Start from current block - 1000 for initial scan
-                this.lastCheckedBlock = await this.provider.getBlockNumber() - 1000;
+                try {
+                    this.lastCheckedBlock = await this.provider.getBlockNumber();
+                } catch {
+                    this.lastCheckedBlock = 0;
+                }
 
                 logger.info('Wallet service initialized', {
                     masterAddress: this.masterAddress,
@@ -102,18 +105,21 @@ class WalletService {
 
     checkReady() {
         if (!this.isReady) {
-            throw new Error('WALLET_NOT_READY — blockchain connection unavailable');
+            throw new Error('WALLET_NOT_READY — blockchain connection unavailable. Check RPC URL or try again later.');
         }
     }
 
     // ========== DEPOSIT SYSTEM ==========
 
-    async getDepositInfo(userId) {
-        const user = await User.findOne({ userId });
+    async getDepositInfo(userId, requestedAmount = 10) {
+        const minDeposit = 0.50;
+        let amount = parseFloat(requestedAmount);
         
-        // Generate unique amount for tracking (e.g., $5.001234)
-        const baseAmount = user?.pendingDeposit || 10.00;
-        const trackingAmount = this.generateTrackingAmount(baseAmount, userId);
+        if (isNaN(amount) || amount < minDeposit) {
+            amount = minDeposit;
+        }
+
+        const trackingAmount = this.generateTrackingAmount(amount, userId);
 
         await User.updateOne(
             { userId },
@@ -131,23 +137,16 @@ class WalletService {
         return {
             address: this.masterAddress,
             amount: trackingAmount,
+            baseAmount: amount,
             network: 'BSC (BEP-20)',
-            token: 'USDT',
-            userId: userId
+            token: 'USDT'
         };
     }
 
-    // Generate unique amount by adding small fraction based on userId
-    // e.g., user 12345 + $10.00 = $10.0012345
     generateTrackingAmount(baseAmount, userId) {
         const userSuffix = parseInt(userId.toString().slice(-5)) / 1000000;
         const trackingAmount = baseAmount + userSuffix;
         return parseFloat(trackingAmount.toFixed(6));
-    }
-
-    // Extract base amount from tracking amount
-    getBaseAmount(trackingAmount) {
-        return Math.floor(trackingAmount);
     }
 
     // ========== MASTER ADDRESS DEPOSIT CHECKING ==========
@@ -157,17 +156,22 @@ class WalletService {
 
         try {
             const latestBlock = await this.provider.getBlockNumber();
+            const scanRange = 500;
             
-            if (latestBlock <= this.lastCheckedBlock) {
+            let fromBlock = this.lastCheckedBlock || (latestBlock - scanRange);
+            
+            if (latestBlock - fromBlock > scanRange) {
+                fromBlock = latestBlock - scanRange;
+            }
+            
+            if (fromBlock < 0) fromBlock = 0;
+
+            if (latestBlock <= fromBlock) {
                 return [];
             }
 
             const filter = this.usdtContract.filters.Transfer(null, this.masterAddress);
-            const events = await this.usdtContract.queryFilter(
-                filter,
-                this.lastCheckedBlock,
-                latestBlock
-            );
+            const events = await this.usdtContract.queryFilter(filter, fromBlock, latestBlock);
 
             const processedDeposits = [];
 
@@ -188,6 +192,17 @@ class WalletService {
 
         } catch (error) {
             logger.error('Deposit check failed', { error: error.message });
+            
+            if (error.message?.includes('exceeds the limits') || error.message?.includes('Forbidden')) {
+                try {
+                    const latestBlock = await this.provider.getBlockNumber();
+                    this.lastCheckedBlock = latestBlock - 400;
+                    logger.warn('Reset scan range due to RPC limit', { newStart: this.lastCheckedBlock });
+                } catch {
+                    this.lastCheckedBlock = 0;
+                }
+            }
+            
             throw error;
         }
     }
@@ -200,25 +215,18 @@ class WalletService {
         const txHash = event.transactionHash;
         const blockNumber = event.blockNumber;
 
-        // Skip if not to master address
         if (toAddress.toLowerCase() !== this.masterAddress.toLowerCase()) {
             return null;
         }
 
-        // Check if already processed
         const existing = await Transaction.findOne({ 'blockchain.txHash': txHash });
         if (existing) return null;
 
-        // Find user by tracking amount or registered wallet
         let user = await User.findOne({ 
-            $or: [
-                { depositTrackingAmount: amount },
-                { registeredWallet: fromAddress.toLowerCase() }
-            ],
-            depositPending: true
+            depositPending: true,
+            depositTrackingAmount: amount
         });
 
-        // If no exact match, try fuzzy match (within $0.01)
         if (!user) {
             user = await User.findOne({
                 depositPending: true,
@@ -238,7 +246,6 @@ class WalletService {
             return null;
         }
 
-        // Create deposit transaction
         const tx = await Transaction.create({
             txId: generateId(),
             userId: user.userId,
@@ -257,7 +264,6 @@ class WalletService {
             }
         });
 
-        // Credit user balance immediately (small amounts, trust-based)
         await User.updateOne(
             { userId: user.userId },
             {
@@ -274,7 +280,6 @@ class WalletService {
             }
         );
 
-        // Process referral
         await this.processReferralDeposit(user.userId, amount);
 
         logger.info('Deposit detected and credited', {
@@ -292,7 +297,6 @@ class WalletService {
         };
     }
 
-    // Single user deposit check (for manual trigger)
     async checkDeposit(userId) {
         this.checkReady();
 
@@ -301,7 +305,6 @@ class WalletService {
             return { found: false, message: 'User not found' };
         }
 
-        // Run full scan
         const results = await this.checkAllDeposits();
         const userDeposit = results.find(r => r.userId === userId);
 
@@ -386,7 +389,7 @@ class WalletService {
 
         try {
             const user = await User.findOne({ userId });
-            if (!user || (user.balance - (user.lockedBalance || 0)) < amount) {
+            if (!user || ((user.balance || 0) - (user.lockedBalance || 0)) < amount) {
                 throw new Error('INSUFFICIENT_FUNDS');
             }
 
@@ -525,7 +528,7 @@ class WalletService {
 
         try {
             const user = await User.findOne({ userId });
-            if (!user || user.balance < amount) {
+            if (!user || (user.balance || 0) < amount) {
                 throw new Error('INSUFFICIENT_BALANCE');
             }
 
@@ -555,7 +558,14 @@ class WalletService {
         }
     }
 
-    // ========== MASTER WALLET INFO ==========
+    async getDepositAddress(userId) {
+        const user = await User.findOne({ userId });
+        if (user && user.depositAddress) {
+            return user.depositAddress;
+        }
+        const info = await this.getDepositInfo(userId);
+        return info.address;
+    }
 
     getMasterAddress() {
         return this.masterAddress || 'WALLET_NOT_READY';
@@ -586,9 +596,13 @@ class WalletService {
             return;
         }
 
+        if (this.scanInterval) {
+            clearInterval(this.scanInterval);
+        }
+
         logger.info('Starting deposit scanner', { interval: intervalMs });
 
-        setInterval(async () => {
+        this.scanInterval = setInterval(async () => {
             try {
                 await this.checkAllDeposits();
             } catch (error) {
@@ -596,7 +610,15 @@ class WalletService {
             }
         }, intervalMs);
     }
+
+    stopDepositScanner() {
+        if (this.scanInterval) {
+            clearInterval(this.scanInterval);
+            this.scanInterval = null;
+            logger.info('Deposit scanner stopped');
+        }
+    }
 }
 
 export default WalletService;
-                
+        
