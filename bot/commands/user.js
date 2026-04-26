@@ -181,7 +181,7 @@ ${user.isVipActive?.() ? `👑 VIP Until: ${user.vipExpiry?.toLocaleDateString()
 ${pendingDeposit ? `⏳ Pending Deposit: ${formatCurrency(pendingDeposit.amount)}` : ''}
 
 💳 Deposit to:
-`${this.walletService.getMasterAddress()}`
+\`${this.walletService.getMasterAddress()}\`
         `;
 
         const keyboard = Markup.inlineKeyboard([
@@ -527,4 +527,4 @@ Toggle settings below:
 }
 
 export default UserCommands;
-        
+                        
