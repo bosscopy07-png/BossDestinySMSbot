@@ -645,4 +645,4 @@ class WalletService {
     }
 }
 
-export 
+export default WalletService;
