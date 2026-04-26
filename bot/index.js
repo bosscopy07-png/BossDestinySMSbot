@@ -111,7 +111,7 @@ Admin Only:
     }
 
     stop(reason = 'manual') {
-        logger.info(`Stopping bot (${reason})`);
+        logger.info(`Stopping bot ({reason})`);
         this.bot.stop(reason);
         
         if (this.walletService) {
