@@ -1,4 +1,4 @@
- import { Markup } from 'telegraf';
+import { Markup } from 'telegraf';
 import { Session, User } from '../../models/index.js';
 import { COUNTRIES, SERVICES } from '../../utils/constants.js';
 import { formatCurrency, maskOTP } from '../../utils/helpers.js';
@@ -6,9 +6,27 @@ import sessionManager from '../../services/otp/index.js';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
 
+// Image URLs mapped by context
+const IMAGES = {
+    otpMenu: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231499/file_000000006c1c724685bb402218b7c208_ste2ky.png',
+    vipFirst: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231496/file_00000000970071f4a9405256d1d028af_hjzc8o.png',
+    vipOther: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231495/file_00000000800071f48dbbef2fbcc543fe_qgr5ch.png',
+    bundleFirst: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231494/file_00000000733c7246bf7774567468638b_l64i5g.png',
+    bundleOther: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231493/file_000000004c8c71f49757d61e50e41a4e_dyocuq.png',
+    freeMode: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231492/file_00000000820072468452896492cba37c_rw0k7f.png',
+    countrySelect: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777235806/file_00000000cad4720a8c06373a016e5150_mg6tx1.png',
+    cheapMode: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231494/file_0000000040a871f4a09afb0846cf618e_jdiomc.png',
+    otpRequested: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777235811/file_00000000e318720a951c5e2e7a2588cf_yyva4e.png',
+    otpReceived: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777235806/file_00000000621c71f4b75e0fc04a89d1c2_saojfi.png',
+    otpFailed: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777235806/file_00000000621c71f4b75e0fc04a89d1c2_saojfi.png',
+    default: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231497/file_0000000034547246812a74392b500be0_gelms4.png',
+    depositConfirmed: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777235826/file_000000001c0c720aa51ae407e6741ca5_steie1.png'
+};
+
 class OTPCommands {
-    constructor(bot) {
+    constructor(bot, walletService) {
         this.bot = bot;
+        this.walletService = walletService;
         this.registerCommands();
     }
 
@@ -20,6 +38,7 @@ class OTPCommands {
         this.bot.action('mode_free', this.handleFreeMode.bind(this));
         this.bot.action('mode_cheap', this.handleCheapMode.bind(this));
         this.bot.action('mode_vip', this.handleVIPMode.bind(this));
+        this.bot.action('mode_bundle', this.handleBuyBundle.bind(this));
         
         // Service selection
         this.bot.action(/service_(.+)/, this.handleServiceSelect.bind(this));
@@ -38,11 +57,36 @@ class OTPCommands {
         
         // Check deposit
         this.bot.action('check_deposit', this.handleCheckDeposit.bind(this));
+        
+        // Missing handlers that were referenced in keyboards
+        this.bot.action('cancel_otp', this.handleCancel.bind(this));
+        this.bot.action('deposit', this.handleDepositInfo.bind(this));
+        this.bot.action('menu', this.handleMenu.bind(this));
+    }
+
+    // Helper: send photo with caption and optional keyboard
+    async sendPhotoWithCaption(ctx, imageUrl, caption, keyboard = null, parseMode = 'Markdown') {
+        try {
+            const payload = {
+                caption: caption.trim(),
+                parse_mode: parseMode
+            };
+            if (keyboard) {
+                payload.reply_markup = keyboard.reply_markup;
+            }
+            await ctx.replyWithPhoto(imageUrl, payload);
+        } catch (error) {
+            logger.error('Failed to send photo', { error: error.message, url: imageUrl });
+            // Fallback to text-only if image fails
+            if (keyboard) {
+                await ctx.reply(caption, { parse_mode: parseMode, ...keyboard });
+            } else {
+                await ctx.reply(caption, { parse_mode: parseMode });
+            }
+        }
     }
 
     async handleOTPCommand(ctx) {
-        const user = ctx.state.user;
-
         const message = `
 📱 Request OTP
 
@@ -61,14 +105,14 @@ Select your preferred mode:
             [Markup.button.callback('🔙 Back', 'menu')]
         ]);
 
-        await ctx.reply(message, keyboard);
+        await this.sendPhotoWithCaption(ctx, IMAGES.otpMenu, message, keyboard);
     }
 
     async handleFreeMode(ctx) {
         const user = ctx.state.user;
 
         if (!user.canUseFree()) {
-            return ctx.reply(`
+            const message = `
 ❌ Free Limit Reached
 
 You've used all 3 free OTPs today.
@@ -76,32 +120,38 @@ You've used all 3 free OTPs today.
 💰 Deposit to continue:
 • CHEAP: $0.05 per OTP
 • Bundle: $5 for 100 OTPs
-            `, Markup.inlineKeyboard([
+            `;
+            const keyboard = Markup.inlineKeyboard([
                 [Markup.button.callback('💳 Deposit', 'deposit')],
                 [Markup.button.callback('🔙 Back', 'menu')]
-            ]));
+            ]);
+            return this.sendPhotoWithCaption(ctx, IMAGES.freeMode, message, keyboard);
         }
 
+        await this.sendPhotoWithCaption(ctx, IMAGES.freeMode, '🆓 Free Mode Selected\n\nChoose your service:', null);
         await this.showServiceSelection(ctx, 'FREE');
     }
 
     async handleCheapMode(ctx) {
         const user = ctx.state.user;
 
-        if (user.getAvailableBalance() < config.pricing.cheapOtp) {
-            return ctx.reply(`
+        if (user.getAvailableBalance() < (config.prices?.cheapOtp || 0.05)) {
+            const message = `
 💰 Insufficient Balance
 
-Required: ${formatCurrency(config.pricing.cheapOtp)}
+Required: ${formatCurrency(config.prices?.cheapOtp || 0.05)}
 Available: ${formatCurrency(user.getAvailableBalance())}
 
 Please deposit first.
-            `, Markup.inlineKeyboard([
+            `;
+            const keyboard = Markup.inlineKeyboard([
                 [Markup.button.callback('💳 Deposit', 'deposit')],
                 [Markup.button.callback('🔙 Back', 'menu')]
-            ]));
+            ]);
+            return this.sendPhotoWithCaption(ctx, IMAGES.cheapMode, message, keyboard);
         }
 
+        await this.sendPhotoWithCaption(ctx, IMAGES.cheapMode, '💰 Cheap Mode Selected\n\nChoose your service:', null);
         await this.showServiceSelection(ctx, 'CHEAP');
     }
 
@@ -109,30 +159,34 @@ Please deposit first.
         const user = ctx.state.user;
 
         if (!user.isVipActive()) {
-            return ctx.reply(`
+            const message = `
 👑 VIP Required
 
 You need an active VIP subscription.
 
-Price: ${formatCurrency(config.pricing.vipMonthly)}/month
+Price: ${formatCurrency(config.prices?.vipSubscription || 5.00)}/month
 Includes: Unlimited OTPs (50/day max)
 
 Upgrade now?
-            `, Markup.inlineKeyboard([
+            `;
+            const keyboard = Markup.inlineKeyboard([
                 [Markup.button.callback('👑 Upgrade VIP', 'buy_vip')],
                 [Markup.button.callback('🔙 Back', 'menu')]
-            ]));
+            ]);
+            return this.sendPhotoWithCaption(ctx, IMAGES.vipFirst, message, keyboard);
         }
 
         if (!user.canUseVip()) {
-            return ctx.reply(`
+            const message = `
 ⚠️ VIP Daily Limit Reached
 
 You've used 50/50 VIP OTPs today.
 Resets at midnight UTC.
-            `);
+            `;
+            return this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message);
         }
 
+        await this.sendPhotoWithCaption(ctx, IMAGES.vipOther, '👑 VIP Mode Selected\n\nChoose your service:', null);
         await this.showServiceSelection(ctx, 'VIP');
     }
 
@@ -178,7 +232,7 @@ Choose number country:
         ]);
         buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
 
-        await ctx.reply(message, Markup.inlineKeyboard(buttons));
+        await this.sendPhotoWithCaption(ctx, IMAGES.countrySelect, message, Markup.inlineKeyboard(buttons));
     }
 
     async handleCountrySelect(ctx) {
@@ -188,7 +242,7 @@ Choose number country:
         const service = ctx.session?.otpService;
 
         if (!mode || !service) {
-            return ctx.reply('❌ Session expired. Please start over with /otp');
+            return this.sendPhotoWithCaption(ctx, IMAGES.default, '❌ Session expired. Please start over with /otp');
         }
 
         try {
@@ -226,7 +280,7 @@ Choose number country:
                 [Markup.button.callback('❌ Cancel', 'cancel_otp')]
             ]);
 
-            await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
+            await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard);
 
         } catch (error) {
             logger.error('OTP session creation failed', {
@@ -245,7 +299,8 @@ Choose number country:
                 VIP_DAILY_LIMIT_REACHED: '⚠️ VIP daily limit (50) reached.'
             };
 
-            await ctx.reply(errorMessages[error.message] || `❌ Error: ${error.message}`);
+            const errorMsg = errorMessages[error.message] || `❌ Error: ${error.message}`;
+            await this.sendPhotoWithCaption(ctx, IMAGES.otpFailed, errorMsg);
         }
     }
 
@@ -259,23 +314,25 @@ Choose number country:
             });
 
             if (!activeSession) {
-                return ctx.reply('❌ No active session to cancel.');
+                return this.sendPhotoWithCaption(ctx, IMAGES.default, '❌ No active session to cancel.');
             }
 
             await sessionManager.cancelSession(activeSession.sessionId, userId);
 
-            await ctx.reply(`
+            const message = `
 ✅ Session Cancelled
 
 📱 Number: ${activeSession.number}
 💰 ${activeSession.cost > 0 ? 'Funds returned to your balance.' : ''}
 
 You can start a new request now.
-            `);
+            `;
+
+            await this.sendPhotoWithCaption(ctx, IMAGES.default, message);
 
         } catch (error) {
             logger.error('Cancel failed', { userId, error: error.message });
-            await ctx.reply('❌ Failed to cancel session. Please try again.');
+            await this.sendPhotoWithCaption(ctx, IMAGES.default, '❌ Failed to cancel session. Please try again.');
         }
     }
 
@@ -285,8 +342,8 @@ You can start a new request now.
         const message = `
 📦 Buy OTP Bundle
 
-💰 Price: ${formatCurrency(config.pricing.bundlePrice)}
-📦 Includes: ${config.pricing.bundleOtpCount} OTPs
+💰 Price: ${formatCurrency(config.prices?.bundlePrice || 5.00)}
+📦 Includes: ${config.prices?.bundleOtpCount || 100} OTPs
 ✅ Never expires
 💡 Best value for regular users
 
@@ -298,21 +355,22 @@ Your Balance: ${formatCurrency(user.balance)}
             [Markup.button.callback('❌ Cancel', 'menu')]
         ]);
 
-        await ctx.reply(message, keyboard);
+        await this.sendPhotoWithCaption(ctx, IMAGES.bundleFirst, message, keyboard);
     }
 
     async handleConfirmBundle(ctx) {
         const user = ctx.state.user;
 
-        if (user.balance < config.pricing.bundlePrice) {
-            return ctx.reply(`
+        if (user.balance < (config.prices?.bundlePrice || 5.00)) {
+            const message = `
 ❌ Insufficient Balance
 
-Required: ${formatCurrency(config.pricing.bundlePrice)}
+Required: ${formatCurrency(config.prices?.bundlePrice || 5.00)}
 Available: ${formatCurrency(user.balance)}
 
 Deposit first with /deposit
-            `);
+            `;
+            return this.sendPhotoWithCaption(ctx, IMAGES.bundleOther, message);
         }
 
         // Deduct balance
@@ -320,21 +378,23 @@ Deposit first with /deposit
             { userId: user.userId },
             {
                 $inc: {
-                    balance: -config.pricing.bundlePrice,
-                    bundleRemaining: config.pricing.bundleOtpCount
+                    balance: -(config.prices?.bundlePrice || 5.00),
+                    bundleRemaining: config.prices?.bundleOtpCount || 100
                 }
             }
         );
 
-        await ctx.reply(`
+        const message = `
 ✅ Bundle Purchased!
 
-📦 ${config.pricing.bundleOtpCount} OTPs added
-💰 ${formatCurrency(config.pricing.bundlePrice)} deducted
-📦 Total Available: ${user.bundleRemaining + config.pricing.bundleOtpCount} OTPs
+📦 ${config.prices?.bundleOtpCount || 100} OTPs added
+💰 ${formatCurrency(config.prices?.bundlePrice || 5.00)} deducted
+📦 Total Available: ${user.bundleRemaining + (config.prices?.bundleOtpCount || 100)} OTPs
 
 Use /otp to start requesting.
-        `);
+        `;
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.bundleOther, message);
     }
 
     async handleBuyVIP(ctx) {
@@ -343,7 +403,7 @@ Use /otp to start requesting.
         const message = `
 👑 Upgrade to VIP
 
-💰 Price: ${formatCurrency(config.pricing.vipMonthly)}/month
+💰 Price: ${formatCurrency(config.prices?.vipSubscription || 5.00)}/month
 ✅ Unlimited OTPs (50/day)
 ⚡ Priority routing
 🚀 Fastest delivery
@@ -356,21 +416,22 @@ Your Balance: ${formatCurrency(user.balance)}
             [Markup.button.callback('❌ Cancel', 'menu')]
         ]);
 
-        await ctx.reply(message, keyboard);
+        await this.sendPhotoWithCaption(ctx, IMAGES.vipFirst, message, keyboard);
     }
 
     async handleConfirmVIP(ctx) {
         const user = ctx.state.user;
 
-        if (user.balance < config.pricing.vipMonthly) {
-            return ctx.reply(`
+        if (user.balance < (config.prices?.vipSubscription || 5.00)) {
+            const message = `
 ❌ Insufficient Balance
 
-Required: ${formatCurrency(config.pricing.vipMonthly)}
+Required: ${formatCurrency(config.prices?.vipSubscription || 5.00)}
 Available: ${formatCurrency(user.balance)}
 
 Deposit first with /deposit
-            `);
+            `;
+            return this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message);
         }
 
         const expiryDate = new Date();
@@ -380,7 +441,7 @@ Deposit first with /deposit
         await User.updateOne(
             { userId: user.userId },
             {
-                $inc: { balance: -config.pricing.vipMonthly },
+                $inc: { balance: -(config.prices?.vipSubscription || 5.00) },
                 $set: {
                     mode: 'VIP',
                     vipExpiry: expiryDate,
@@ -390,7 +451,7 @@ Deposit first with /deposit
             }
         );
 
-        await ctx.reply(`
+        const message = `
 👑 VIP Activated!
 
 ⏰ Valid until: ${expiryDate.toLocaleDateString()}
@@ -398,7 +459,9 @@ Deposit first with /deposit
 ⚡ Priority delivery enabled
 
 Enjoy premium service!
-        `);
+        `;
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message);
     }
 
     async handleRevealOTP(ctx) {
@@ -413,7 +476,8 @@ Enjoy premium service!
             }
 
             await ctx.answerCbQuery();
-            await ctx.reply(`
+            
+            const message = `
 🔓 Full OTP Revealed
 
 📱 Number: ${session.number}
@@ -421,7 +485,9 @@ Enjoy premium service!
 🕐 Delivered: ${session.endTime.toLocaleTimeString()}
 
 ⚠️ Do not share this code with anyone.
-            `, { parse_mode: 'Markdown' });
+            `;
+
+            await this.sendPhotoWithCaption(ctx, IMAGES.otpReceived, message, null, 'Markdown');
 
         } catch (error) {
             await ctx.answerCbQuery('❌ Error revealing OTP');
@@ -435,42 +501,66 @@ Enjoy premium service!
             const result = await this.walletService.checkDeposit(userId);
 
             if (!result.found) {
-                return ctx.reply(`
+                const message = `
 ⏳ No Deposit Found
 
 Your deposit address hasn't received any confirmed deposits yet.
 
 Send USDT (BEP-20) to your address and check again.
-                `);
+                `;
+                return this.sendPhotoWithCaption(ctx, IMAGES.default, message);
             }
 
             if (result.status === 'CONFIRMING') {
-                return ctx.reply(`
+                const message = `
 ⏳ Deposit Confirming
 
 Amount: ${formatCurrency(result.amount)}
-Confirmations: ${result.confirmations || 0}/${config.blockchain.blockConfirmations}
+Confirmations: ${result.confirmations || 0}/${config.blockchain?.blockConfirmations || 12}
 
 Please wait for full confirmation.
-                `);
+                `;
+                return this.sendPhotoWithCaption(ctx, IMAGES.default, message);
             }
 
             if (result.status === 'CONFIRMED') {
-                return ctx.reply(`
+                const message = `
 ✅ Deposit Confirmed!
 
 Amount: ${formatCurrency(result.amount)}
 Tx Hash: \`${result.txHash}\`
 
 Your balance has been updated.
-                `, { parse_mode: 'Markdown' });
+                `;
+                return this.sendPhotoWithCaption(ctx, IMAGES.depositConfirmed, message, null, 'Markdown');
             }
 
         } catch (error) {
             logger.error('Check deposit failed', { userId, error: error.message });
-            await ctx.reply('❌ Error checking deposit. Please try again.');
+            await this.sendPhotoWithCaption(ctx, IMAGES.default, '❌ Error checking deposit. Please try again.');
         }
+    }
+
+    // Handler for deposit button clicks
+    async handleDepositInfo(ctx) {
+        const message = `
+💳 Deposit Information
+
+Send USDT (BEP-20) to your deposit address.
+
+Your deposit will be credited automatically after confirmation.
+
+Use /check_deposit to check status.
+        `;
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message);
+    }
+
+    // Handler for menu button clicks
+    async handleMenu(ctx) {
+        // Redirect to main menu - assumes main menu command exists elsewhere
+        await ctx.reply('🏠 Main Menu');
     }
 }
 
 export default OTPCommands;
+ 
