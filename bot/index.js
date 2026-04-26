@@ -43,21 +43,23 @@ class TelegramBot {
         });
 
         this.bot.action('help', async (ctx) => {
-            await ctx.reply(`
-❓ Help & Commands
+            const helpMessage = [
+                "❓ Help & Commands",
+                "",
+                "📱 /otp - Request OTP",
+                "💰 /balance - Check balance",
+                "💳 /deposit - Add funds",
+                "📜 /history - Transaction history",
+                "🎁 /referral - Referral program",
+                "📊 /stats - Your statistics",
+                "⚙️ /settings - Bot settings",
+                "❌ /cancel - Cancel active session",
+                "",
+                "Admin Only:",
+                "🔐 /admin - Admin dashboard"
+            ].join("\n");
 
-📱 /otp - Request OTP
-💰 /balance - Check balance
-💳 /deposit - Add funds
-📜 /history - Transaction history
-🎁 /referral - Referral program
-📊 /stats - Your statistics
-⚙️ /settings - Bot settings
-❌ /cancel - Cancel active session
-
-Admin Only:
-🔐 /admin - Admin dashboard
-            `);
+            await ctx.reply(helpMessage);
         });
 
         this.bot.action('menu', async (ctx) => {
@@ -111,7 +113,7 @@ Admin Only:
     }
 
     stop(reason = 'manual') {
-        logger.info(`Stopping bot ({reason})`);
+        logger.info(`Stopping bot (${reason})`);
         this.bot.stop(reason);
         
         if (this.walletService) {
