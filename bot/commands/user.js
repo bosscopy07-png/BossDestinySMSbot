@@ -1,6 +1,8 @@
+
 import { Markup } from 'telegraf';
 import QRCode from 'qrcode';
 import { User, Session, Transaction } from '../../models/index.js';
+import { COUNTRIES, SERVICES } from '../../utils/constants.js';
 import { formatCurrency, generateReferralCode, isNewDay } from '../../utils/helpers.js';
 import config from '../../config/env.js';
 import logger from '../../utils/logger.js';
