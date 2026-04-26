@@ -1,164 +1,113 @@
 process.on('uncaughtException', (err) => {
     console.error('💥 UNCAUGHT EXCEPTION:', err.message);
     console.error('Stack:', err.stack);
-    console.error('Type:', err.name);
-    console.error('Code:', err.code || 'N/A');
-    if (err.cause) console.error('Cause:', err.cause);
     process.exit(1);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
     console.error('💥 UNHANDLED REJECTION at:', promise);
     console.error('Reason:', reason);
-    if (reason instanceof Error) {
-        console.error('Stack:', reason.stack);
-    }
     process.exit(1);
 });
 
-process.on('warning', (warning) => {
-    console.warn('⚠️  NODE WARNING:', warning.name);
-    console.warn('Message:', warning.message);
-    console.warn('Stack:', warning.stack);
-});
-
-const logImportAttempt = (modulePath) => {
+const safeImport = async (modulePath) => {
     console.log(`📦 Importing: ${modulePath}...`);
-};
-
-const logImportSuccess = (modulePath, exports) => {
-    console.log(`✅ Imported: ${modulePath}`);
-    console.log(`   Exports: ${Object.keys(exports || {}).join(', ') || 'default only'}`);
-};
-
-const logImportError = (modulePath, error) => {
-    console.error(`❌ FAILED to import: ${modulePath}`);
-    console.error(`   Error: ${error.message}`);
-    console.error(`   Type: ${error.name}`);
-    if (error.stack) {
-        const relevantStack = error.stack.split('\n').slice(0, 5).join('\n');
-        console.error(`   Stack:\n${relevantStack}`);
+    try {
+        const module = await import(modulePath);
+        console.log(`✅ Imported: ${modulePath}`);
+        return module;
+    } catch (error) {
+        console.error(`\n❌ FAILED to import: ${modulePath}`);
+        console.error(`   Error: ${error.message}`);
+        
+        // SYNTAX ERROR: Show exact file and line
+        if (error instanceof SyntaxError && error.stack) {
+            const lines = error.stack.split('\n');
+            console.error('\n🔍 SYNTAX ERROR LOCATION:');
+            for (const line of lines) {
+                if (line.includes('file://') || line.includes('.js:')) {
+                    const match = line.match(/(file:\/\/[^\s]+|[^\s]+\.js:\d+:\d+)/);
+                    if (match) {
+                        console.error(`   📍 ${match[1]}`);
+                    }
+                }
+            }
+        }
+        
+        throw error;
     }
 };
 
-const safeImport = async (modulePath) => {
-    logImportAttempt(modulePath);
+// DEEP TRACER: Follow the import chain to find the real culprit
+const traceImportChain = async (modulePath, depth = 0) => {
+    const indent = '  '.repeat(depth);
+    console.log(`${indent}📂 Tracing: ${modulePath}`);
+    
     try {
         const module = await import(modulePath);
-        logImportSuccess(modulePath, module);
+        console.log(`${indent}✅ OK: ${modulePath}`);
         return module;
     } catch (error) {
-        logImportError(modulePath, error);
+        console.error(`${indent}❌ BROKEN: ${modulePath}`);
+        
+        // If it's a syntax error, we found it
+        if (error instanceof SyntaxError) {
+            console.error(`\n🎯 ROOT CAUSE FOUND at depth ${depth}:`);
+            console.error(`   File: ${modulePath}`);
+            console.error(`   Error: ${error.message}`);
+            
+            // Try to extract the exact line from stack
+            const stackLines = error.stack.split('\n');
+            for (const line of stackLines) {
+                if (line.includes('.js:')) {
+                    console.error(`   Stack: ${line.trim()}`);
+                }
+            }
+            throw new Error(`SYNTAX ERROR in ${modulePath}: ${error.message}`);
+        }
+        
+        // If it's a module not found, the missing file is the issue
+        if (error.code === 'ERR_MODULE_NOT_FOUND') {
+            console.error(`   Missing module: ${error.message}`);
+            throw error;
+        }
+        
+        // Otherwise, the error is in a dependency - trace deeper
+        console.error(`${indent}   Error in dependency, tracing deeper...`);
         throw error;
     }
 };
 
 try {
     console.log('🚀 app.js starting...');
-    console.log(`   Node version: ${process.version}`);
-    console.log(`   Platform: ${process.platform}`);
-    console.log(`   CWD: ${process.cwd()}`);
+    console.log(`   Node: ${process.version}`);
 
     const { config, connectDatabase } = await safeImport('./config/index.js');
     const { default: logger } = await safeImport('./utils/logger.js');
-    const { default: TelegramBot } = await safeImport('./bot/index.js');
+    
+    // USE DEEP TRACER for the problematic import
+    const { default: TelegramBot } = await traceImportChain('./bot/index.js');
+    
     const { startServer } = await safeImport('./api/index.js');
     const { default: CronJobs } = await safeImport('./cron/index.js');
 
     let bot = null;
-    let isShuttingDown = false;
-
-    const gracefulShutdown = (signal) => {
-        if (isShuttingDown) {
-            console.log('⚡ Forced exit (already shutting down)...');
-            process.exit(1);
-        }
-        isShuttingDown = true;
-        console.log(`\n🛑 Received ${signal}, shutting down gracefully...`);
-        if (bot && typeof bot.stop === 'function') {
-            try {
-                bot.stop(signal);
-                console.log('   Bot stopped');
-            } catch (e) {
-                console.error('   Error stopping bot:', e.message);
-            }
-        }
-        setTimeout(() => {
-            console.log('⏱️  Forcing exit after timeout');
-            process.exit(0);
-        }, 5000);
-    };
 
     const startApp = async () => {
-        const steps = [
-            { name: 'Database', fn: () => connectDatabase() },
-            { name: 'Bot instance', fn: () => { bot = new TelegramBot(); return Promise.resolve(); } },
-            { name: 'Bot launch', fn: () => bot.launch() },
-            { name: 'API server', fn: () => startServer(config?.server?.port || 3000) },
-            { name: 'Cron jobs', fn: () => { const cron = new CronJobs(); cron.start(); return Promise.resolve(); } }
-        ];
-
-        try {
-            console.log('🟢 Starting app initialization...');
-            
-            for (const step of steps) {
-                console.log(`🔧 ${step.name}...`);
-                try {
-                    await step.fn();
-                    console.log(`✅ ${step.name} completed`);
-                } catch (stepError) {
-                    console.error(`❌ ${step.name} FAILED:`, stepError.message);
-                    console.error('   Stack:', stepError.stack?.split('\n').slice(0, 3).join('\n'));
-                    throw new Error(`${step.name} failed: ${stepError.message}`);
-                }
-            }
-
-            if (logger && typeof logger.info === 'function') {
-                logger.info('Application started successfully');
-            } else {
-                console.warn('⚠️  Logger not available for final success log');
-            }
-
-            console.log('🎉 Application fully started and operational');
-
-        } catch (error) {
-            console.error('💥 startApp FAILED:', error.message);
-            console.error('Full stack:', error.stack);
-            if (logger && typeof logger.error === 'function') {
-                logger.error('Failed to start application', { 
-                    error: error.message, 
-                    stack: error.stack 
-                });
-            }
-            process.exit(1);
-        }
+        await connectDatabase();
+        bot = new TelegramBot();
+        await bot.launch();
+        startServer(config?.server?.port || 3000);
+        const cron = new CronJobs();
+        cron.start();
+        console.log('🎉 App started');
     };
 
-    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-    process.on('exit', (code) => {
-        console.log(`👋 Process exiting with code ${code}`);
-    });
-
-    console.log('🟢 All imports successful, calling startApp()...');
     startApp();
 
 } catch (err) {
-    console.error('💥 IMPORT CRASH:', err.message);
-    console.error('Error type:', err.name);
-    console.error('Error code:', err.code || 'N/A');
-    console.error('Stack trace:');
-    console.error(err.stack);
-    
-    if (err.url) console.error('Module URL:', err.url);
-    if (err instanceof SyntaxError) {
-        console.error('\n🔍 SYNTAX ERROR DETECTED');
-        console.error('This usually means:');
-        console.error('  - Missing/extra braces, parentheses, or quotes');
-        console.error('  - Invalid character (check for hidden unicode)');
-        console.error('  - Using unsupported syntax for your Node version');
-        console.error(`  - Current Node ${process.version} may not support certain features`);
-    }
-    
+    console.error('\n💥 FATAL ERROR:', err.message);
+    console.error('Stack:', err.stack);
     process.exit(1);
-    }
+           }
+    
