@@ -206,9 +206,11 @@ class UserCommands {
         
         // Store mode and redirect to service selection (would be handled by OTPCommands or next step)
         ctx.session = ctx.session || {};
-        ctx.session.otpMode = 'FREE';
-        await ctx.reply('FREE mode selected. Use /otp to choose service and country.');
+ctx.session.otpMode = 'FREE';
+await this.showServiceSelection(ctx, 'FREE');
     }
+        
+        
 
     async handleCheapMode(ctx) {
         try { await ctx.answerCbQuery('Loading CHEAP...'); } catch (e) {}
@@ -224,9 +226,10 @@ class UserCommands {
             return this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, keyboard);
         }
         
+        
         ctx.session = ctx.session || {};
-        ctx.session.otpMode = 'CHEAP';
-        await ctx.reply('CHEAP mode selected. Use /otp to choose service and country.');
+ctx.session.otpMode = 'CHEAP';
+await this.showServiceSelection(ctx, 'CHEAP');
     }
 
     async handleVIPMode(ctx) {
@@ -248,9 +251,28 @@ class UserCommands {
         }
         
         ctx.session = ctx.session || {};
-        ctx.session.otpMode = 'VIP';
-        await ctx.reply('VIP mode selected. Use /otp to choose service and country.');
+ctx.session.otpMode = 'VIP';
+await this.showServiceSelection(ctx, 'VIP');
     }
+    
+    async showServiceSelection(ctx, mode) {
+    ctx.session = ctx.session || {};
+    ctx.session.otpMode = mode;
+
+    const message = mode + ' Mode Selected\n\nChoose the service you need OTP for:';
+
+    const buttons = [];
+    for (let i = 0; i < SERVICES.length; i += 3) {
+        const row = SERVICES.slice(i, i + 3).map(service => 
+            Markup.button.callback(service, 'service_' + service)
+        );
+        buttons.push(row);
+    }
+    buttons.push([Markup.button.callback('Back', 'menu')]);
+
+    await this.sendPhotoWithCaption(ctx, IMAGES.default, message, Markup.inlineKeyboard(buttons));
+    }
+    
 
     async handleBalance(ctx) {
         const userId = ctx.from.id.toString();
