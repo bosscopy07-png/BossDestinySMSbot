@@ -361,7 +361,7 @@ class UserCommands {
         }
     }
 
-    // FIXED: Use https:// link instead of ethereum: scheme for button URL
+// FIXED: Use https:// link instead of ethereum: scheme for button URL
     async handleDepositQR(ctx) {
         const userId = ctx.from.id.toString();
         try {
@@ -382,4 +382,451 @@ class UserCommands {
             
             const qrBuffer = await QRCode.toBuffer(masterAddress, {
                 width: 400,
+                margin: 2,
+                color: { dark: '#00BCD4', light: '#FFFFFF' }
+            });
+
+            const caption = 'Scan to Deposit\n\n' +
+                'Amount: $' + trackingAmount + ' USDT\n' +
+                'Address: ' + masterAddress + '\n\n' +
+                'Send EXACTLY $' + trackingAmount + ' USDT on BSC (BEP-20)';
+
+            // FIXED: Use https URL in button, not ethereum: scheme
+            const keyboard = {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: 'Open in MetaMask', url: walletUrl }],
+                        [{ text: 'Copy Address', callback_data: 'copy_address_' + masterAddress }],
+                        [{ text: 'Check Deposit', callback_data: 'check_deposit' }],
+                        [{ text: 'Back', callback_data: 'menu' }]
+                    ]
+                }
+            };
+
+            await ctx.replyWithPhoto(
+                { source: qrBuffer },
+                { caption: caption, reply_markup: keyboard.reply_markup }
+            );
+
+        } catch (error) {
+            logger.error('QR generation failed', { userId, error: error.message });
+            await ctx.answerCbQuery('Failed to generate QR');
+        }
+    }
+
+    async handleCheckDeposit(ctx) {
+        const userId = ctx.from.id.toString();
+        try {
+            await ctx.answerCbQuery('Checking...');
+            const result = await this.walletService.checkDeposit(userId);
+
+            if (result.found && result.status === 'CONFIRMED') {
+                if (result.amount && result.amount > 0) {
+                    await User.updateOne(
+                        { userId },
+                        { $inc: { balance: result.amount, totalDeposited: result.amount }, $set: { depositTrackingAmount: null } }
+                    );
+                    
+                    const user = await User.findOne({ userId });
+                    if (user?.referredBy && !user?.referralBonusReceived) {
+                        const bonusAmount = result.amount * ((config.referral?.percentage || 0.05));
+                        await User.updateOne(
+                            { userId },
+                            { $inc: { balance: bonusAmount, referralRewardsPending: bonusAmount }, $set: { referralBonusReceived: true } }
+                        );
+                        
+                        const referrer = await User.findOne({ referralCode: user.referredBy });
+                        if (referrer) {
+                            await User.updateOne(
+                                { userId: referrer.userId },
+                                { $inc: { referralEarnings: bonusAmount, referralRewardsPending: -bonusAmount } }
+                            );
+                            try {
+                                await ctx.telegram.sendMessage(
+                                    referrer.userId,
+                                    'Your referral ' + (ctx.from.username || userId) + ' made their first deposit!\n\nYou earned: ' + formatCurrency(bonusAmount)
+                                );
+                            } catch (e) {
+                                logger.warn('Failed to notify referrer', { referrerId: referrer.userId });
+                            }
+                        }
+                    }
+                }
+
+                const message = 'Deposit Confirmed!\n\n' +
+                    'Amount: ' + formatCurrency(result.amount) + '\n' +
+                    'Status: ' + result.status + '\n' +
+                    'TX: ' + result.txHash + '\n\n' +
+                    'Your balance has been updated.';
+                
+                return this.sendPhotoWithCaption(ctx, IMAGES.depositConfirmed, message);
+            } 
+            
+            if (result.found && result.status === 'CONFIRMING') {
+                const message = 'Deposit Confirming\n\n' +
+                    'Amount: ' + formatCurrency(result.amount) + '\n' +
+                    'Confirmations: ' + (result.confirmations || 0) + '/' + (config.blockchain?.blockConfirmations || 12) + '\n\n' +
+                    'Please wait for full confirmation.';
+                return this.sendPhotoWithCaption(ctx, IMAGES.deposit, message);
+            }
+
+            const message = 'No deposit found yet.\n\n' +
+                'Make sure you:\n' +
+                '1. Sent to: ' + this.walletService.getMasterAddress() + '\n' +
+                '2. Sent exactly the shown amount\n' +
+                '3. Used BSC (BEP-20) network\n\n' +
+                'Check again in 1 minute.';
+            
+            await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message);
+
+        } catch (error) {
+            logger.error('Check deposit failed', { userId, error: error.message });
+            await ctx.answerCbQuery('Check failed');
+            await ctx.reply('Error checking deposit. Try again later.');
+        }
+    }
+
+    async handleHistory(ctx) {
+        const userId = ctx.from.id.toString();
+        const transactions = await Transaction.find({ userId }).sort({ createdAt: -1 }).limit(10);
+
+        let message = 'Recent Transactions\n\n';
+        if (transactions.length === 0) {
+            message += 'No transactions yet. Deposit to get started!';
+        } else {
+            transactions.forEach((tx, index) => {
+                const icon = tx.amount > 0 ? '+' : '-';
+                const type = tx.type?.replace(/_/g, ' ') || 'Unknown';
+                message += (index + 1) + '. ' + icon + ' ' + type + '\n';
+                message += '   Amount: ' + formatCurrency(Math.abs(tx.amount || 0)) + '\n';
+                message += '   Status: ' + tx.status + '\n';
+                message += '   Date: ' + (tx.createdAt?.toLocaleDateString() || 'Unknown') + '\n\n';
+            });
+        }
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('Export CSV', 'export_history')],
+            [Markup.button.callback('Back', 'menu')]
+        ]);
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.history, message, keyboard);
+    }
+
+    async handleExportHistory(ctx) {
+        const userId = ctx.from.id.toString();
+        try {
+            await ctx.answerCbQuery('Generating CSV...');
+            const transactions = await Transaction.find({ userId }).sort({ createdAt: -1 });
+            
+            if (transactions.length === 0) {
+                return ctx.reply('No transactions to export.');
+            }
+            
+            let csv = 'Date,Type,Amount,Status,TX Hash\n';
+            for (const tx of transactions) {
+                const date = tx.createdAt ? tx.createdAt.toISOString().split('T')[0] : 'N/A';
+                csv += date + ',' + (tx.type || 'Unknown') + ',' + (tx.amount || 0) + ',' + (tx.status || 'Unknown') + ',' + (tx.txHash || 'N/A') + '\n';
+            }
+            
+            await ctx.replyWithDocument(
+                { source: Buffer.from(csv), filename: 'history_' + userId + '.csv' },
+                { caption: 'Your transaction history export.' }
+            );
+        } catch (error) {
+            logger.error('Export history failed', { userId, error: error.message });
+            await ctx.reply('Failed to export history.');
+        }
+    }
+
+    async handleReferral(ctx) {
+        const user = await User.findOne({ userId: ctx.from.id.toString() });
+        const botUsername = ctx.botInfo?.username || 'SwiftOTPBot';
+        const referralLink = 'https://t.me/' + botUsername + '?start=' + user.referralCode;
+
+        const message = 'Referral Program\n\n' +
+            'Your Code: ' + user.referralCode + '\n\n' +
+            'Share your link and earn ' + (((config.referral?.percentage || 0.05) * 100).toFixed(0)) + '% of your referrals deposits!\n\n' +
+            'Your Stats:\n' +
+            '- Referrals: ' + (user.referralCount || 0) + '\n' +
+            '- Total Earnings: ' + formatCurrency(user.referralEarnings || 0) + '\n' +
+            '- Pending Approval: ' + formatCurrency(user.referralRewardsPending || 0) + '\n\n' +
+            'Your Link:\n' + referralLink;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('Share Link', 'share_' + user.referralCode)],
+            [Markup.button.callback('Back', 'menu')]
+        ]);
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.referral, message, keyboard);
+    }
+
+    async handleShareReferral(ctx) {
+        const referralCode = ctx.match[1];
+        const botUsername = ctx.botInfo?.username || 'SwiftOTPBot';
+        const referralLink = 'https://t.me/' + botUsername + '?start=' + referralCode;
         
+        await ctx.answerCbQuery('Link copied to clipboard!');
+        await ctx.reply('Share Your Referral Link\n\n' + referralLink + '\n\nTap and hold to copy, then share with friends!');
+    }
+
+    async handleStats(ctx) {
+        const userId = ctx.from.id.toString();
+        const user = await User.findOne({ userId });
+        const sessions = await Session.find({ userId });
+        
+        const totalRequests = sessions.length;
+        const successful = sessions.filter(s => s.status === 'RECEIVED').length;
+        const failed = sessions.filter(s => s.status === 'TIMEOUT').length;
+        const successRate = totalRequests > 0 ? ((successful / totalRequests) * 100).toFixed(1) : 0;
+
+        const completedSessions = sessions.filter(s => s.endTime && s.startTime);
+        const avgWaitTime = completedSessions.length > 0
+            ? (completedSessions.reduce((acc, s) => acc + (s.endTime - s.startTime), 0) / completedSessions.length / 1000)
+            : 0;
+
+        const message = 'Your Statistics\n\n' +
+            'OTP Requests:\n' +
+            '- Total: ' + totalRequests + '\n' +
+            '- Successful: ' + successful + '\n' +
+            '- Failed: ' + failed + '\n' +
+            '- Success Rate: ' + successRate + '%\n\n' +
+            'Performance:\n' +
+            '- Avg Wait Time: ' + avgWaitTime.toFixed(1) + 's\n\n' +
+            'Financial:\n' +
+            '- Total Deposited: ' + formatCurrency(user?.totalDeposited || 0) + '\n' +
+            '- Total Spent: ' + formatCurrency(user?.totalSpent || 0) + '\n' +
+            '- Current Balance: ' + formatCurrency(user?.balance || 0) + '\n\n' +
+            'Member Since: ' + (user?.createdAt?.toLocaleDateString() || 'Unknown');
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.stats, message, Markup.inlineKeyboard([
+            [Markup.button.callback('Back', 'menu')]
+        ]));
+    }
+
+    async handleSettings(ctx) {
+        const user = await User.findOne({ userId: ctx.from.id.toString() });
+
+        const message = 'Settings\n\n' +
+            'Privacy: ' + (user.privacyEnabled ? 'Masked OTPs' : 'Full OTPs') + '\n' +
+            'Notifications: ' + (user.notificationsEnabled ? 'On' : 'Off') + '\n' +
+            'Country: ' + (user.preferredCountry || 'US') + '\n\n' +
+            'Toggle settings below:';
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback(user.privacyEnabled ? 'Show Full OTPs' : 'Mask OTPs', 'toggle_privacy')],
+            [Markup.button.callback(user.notificationsEnabled ? 'Disable Notifications' : 'Enable Notifications', 'toggle_notifications')],
+            [Markup.button.callback('Change Country', 'change_country')],
+            [Markup.button.callback('Back', 'menu')]
+        ]);
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, keyboard);
+    }
+
+    async handleTogglePrivacy(ctx) {
+        const userId = ctx.from.id.toString();
+        const user = await User.findOne({ userId });
+        const newValue = !user.privacyEnabled;
+        await User.updateOne({ userId }, { $set: { privacyEnabled: newValue } });
+        await ctx.answerCbQuery(newValue ? 'Privacy ON' : 'Privacy OFF');
+        await this.handleSettings(ctx);
+    }
+
+    async handleToggleNotifications(ctx) {
+        const userId = ctx.from.id.toString();
+        const user = await User.findOne({ userId });
+        const newValue = !user.notificationsEnabled;
+        await User.updateOne({ userId }, { $set: { notificationsEnabled: newValue } });
+        await ctx.answerCbQuery(newValue ? 'Notifications ON' : 'Notifications OFF');
+        await this.handleSettings(ctx);
+    }
+
+    async handleChangeCountry(ctx) {
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingCustomCountry = false;
+        
+        const countries = [
+            { code: 'US', name: 'United States' },
+            { code: 'UK', name: 'United Kingdom' },
+            { code: 'CA', name: 'Canada' },
+            { code: 'AU', name: 'Australia' },
+            { code: 'DE', name: 'Germany' },
+            { code: 'FR', name: 'France' },
+            { code: 'IN', name: 'India' },
+            { code: 'NG', name: 'Nigeria' }
+        ];
+        
+        const buttons = countries.map(c => [
+            Markup.button.callback(c.name, 'setcountry_' + c.code)
+        ]);
+        buttons.push([Markup.button.callback('Custom', 'custom_country')]);
+        buttons.push([Markup.button.callback('Back', 'settings')]);
+        
+        const message = 'Select Your Preferred Country\n\nChoose a country for your OTP numbers:';
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, Markup.inlineKeyboard(buttons));
+    }
+
+    async handleSetCountry(ctx) {
+        const countryCode = ctx.match[1];
+        const userId = ctx.from.id.toString();
+        await User.updateOne({ userId }, { $set: { preferredCountry: countryCode } });
+        await ctx.answerCbQuery('Country set to ' + countryCode);
+        await this.handleSettings(ctx);
+    }
+
+    async handleCustomCountryInput(ctx) {
+        const countryCode = ctx.message.text.trim().toUpperCase().substring(0, 2);
+        const userId = ctx.from.id.toString();
+        await User.updateOne({ userId }, { $set: { preferredCountry: countryCode } });
+        await ctx.reply('Country set to ' + countryCode);
+        await this.handleSettings(ctx);
+    }
+
+    // FIXED: Removed all Markdown parse_mode. Using plain text to avoid entity errors.
+    // FIXED: URL button uses raw object syntax with https://t.me link.
+    async handleSupport(ctx) {
+        try {
+            const message = 'SwiftSupport - Customer Service\n\n' +
+                'Need help? Our support team is here for you!\n\n' +
+                'Contact: swiftsupport\n' +
+                'Response Time: Usually within 5 minutes\n\n' +
+                'Common Issues:\n' +
+                '- Deposit not showing? -> Use /check_deposit\n' +
+                '- OTP not received? -> Use /cancel and retry\n' +
+                '- Wrong amount sent? -> Contact support with TX hash\n\n' +
+                'Please include your User ID when contacting support.';
+            
+            // FIXED: Raw keyboard object with https URL, no Markdown parsing
+            const keyboard = {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: 'Chat Support', url: 'https://t.me/swiftsupport' }],
+                        [{ text: 'Back', callback_data: 'menu' }]
+                    ]
+                }
+            };
+
+            await this.sendPhotoWithCaption(ctx, IMAGES.support, message, keyboard);
+        } catch (error) {
+            logger.error('Support handler error', { error: error.message, userId: ctx.from?.id });
+            // Fallback without image if photo fails
+            try {
+                await ctx.reply('Customer Service\n\nContact @swiftsupport for help.', {
+                    reply_markup: {
+                        inline_keyboard: [[{ text: 'Chat Support', url: 'https://t.me/swiftsupport' }]]
+                    }
+                });
+            } catch (e) {
+                logger.error('Support fallback failed', { error: e.message });
+            }
+        }
+    }
+
+    async handleHelp(ctx) {
+        const message = 'Help & FAQ\n\n' +
+            'How to request OTP:\n' +
+            '1. Tap Request OTP or use /otp\n' +
+            '2. Select mode (FREE, CHEAP, VIP, or Bundle)\n' +
+            '3. Choose service (WhatsApp, Telegram, etc.)\n' +
+            '4. Select country\n' +
+            '5. Wait for OTP to arrive\n\n' +
+            'How to deposit:\n' +
+            '1. Tap Deposit or use /deposit\n' +
+            '2. Select amount\n' +
+            '3. Send USDT (BEP-20) to shown address\n' +
+            '4. Tap Check Deposit or wait 1-2 minutes\n\n' +
+            'VIP Benefits:\n' +
+            '- Unlimited OTPs (50/day)\n' +
+            '- Priority routing\n' +
+            '- Fastest delivery\n' +
+            '- $5/month\n\n' +
+            'Bundle:\n' +
+            '- 100 OTPs for $5\n' +
+            '- Never expires\n\n' +
+            'Commands:\n' +
+            '/start - Welcome screen\n' +
+            '/menu - Main menu\n' +
+            '/balance - Check balance\n' +
+            '/deposit - Add funds\n' +
+            '/history - Transactions\n' +
+            '/referral - Earn rewards\n' +
+            '/stats - Your statistics\n' +
+            '/settings - Preferences\n' +
+            '/support - Customer service';
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, Markup.inlineKeyboard([
+            [Markup.button.callback('Back', 'menu')]
+        ]));
+    }
+
+    async handleBuyBundle(ctx) {
+        const user = await User.findOne({ userId: ctx.from.id.toString() });
+        const bundlePrice = config.prices?.bundlePrice || 5.00;
+        const bundleCount = config.prices?.bundleOtpCount || 100;
+        
+        if (user.balance < bundlePrice) {
+            const message = 'Insufficient Balance\n\n' +
+                'Required: ' + formatCurrency(bundlePrice) + '\n' +
+                'Available: ' + formatCurrency(user.balance) + '\n\n' +
+                'Deposit first with /deposit';
+            return this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, Markup.inlineKeyboard([
+                [Markup.button.callback('Deposit', 'deposit')],
+                [Markup.button.callback('Back', 'menu')]
+            ]));
+        }
+        
+        await User.updateOne(
+            { userId: user.userId },
+            { $inc: { balance: -bundlePrice, bundleRemaining: bundleCount, totalSpent: bundlePrice } }
+        );
+        
+        const message = 'Bundle Purchased!\n\n' +
+            bundleCount + ' OTPs added\n' +
+            formatCurrency(bundlePrice) + ' deducted\n' +
+            'Total Available: ' + ((user.bundleRemaining || 0) + bundleCount) + ' OTPs\n\n' +
+            'Use /otp to start requesting.';
+        
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message);
+    }
+
+    async handleBuyVIP(ctx) {
+        const user = await User.findOne({ userId: ctx.from.id.toString() });
+        const vipPrice = config.prices?.vipSubscription || 5.00;
+        
+        if (user.balance < vipPrice) {
+            const message = 'Insufficient Balance\n\n' +
+                'Required: ' + formatCurrency(vipPrice) + '\n' +
+                'Available: ' + formatCurrency(user.balance) + '\n\n' +
+                'Deposit first with /deposit';
+            return this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, Markup.inlineKeyboard([
+                [Markup.button.callback('Deposit', 'deposit')],
+                [Markup.button.callback('Back', 'menu')]
+            ]));
+        }
+        
+        const expiryDate = new Date();
+        expiryDate.setMonth(expiryDate.getMonth() + 1);
+        
+        await User.updateOne(
+            { userId: user.userId },
+            {
+                $inc: { balance: -vipPrice, totalSpent: vipPrice },
+                $set: {
+                    mode: 'VIP',
+                    vipExpiry: expiryDate,
+                    vipDailyUsed: 0,
+                    vipDailyReset: new Date()
+                }
+            }
+        );
+        
+        const message = 'VIP Activated!\n\n' +
+            'Valid until: ' + expiryDate.toLocaleDateString() + '\n' +
+            'Unlimited OTPs (50/day)\n' +
+            'Priority delivery enabled\n\n' +
+            'Enjoy premium service!';
+        
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message);
+    }
+}
+
+export default UserCommands;
