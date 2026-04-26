@@ -26,6 +26,10 @@ class AdminCommands {
         this.bot.command('approve_referral', this.requireAdmin, this.handleApproveReferral.bind(this));
         this.bot.command('master_balance', this.requireAdmin, this.handleMasterBalance.bind(this));
         this.bot.command('withdraw_profits', this.requireAdmin, this.handleWithdrawProfits.bind(this));
+        this.bot.command('setprice', this.requireAdmin, this.handleSetPrice.bind(this));
+        this.bot.command('setvip', this.requireAdmin, this.handleSetVip.bind(this));
+        this.bot.command('setfree', this.requireAdmin, this.handleSetFree.bind(this));
+        this.bot.command('toggleprovider', this.requireAdmin, this.handleToggleProvider.bind(this));
 
         this.bot.action('admin_users', this.requireAdmin, this.handleUsers.bind(this));
         this.bot.action('admin_profits', this.requireAdmin, this.handleProfits.bind(this));
@@ -33,6 +37,7 @@ class AdminCommands {
         this.bot.action('admin_logs', this.requireAdmin, this.handleLogs.bind(this));
         this.bot.action('admin_broadcast', this.requireAdmin, this.handleBroadcastMenu.bind(this));
         this.bot.action('admin_settings', this.requireAdmin, this.handleSettings.bind(this));
+        this.bot.action('admin', this.requireAdmin, this.handleAdmin.bind(this));
 
         this.bot.action('broadcast_all', this.requireAdmin, this.handleBroadcastAll.bind(this));
         this.bot.action('broadcast_vip', this.requireAdmin, this.handleBroadcastVip.bind(this));
@@ -44,6 +49,9 @@ class AdminCommands {
         this.bot.action('settings_free', this.requireAdmin, this.handleSettingsFree.bind(this));
         this.bot.action('settings_providers', this.requireAdmin, this.handleSettingsProviders.bind(this));
         this.bot.action('settings_maintenance', this.requireAdmin, this.handleSettingsMaintenance.bind(this));
+
+        this.bot.action('export_profits', this.requireAdmin, this.handleExportProfits.bind(this));
+        this.bot.action('withdraw_profits', this.requireAdmin, this.handleWithdrawProfits.bind(this));
 
         this.bot.action(/admin_users_(\d+)/, this.requireAdmin, this.handleUsers.bind(this));
         
@@ -154,7 +162,7 @@ class AdminCommands {
 
                 message += `
 ${status} ${user.username || user.firstName || 'Unknown'}
-ID: \\`${user.userId}\\`
+ID: \`${user.userId}\`
 Balance: ${formatCurrency(user.balance)}
 Mode: ${user.mode}
 Last Active: ${user.lastActive?.toLocaleDateString() || 'Never'}
@@ -170,7 +178,7 @@ Last Active: ${user.lastActive?.toLocaleDateString() || 'Never'}
                 [Markup.button.callback('🔙 Back to Admin', 'admin')]
             ]);
 
-            await ctx.reply(message, { parse_mode: 'MarkdownV2', ...keyboard });
+            await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
         } catch (error) {
             logger.error('Users list error', { error: error.message });
             await ctx.reply('❌ Failed to load users.');
@@ -199,7 +207,7 @@ Last Active: ${user.lastActive?.toLocaleDateString() || 'Never'}
             const message = `
 👤 User Details
 
-🆔 ID: \\`${user.userId}\\`
+🆔 ID: \`${user.userId}\`
 👤 Name: ${(user.firstName || '') + ' ' + (user.lastName || '')}
 📱 Username: @${user.username || 'N/A'}
 💰 Balance: ${formatCurrency(user.balance)}
@@ -227,7 +235,7 @@ Recent Transactions: ${transactions.length}
                 [Markup.button.callback('🔙 Back', 'admin_users')]
             ]);
 
-            await ctx.reply(message, { parse_mode: 'MarkdownV2', ...keyboard });
+            await ctx.reply(message, { parse_mode: 'Markdown', ...keyboard });
         } catch (error) {
             logger.error('User detail error', { error: error.message });
             await ctx.reply('❌ Failed to load user details.');
@@ -502,7 +510,8 @@ Select target audience:
 
         return { total, vip, paying, recent };
     }
-        async executeBroadcast(ctx, filter, label, forcedMessage = null) {
+
+    async executeBroadcast(ctx, filter, label, forcedMessage = null) {
         try {
             await ctx.answerCbQuery?.(`Broadcasting to ${label}...`);
 
@@ -514,462 +523,4 @@ Select target audience:
                 ctx.session = ctx.session || {};
                 ctx.session.broadcastTarget = label;
                 ctx.session.broadcastFilter = filter;
-                return ctx.reply('✍️ Send the message you want to broadcast:');
-            }
-
-            const message = forcedMessage || ctx.session.broadcastMessage;
-            if (ctx.session) {
-                delete ctx.session.broadcastMessage;
-                delete ctx.session.broadcastTarget;
-                delete ctx.session.broadcastFilter;
-            }
-
-            for (const user of users) {
-                try {
-                    await ctx.telegram.sendMessage(user.userId, `
-📢 ${label}
-
-${message}
-
----
-OTP Bot Team
-                    `);
-                    sent++;
-                    await new Promise(r => setTimeout(r, 50));
-                } catch (error) {
-                    failed++;
-                    logger.warn('Broadcast failed for user', { userId: user.userId, error: error.message });
-                }
-            }
-
-            await ctx.reply(`📢 Broadcast to ${label} complete.\n✅ Sent: ${sent}\n❌ Failed: ${failed}`);
-        } catch (error) {
-            logger.error('Broadcast execution error', { error: error.message });
-            await ctx.reply('❌ Broadcast failed.');
-        }
-    }
-
-    async handleBroadcastAll(ctx) {
-        await this.executeBroadcast(ctx, {}, 'All Users');
-    }
-
-    async handleBroadcastVip(ctx) {
-        const now = new Date();
-        await this.executeBroadcast(ctx, { vipExpiry: { $gt: now } }, 'VIP Users');
-    }
-
-    async handleBroadcastPaying(ctx) {
-        await this.executeBroadcast(ctx, { balance: { $gt: 0 } }, 'Paying Users');
-    }
-
-    async handleBroadcastRecent(ctx) {
-        const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-        await this.executeBroadcast(ctx, { createdAt: { $gte: weekAgo } }, 'Recent Users');
-    }
-
-    async handleSettings(ctx) {
-        try {
-            const settings = await this.getCurrentSettings();
-
-            await ctx.reply(`
-🔧 Admin Settings
-
-💰 OTP Prices:
-• Cheap OTP: ${formatCurrency(settings.cheapOtpPrice)}
-• VIP OTP: ${formatCurrency(settings.vipOtpPrice)}
-
-👑 VIP Subscription:
-• Price: ${formatCurrency(settings.vipPrice)}
-• Duration: ${settings.vipDuration} days
-
-🆓 Free Limits:
-• Daily: ${settings.freeDaily} OTPs
-• Per Number: ${settings.freePerNumber}
-
-⚡ Providers:
-• Twilio: ${settings.twilioEnabled ? '✅' : '❌'}
-• Telnyx: ${settings.telnyxEnabled ? '✅' : '❌'}
-• Cheap Panel: ${settings.cheapPanelEnabled ? '✅' : '❌'}
-• Free Public: ${settings.freePublicEnabled ? '✅' : '❌'}
-
-🛠 Maintenance: ${settings.maintenanceMode ? '🔴 ON' : '🟢 OFF'}
-            `, Markup.inlineKeyboard([
-                [Markup.button.callback('💰 OTP Prices', 'settings_prices')],
-                [Markup.button.callback('👑 VIP Config', 'settings_vip')],
-                [Markup.button.callback('🆓 Free Limits', 'settings_free')],
-                [Markup.button.callback('⚡ Providers', 'settings_providers')],
-                [Markup.button.callback('🛠 Maintenance', 'settings_maintenance')],
-                [Markup.button.callback('🔙 Back', 'admin')]
-            ]));
-        } catch (error) {
-            logger.error('Settings error', { error: error.message });
-            await ctx.reply('❌ Failed to load settings.');
-        }
-    }
-
-    async getCurrentSettings() {
-        return {
-            cheapOtpPrice: config.prices?.cheapOtp || 0.50,
-            vipOtpPrice: config.prices?.vipOtp || 0.30,
-            vipPrice: config.prices?.vipSubscription || 5.00,
-            vipDuration: config.prices?.vipDuration || 30,
-            freeDaily: config.limits?.freeDaily || 3,
-            freePerNumber: config.limits?.freePerNumber || 1,
-            twilioEnabled: config.providers?.twilio !== false,
-            telnyxEnabled: config.providers?.telnyx !== false,
-            cheapPanelEnabled: config.providers?.cheapPanel !== false,
-            freePublicEnabled: config.providers?.freePublic !== false,
-            maintenanceMode: config.maintenance || false
-        };
-    }
-
-    async handleSettingsPrices(ctx) {
-        await ctx.reply(`
-💰 Update OTP Prices
-
-Current:
-• Cheap OTP: ${formatCurrency(config.prices?.cheapOtp || 0.50)}
-• VIP OTP: ${formatCurrency(config.prices?.vipOtp || 0.30)}
-
-To update, use:
-/setprice cheap <amount>
-/setprice vip <amount>
-        `, Markup.inlineKeyboard([
-            [Markup.button.callback('🔙 Back', 'admin_settings')]
-        ]));
-    }
-
-    async handleSettingsVip(ctx) {
-        await ctx.reply(`
-👑 VIP Configuration
-
-Current:
-• Price: ${formatCurrency(config.prices?.vipSubscription || 5.00)}
-• Duration: ${config.prices?.vipDuration || 30} days
-
-To update, use:
-/setvip price <amount>
-/setvip days <number>
-        `, Markup.inlineKeyboard([
-            [Markup.button.callback('🔙 Back', 'admin_settings')]
-        ]));
-    }
-
-    async handleSettingsFree(ctx) {
-        await ctx.reply(`
-🆓 Free OTP Limits
-
-Current:
-• Daily per user: ${config.limits?.freeDaily || 3}
-• Per number: ${config.limits?.freePerNumber || 1}
-
-To update, use:
-/setfree daily <number>
-/setfree pernumber <number>
-        `, Markup.inlineKeyboard([
-            [Markup.button.callback('🔙 Back', 'admin_settings')]
-        ]));
-    }
-
-    async handleSettingsProviders(ctx) {
-        await ctx.reply(`
-⚡ Provider Settings
-
-Toggle providers on/off:
-/toggleprovider twilio
-/toggleprovider telnyx
-/toggleprovider cheappanel
-/toggleprovider freepublic
-
-Current status shown in main settings menu.
-        `, Markup.inlineKeyboard([
-            [Markup.button.callback('🔙 Back', 'admin_settings')]
-        ]));
-    }
-
-    async handleSettingsMaintenance(ctx) {
-        try {
-            const current = config.maintenance || false;
-            config.maintenance = !current;
-
-            await ctx.reply(`
-🛠 Maintenance Mode ${!current ? 'ENABLED' : 'DISABLED'}
-
-Users will ${!current ? 'see a maintenance message' : 'have normal access'}.
-            `, Markup.inlineKeyboard([
-                [Markup.button.callback('🔙 Back', 'admin_settings')]
-            ]));
-
-            logger.info('Maintenance mode toggled', {
-                admin: ctx.from.id,
-                enabled: !current
-            });
-        } catch (error) {
-            logger.error('Maintenance toggle error', { error: error.message });
-            await ctx.reply('❌ Failed to toggle maintenance mode.');
-        }
-    }
-
-    async handleSystem(ctx) {
-        try {
-            let masterBalance = { usdt: 'N/A', bnb: 'N/A' };
-            try {
-                masterBalance = await this.walletService.getMasterBalance();
-            } catch (error) {
-                logger.warn('Failed to get master balance for system status', { error: error.message });
-            }
-
-            const message = `
-⚙️ System Status
-
-🖥 Server: Online
-💾 Database: Connected
-⏱ Uptime: ${Math.floor(process.uptime() / 3600)}h ${Math.floor((process.uptime() % 3600) / 60)}m
-
-💎 Master Wallet:
-• Address: \\`${this.walletService.getMasterAddress()}\\`
-• USDT: ${masterBalance.usdt}
-• BNB: ${masterBalance.bnb}
-
-📊 Memory: ${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB
-            `;
-
-            await ctx.reply(message, { parse_mode: 'MarkdownV2' });
-        } catch (error) {
-            logger.error('System status error', { error: error.message });
-            await ctx.reply('❌ Failed to load system status.');
-        }
-    }
-
-    async handleLogs(ctx) {
-        try {
-            const logs = await AdminLog.find()
-                .sort({ timestamp: -1 })
-                .limit(20);
-
-            let message = '📋 Admin Logs (Last 20)\n\n';
-
-            if (logs.length === 0) {
-                message += 'No logs yet.';
-            } else {
-                for (const log of logs) {
-                    message += `
-[${log.timestamp.toLocaleString()}]
-👤 ${log.adminId} → ${log.action}
-🎯 ${log.targetUserId || 'N/A'}
-📄 ${JSON.stringify(log.details).substring(0, 100)}
-                    `;
-                }
-            }
-
-            await ctx.reply(message);
-        } catch (error) {
-            logger.error('Logs error', { error: error.message });
-            await ctx.reply('❌ Failed to load logs.');
-        }
-    }
-
-    async handleApproveReferral(ctx) {
-        try {
-            const args = ctx.message.text.split(' ');
-            if (args.length < 2) {
-                return ctx.reply('Usage: /approve_referral <tx_id>');
-            }
-
-            const txId = args[1];
-            const tx = await Transaction.findOne({ txId, type: 'REFERRAL_REWARD', status: 'PENDING' });
-
-            if (!tx) {
-                return ctx.reply('❌ Referral transaction not found or already processed.');
-            }
-
-            await User.updateOne(
-                { userId: tx.userId },
-                { $inc: { balance: tx.amount } }
-            );
-
-            await Transaction.updateOne(
-                { txId },
-                {
-                    $set: {
-                        status: 'COMPLETED',
-                        approvedBy: ctx.from.id.toString(),
-                        approvedAt: new Date()
-                    }
-                }
-            );
-
-            await ctx.reply(`✅ Referral reward ${formatCurrency(tx.amount)} approved for user ${tx.userId}`);
-
-            await ctx.telegram.sendMessage(tx.userId, `
-🎁 Referral Reward Approved!
-
-Amount: ${formatCurrency(tx.amount)}
-Status: Credited to your balance
-
-Thank you for referring users!
-            `).catch(() => {});
-
-            await this.logAdminAction(ctx.from.id.toString(), 'APPROVE_REFERRAL', tx.userId, { txId, amount: tx.amount });
-        } catch (error) {
-            logger.error('Approve referral error', { error: error.message });
-            await ctx.reply('❌ Failed to approve referral.');
-        }
-    }
-
-    async handleMasterBalance(ctx) {
-        try {
-            let balance = { usdt: 'N/A', bnb: 'N/A' };
-            try {
-                balance = await this.walletService.getMasterBalance();
-            } catch (error) {
-                logger.warn('Failed to get master balance', { error: error.message });
-            }
-            
-            await ctx.reply(`
-💎 Master Wallet Balance
-
-Address: \\`${this.walletService.getMasterAddress()}\\`
-
-USDT: ${balance.usdt}
-BNB: ${balance.bnb}
-
-This is your revenue wallet.
-            `, { parse_mode: 'MarkdownV2' });
-        } catch (error) {
-            logger.error('Master balance error', { error: error.message });
-            await ctx.reply('❌ Failed to get master balance.');
-        }
-    }
-
-    async handleWithdrawProfits(ctx) {
-        await ctx.reply(`
-💸 Withdraw Profits
-
-To withdraw, send USDT from your master wallet manually or use your wallet app.
-
-Master Address: \\`${this.walletService.getMasterAddress()}\\`
-
-⚠️ Always keep some BNB for gas fees.
-        `, { parse_mode: 'MarkdownV2' });
-    }
-
-    async getSystemStats() {
-        const now = new Date();
-        const dayAgo = new Date(now - 24 * 60 * 60 * 1000);
-
-        let masterBalance = { usdt: '0', bnb: '0' };
-        try {
-            masterBalance = await this.walletService.getMasterBalance();
-        } catch (error) {
-            logger.warn('getSystemStats: master balance unavailable', { error: error.message });
-        }
-
-        const [
-            totalUsers,
-            payingUsers,
-            vipUsers,
-            activeToday,
-            otpStats
-        ] = await Promise.all([
-            User.countDocuments(),
-            User.countDocuments({ balance: { $gt: 0 } }),
-            User.countDocuments({ vipExpiry: { $gt: now } }),
-            User.countDocuments({ lastActive: { $gte: dayAgo } }),
-            Session.aggregate([
-                { $match: { startTime: { $gte: dayAgo } } },
-                {
-                    $group: {
-                        _id: null,
-                        total: { $sum: 1 },
-                        success: { $sum: { $cond: [{ $eq: ['$status', 'RECEIVED'] }, 1, 0] } },
-                        failed: { $sum: { $cond: [{ $eq: ['$status', 'TIMEOUT'] }, 1, 0] } }
-                    }
-                }
-            ])
-        ]);
-
-        const stats = otpStats[0] || { total: 0, success: 0, failed: 0 };
-
-        const [revenue24h, revenue7d, revenue30d] = await Promise.all([
-            this.calculateRevenue(dayAgo),
-            this.calculateRevenue(new Date(now - 7 * 24 * 60 * 60 * 1000)),
-            this.calculateRevenue(new Date(now - 30 * 24 * 60 * 60 * 1000))
-        ]);
-
-        return {
-            totalUsers,
-            payingUsers,
-            vipUsers,
-            activeToday,
-            otpRequests24h: stats.total,
-            otpSuccess24h: stats.success,
-            otpFailed24h: stats.failed,
-            successRate24h: stats.total > 0 ? ((stats.success / stats.total) * 100).toFixed(1) : 0,
-            revenue24h,
-            revenue7d,
-            revenue30d,
-            masterBalance: parseFloat(masterBalance.usdt) || 0,
-            uptime: `${Math.floor(process.uptime() / 3600)}h ${Math.floor((process.uptime() % 3600) / 60)}m`
-        };
-    }
-
-    async calculateRevenue(since) {
-        const result = await Transaction.aggregate([
-            {
-                $match: {
-                    type: { $in: ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION'] },
-                    status: 'COMPLETED',
-                    createdAt: { $gte: since }
-                }
-            },
-            { $group: { _id: null, total: { $sum: '$amount' } } }
-        ]);
-        return Math.abs(result[0]?.total || 0);
-    }
-
-    async getRevenueByMode(since) {
-        const results = await Transaction.aggregate([
-            {
-                $match: {
-                    type: { $in: ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION'] },
-                    status: 'COMPLETED',
-                    createdAt: { $gte: since }
-                }
-            },
-            {
-                $group: {
-                    _id: '$type',
-                    total: { $sum: { $abs: '$amount' } }
-                }
-            }
-        ]);
-
-        return results.map(r => `• ${r._id}: ${formatCurrency(r.total)}`).join('\n') || 'No data';
-    }
-
-    async getRevenueByService(since) {
-        const results = await Session.aggregate([
-            {
-                $match: {
-                    status: 'RECEIVED',
-                    startTime: { $gte: since }
-                }
-            },
-            {
-                $group: {
-                    _id: '$service',
-                    count: { $sum: 1 },
-                    revenue: { $sum: '$cost' }
-                }
-            },
-            { $sort: { revenue: -1 } },
-            { $limit: 5 }
-        ]);
-
-        return results.map(r => `• ${r._id}: ${formatCurrency(r.revenue)} (${r.count} OTPs)`).join('\n') || 'No data';
-    }
-}
-
-export default AdminCommands;
-            
+                
