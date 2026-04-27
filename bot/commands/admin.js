@@ -1423,3 +1423,602 @@ ${forcedMessage}
         await this.replySuccess(ctx, '❌ <b>Broadcast cancelled.</b>');
                                                   }
             
+    // ═══════════════════════════════════════════════════════════
+    //  REFERRAL MANAGEMENT
+    // ═══════════════════════════════════════════════════════════
+
+    async handleApproveReferral(ctx) {
+        try {
+            const args = ctx.message.text.split(' ');
+            if (args.length < 2) {
+                return this.replyError(ctx, '❌ <b>Usage:</b> <code>/approve_referral &lt;tx_id&gt;</code>');
+            }
+
+            const txId = args[1];
+            const tx = await Transaction.findOne({ txId, type: 'REFERRAL_REWARD', status: 'PENDING' });
+
+            if (!tx) {
+                return this.replyError(ctx, '❌ <b>Referral transaction not found or already processed.</b>');
+            }
+
+            await User.updateOne(
+                { userId: tx.userId },
+                { $inc: { balance: tx.amount, referralRewardsPending: -tx.amount } }
+            );
+
+            await Transaction.updateOne(
+                { txId },
+                {
+                    $set: {
+                        status: 'COMPLETED',
+                        approvedBy: ctx.from.id.toString(),
+                        approvedAt: new Date()
+                    }
+                }
+            );
+
+            await this.replySuccess(ctx, `✅ <b>Referral Reward Approved!</b>\n\nAmount: <code>${formatCurrency(tx.amount)}</code>\nUser: <code>${tx.userId}</code>`);
+
+            // Notify user
+            await ctx.telegram.sendMessage(tx.userId, `
+<b>🎁 Referral Reward Approved!</b>
+
+Amount: <code>${formatCurrency(tx.amount)}</code>
+Status: <b>Credited to your balance</b>
+
+Thank you for referring users!
+            `, { parse_mode: 'HTML' }).catch(() => {});
+
+            await this.logAdminAction(ctx.from.id.toString(), 'APPROVE_REFERRAL', tx.userId, { txId, amount: tx.amount });
+
+        } catch (error) {
+            logger.error('Approve referral error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to approve referral.</b>');
+        }
+    }
+
+    async handleRejectReferral(ctx) {
+        try {
+            const args = ctx.message.text.split(' ');
+            if (args.length < 2) {
+                return this.replyError(ctx, '❌ <b>Usage:</b> <code>/reject_referral &lt;tx_id&gt; [reason]</code>');
+            }
+
+            const txId = args[1];
+            const reason = args.slice(2).join(' ') || 'Rejected by admin';
+
+            const tx = await Transaction.findOne({ txId, type: 'REFERRAL_REWARD', status: 'PENDING' });
+            if (!tx) {
+                return this.replyError(ctx, '❌ <b>Referral transaction not found or already processed.</b>');
+            }
+
+            await Transaction.updateOne(
+                { txId },
+                {
+                    $set: {
+                        status: 'REJECTED',
+                        rejectedBy: ctx.from.id.toString(),
+                        rejectedAt: new Date(),
+                        rejectionReason: reason
+                    }
+                }
+            );
+
+            await User.updateOne(
+                { userId: tx.userId },
+                { $inc: { referralRewardsPending: -tx.amount } }
+            );
+
+            await this.replySuccess(ctx, `❌ <b>Referral Reward Rejected</b>\n\nTxID: <code>${txId}</code>\nReason: <i>${reason}</i>`);
+
+            // Notify user
+            await ctx.telegram.sendMessage(tx.userId, `
+<b>❌ Referral Reward Rejected</b>
+
+Amount: <code>${formatCurrency(tx.amount)}</code>
+Reason: <i>${reason}</i>
+
+Contact support if you have questions.
+            `, { parse_mode: 'HTML' }).catch(() => {});
+
+            await this.logAdminAction(ctx.from.id.toString(), 'REJECT_REFERRAL', tx.userId, { txId, reason });
+
+        } catch (error) {
+            logger.error('Reject referral error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to reject referral.</b>');
+        }
+    }
+            // ═══════════════════════════════════════════════════════════
+    //  MASTER BALANCE
+    // ═══════════════════════════════════════════════════════════
+
+    async handleMasterBalance(ctx) {
+        try {
+            let balance = { usdt: 'N/A', bnb: 'N/A' };
+            let address = 'N/A';
+
+            try {
+                if (this.walletService?.getMasterBalance) {
+                    balance = await this.walletService.getMasterBalance();
+                }
+                if (this.walletService?.getMasterAddress) {
+                    address = this.walletService.getMasterAddress();
+                }
+            } catch (error) {
+                logger.warn('Failed to get master balance', { error: error.message });
+            }
+
+            await this.replySuccess(ctx, `
+<b>💎 Master Wallet Balance</b>
+
+<b>Address:</b> <code>${address}</code>
+
+<b>USDT:</b> <code>${balance.usdt}</code>
+<b>BNB:</b> <code>${balance.bnb}</code>
+
+<i>This is your revenue wallet.</i>
+            `);
+        } catch (error) {
+            logger.error('Master balance error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to get master balance.</b>');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  SETTINGS (with DB Persistence)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleSettings(ctx) {
+        try {
+            const settings = await this.getCurrentSettings();
+
+            const message = `
+<b>🔧 Admin Settings</b>
+
+<b>💰 OTP Prices:</b>
+• Cheap OTP: <code>${formatCurrency(settings.cheapOtpPrice)}</code>
+• VIP OTP: <code>${formatCurrency(settings.vipOtpPrice)}</code>
+
+<b>👑 VIP Subscription:</b>
+• Price: <code>${formatCurrency(settings.vipPrice)}</code>
+• Duration: <code>${settings.vipDuration}</code> days
+
+<b>🆓 Free Limits:</b>
+• Daily: <code>${settings.freeDaily}</code> OTPs
+• Per Number: <code>${settings.freePerNumber}</code>
+
+<b>⚡ Providers:</b>
+• Twilio: ${settings.twilioEnabled ? '✅' : '❌'}
+• Telnyx: ${settings.telnyxEnabled ? '✅' : '❌'}
+• Cheap Panel: ${settings.cheapPanelEnabled ? '✅' : '❌'}
+• Free Public: ${settings.freePublicEnabled ? '✅' : '❌'}
+
+<b>🛠 Maintenance:</b> ${settings.maintenanceMode ? '🔴 ON' : '🟢 OFF'}
+            `;
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('💰 OTP Prices', 'settings_prices')],
+                [Markup.button.callback('👑 VIP Config', 'settings_vip')],
+                [Markup.button.callback('🆓 Free Limits', 'settings_free')],
+                [Markup.button.callback('⚡ Providers', 'settings_providers')],
+                [Markup.button.callback('🛠 Maintenance', 'settings_maintenance')],
+                [Markup.button.callback('🔙 Back', 'admin')]
+            ]);
+
+            await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+        } catch (error) {
+            logger.error('Settings error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to load settings.</b>');
+        }
+    }
+
+    async getCurrentSettings() {
+        return {
+            cheapOtpPrice: config.prices?.cheapOtp || 0.50,
+            vipOtpPrice: config.prices?.vipOtp || 0.30,
+            vipPrice: config.prices?.vipSubscription || 5.00,
+            vipDuration: config.prices?.vipDuration || 30,
+            freeDaily: config.limits?.freeDaily || 3,
+            freePerNumber: config.limits?.freePerNumber || 1,
+            twilioEnabled: config.providers?.twilio !== false,
+            telnyxEnabled: config.providers?.telnyx !== false,
+            cheapPanelEnabled: config.providers?.cheapPanel !== false,
+            freePublicEnabled: config.providers?.freePublic !== false,
+            maintenanceMode: config.maintenance || false
+        };
+    }
+
+    // ─── Settings Submenus ───
+
+    async handleSettingsPrices(ctx) {
+        const currentCheap = formatCurrency(config.prices?.cheapOtp || 0.50);
+        const currentVip = formatCurrency(config.prices?.vipOtp || 0.30);
+
+        const message = `
+<b>💰 Update OTP Prices</b>
+
+<b>Current:</b>
+• Cheap OTP: <code>${currentCheap}</code>
+• VIP OTP: <code>${currentVip}</code>
+
+<b>To update, use:</b>
+<code>/setprice cheap &lt;amount&gt;</code>
+<code>/setprice vip &lt;amount&gt;</code>
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'admin_settings')]
+        ]);
+
+        await this.editCaption(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async handleSettingsVip(ctx) {
+        const currentPrice = formatCurrency(config.prices?.vipSubscription || 5.00);
+        const currentDuration = config.prices?.vipDuration || 30;
+
+        const message = `
+<b>👑 VIP Configuration</b>
+
+<b>Current:</b>
+• Price: <code>${currentPrice}</code>
+• Duration: <code>${currentDuration}</code> days
+
+<b>To update, use:</b>
+<code>/setvip price &lt;amount&gt;</code>
+<code>/setvip days &lt;number&gt;</code>
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'admin_settings')]
+        ]);
+
+        await this.editCaption(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async handleSettingsFree(ctx) {
+        const currentDaily = config.limits?.freeDaily || 3;
+        const currentPerNumber = config.limits?.freePerNumber || 1;
+
+        const message = `
+<b>🆓 Free OTP Limits</b>
+
+<b>Current:</b>
+• Daily per user: <code>${currentDaily}</code>
+• Per number: <code>${currentPerNumber}</code>
+
+<b>To update, use:</b>
+<code>/setfree daily &lt;number&gt;</code>
+<code>/setfree pernumber &lt;number&gt;</code>
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'admin_settings')]
+        ]);
+
+        await this.editCaption(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async handleSettingsProviders(ctx) {
+        const twilio = config.providers?.twilio !== false ? '✅' : '❌';
+        const telnyx = config.providers?.telnyx !== false ? '✅' : '❌';
+        const cheapPanel = config.providers?.cheapPanel !== false ? '✅' : '❌';
+        const freePublic = config.providers?.freePublic !== false ? '✅' : '❌';
+
+        const message = `
+<b>⚡ Provider Settings</b>
+
+<b>Current Status:</b>
+• Twilio: ${twilio}
+• Telnyx: ${telnyx}
+• Cheap Panel: ${cheapPanel}
+• Free Public: ${freePublic}
+
+<b>Toggle providers on/off:</b>
+<code>/toggleprovider twilio</code>
+<code>/toggleprovider telnyx</code>
+<code>/toggleprovider cheappanel</code>
+<code>/toggleprovider freepublic</code>
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'admin_settings')]
+        ]);
+
+        await this.editCaption(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async handleSettingsMaintenance(ctx) {
+        try {
+            const current = config.maintenance || false;
+            config.maintenance = !current;
+
+            // Persist to DB immediately
+            await this._saveSettings();
+
+            // Notify other admins about the change
+            const adminIds = (config.bot?.adminId || '')
+                .toString()
+                .split(',')
+                .map(id => id.trim())
+                .filter(Boolean);
+
+            for (const adminId of adminIds) {
+                if (adminId === ctx.from.id.toString()) continue;
+                await ctx.telegram.sendMessage(adminId, `
+<b>🛠 Maintenance Mode ${!current ? 'ENABLED' : 'DISABLED'}</b>
+
+Changed by admin: <code>${ctx.from.id}</code>
+
+Users will ${!current ? 'see a maintenance message' : 'have normal access'}.
+                `, { parse_mode: 'HTML' }).catch(() => {});
+            }
+
+            const message = `
+<b>🛠 Maintenance Mode ${!current ? 'ENABLED' : 'DISABLED'}</b>
+
+Users will ${!current ? 'see a maintenance message' : 'have normal access'}.
+
+<i>Setting has been saved to database.</i>
+            `;
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('🔙 Back', 'admin_settings')]
+            ]);
+
+            await this.editCaption(ctx, message, { reply_markup: keyboard.reply_markup });
+
+            logger.info('Maintenance mode toggled', {
+                admin: ctx.from.id,
+                enabled: !current
+            });
+        } catch (error) {
+            logger.error('Maintenance toggle error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to toggle maintenance mode.</b>');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  SET COMMANDS (with DB Persistence)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleSetPrice(ctx) {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 3) {
+            return this.replyError(ctx, '❌ <b>Usage:</b> <code>/setprice &lt;cheap|vip&gt; &lt;amount&gt;</code>');
+        }
+
+        const type = args[1].toLowerCase();
+        const amount = parseFloat(args[2]);
+
+        if (isNaN(amount) || amount < 0) {
+            return this.replyError(ctx, '❌ <b>Invalid amount.</b>\n\nAmount must be a non-negative number.');
+        }
+
+        if (!config.prices) config.prices = {};
+
+        if (type === 'cheap') {
+            config.prices.cheapOtp = amount;
+        } else if (type === 'vip') {
+            config.prices.vipOtp = amount;
+        } else {
+            return this.replyError(ctx, '❌ <b>Invalid type.</b>\n\nUse: <code>cheap</code> or <code>vip</code>');
+        }
+
+        // Persist to DB
+        await this._saveSettings();
+
+        await this.replySuccess(ctx, `✅ <b>Price Updated!</b>\n\n${type === 'cheap' ? 'Cheap' : 'VIP'} OTP price set to <code>${formatCurrency(amount)}</code>\n\n<i>Saved to database.</i>`);
+
+        await this.logAdminAction(
+            ctx.from.id.toString(),
+            'SET_PRICE',
+            null,
+            { type, amount }
+        );
+    }
+
+    async handleSetVip(ctx) {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 3) {
+            return this.replyError(ctx, '❌ <b>Usage:</b> <code>/setvip &lt;price|days&gt; &lt;value&gt;</code>');
+        }
+
+        const type = args[1].toLowerCase();
+        const value = parseFloat(args[2]);
+
+        if (isNaN(value) || value < 0) {
+            return this.replyError(ctx, '❌ <b>Invalid value.</b>\n\nValue must be a non-negative number.');
+        }
+
+        if (!config.prices) config.prices = {};
+
+        if (type === 'price') {
+            config.prices.vipSubscription = value;
+        } else if (type === 'days') {
+            config.prices.vipDuration = Math.floor(value);
+        } else {
+            return this.replyError(ctx, '❌ <b>Invalid type.</b>\n\nUse: <code>price</code> or <code>days</code>');
+        }
+
+        // Persist to DB
+        await this._saveSettings();
+
+        const displayValue = type === 'price' ? formatCurrency(value) : `${Math.floor(value)} days`;
+        await this.replySuccess(ctx, `✅ <b>VIP Config Updated!</b>\n\nVIP ${type === 'price' ? 'price' : 'duration'} set to <code>${displayValue}</code>\n\n<i>Saved to database.</i>`);
+
+        await this.logAdminAction(
+            ctx.from.id.toString(),
+            'SET_VIP',
+            null,
+            { type, value }
+        );
+    }
+
+    async handleSetFree(ctx) {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 3) {
+            return this.replyError(ctx, '❌ <b>Usage:</b> <code>/setfree &lt;daily|pernumber&gt; &lt;number&gt;</code>');
+        }
+
+        const type = args[1].toLowerCase();
+        const value = parseInt(args[2]);
+
+        if (isNaN(value) || value < 0) {
+            return this.replyError(ctx, '❌ <b>Invalid value.</b>\n\nValue must be a non-negative integer.');
+        }
+
+        if (!config.limits) config.limits = {};
+
+        if (type === 'daily') {
+            config.limits.freeDaily = value;
+        } else if (type === 'pernumber') {
+            config.limits.freePerNumber = value;
+        } else {
+            return this.replyError(ctx, '❌ <b>Invalid type.</b>\n\nUse: <code>daily</code> or <code>pernumber</code>');
+        }
+
+        // Persist to DB
+        await this._saveSettings();
+
+        const label = type === 'daily' ? 'daily limit' : 'per-number limit';
+        await this.replySuccess(ctx, `✅ <b>Free Limits Updated!</b>\n\nFree ${label} set to <code>${value}</code>\n\n<i>Saved to database.</i>`);
+
+        await this.logAdminAction(
+            ctx.from.id.toString(),
+            'SET_FREE',
+            null,
+            { type, value }
+        );
+    }
+
+    async handleToggleProvider(ctx) {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            return this.replyError(ctx, '❌ <b>Usage:</b> <code>/toggleprovider &lt;twilio|telnyx|cheappanel|freepublic&gt;</code>');
+        }
+
+        const name = args[1].toLowerCase();
+        const valid = ['twilio', 'telnyx', 'cheappanel', 'freepublic'];
+
+        if (!valid.includes(name)) {
+            return this.replyError(ctx, '❌ <b>Invalid provider name.</b>\n\nValid: <code>twilio, telnyx, cheappanel, freepublic</code>');
+        }
+
+        if (!config.providers) config.providers = {};
+
+        const current = config.providers[name] !== false;
+        config.providers[name] = !current;
+
+        // Persist to DB
+        await this._saveSettings();
+
+        const status = !current ? '✅ Enabled' : '❌ Disabled';
+        const displayName = name.charAt(0).toUpperCase() + name.slice(1);
+
+        await this.replySuccess(ctx, `✅ <b>Provider Updated!</b>\n\n${displayName}: <b>${status}</b>\n\n<i>Saved to database.</i>`);
+
+        await this.logAdminAction(
+            ctx.from.id.toString(),
+            'TOGGLE_PROVIDER',
+            null,
+            { provider: name, enabled: !current }
+        );
+}
+      // ═══════════════════════════════════════════════════════════
+    //  DATA EXPORT COMMANDS
+    // ═══════════════════════════════════════════════════════════
+
+    async handleExportUsers(ctx) {
+        try {
+            const users = await User.find().lean();
+
+            if (!users.length) {
+                return this.replyError(ctx, '<b>📥 No users to export.</b>');
+            }
+
+            const headers = [
+                'userId', 'username', 'firstName', 'lastName', 'balance',
+                'lockedBalance', 'bundleRemaining', 'mode', 'vipExpiry',
+                'isBlacklisted', 'referralCode', 'referredBy', 'referralCount',
+                'createdAt', 'lastActive'
+            ];
+
+            const rows = users.map(u => headers.map(h => this.escapeCSV(u[h])).join(','));
+            const csv = [headers.join(','), ...rows].join('\n');
+
+            // Send as document if too long, otherwise as text
+            if (csv.length > 4000) {
+                const buffer = Buffer.from(csv, 'utf-8');
+                await ctx.replyWithDocument(
+                    { source: buffer, filename: `users_export_${Date.now()}.csv` },
+                    { caption: '<b>📥 Users Export</b>', parse_mode: 'HTML' }
+                );
+            } else {
+                await this.replySuccess(ctx, `<b>📥 Users Export</b>\n\n<pre>${csv.substring(0, 4000)}</pre>`);
+            }
+
+            await this.logAdminAction(ctx.from.id.toString(), 'EXPORT_USERS', null, { count: users.length });
+
+        } catch (error) {
+            logger.error('Export users error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to export users.</b>');
+        }
+    }
+
+    async handleExportTransactions(ctx) {
+        try {
+            const args = ctx.message.text.split(' ');
+            const startDate = args[1] ? new Date(args[1]) : new Date(0);
+            const endDate = args[2] ? new Date(args[2]) : new Date();
+
+            if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+                return this.replyError(ctx, '❌ <b>Invalid date format.</b>\n\nUsage: <code>/export_transactions [YYYY-MM-DD] [YYYY-MM-DD]</code>');
+            }
+
+            const transactions = await Transaction.find({
+                createdAt: { $gte: startDate, $lte: endDate }
+            }).lean();
+
+            if (!transactions.length) {
+                return this.replyError(ctx, '<b>📥 No transactions found for the given period.</b>');
+            }
+
+            const headers = ['txId', 'userId', 'type', 'amount', 'status', 'metadata', 'createdAt'];
+            const rows = transactions.map(t => headers.map(h => {
+                if (h === 'metadata') return this.escapeCSV(JSON.stringify(t[h] || {}));
+                return this.escapeCSV(t[h]);
+            }).join(','));
+
+            const csv = [headers.join(','), ...rows].join('\n');
+
+            if (csv.length > 4000) {
+                const buffer = Buffer.from(csv, 'utf-8');
+                await ctx.replyWithDocument(
+                    { source: buffer, filename: `transactions_export_${Date.now()}.csv` },
+                    { caption: '<b>📥 Transactions Export</b>', parse_mode: 'HTML' }
+                );
+            } else {
+                await this.replySuccess(ctx, `<b>📥 Transactions Export</b>\n\n<pre>${csv.substring(0, 4000)}</pre>`);
+            }
+
+            await this.logAdminAction(ctx.from.id.toString(), 'EXPORT_TRANSACTIONS', null, { count: transactions.length, startDate, endDate });
+
+        } catch (error) {
+            logger.error('Export transactions error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to export transactions.</b>');
+        }
+    }
+
+    // ─── CSV Escaping Helper ───
+    escapeCSV(value) {
+        if (value === null || value === undefined) return '';
+        const str = String(value);
+        if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+            return '"' + str.replace(/"/g, '""') + '"';
+        }
+        return str;
+            }
+                }
+
+export default AdminCommands;
