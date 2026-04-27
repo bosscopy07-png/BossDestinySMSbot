@@ -511,7 +511,7 @@ class WalletService {
      * Add balance to a user (admin operation)
      * M0-compatible: no transactions, manual rollback on failure
      */
-    async addBalance(userId, amount, adminId, reason) {
+                    async addBalance(userId, amount, adminId, reason) {
         const txId = generateId();
 
         // Validate inputs before any DB writes
@@ -623,4 +623,98 @@ class WalletService {
                 try {
                     await User.updateOne({ userId }, { $inc: { balance: amount } });
                     logger.warn('Restored user balance after failed transaction creation', { userId, amount, txId });
-      
+                } catch (rollbackError) {
+                    logger.error('CRITICAL: Failed to restore user balance', { userId, amount, txId, error: rollbackError.message });
+                }
+            }
+
+            // If tx was created but something else failed, delete it
+            if (txCreated) {
+                try {
+                    await Transaction.deleteOne({ txId });
+                    logger.warn('Rolled back orphaned transaction', { txId, reason: error.message });
+                } catch (rollbackError) {
+                    logger.error('Failed to rollback transaction', { txId, error: rollbackError.message });
+                }
+            }
+
+            logger.error('Failed to deduct balance', { userId, amount, adminId, error: error.message });
+            throw error;
+        }
+    }
+
+    async getDepositAddress(userId) {
+        const user = await User.findOne({ userId });
+        if (user && user.depositAddress) {
+            return user.depositAddress;
+        }
+        const info = await this.getDepositInfo(userId);
+        return info.address;
+    }
+
+    getMasterAddress() {
+        return this.masterAddress || 'WALLET_NOT_READY';
+    }
+
+    async getMasterBalance() {
+        await this.ensureReady();
+
+        try {
+            const bnbBalance = await this.provider.getBalance(this.masterWallet.address);
+            const usdtBalance = await this.usdtContract.balanceOf(this.masterWallet.address);
+            
+            return {
+                bnb: ethers.formatEther(bnbBalance),
+                usdt: ethers.formatUnits(usdtBalance, this.decimals)
+            };
+        } catch (error) {
+            logger.error('Failed to get master balance', { error: error.message });
+            throw new Error('BALANCE_CHECK_FAILED — ' + error.message);
+        }
+    }
+
+    // ========== BACKGROUND SCANNER ==========
+
+    startDepositScanner(intervalMs = 30000) {
+        if (!this.isReady) {
+            logger.warn('Cannot start scanner — wallet not ready');
+            return;
+        }
+
+        if (this.scanInterval) {
+            clearInterval(this.scanInterval);
+        }
+
+        logger.info('Starting deposit scanner', { interval: intervalMs });
+
+        this.scanInterval = setInterval(async () => {
+            try {
+                await this.checkAllDeposits();
+            } catch (error) {
+                logger.error('Deposit scanner error', { error: error.message });
+            }
+        }, intervalMs);
+
+        this.scanInterval.unref?.();
+    }
+
+    stopDepositScanner() {
+        if (this.scanInterval) {
+            clearInterval(this.scanInterval);
+            this.scanInterval = null;
+            logger.info('Deposit scanner stopped');
+        }
+    }
+
+    // ========== GRACEFUL SHUTDOWN ==========
+
+    async disconnect() {
+        this.stopDepositScanner();
+        this.provider?.removeAllListeners?.();
+        this.provider = null;
+        this.isReady = false;
+        logger.info('Wallet service disconnected');
+    }
+}
+
+export default WalletService;
