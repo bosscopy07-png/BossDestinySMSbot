@@ -1,7 +1,6 @@
 import mongoose from 'mongoose';
 
 const userSchema = new mongoose.Schema({
-    // Existing fields (keep what you already have)
     userId: {
         type: String,
         required: true,
@@ -72,11 +71,12 @@ const userSchema = new mongoose.Schema({
     referralCode: {
         type: String,
         unique: true,
-        sparse: true
+        sparse: true    // ← This auto-creates the index with unique + sparse
     },
     referredBy: {
         type: String,
-        default: null
+        default: null,
+        index: true      // ← Inline index, no separate userSchema.index() needed
     },
     referralCount: {
         type: Number,
@@ -92,7 +92,8 @@ const userSchema = new mongoose.Schema({
     },
     lastActive: {
         type: Date,
-        default: Date.now
+        default: Date.now,
+        index: true       // ← Inline index
     },
     privacyEnabled: {
         type: Boolean,
@@ -107,18 +108,18 @@ const userSchema = new mongoose.Schema({
         default: 'US'
     },
     
-    // ========== NEW DEPOSIT FIELDS ==========
+    // ========== DEPOSIT FIELDS ==========
     depositAddress: {
         type: String,
-        default: null        // Always master address
+        default: null
     },
     depositTrackingAmount: {
         type: Number,
-        default: null        // Unique amount for matching (e.g., 10.001234)
+        default: null
     },
     depositPending: {
         type: Boolean,
-        default: false       // Waiting for deposit?
+        default: false
     },
     depositRequestedAt: {
         type: Date,
@@ -126,25 +127,36 @@ const userSchema = new mongoose.Schema({
     },
     registeredWallet: {
         type: String,
-        default: null        // Wallet address they sent from
+        default: null
     },
     lastDepositAt: {
         type: Date,
         default: null
     }
-    // =======================================
+    // ====================================
 
 }, {
     timestamps: true
 });
 
-// Indexes
-userSchema.index({ referralCode: 1 });
-userSchema.index({ referredBy: 1 });
-userSchema.index({ isBlacklisted: 1 });
-userSchema.index({ lastActive: -1 });
+// ═══════════════════════════════════════════════════════════
+//  INDEXES — Only compound/background indexes here.
+//  Single-field indexes should use `index: true` inline above.
+// ═══════════════════════════════════════════════════════════
 
-// Methods
+// Compound index for admin queries: blacklisted users sorted by last active
+userSchema.index({ isBlacklisted: 1, lastActive: -1 });
+
+// Compound index for deposit tracking
+userSchema.index({ depositPending: 1, depositTrackingAmount: 1 });
+
+// Compound index for referral lookups
+userSchema.index({ referredBy: 1, referralCount: -1 });
+
+// ═══════════════════════════════════════════════════════════
+//  METHODS
+// ═══════════════════════════════════════════════════════════
+
 userSchema.methods.isVipActive = function() {
     return this.vipExpiry && this.vipExpiry > new Date();
 };
@@ -153,12 +165,18 @@ userSchema.methods.getAvailableBalance = function() {
     return (this.balance || 0) - (this.lockedBalance || 0);
 };
 
-// Static method to generate referral code
+// ═══════════════════════════════════════════════════════════
+//  STATICS
+// ═══════════════════════════════════════════════════════════
+
 userSchema.statics.generateReferralCode = function() {
     return Math.random().toString(36).substring(2, 8).toUpperCase();
 };
 
-// Pre-save hook to generate referral code
+// ═══════════════════════════════════════════════════════════
+//  PRE-SAVE HOOKS
+// ═══════════════════════════════════════════════════════════
+
 userSchema.pre('save', function(next) {
     if (!this.referralCode) {
         this.referralCode = Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -169,3 +187,4 @@ userSchema.pre('save', function(next) {
 const User = mongoose.model('User', userSchema);
 
 export default User;
+        
