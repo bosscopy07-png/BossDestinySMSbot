@@ -2,7 +2,9 @@
 //  models/index.js — Centralized Model Registry
 // ═══════════════════════════════════════════════════════════
 
+
 import mongoose from 'mongoose';
+import logger from '../utils/logger.js';  // ← ADD THIS LINE
 
 // ─── Import all models ───
 import User from './User.js';
@@ -13,6 +15,9 @@ import Referral from './Referral.js';
 import ApiKey from './ApiKey.js';
 import AdminLog from './AdminLog.js';
 import Settings from './Settings.js';
+
+// ... rest of file unchanged
+
 
 // ─── Registry for model validation & iteration ───
 const modelRegistry = {
