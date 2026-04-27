@@ -2615,4 +2615,49 @@ Users will ${!current ? 'see a maintenance message' : 'have normal access'}.
                 return this.replyError(ctx, '❌ <b>Invalid date format.</b>\n\nUsage: <code>/export_transactions [YYYY-MM-DD] [YYYY-MM-DD]</code>');
             }
 
-            const transactions = await Transaction.fi
+            const transactions = await Transaction.find({
+                createdAt: { $gte: startDate, $lte: endDate }
+            }).lean();
+
+            if (!transactions.length) {
+                return this.replyError(ctx, '<b>📥 No transactions found for the given period.</b>');
+            }
+
+            const headers = ['txId', 'userId', 'type', 'amount', 'status', 'metadata', 'createdAt'];
+            const rows = transactions.map(t => headers.map(h => {
+                if (h === 'metadata') return this.escapeCSV(JSON.stringify(t[h] || {}));
+                return this.escapeCSV(t[h]);
+            }).join(','));
+
+            const csv = [headers.join(','), ...rows].join('\n');
+
+            if (csv.length > 4000) {
+                const buffer = Buffer.from(csv, 'utf-8');
+                await ctx.replyWithDocument(
+                    { source: buffer, filename: `transactions_export_${Date.now()}.csv` },
+                    { caption: '<b>📥 Transactions Export</b>', parse_mode: 'HTML' }
+                );
+            } else {
+                await this.replySuccess(ctx, `<b>📥 Transactions Export</b>\n\n<pre>${csv.substring(0, 4000)}</pre>`);
+            }
+
+            await this.logAdminAction(ctx.from.id.toString(), 'EXPORT_TRANSACTIONS', null, { count: transactions.length, startDate, endDate });
+
+        } catch (error) {
+            logger.error('Export transactions error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to export transactions.</b>');
+        }
+    }
+
+    // ─── CSV Escaping Helper ───
+    escapeCSV(value) {
+        if (value === null || value === undefined) return '';
+        const str = String(value);
+        if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+            return '"' + str.replace(/"/g, '""') + '"';
+        }
+        return str;
+    }
+}
+
+export default AdminCommands;
