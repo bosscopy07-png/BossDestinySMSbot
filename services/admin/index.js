@@ -1,12 +1,13 @@
-import { User, Session, Transaction, AdminLog, Referral } from '../../models/index.js';
+import { User, Session, Transaction, AdminLog } from '../../models/index.js';
 import { generateId, formatCurrency } from '../../utils/helpers.js';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
 
 class AdminService {
-    constructor(walletService, referralService) {
+    constructor(walletService, referralService, bot = null) {
         this.walletService = walletService;
         this.referralService = referralService;
+        this.bot = bot; // For broadcast messages
     }
 
     async logAction(adminId, action, targetUserId = null, details = {}) {
@@ -14,14 +15,14 @@ class AdminService {
             await AdminLog.create({
                 logId: generateId(),
                 type: 'ADMIN_ACTION',
-                adminId,
-                targetUserId,
+                adminId: adminId?.toString(),
+                targetUserId: targetUserId?.toString(),
                 action,
                 details,
                 timestamp: new Date()
             });
         } catch (error) {
-            logger.error('Failed to log admin action', { error: error.message });
+            logger.error('Failed to log admin action', { adminId, action, error: error.message });
         }
     }
 
@@ -31,6 +32,19 @@ class AdminService {
         const dayAgo = new Date(now - 24 * 60 * 60 * 1000);
         const weekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
         const monthAgo = new Date(now - 30 * 24 * 60 * 60 * 1000);
+
+        let masterWallet = { address: 'N/A', usdt: '0', bnb: '0' };
+        try {
+            // Try getMasterWalletInfo first, fallback to getMasterBalance
+            if (this.walletService.getMasterWalletInfo) {
+                masterWallet = await this.walletService.getMasterWalletInfo();
+            } else if (this.walletService.getMasterBalance) {
+                const bal = await this.walletService.getMasterBalance();
+                masterWallet = { address: this.walletService.getMasterAddress?.() || 'N/A', usdt: bal.usdt, bnb: bal.bnb };
+            }
+        } catch (error) {
+            logger.warn('Failed to get master wallet info', { error: error.message });
+        }
 
         const [
             totalUsers,
@@ -44,7 +58,8 @@ class AdminService {
             revenue7d,
             revenue30d,
             pendingReferrals,
-            masterWallet
+            pendingDeposits,
+            totalRevenueAllTime
         ] = await Promise.all([
             User.countDocuments(),
             User.countDocuments({ createdAt: { $gte: dayAgo } }),
@@ -56,8 +71,9 @@ class AdminService {
             this.calculateRevenue(dayAgo),
             this.calculateRevenue(weekAgo),
             this.calculateRevenue(monthAgo),
-            Referral.countDocuments({ status: 'DEPOSITED' }),
-            this.walletService.getMasterWalletInfo().catch(() => ({ usdt: '0', bnb: '0' }))
+            this.getPendingReferralsCount(),
+            Transaction.countDocuments({ type: 'DEPOSIT', status: 'PENDING' }),
+            this.calculateRevenue(new Date(0))
         ]);
 
         const otpStats24h = await Session.aggregate([
@@ -75,13 +91,51 @@ class AdminService {
 
         const stats = otpStats24h[0] || { total: 0, received: 0, timeout: 0, cancelled: 0 };
 
+        // Calculate average session duration
+        const avgDurationAgg = await Session.aggregate([
+            { $match: { startTime: { $gte: dayAgo }, endTime: { $exists: true } } },
+            {
+                $group: {
+                    _id: null,
+                    avgDuration: { $avg: { $subtract: ['$endTime', '$startTime'] } }
+                }
+            }
+        ]);
+        const avgDuration = avgDurationAgg[0]?.avgDuration || 0;
+
+        // Top services today
+        const topServices = await Session.aggregate([
+            { $match: { startTime: { $gte: dayAgo } } },
+            { $group: { _id: '$service', count: { $sum: 1 } } },
+            { $sort: { count: -1 } },
+            { $limit: 5 }
+        ]);
+
+        // Revenue by type (24h)
+        const revenueByType = await Transaction.aggregate([
+            {
+                $match: {
+                    type: { $in: ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION'] },
+                    status: 'COMPLETED',
+                    createdAt: { $gte: dayAgo }
+                }
+            },
+            {
+                $group: {
+                    _id: '$type',
+                    total: { $sum: { $abs: '$amount' } }
+                }
+            }
+        ]);
+
         return {
             users: {
                 total: totalUsers,
                 new24h: newUsers24h,
                 active24h: activeUsers24h,
                 vip: vipUsers,
-                blacklisted: blacklistedUsers
+                blacklisted: blacklistedUsers,
+                growthRate: totalUsers > 0 ? ((newUsers24h / totalUsers) * 100).toFixed(2) : 0
             },
             sessions: {
                 total: totalSessions,
@@ -91,46 +145,92 @@ class AdminService {
                     received: stats.received,
                     timeout: stats.timeout,
                     cancelled: stats.cancelled
-                }
+                },
+                avgDuration: Math.round(avgDuration / 1000) // seconds
             },
             revenue: {
                 today: revenue24h,
                 week: revenue7d,
-                month: revenue30d
+                month: revenue30d,
+                allTime: totalRevenueAllTime,
+                byType: revenueByType.reduce((acc, r) => {
+                    acc[r._id] = r.total;
+                    return acc;
+                }, {})
             },
             referrals: {
                 pendingApproval: pendingReferrals
             },
+            deposits: {
+                pending: pendingDeposits
+            },
             wallet: {
-                masterAddress: masterWallet.address,
-                usdtBalance: parseFloat(masterWallet.usdt),
-                bnbBalance: parseFloat(masterWallet.bnb)
+                masterAddress: masterWallet.address || 'N/A',
+                usdtBalance: parseFloat(masterWallet.usdt) || 0,
+                bnbBalance: parseFloat(masterWallet.bnb) || 0
+            },
+            services: {
+                topToday: topServices.map(s => ({ name: s._id, count: s.count }))
             },
             system: {
                 uptime: process.uptime(),
-                memory: process.memoryUsage(),
+                uptimeFormatted: this.formatUptime(process.uptime()),
+                memory: {
+                    used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+                    total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024)
+                },
                 nodeVersion: process.version
             }
         };
     }
 
+    formatUptime(seconds) {
+        const days = Math.floor(seconds / 86400);
+        const hours = Math.floor((seconds % 86400) / 3600);
+        const mins = Math.floor((seconds % 3600) / 60);
+        if (days > 0) return `${days}d ${hours}h ${mins}m`;
+        if (hours > 0) return `${hours}h ${mins}m`;
+        return `${mins}m`;
+    }
+
     async calculateRevenue(since) {
-        const result = await Transaction.aggregate([
-            {
-                $match: {
-                    type: { $in: ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION'] },
-                    status: 'COMPLETED',
-                    createdAt: { $gte: since }
+        try {
+            const result = await Transaction.aggregate([
+                {
+                    $match: {
+                        type: { $in: ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION'] },
+                        status: 'COMPLETED',
+                        createdAt: { $gte: since }
+                    }
+                },
+                {
+                    $group: {
+                        _id: null,
+                        total: { $sum: { $abs: '$amount' } }
+                    }
                 }
-            },
-            {
-                $group: {
-                    _id: null,
-                    total: { $sum: { $abs: '$amount' } }
-                }
+            ]);
+            return Math.abs(result[0]?.total || 0);
+        } catch (error) {
+            logger.error('Revenue calculation failed', { error: error.message });
+            return 0;
+        }
+    }
+
+    async getPendingReferralsCount() {
+        try {
+            if (this.referralService?.getPendingCount) {
+                return await this.referralService.getPendingCount();
             }
-        ]);
-        return Math.abs(result[0]?.total || 0);
+            // Fallback: count users with pending referral rewards
+            const count = await User.countDocuments({
+                referralRewardsPending: { $gt: 0 }
+            });
+            return count;
+        } catch (error) {
+            logger.warn('Failed to get pending referrals count', { error: error.message });
+            return 0;
+        }
     }
 
     // User management
@@ -140,12 +240,22 @@ class AdminService {
         if (filters.mode) query.mode = filters.mode;
         if (filters.isBlacklisted !== undefined) query.isBlacklisted = filters.isBlacklisted;
         if (filters.hasBalance) query.balance = { $gt: 0 };
+        if (filters.isVip) query.vipExpiry = { $gt: new Date() };
+        if (filters.minBalance) query.balance = { $gte: filters.minBalance };
+        if (filters.maxBalance) query.balance = { ...query.balance, $lte: filters.maxBalance };
         if (filters.search) {
+            const searchRegex = { $regex: filters.search, $options: 'i' };
             query.$or = [
-                { userId: { $regex: filters.search, $options: 'i' } },
-                { username: { $regex: filters.search, $options: 'i' } },
-                { firstName: { $regex: filters.search, $options: 'i' } }
+                { userId: searchRegex },
+                { username: searchRegex },
+                { firstName: searchRegex },
+                { lastName: searchRegex }
             ];
+        }
+        if (filters.dateFrom || filters.dateTo) {
+            query.createdAt = {};
+            if (filters.dateFrom) query.createdAt.$gte = new Date(filters.dateFrom);
+            if (filters.dateTo) query.createdAt.$lte = new Date(filters.dateTo);
         }
 
         const [users, total] = await Promise.all([
@@ -163,7 +273,9 @@ class AdminService {
                 page,
                 limit,
                 total,
-                pages: Math.ceil(total / limit)
+                pages: Math.ceil(total / limit),
+                hasNext: page * limit < total,
+                hasPrev: page > 1
             }
         };
     }
@@ -179,42 +291,52 @@ class AdminService {
                 .sort({ createdAt: -1 })
                 .limit(20)
                 .lean(),
-            Referral.find({ referrerId: userId })
-                .sort({ createdAt: -1 })
-                .limit(10)
+            User.find({ referredBy: userId })
+                .select('userId username createdAt')
                 .lean()
         ]);
 
         if (!user) throw new Error('USER_NOT_FOUND');
 
-        // Calculate stats
         const totalSpent = transactions
             .filter(t => ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION'].includes(t.type))
-            .reduce((sum, t) => sum + Math.abs(t.amount), 0);
+            .reduce((sum, t) => sum + Math.abs(t.amount || 0), 0);
 
         const totalDeposited = transactions
             .filter(t => t.type === 'DEPOSIT' && t.status === 'COMPLETED')
-            .reduce((sum, t) => sum + t.amount, 0);
+            .reduce((sum, t) => sum + (t.amount || 0), 0);
+
+        const totalRefEarnings = transactions
+            .filter(t => t.type === 'REFERRAL_REWARD' && t.status === 'COMPLETED')
+            .reduce((sum, t) => sum + (t.amount || 0), 0);
 
         return {
             user,
             stats: {
                 totalSessions: sessions.length,
                 successfulSessions: sessions.filter(s => s.status === 'RECEIVED').length,
+                failedSessions: sessions.filter(s => s.status === 'TIMEOUT').length,
                 totalSpent,
                 totalDeposited,
-                netRevenue: totalSpent // What user has paid
+                totalRefEarnings,
+                netBalance: (user.balance || 0) - (user.lockedBalance || 0),
+                lifetimeValue: totalSpent + (user.bundleRemaining || 0) * (config.prices?.cheapOtp || 0.05)
             },
             recentSessions: sessions,
             recentTransactions: transactions,
-            referrals
+            referrals: {
+                count: referrals.length,
+                list: referrals,
+                earnings: totalRefEarnings
+            }
         };
     }
 
     async updateUser(userId, updates, adminId) {
         const allowedUpdates = [
             'balance', 'bundleRemaining', 'vipExpiry', 'mode',
-            'isBlacklisted', 'blacklistReason', 'preferredCountry'
+            'isBlacklisted', 'blacklistReason', 'preferredCountry',
+            'notificationsEnabled', 'privacyEnabled'
         ];
 
         const filteredUpdates = {};
@@ -243,13 +365,54 @@ class AdminService {
 
     // Financial operations
     async addBalance(userId, amount, adminId, reason) {
-        const txId = await this.walletService.addBalance(userId, amount, adminId, reason);
+        if (!amount || amount <= 0) throw new Error('INVALID_AMOUNT');
+        
+        let txId;
+        if (this.walletService.addBalance) {
+            txId = await this.walletService.addBalance(userId, amount, adminId, reason);
+        } else {
+            // Fallback: direct DB update
+            await User.updateOne({ userId }, { $inc: { balance: amount } });
+            txId = generateId();
+            await Transaction.create({
+                txId,
+                userId,
+                type: 'ADMIN_ADD',
+                amount,
+                status: 'COMPLETED',
+                metadata: { adminId, reason },
+                createdAt: new Date()
+            });
+        }
+        
         await this.logAction(adminId, 'ADD_BALANCE', userId, { amount, reason, txId });
         return txId;
     }
 
     async deductBalance(userId, amount, adminId, reason) {
-        const txId = await this.walletService.deductBalance(userId, amount, adminId, reason);
+        if (!amount || amount <= 0) throw new Error('INVALID_AMOUNT');
+        
+        const user = await User.findOne({ userId });
+        if (!user) throw new Error('USER_NOT_FOUND');
+        if ((user.balance || 0) < amount) throw new Error('INSUFFICIENT_BALANCE');
+
+        let txId;
+        if (this.walletService.deductBalance) {
+            txId = await this.walletService.deductBalance(userId, amount, adminId, reason);
+        } else {
+            await User.updateOne({ userId }, { $inc: { balance: -amount } });
+            txId = generateId();
+            await Transaction.create({
+                txId,
+                userId,
+                type: 'ADMIN_DEDUCT',
+                amount: -amount,
+                status: 'COMPLETED',
+                metadata: { adminId, reason },
+                createdAt: new Date()
+            });
+        }
+        
         await this.logAction(adminId, 'DEDUCT_BALANCE', userId, { amount, reason, txId });
         return txId;
     }
@@ -267,10 +430,9 @@ class AdminService {
             }
         );
 
-        // Cancel active sessions
         await Session.updateMany(
             { userId, status: { $in: ['WAITING', 'CHECKING'] } },
-            { $set: { status: 'CANCELLED' } }
+            { $set: { status: 'CANCELLED', cancelledAt: new Date() } }
         );
 
         await this.logAction(adminId, 'BLACKLIST', userId, { reason });
@@ -291,115 +453,94 @@ class AdminService {
         await this.logAction(adminId, 'WHITELIST', userId, {});
     }
 
-    // Broadcast
-    async broadcastMessage(message, filters = {}) {
+    // Broadcast - NOW ACTUALLY WORKS
+    async broadcastMessage(message, filters = {}, options = {}) {
+        if (!this.bot) {
+            logger.error('Broadcast failed: no bot instance provided');
+            throw new Error('BOT_NOT_INITIALIZED');
+        }
+
         const query = { isBlacklisted: false };
-        
         if (filters.mode) query.mode = filters.mode;
         if (filters.vipOnly) query.vipExpiry = { $gt: new Date() };
         if (filters.activeSince) query.lastActive = { $gte: filters.activeSince };
+        if (filters.minBalance) query.balance = { $gte: filters.minBalance };
 
-        const users = await User.find(query).select('userId');
-        const results = { sent: 0, failed: 0 };
+        const users = await User.find(query).select('userId').lean();
+        const results = { sent: 0, failed: 0, total: users.length };
+        const delay = options.delay || 50; // ms between messages
+        const batchSize = options.batchSize || 30; // Process in batches
 
-        for (const user of users) {
-            try {
-                // This would need bot instance to send messages
-                // Implementation depends on how you inject the bot
-                results.sent++;
-            } catch (error) {
-                results.failed++;
+        logger.info('Broadcast started', { targetCount: users.length, filters });
+
+        for (let i = 0; i < users.length; i += batchSize) {
+            const batch = users.slice(i, i + batchSize);
+            
+            await Promise.all(batch.map(async (user) => {
+                try {
+                    await this.bot.telegram.sendMessage(user.userId, message, {
+                        parse_mode: options.parseMode || undefined,
+                        disable_notification: options.silent || false
+                    });
+                    results.sent++;
+                } catch (error) {
+                    results.failed++;
+                    if (error.response?.error_code === 403) {
+                        // User blocked bot, mark as inactive
+                        await User.updateOne({ userId: user.userId }, { $set: { blockedBot: true } });
+                    }
+                }
+            }));
+
+            // Rate limit protection
+            if (i + batchSize < users.length) {
+                await new Promise(r => setTimeout(r, 1000));
             }
         }
 
+        logger.info('Broadcast completed', results);
         return results;
     }
 
     // Referral management
     async getPendingReferrals(page = 1, limit = 20) {
-        return await this.referralService.getPendingRewards(page, limit);
-    }
-
-    async approveReferral(txId, adminId) {
-        const result = await this.referralService.approveReward(txId, adminId);
-        await this.logAction(adminId, 'APPROVE_REFERRAL', result.referrerId, { txId, amount: result.amount });
-        return result;
-    }
-
-    async rejectReferral(txId, adminId, reason) {
-        const result = await this.referralService.rejectReward(txId, adminId, reason);
-        await this.logAction(adminId, 'REJECT_REFERRAL', null, { txId, reason });
-        return result;
-    }
-
-    // System settings
-    async updateSettings(settings, adminId) {
-        // Update config in database or file
-        // Implementation depends on your settings storage
-        await this.logAction(adminId, 'UPDATE_SETTINGS', null, settings);
-        return settings;
-    }
-
-    // Export data
-    async exportUsers(format = 'csv') {
-        const users = await User.find().lean();
-        
-        if (format === 'csv') {
-            const headers = ['userId', 'username', 'balance', 'mode', 'vipExpiry', 'createdAt'];
-            const rows = users.map(u => headers.map(h => u[h] || '').join(','));
-            return [headers.join(','), ...rows].join('\n');
+        if (this.referralService?.getPendingRewards) {
+            return await this.referralService.getPendingRewards(page, limit);
         }
 
-        return users;
-    }
-
-    async exportTransactions(startDate, endDate, format = 'csv') {
-        const query = {
-            createdAt: {
-                $gte: startDate || new Date(0),
-                $lte: endDate || new Date()
-            }
-        };
-
-        const transactions = await Transaction.find(query).lean();
-
-        if (format === 'csv') {
-            const headers = ['txId', 'userId', 'type', 'amount', 'status', 'createdAt'];
-            const rows = transactions.map(t => headers.map(h => t[h] || '').join(','));
-            return [headers.join(','), ...rows].join('\n');
-        }
-
-        return transactions;
-    }
-
-    // Logs
-    async getAdminLogs(page = 1, limit = 50, filters = {}) {
-        const query = {};
-        if (filters.adminId) query.adminId = filters.adminId;
-        if (filters.action) query.action = filters.action;
-        if (filters.targetUserId) query.targetUserId = filters.targetUserId;
-
-        const [logs, total] = await Promise.all([
-            AdminLog.find(query)
-                .sort({ timestamp: -1 })
+        // Fallback: query users with pending rewards
+        const query = { referralRewardsPending: { $gt: 0 } };
+        const [users, total] = await Promise.all([
+            User.find(query)
+                .sort({ referralRewardsPending: -1 })
                 .skip((page - 1) * limit)
                 .limit(limit)
                 .lean(),
-            AdminLog.countDocuments(query)
+            User.countDocuments(query)
         ]);
 
         return {
-            logs,
-            pagination: {
-                page,
-                limit,
-                total,
-                pages: Math.ceil(total / limit)
-            }
+            referrals: users.map(u => ({
+                userId: u.userId,
+                username: u.username,
+                pendingAmount: u.referralRewardsPending,
+                totalEarnings: u.referralEarnings,
+                referralCount: u.referralCount
+            })),
+            pagination: { page, limit, total, pages: Math.ceil(total / limit) }
         };
     }
-}
 
-export default AdminService;
+    async approveReferral(txId, adminId) {
+        if (this.referralService?.approveReward) {
+            const result = await this.referralService.approveReward(txId, adminId);
+            await this.logAction(adminId, 'APPROVE_REFERRAL', result.referrerId, { txId, amount: result.amount });
+            return result;
+        }
 
- 
+        // Fallback: manual approval via transaction
+        const tx = await Transaction.findOne({ txId, type: 'REFERRAL_REWARD', status: 'PENDING' });
+        if (!tx) throw new Error('TRANSACTION_NOT_FOUND');
+
+        await Promise.all([
+   
