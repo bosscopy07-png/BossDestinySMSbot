@@ -531,7 +531,7 @@ class AdminService {
         };
     }
 
-    async approveReferral(txId, adminId) {
+        async approveReferral(txId, adminId) {
         if (this.referralService?.approveReward) {
             const result = await this.referralService.approveReward(txId, adminId);
             await this.logAction(adminId, 'APPROVE_REFERRAL', result.referrerId, { txId, amount: result.amount });
@@ -543,4 +543,232 @@ class AdminService {
         if (!tx) throw new Error('TRANSACTION_NOT_FOUND');
 
         await Promise.all([
-   
+            User.updateOne({ userId: tx.userId }, { $inc: { balance: tx.amount, referralRewardsPending: -tx.amount } }),
+            Transaction.updateOne({ txId }, { $set: { status: 'COMPLETED', approvedBy: adminId, approvedAt: new Date() } })
+        ]);
+
+        await this.logAction(adminId, 'APPROVE_REFERRAL', tx.userId, { txId, amount: tx.amount });
+        return { txId, amount: tx.amount, userId: tx.userId };
+    }
+
+    async rejectReferral(txId, adminId, reason) {
+        if (this.referralService?.rejectReward) {
+            const result = await this.referralService.rejectReward(txId, adminId, reason);
+            await this.logAction(adminId, 'REJECT_REFERRAL', null, { txId, reason });
+            return result;
+        }
+
+        const tx = await Transaction.findOne({ txId, type: 'REFERRAL_REWARD', status: 'PENDING' });
+        if (!tx) throw new Error('TRANSACTION_NOT_FOUND');
+
+        await Transaction.updateOne(
+            { txId },
+            { $set: { status: 'REJECTED', rejectedBy: adminId, rejectedAt: new Date(), rejectionReason: reason } }
+        );
+
+        await this.logAction(adminId, 'REJECT_REFERRAL', tx.userId, { txId, reason });
+        return { txId, status: 'REJECTED' };
+    }
+
+    // System settings
+    async updateSettings(settings, adminId) {
+        // Validate settings
+        const allowedSettings = ['prices', 'limits', 'providers', 'maintenance', 'referral'];
+        const validated = {};
+        
+        for (const key of allowedSettings) {
+            if (settings[key] !== undefined) {
+                validated[key] = settings[key];
+            }
+        }
+
+        if (Object.keys(validated).length === 0) {
+            throw new Error('NO_VALID_SETTINGS');
+        }
+
+        // Update in-memory config (persistent storage depends on your setup)
+        Object.assign(config, validated);
+
+        await this.logAction(adminId, 'UPDATE_SETTINGS', null, validated);
+        return validated;
+    }
+
+    // Export data with proper CSV escaping
+    escapeCSV(value) {
+        if (value === null || value === undefined) return '';
+        const str = String(value);
+        if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+            return '"' + str.replace(/"/g, '""') + '"';
+        }
+        return str;
+    }
+
+    async exportUsers(format = 'csv') {
+        const users = await User.find().lean();
+        
+        if (format === 'csv') {
+            const headers = ['userId', 'username', 'firstName', 'lastName', 'balance', 'lockedBalance', 'bundleRemaining', 'mode', 'vipExpiry', 'isBlacklisted', 'referralCode', 'referredBy', 'referralCount', 'createdAt', 'lastActive'];
+            const rows = users.map(u => headers.map(h => this.escapeCSV(u[h])).join(','));
+            return [headers.join(','), ...rows].join('\n');
+        }
+
+        if (format === 'json') {
+            return JSON.stringify(users, null, 2);
+        }
+
+        return users;
+    }
+
+    async exportTransactions(startDate, endDate, format = 'csv') {
+        const query = {
+            createdAt: {
+                $gte: startDate ? new Date(startDate) : new Date(0),
+                $lte: endDate ? new Date(endDate) : new Date()
+            }
+        };
+
+        const transactions = await Transaction.find(query).lean();
+
+        if (format === 'csv') {
+            const headers = ['txId', 'userId', 'type', 'amount', 'status', 'metadata', 'createdAt'];
+            const rows = transactions.map(t => headers.map(h => {
+                if (h === 'metadata') return this.escapeCSV(JSON.stringify(t[h] || {}));
+                return this.escapeCSV(t[h]);
+            }).join(','));
+            return [headers.join(','), ...rows].join('\n');
+        }
+
+        if (format === 'json') {
+            return JSON.stringify(transactions, null, 2);
+        }
+
+        return transactions;
+    }
+
+    async exportSessions(startDate, endDate, format = 'csv') {
+        const query = {
+            startTime: {
+                $gte: startDate ? new Date(startDate) : new Date(0),
+                $lte: endDate ? new Date(endDate) : new Date()
+            }
+        };
+
+        const sessions = await Session.find(query).lean();
+
+        if (format === 'csv') {
+            const headers = ['sessionId', 'userId', 'mode', 'service', 'country', 'number', 'status', 'cost', 'otpCode', 'startTime', 'endTime'];
+            const rows = sessions.map(s => headers.map(h => this.escapeCSV(s[h])).join(','));
+            return [headers.join(','), ...rows].join('\n');
+        }
+
+        return sessions;
+    }
+
+    // Logs
+    async getAdminLogs(page = 1, limit = 50, filters = {}) {
+        const query = {};
+        if (filters.adminId) query.adminId = filters.adminId;
+        if (filters.action) query.action = filters.action;
+        if (filters.targetUserId) query.targetUserId = filters.targetUserId;
+        if (filters.dateFrom || filters.dateTo) {
+            query.timestamp = {};
+            if (filters.dateFrom) query.timestamp.$gte = new Date(filters.dateFrom);
+            if (filters.dateTo) query.timestamp.$lte = new Date(filters.dateTo);
+        }
+
+        const [logs, total] = await Promise.all([
+            AdminLog.find(query)
+                .sort({ timestamp: -1 })
+                .skip((page - 1) * limit)
+                .limit(limit)
+                .lean(),
+            AdminLog.countDocuments(query)
+        ]);
+
+        return {
+            logs,
+            pagination: {
+                page,
+                limit,
+                total,
+                pages: Math.ceil(total / limit),
+                hasNext: page * limit < total,
+                hasPrev: page > 1
+            }
+        };
+    }
+
+    // Service management
+    async getServiceStats() {
+        const now = new Date();
+        const dayAgo = new Date(now - 24 * 60 * 60 * 1000);
+        const weekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
+
+        const [serviceStats, countryStats, hourlyStats] = await Promise.all([
+            // By service
+            Session.aggregate([
+                { $match: { startTime: { $gte: dayAgo } } },
+                { $group: { _id: '$service', count: { $sum: 1 }, success: { $sum: { $cond: [{ $eq: ['$status', 'RECEIVED'] }, 1, 0] } } } },
+                { $sort: { count: -1 } }
+            ]),
+            // By country
+            Session.aggregate([
+                { $match: { startTime: { $gte: dayAgo } } },
+                { $group: { _id: '$country', count: { $sum: 1 } } },
+                { $sort: { count: -1 } }
+            ]),
+            // Hourly distribution
+            Session.aggregate([
+                { $match: { startTime: { $gte: dayAgo } } },
+                { $group: { _id: { $hour: '$startTime' }, count: { $sum: 1 } } },
+                { $sort: { _id: 1 } }
+            ])
+        ]);
+
+        return {
+            byService: serviceStats.map(s => ({ name: s._id, requests: s.count, successRate: s.count > 0 ? ((s.success / s.count) * 100).toFixed(1) : 0 })),
+            byCountry: countryStats.map(c => ({ code: c._id, requests: c.count })),
+            byHour: hourlyStats.map(h => ({ hour: h._id, requests: h.count }))
+        };
+    }
+
+    // Financial reports
+    async getFinancialReport(startDate, endDate) {
+        const query = {
+            createdAt: {
+                $gte: startDate ? new Date(startDate) : new Date(0),
+                $lte: endDate ? new Date(endDate) : new Date()
+            }
+        };
+
+        const [revenue, expenses, deposits, withdrawals] = await Promise.all([
+            Transaction.aggregate([
+                { $match: { ...query, type: { $in: ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION'] }, status: 'COMPLETED' } },
+                { $group: { _id: null, total: { $sum: { $abs: '$amount' } } } }
+            ]),
+            Transaction.aggregate([
+                { $match: { ...query, type: { $in: ['REFERRAL_REWARD', 'ADMIN_ADD'] }, status: 'COMPLETED' } },
+                { $group: { _id: null, total: { $sum: '$amount' } } }
+            ]),
+            Transaction.aggregate([
+                { $match: { ...query, type: 'DEPOSIT', status: 'COMPLETED' } },
+                { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }
+            ]),
+            Transaction.aggregate([
+                { $match: { ...query, type: 'WITHDRAWAL', status: 'COMPLETED' } },
+                { $group: { _id: null, total: { $sum: { $abs: '$amount' } }, count: { $sum: 1 } } }
+            ])
+        ]);
+
+        return {
+            period: { start: startDate, end: endDate },
+            revenue: revenue[0]?.total || 0,
+            expenses: expenses[0]?.total || 0,
+            netProfit: (revenue[0]?.total || 0) - (expenses[0]?.total || 0),
+            deposits: { total: deposits[0]?.total || 0, count: deposits[0]?.count || 0 },
+            withdrawals: { total: withdrawals[0]?.total || 0, count: withdrawals[0]?.count || 0 }
+        };
+    }
+}
+
+export default AdminService;
