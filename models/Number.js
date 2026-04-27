@@ -4,16 +4,17 @@ const numberSchema = new mongoose.Schema({
     numberId: {
         type: String,
         required: true,
-        unique: true
+        unique: true    // ← Auto-creates unique index
     },
     phoneNumber: {
         type: String,
         required: true,
-        unique: true
+        unique: true    // ← Auto-creates unique index
     },
     country: {
         type: String,
-        required: true
+        required: true,
+        index: true
     },
     countryCode: {
         type: String,
@@ -23,7 +24,8 @@ const numberSchema = new mongoose.Schema({
     // Provider
     provider: {
         type: String,
-        required: true
+        required: true,
+        index: true
     },
     providerNumberId: {
         type: String,
@@ -34,20 +36,23 @@ const numberSchema = new mongoose.Schema({
     tier: {
         type: String,
         enum: ['FREE', 'CHEAP', 'VIP'],
-        required: true
+        required: true,
+        index: true
     },
     
     // Status
     status: {
         type: String,
         enum: ['ACTIVE', 'BUSY', 'EXPIRED', 'BLOCKED', 'ERROR'],
-        default: 'ACTIVE'
+        default: 'ACTIVE',
+        index: true
     },
     
     // Assignment
     assignedTo: {
         type: String,
-        default: null
+        default: null,
+        index: true
     },
     sessionId: {
         type: String,
@@ -61,11 +66,13 @@ const numberSchema = new mongoose.Schema({
     },
     expiresAt: {
         type: Date,
-        default: null
+        default: null,
+        index: true     // ← For expiry cleanup jobs
     },
     lastUsed: {
         type: Date,
-        default: null
+        default: null,
+        index: true
     },
     
     // Stats
@@ -99,9 +106,109 @@ const numberSchema = new mongoose.Schema({
     timestamps: true
 });
 
-numberSchema.index({ tier: 1, country: 1, status: 1 });
-numberSchema.index({ status: 1, lastUsed: 1 });
+// ═══════════════════════════════════════════════════════════
+//  COMPOUND INDEXES
+// ═══════════════════════════════════════════════════════════
+
+// Number pool query: find available numbers by tier + country + status
+numberSchema.index({ tier: 1, country: 1, status: 1, lastUsed: 1 });
+
+// Provider inventory
+numberSchema.index({ provider: 1, tier: 1, status: 1 });
+
+// Expiry cleanup job
+numberSchema.index({ status: 1, expiresAt: 1 });
+
+// Assigned numbers lookup
+numberSchema.index({ assignedTo: 1, status: 1 });
+
+// ═══════════════════════════════════════════════════════════
+//  STATICS
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * Find available number for OTP request
+ */
+numberSchema.statics.findAvailable = async function(tier, country, excludeIds = []) {
+    return this.findOne({
+        tier,
+        country,
+        status: 'ACTIVE',
+        assignedTo: null,
+        numberId: { $nin: excludeIds }
+    }).sort({ lastUsed: 1, successRate: -1 }).lean();
+};
+
+/**
+ * Mark number as assigned
+ */
+numberSchema.statics.assign = async function(numberId, userId, sessionId) {
+    return this.findOneAndUpdate(
+        { numberId, status: 'ACTIVE', assignedTo: null },
+        { $set: { assignedTo: userId, sessionId, status: 'BUSY', lastUsed: new Date() } },
+        { new: true }
+    );
+};
+
+/**
+ * Release number after session ends
+ */
+numberSchema.statics.release = async function(numberId, status = 'ACTIVE') {
+    return this.findOneAndUpdate(
+        { numberId },
+        { $set: { assignedTo: null, sessionId: null, status }, $inc: { totalOTPs: 1 } },
+        { new: true }
+    );
+};
+
+/**
+ * Update success rate after OTP result
+ */
+numberSchema.statics.recordResult = async function(numberId, success) {
+    const number = await this.findOne({ numberId });
+    if (!number) return null;
+
+    const successCount = number.successCount + (success ? 1 : 0);
+    const failCount = number.failCount + (success ? 0 : 1);
+    const total = successCount + failCount;
+    const successRate = total > 0 ? (successCount / total) * 100 : 100;
+
+    return this.findOneAndUpdate(
+        { numberId },
+        { $set: { successCount, failCount, successRate } },
+        { new: true }
+    );
+};
+
+/**
+ * Get expired numbers for cleanup
+ */
+numberSchema.statics.getExpired = async function() {
+    return this.find({
+        expiresAt: { $lte: new Date() },
+        status: { $ne: 'EXPIRED' }
+    }).lean();
+};
+
+/**
+ * Get provider stats
+ */
+numberSchema.statics.getProviderStats = async function(provider) {
+    return this.aggregate([
+        { $match: { provider } },
+        {
+            $group: {
+                _id: '$tier',
+                total: { $sum: 1 },
+                active: { $sum: { $cond: [{ $eq: ['$status', 'ACTIVE'] }, 1, 0] } },
+                busy: { $sum: { $cond: [{ $eq: ['$status', 'BUSY'] }, 1, 0] } },
+                avgSuccessRate: { $avg: '$successRate' }
+            }
+        }
+    ]);
+};
 
 const NumberModel = mongoose.model('Number', numberSchema);
 
 export default NumberModel;
+    
