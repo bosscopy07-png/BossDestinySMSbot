@@ -68,7 +68,29 @@ async _saveSettings() {
                 }
     
     
+// IN bot/commands/admin.js — processAddBalance() method
 
+// BEFORE (around line where Transaction.create is called):
+await Transaction.create({
+    txId,
+    userId: targetId,
+    type: 'ADMIN_ADJUSTMENT',   // ← WRONG
+    amount,
+    status: 'COMPLETED',
+    ...
+});
+
+// AFTER:
+await Transaction.create({
+    txId,
+    userId: targetId,
+    type: 'ADMIN_ADD',          // ← FIXED
+    amount,
+    status: 'COMPLETED',
+    metadata: { adminId: ctx.from.id.toString(), reason },
+    createdAt: new Date()
+});
+    
     // ─── Image reply helpers ───
     async replySuccess(ctx, text, extra = {}) {
         try {
