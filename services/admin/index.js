@@ -75,29 +75,7 @@ class AdminService {
             Transaction.countDocuments({ type: 'DEPOSIT', status: 'PENDING' }),
             this.calculateRevenue(new Date(0))
         ]);
-        // IN bot/commands/admin.js — processDeductBalance() method
-
-// BEFORE:
-await Transaction.create({
-    txId,
-    userId: targetId,
-    type: 'ADMIN_ADJUSTMENT',   // ← WRONG
-    amount: -amount,
-    ...
-});
-
-// AFTER:
-await Transaction.create({
-    txId,
-    userId: targetId,
-    type: 'ADMIN_DEDUCT',       // ← FIXED
-    amount: -amount,
-    status: 'COMPLETED',
-    metadata: { adminId: ctx.from.id.toString(), reason },
-    createdAt: new Date()
-});
         
-
         const otpStats24h = await Session.aggregate([
             { $match: { startTime: { $gte: dayAgo } } },
             {
