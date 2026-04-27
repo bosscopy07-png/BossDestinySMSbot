@@ -504,7 +504,6 @@ class AdminCommands {
     // ═══════════════════════════════════════════════════════════
     //  USER DETAIL (inline) with Action Buttons
     // ═══════════════════════════════════════════════════════════
-
     async showUserDetailInline(ctx, userId) {
         try {
             const user = await User.findOne({ userId }).lean();
@@ -513,7 +512,14 @@ class AdminCommands {
                 return this.replyError(ctx, '❌ <b>User not found.</b>');
             }
 
-            const [sessions, transactions, referrals] = await Promise.all([
+            // Fetch display data (limited) + stats (aggregated) in parallel
+            const [
+                recentSessions,
+                recentTransactions,
+                referrals,
+                sessionCounts,
+                txStats
+            ] = await Promise.all([
                 Session.find({ userId })
                     .sort({ startTime: -1 })
                     .limit(10)
@@ -524,21 +530,38 @@ class AdminCommands {
                     .lean(),
                 User.find({ referredBy: userId })
                     .select('userId username createdAt')
-                    .lean()
+                    .lean(),
+                Session.countDocuments({ userId }),
+                Transaction.aggregate([
+                    { $match: { userId, status: 'COMPLETED' } },
+                    {
+                        $group: {
+                            _id: null,
+                            totalSpent: {
+                                $sum: {
+                                    $cond: [
+                                        { $in: ['$type', ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION']] },
+                                        { $abs: '$amount' },
+                                        0
+                                    ]
+                                }
+                            },
+                            totalDeposited: {
+                                $sum: {
+                                    $cond: [{ $eq: ['$type', 'DEPOSIT'] }, '$amount', 0]
+                                }
+                            },
+                            totalRefEarnings: {
+                                $sum: {
+                                    $cond: [{ $eq: ['$type', 'REFERRAL_REWARD'] }, '$amount', 0]
+                                }
+                            }
+                        }
+                    }
+                ])
             ]);
 
-            const totalSpent = transactions
-                .filter(t => ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION'].includes(t.type))
-                .reduce((sum, t) => sum + Math.abs(t.amount || 0), 0);
-
-            const totalDeposited = transactions
-                .filter(t => t.type === 'DEPOSIT' && t.status === 'COMPLETED')
-                .reduce((sum, t) => sum + (t.amount || 0), 0);
-
-            const totalRefEarnings = transactions
-                .filter(t => t.type === 'REFERRAL_REWARD' && t.status === 'COMPLETED')
-                .reduce((sum, t) => sum + (t.amount || 0), 0);
-
+            const stats = txStats[0] || { totalSpent: 0, totalDeposited: 0, totalRefEarnings: 0 };
             const isVip = user.vipExpiry && new Date(user.vipExpiry) > new Date();
             const statusEmoji = user.isBlacklisted ? '🔴 BANNED' : isVip ? '👑 VIP' : '✅ Active';
 
@@ -561,11 +584,16 @@ ${user.isBlacklisted ? `<b>Reason:</b> ${user.blacklistReason || 'N/A'}\n` : ''}
 <b>🕐 Last Active:</b> ${user.lastActive ? new Date(user.lastActive).toLocaleDateString() : 'Never'}
 
 <b>📊 Stats</b>
-• Total Spent: <code>${formatCurrency(totalSpent)}</code>
-• Total Deposited: <code>${formatCurrency(totalDeposited)}</code>
-• Ref Earnings: <code>${formatCurrency(totalRefEarnings)}</code>
-• Sessions: <code>${sessions.length}</code>
+• Total Spent: <code>${formatCurrency(stats.totalSpent)}</code>
+• Total Deposited: <code>${formatCurrency(stats.totalDeposited)}</code>
+• Ref Earnings: <code>${formatCurrency(stats.totalRefEarnings)}</code>
+• Total Sessions: <code>${sessionCounts}</code>
 • Referrals: <code>${referrals.length}</code>
+• Net Balance: <code>${formatCurrency((user.balance || 0) - (user.lockedBalance || 0))}</code>
+• Lifetime Value: <code>${formatCurrency(stats.totalSpent + (user.bundleRemaining || 0) * (config.prices?.cheapOtp || 0.05))}</code>
+
+<b>📞 Recent Sessions:</b> <code>${recentSessions.length}</code> shown
+<b>📜 Recent Transactions:</b> <code>${recentTransactions.length}</code> shown
             `;
 
             const keyboard = Markup.inlineKeyboard([
@@ -597,7 +625,8 @@ ${user.isBlacklisted ? `<b>Reason:</b> ${user.blacklistReason || 'N/A'}\n` : ''}
             await this.replyError(ctx, '❌ <b>Failed to load user details.</b>');
         }
     }
-
+    
+    
     async handleUserDetail(ctx) {
         try {
             const args = ctx.message.text.split(' ');
