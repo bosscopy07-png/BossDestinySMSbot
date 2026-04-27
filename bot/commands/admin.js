@@ -32,18 +32,18 @@ class AdminCommands {
         }
     }
 
-    // ─── Persist settings to DB ───
+    
+        // ─── Persist settings to DB (uses Settings.merge for nested updates) ───
     async _saveSettings() {
         try {
-            await Settings.findOneAndUpdate(
-                {},
-                { $set: config },
-                { upsert: true, new: true }
-            );
+            await Settings.merge(config);
+            logger.info('Admin settings saved to DB');
         } catch (error) {
             logger.error('Failed to save settings', { error: error.message });
+            throw error; // Re-throw so caller knows it failed
         }
     }
+    
 
     // ─── Image reply helpers ───
     async replySuccess(ctx, text, extra = {}) {
