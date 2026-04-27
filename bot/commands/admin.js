@@ -501,3 +501,925 @@ class AdminCommands {
         }
                                                         }
                                
+    // ═══════════════════════════════════════════════════════════
+    //  USER DETAIL (inline) with Action Buttons
+    // ═══════════════════════════════════════════════════════════
+
+    async showUserDetailInline(ctx, userId) {
+        try {
+            const user = await User.findOne({ userId }).lean();
+
+            if (!user) {
+                return this.replyError(ctx, '❌ <b>User not found.</b>');
+            }
+
+            const [sessions, transactions, referrals] = await Promise.all([
+                Session.find({ userId })
+                    .sort({ startTime: -1 })
+                    .limit(10)
+                    .lean(),
+                Transaction.find({ userId })
+                    .sort({ createdAt: -1 })
+                    .limit(10)
+                    .lean(),
+                User.find({ referredBy: userId })
+                    .select('userId username createdAt')
+                    .lean()
+            ]);
+
+            const totalSpent = transactions
+                .filter(t => ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION'].includes(t.type))
+                .reduce((sum, t) => sum + Math.abs(t.amount || 0), 0);
+
+            const totalDeposited = transactions
+                .filter(t => t.type === 'DEPOSIT' && t.status === 'COMPLETED')
+                .reduce((sum, t) => sum + (t.amount || 0), 0);
+
+            const totalRefEarnings = transactions
+                .filter(t => t.type === 'REFERRAL_REWARD' && t.status === 'COMPLETED')
+                .reduce((sum, t) => sum + (t.amount || 0), 0);
+
+            const isVip = user.vipExpiry && new Date(user.vipExpiry) > new Date();
+            const statusEmoji = user.isBlacklisted ? '🔴 BANNED' : isVip ? '👑 VIP' : '✅ Active';
+
+            const message = `
+<b>👤 User Details</b>
+
+<b>🆔 ID:</b> <code>${user.userId}</code>
+<b>👤 Name:</b> ${(user.firstName || '') + ' ' + (user.lastName || '')}
+<b>📱 Username:</b> ${user.username ? '@' + user.username : 'N/A'}
+<b>💰 Balance:</b> <code>${formatCurrency(user.balance)}</code>
+<b>🔒 Locked:</b> <code>${formatCurrency(user.lockedBalance || 0)}</code>
+<b>📦 Bundle:</b> <code>${user.bundleRemaining || 0}</code> OTPs
+<b>👑 VIP:</b> ${isVip ? `Until ${new Date(user.vipExpiry).toLocaleDateString()}` : 'Inactive'}
+<b>🆓 Free Used Today:</b> <code>${user.freeUsedToday || 0}</code>/3
+<b>📊 Mode:</b> <code>${user.mode || 'N/A'}</code>
+
+<b>🚫 Status:</b> ${statusEmoji}
+${user.isBlacklisted ? `<b>Reason:</b> ${user.blacklistReason || 'N/A'}\n` : ''}
+<b>📅 Joined:</b> ${user.createdAt ? new Date(user.createdAt).toLocaleDateString() : 'Unknown'}
+<b>🕐 Last Active:</b> ${user.lastActive ? new Date(user.lastActive).toLocaleDateString() : 'Never'}
+
+<b>📊 Stats</b>
+• Total Spent: <code>${formatCurrency(totalSpent)}</code>
+• Total Deposited: <code>${formatCurrency(totalDeposited)}</code>
+• Ref Earnings: <code>${formatCurrency(totalRefEarnings)}</code>
+• Sessions: <code>${sessions.length}</code>
+• Referrals: <code>${referrals.length}</code>
+            `;
+
+            const keyboard = Markup.inlineKeyboard([
+                [
+                    Markup.button.callback('➕ Add Balance', `addbal_${userId}`),
+                    Markup.button.callback('➖ Deduct Balance', `dedbal_${userId}`)
+                ],
+                [
+                    Markup.button.callback('📨 Message', `msg_${userId}`),
+                    Markup.button.callback('📜 Transactions', `viewtx_${userId}`)
+                ],
+                [
+                    Markup.button.callback('📞 Sessions', `viewsess_${userId}`),
+                    user.isBlacklisted 
+                        ? Markup.button.callback('🟢 Unban', `unban_${userId}`)
+                        : Markup.button.callback('🔴 Ban', `ban_${userId}`)
+                ],
+                [
+                    user.isBlacklisted
+                        ? Markup.button.callback('🟢 Whitelist', `wl_${userId}`)
+                        : Markup.button.callback('🔴 Blacklist', `bl_${userId}`)
+                ],
+                [Markup.button.callback('🔙 Back to Users', 'admin_users')]
+            ]);
+
+            await this.editCaption(ctx, message, { reply_markup: keyboard.reply_markup });
+        } catch (error) {
+            logger.error('User detail inline error', { userId, error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to load user details.</b>');
+        }
+    }
+
+    async handleUserDetail(ctx) {
+        try {
+            const args = ctx.message.text.split(' ');
+            if (args.length < 2) {
+                return this.replyError(ctx, '❌ <b>Usage:</b> <code>/user &lt;user_id&gt;</code>');
+            }
+
+            const targetId = args[1];
+            await this.showUserDetailInline(ctx, targetId);
+        } catch (error) {
+            logger.error('User detail error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to load user details.</b>');
+        }
+    }
+
+    async handleViewUserTransactions(ctx) {
+        try {
+            const userId = ctx.match[1];
+            const transactions = await Transaction.find({ userId })
+                .sort({ createdAt: -1 })
+                .limit(15)
+                .lean();
+
+            if (!transactions.length) {
+                return this.editCaption(ctx, '<b>📜 No transactions found.</b>', {
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🔙 Back', `back_user_${userId}`)]
+                    ]).reply_markup
+                });
+            }
+
+            let message = `<b>📜 Recent Transactions</b> for <code>${userId}</code>\n\n`;
+            for (const tx of transactions) {
+                const emoji = tx.status === 'COMPLETED' ? '✅' : tx.status === 'PENDING' ? '⏳' : '❌';
+                message += `${emoji} <b>${tx.type}</b> | <code>${formatCurrency(Math.abs(tx.amount || 0))}</code>\n`;
+                message += `   Status: <code>${tx.status}</code> | ${tx.createdAt ? new Date(tx.createdAt).toLocaleDateString() : 'N/A'}\n\n`;
+            }
+
+            await this.editCaption(ctx, message, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔙 Back to User', `back_user_${userId}`)]
+                ]).reply_markup
+            });
+        } catch (error) {
+            logger.error('View transactions error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load transactions.</b>');
+        }
+    }
+
+    async handleViewUserSessions(ctx) {
+        try {
+            const userId = ctx.match[1];
+            const sessions = await Session.find({ userId })
+                .sort({ startTime: -1 })
+                .limit(15)
+                .lean();
+
+            if (!sessions.length) {
+                return this.editCaption(ctx, '<b>📞 No sessions found.</b>', {
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🔙 Back', `back_user_${userId}`)]
+                    ]).reply_markup
+                });
+            }
+
+            let message = `<b>📞 Recent Sessions</b> for <code>${userId}</code>\n\n`;
+            for (const s of sessions) {
+                const emoji = s.status === 'RECEIVED' ? '✅' : s.status === 'TIMEOUT' ? '⏰' : '❌';
+                message += `${emoji} <b>${s.service || 'N/A'}</b> (${s.country || 'N/A'})\n`;
+                message += `   Status: <code>${s.status}</code> | Cost: <code>${formatCurrency(s.cost || 0)}</code>\n`;
+                message += `   ${s.startTime ? new Date(s.startTime).toLocaleString() : 'N/A'}\n\n`;
+            }
+
+            await this.editCaption(ctx, message, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔙 Back to User', `back_user_${userId}`)]
+                ]).reply_markup
+            });
+        } catch (error) {
+            logger.error('View sessions error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load sessions.</b>');
+        }
+        }
+        // ═══════════════════════════════════════════════════════════
+    //  BALANCE OPERATIONS
+    // ═══════════════════════════════════════════════════════════
+
+    async handleAddBalance(ctx) {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 3) {
+            return this.replyError(ctx, '❌ <b>Usage:</b> <code>/addbalance &lt;user_id&gt; &lt;amount&gt; [reason]</code>');
+        }
+
+        const targetId = args[1];
+        const amount = parseFloat(args[2]);
+        const reason = args.slice(3).join(' ') || 'Admin credit';
+
+        if (isNaN(amount) || amount <= 0) {
+            return this.replyError(ctx, '❌ <b>Invalid amount.</b>\n\nAmount must be a positive number.');
+        }
+
+        await this.processAddBalance(ctx, targetId, amount, reason);
+    }
+
+    async processAddBalance(ctx, targetId, amount, reason) {
+        try {
+            let txId;
+            if (this.walletService?.addBalance) {
+                txId = await this.walletService.addBalance(targetId, amount, ctx.from.id.toString(), reason);
+            } else {
+                // Fallback: direct DB update
+                await User.updateOne({ userId: targetId }, { $inc: { balance: amount } });
+                txId = generateId();
+                await Transaction.create({
+                    txId,
+                    userId: targetId,
+                    type: 'ADMIN_ADD',
+                    amount,
+                    status: 'COMPLETED',
+                    metadata: { adminId: ctx.from.id.toString(), reason },
+                    createdAt: new Date()
+                });
+            }
+
+            await this.logAdminAction(
+                ctx.from.id.toString(),
+                'ADD_BALANCE',
+                targetId,
+                { amount, reason, txId }
+            );
+
+            await this.replySuccess(ctx, `✅ <b>Balance Added!</b>\n\nUser: <code>${targetId}</code>\nAmount: <code>+${formatCurrency(amount)}</code>\nReason: <i>${reason}</i>\nTxID: <code>${txId}</code>`);
+
+            // Notify user
+            await ctx.telegram.sendMessage(targetId, `
+<b>🎁 Balance Added!</b>
+
+Amount: <code>+${formatCurrency(amount)}</code>
+Reason: <i>${reason}</i>
+
+Your new balance has been updated.
+            `, { parse_mode: 'HTML' }).catch(err => {
+                logger.warn('Failed to notify user of balance addition', { userId: targetId, error: err.message });
+            });
+
+        } catch (error) {
+            logger.error('Add balance error', { targetId, amount, error: error.message, stack: error.stack });
+            await this.replyError(ctx, `❌ <b>Error:</b> ${error.message}`);
+        }
+    }
+
+    async handleAddBalanceAction(ctx) {
+        const targetId = ctx.match[1];
+        if (!ctx.session) ctx.session = {};
+        ctx.session.awaitingAddBalance = targetId;
+        await this.replySuccess(ctx, `💰 <b>Add Balance</b>\n\nSend the amount to add to user <code>${targetId}</code>:\n\n<i>Reply with a number (e.g., 10.50)</i>`);
+    }
+
+    async handleDeductBalance(ctx) {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 3) {
+            return this.replyError(ctx, '❌ <b>Usage:</b> <code>/deductbalance &lt;user_id&gt; &lt;amount&gt; [reason]</code>');
+        }
+
+        const targetId = args[1];
+        const amount = parseFloat(args[2]);
+        const reason = args.slice(3).join(' ') || 'Admin deduction';
+
+        if (isNaN(amount) || amount <= 0) {
+            return this.replyError(ctx, '❌ <b>Invalid amount.</b>\n\nAmount must be a positive number.');
+        }
+
+        await this.processDeductBalance(ctx, targetId, amount, reason);
+    }
+
+    async processDeductBalance(ctx, targetId, amount, reason) {
+        try {
+            const user = await User.findOne({ userId: targetId });
+            if (!user) throw new Error('USER_NOT_FOUND');
+            if ((user.balance || 0) < amount) throw new Error('INSUFFICIENT_BALANCE');
+
+            let txId;
+            if (this.walletService?.deductBalance) {
+                txId = await this.walletService.deductBalance(targetId, amount, ctx.from.id.toString(), reason);
+            } else {
+                await User.updateOne({ userId: targetId }, { $inc: { balance: -amount } });
+                txId = generateId();
+                await Transaction.create({
+                    txId,
+                    userId: targetId,
+                    type: 'ADMIN_DEDUCT',
+                    amount: -amount,
+                    status: 'COMPLETED',
+                    metadata: { adminId: ctx.from.id.toString(), reason },
+                    createdAt: new Date()
+                });
+            }
+
+            await this.logAdminAction(
+                ctx.from.id.toString(),
+                'DEDUCT_BALANCE',
+                targetId,
+                { amount, reason, txId }
+            );
+
+            await this.replySuccess(ctx, `✅ <b>Balance Deducted!</b>\n\nUser: <code>${targetId}</code>\nAmount: <code>-${formatCurrency(amount)}</code>\nReason: <i>${reason}</i>\nTxID: <code>${txId}</code>`);
+
+            // Notify user
+            await ctx.telegram.sendMessage(targetId, `
+<b>⚠️ Balance Deducted</b>
+
+Amount: <code>-${formatCurrency(amount)}</code>
+Reason: <i>${reason}</i>
+
+Your balance has been updated.
+            `, { parse_mode: 'HTML' }).catch(err => {
+                logger.warn('Failed to notify user of balance deduction', { userId: targetId, error: err.message });
+            });
+
+        } catch (error) {
+            logger.error('Deduct balance error', { targetId, amount, error: error.message, stack: error.stack });
+            await this.replyError(ctx, `❌ <b>Error:</b> ${error.message}`);
+        }
+    }
+
+    async handleDeductBalanceAction(ctx) {
+        const targetId = ctx.match[1];
+        if (!ctx.session) ctx.session = {};
+        ctx.session.awaitingDeductBalance = targetId;
+        await this.replySuccess(ctx, `💰 <b>Deduct Balance</b>\n\nSend the amount to deduct from user <code>${targetId}</code>:\n\n<i>Reply with a number (e.g., 5.00)</i>`);
+    }
+        // ═══════════════════════════════════════════════════════════
+    //  BLACKLIST / BAN / WHITELIST / MESSAGE USER
+    // ═══════════════════════════════════════════════════════════
+
+    async handleBlacklist(ctx) {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            return this.replyError(ctx, '❌ <b>Usage:</b> <code>/blacklist &lt;user_id&gt; [reason]</code>');
+        }
+
+        const targetId = args[1];
+        const reason = args.slice(2).join(' ') || 'Manual blacklist';
+        await this.processBlacklist(ctx, targetId, reason);
+    }
+
+    async processBlacklist(ctx, targetId, reason) {
+        try {
+            await User.updateOne(
+                { userId: targetId },
+                {
+                    $set: {
+                        isBlacklisted: true,
+                        blacklistReason: reason,
+                        blacklistDate: new Date()
+                    }
+                }
+            );
+
+            await Session.updateMany(
+                { userId: targetId, status: { $in: ['WAITING', 'CHECKING'] } },
+                { $set: { status: 'CANCELLED', cancelledAt: new Date() } }
+            );
+
+            await this.logAdminAction(
+                ctx.from.id.toString(),
+                'BLACKLIST',
+                targetId,
+                { reason }
+            );
+
+            await this.replySuccess(ctx, `🚫 <b>User Blacklisted</b>\n\nUser: <code>${targetId}</code>\nReason: <i>${reason}</i>\n\nAll active sessions have been cancelled.`);
+
+            // Notify user
+            await ctx.telegram.sendMessage(targetId, `
+<b>🚫 Account Restricted</b>
+
+Your account has been blacklisted.
+
+<b>Reason:</b> <i>${reason}</i>
+
+Contact support if you believe this is a mistake.
+            `, { parse_mode: 'HTML' }).catch(() => {});
+
+        } catch (error) {
+            logger.error('Blacklist error', { targetId, error: error.message });
+            await this.replyError(ctx, `❌ <b>Error:</b> ${error.message}`);
+        }
+    }
+
+    async handleBlacklistAction(ctx) {
+        const targetId = ctx.match[1];
+        if (!ctx.session) ctx.session = {};
+        ctx.session.awaitingBlacklistReason = targetId;
+        await this.replySuccess(ctx, `🔴 <b>Blacklist User</b>\n\nSend reason for blacklisting user <code>${targetId}</code>:\n\n<i>Reply with a reason or send "skip" for default reason.</i>`);
+    }
+
+    async handleWhitelist(ctx) {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            return this.replyError(ctx, '❌ <b>Usage:</b> <code>/whitelist &lt;user_id&gt;</code>');
+        }
+
+        const targetId = args[1];
+        await this.processWhitelist(ctx, targetId);
+    }
+
+    async processWhitelist(ctx, targetId) {
+        try {
+            await User.updateOne(
+                { userId: targetId },
+                {
+                    $set: {
+                        isBlacklisted: false,
+                        blacklistReason: null,
+                        blacklistDate: null
+                    }
+                }
+            );
+
+            await this.logAdminAction(
+                ctx.from.id.toString(),
+                'WHITELIST',
+                targetId,
+                {}
+            );
+
+            await this.replySuccess(ctx, `✅ <b>User Whitelisted</b>\n\nUser: <code>${targetId}</code>\n\nAll restrictions have been removed.`);
+
+            // Notify user
+            await ctx.telegram.sendMessage(targetId, `
+<b>✅ Account Restored</b>
+
+Your account has been whitelisted. All restrictions have been removed.
+
+You can now use the bot normally.
+            `, { parse_mode: 'HTML' }).catch(() => {});
+
+        } catch (error) {
+            logger.error('Whitelist error', { targetId, error: error.message });
+            await this.replyError(ctx, `❌ <b>Error:</b> ${error.message}`);
+        }
+    }
+
+    async handleWhitelistAction(ctx) {
+        const targetId = ctx.match[1];
+        await this.processWhitelist(ctx, targetId);
+    }
+
+    async handleBanAction(ctx) {
+        const targetId = ctx.match[1];
+        await this.processBlacklist(ctx, targetId, 'Banned by admin');
+    }
+
+    async handleUnbanAction(ctx) {
+        const targetId = ctx.match[1];
+        await this.processWhitelist(ctx, targetId);
+    }
+
+    async handleMessageUser(ctx) {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 3) {
+            return this.replyError(ctx, '❌ <b>Usage:</b> <code>/message_user &lt;user_id&gt; &lt;message&gt;</code>');
+        }
+
+        const targetId = args[1];
+        const messageText = args.slice(2).join(' ');
+        await this.processMessageUser(ctx, targetId, messageText);
+    }
+
+    async handleMessageUserAction(ctx) {
+        const targetId = ctx.match[1];
+        if (!ctx.session) ctx.session = {};
+        ctx.session.awaitingMessageUser = targetId;
+        await this.replySuccess(ctx, `📨 <b>Message User</b>\n\nSend the message to deliver to user <code>${targetId}</code>:\n\n<i>Type your message and send it.</i>`);
+    }
+
+    async processMessageUser(ctx, targetId, messageText) {
+        try {
+            const user = await User.findOne({ userId: targetId });
+            if (!user) throw new Error('USER_NOT_FOUND');
+
+            await ctx.telegram.sendMessage(targetId, `
+<b>📨 Message from Admin</b>
+
+<i>${messageText}</i>
+
+---
+<i>Reply to this bot if you need assistance.</i>
+            `, { parse_mode: 'HTML' });
+
+            await this.logAdminAction(
+                ctx.from.id.toString(),
+                'MESSAGE_USER',
+                targetId,
+                { message: messageText.substring(0, 500) }
+            );
+
+            await this.replySuccess(ctx, `✅ <b>Message Sent!</b>\n\nTo: <code>${targetId}</code>\nMessage: <i>${messageText.substring(0, 200)}${messageText.length > 200 ? '...' : ''}</i>`);
+
+        } catch (error) {
+            logger.error('Message user error', { targetId, error: error.message });
+            await this.replyError(ctx, `❌ <b>Error:</b> ${error.message}`);
+        }
+                }
+            // ═══════════════════════════════════════════════════════════
+    //  PROFITS
+    // ═══════════════════════════════════════════════════════════
+
+    async handleProfits(ctx) {
+        try {
+            const now = new Date();
+            const dayAgo = new Date(now - 24 * 60 * 60 * 1000);
+            const weekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
+            const monthAgo = new Date(now - 30 * 24 * 60 * 60 * 1000);
+
+            const [dayRevenue, weekRevenue, monthRevenue] = await Promise.all([
+                this.calculateRevenue(dayAgo),
+                this.calculateRevenue(weekAgo),
+                this.calculateRevenue(monthAgo)
+            ]);
+
+            let masterBalance = { usdt: 'N/A', bnb: 'N/A', address: 'N/A' };
+            try {
+                if (this.walletService?.getMasterBalance) {
+                    masterBalance = await this.walletService.getMasterBalance();
+                }
+                if (this.walletService?.getMasterAddress) {
+                    masterBalance.address = this.walletService.getMasterAddress();
+                }
+            } catch (error) {
+                logger.warn('Failed to get master balance for profits', { error: error.message });
+            }
+
+            const message = `
+<b>💰 Profit Analytics</b>
+
+<b>📅 Revenue:</b>
+• 24h: <code>${formatCurrency(dayRevenue)}</code>
+• 7d: <code>${formatCurrency(weekRevenue)}</code>
+• 30d: <code>${formatCurrency(monthRevenue)}</code>
+
+<b>💎 Master Wallet:</b>
+• Address: <code>${masterBalance.address}</code>
+• USDT: <code>${masterBalance.usdt}</code>
+• BNB: <code>${masterBalance.bnb}</code>
+
+<b>📊 By Mode (30d):</b>
+${await this.getRevenueByMode(monthAgo)}
+
+<b>📊 By Service (30d):</b>
+${await this.getRevenueByService(monthAgo)}
+            `;
+
+            await this.replySuccess(ctx, message, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('📥 Export CSV', 'export_profits')],
+                    [Markup.button.callback('💸 Withdraw', 'withdraw_profits')],
+                    [Markup.button.callback('🔙 Back', 'admin')]
+                ]).reply_markup
+            });
+        } catch (error) {
+            logger.error('Profits error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to load profit data.</b>');
+        }
+    }
+
+    async getRevenueByMode(since) {
+        try {
+            const results = await Transaction.aggregate([
+                {
+                    $match: {
+                        type: { $in: ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION'] },
+                        status: 'COMPLETED',
+                        createdAt: { $gte: since }
+                    }
+                },
+                {
+                    $group: {
+                        _id: '$type',
+                        total: { $sum: { $abs: '$amount' } }
+                    }
+                }
+            ]);
+            return results.map(r => `• ${r._id}: <code>${formatCurrency(r.total)}</code>`).join('\n') || '<i>No data</i>';
+        } catch (error) {
+            logger.error('Revenue by mode error', { error: error.message });
+            return '<i>Error loading data</i>';
+        }
+    }
+
+    async getRevenueByService(since) {
+        try {
+            const results = await Session.aggregate([
+                {
+                    $match: {
+                        status: 'RECEIVED',
+                        startTime: { $gte: since }
+                    }
+                },
+                {
+                    $group: {
+                        _id: '$service',
+                        count: { $sum: 1 },
+                        revenue: { $sum: '$cost' }
+                    }
+                },
+                { $sort: { revenue: -1 } },
+                { $limit: 5 }
+            ]);
+            return results.map(r => `• ${r._id}: <code>${formatCurrency(r.revenue)}</code> (${r.count} OTPs)`).join('\n') || '<i>No data</i>';
+        } catch (error) {
+            logger.error('Revenue by service error', { error: error.message });
+            return '<i>Error loading data</i>';
+        }
+    }
+
+    async handleExportProfits(ctx) {
+        try {
+            if (ctx.answerCbQuery) await ctx.answerCbQuery('Generating export...');
+
+            const monthAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+            const results = await Transaction.aggregate([
+                {
+                    $match: {
+                        type: { $in: ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION'] },
+                        status: 'COMPLETED',
+                        createdAt: { $gte: monthAgo }
+                    }
+                },
+                {
+                    $group: {
+                        _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+                        total: { $sum: { $abs: '$amount' } }
+                    }
+                },
+                { $sort: { _id: 1 } }
+            ]);
+
+            if (results.length === 0) {
+                return this.replyError(ctx, '<b>📥 No profit data to export.</b>');
+            }
+
+            let csv = 'Date,Revenue\n';
+            for (const r of results) {
+                csv += `${r._id},${r.total.toFixed(2)}\n`;
+            }
+
+            await this.replySuccess(ctx, `<b>📥 Profit Export (Last 30 Days)</b>\n\n<pre>${csv}</pre>`);
+        } catch (error) {
+            logger.error('Export profits error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to export profits.</b>');
+        }
+    }
+
+    async handleWithdrawProfits(ctx) {
+        let address = 'N/A';
+        try {
+            if (this.walletService?.getMasterAddress) {
+                address = this.walletService.getMasterAddress();
+            }
+        } catch (error) {
+            logger.warn('Failed to get master address', { error: error.message });
+        }
+
+        await this.replySuccess(ctx, `
+<b>💸 Withdraw Profits</b>
+
+To withdraw, send USDT from your master wallet manually or use your wallet app.
+
+<b>Master Address:</b> <code>${address}</code>
+
+⚠️ <i>Always keep some BNB for gas fees.</i>
+        `, { parse_mode: 'HTML' });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  SYSTEM STATUS
+    // ═══════════════════════════════════════════════════════════
+
+    async handleSystem(ctx) {
+        try {
+            let masterBalance = { usdt: 'N/A', bnb: 'N/A' };
+            let address = 'N/A';
+            try {
+                if (this.walletService?.getMasterBalance) {
+                    masterBalance = await this.walletService.getMasterBalance();
+                }
+                if (this.walletService?.getMasterAddress) {
+                    address = this.walletService.getMasterAddress();
+                }
+            } catch (error) {
+                logger.warn('Failed to get master data for system status', { error: error.message });
+            }
+
+            const uptime = process.uptime();
+            const hours = Math.floor(uptime / 3600);
+            const mins = Math.floor((uptime % 3600) / 60);
+
+            const message = `
+<b>⚙️ System Status</b>
+
+🖥 <b>Server:</b> Online
+💾 <b>Database:</b> Connected
+⏱ <b>Uptime:</b> <code>${hours}h ${mins}m</code>
+
+<b>💎 Master Wallet:</b>
+• Address: <code>${address}</code>
+• USDT: <code>${masterBalance.usdt}</code>
+• BNB: <code>${masterBalance.bnb}</code>
+
+<b>📊 Memory:</b>
+• Used: <code>${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB</code>
+• Total: <code>${(process.memoryUsage().heapTotal / 1024 / 1024).toFixed(2)} MB</code>
+• RSS: <code>${(process.memoryUsage().rss / 1024 / 1024).toFixed(2)} MB</code>
+
+<b>🔧 Node.js:</b> <code>${process.version}</code>
+            `;
+
+            await this.replySuccess(ctx, message);
+        } catch (error) {
+            logger.error('System status error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to load system status.</b>');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ADMIN LOGS
+    // ═══════════════════════════════════════════════════════════
+
+    async handleLogs(ctx) {
+        try {
+            const logs = await AdminLog.find()
+                .sort({ timestamp: -1 })
+                .limit(20)
+                .lean();
+
+            let message = '<b>📋 Admin Logs</b> (Last 20)\n\n';
+
+            if (logs.length === 0) {
+                message += '<i>No logs yet.</i>';
+            } else {
+                for (const log of logs) {
+                    const time = log.timestamp ? new Date(log.timestamp).toLocaleString() : 'N/A';
+                    const details = JSON.stringify(log.details || {}).substring(0, 100);
+                    message += `<b>[${time}]</b>\n`;
+                    message += `👤 <code>${log.adminId}</code> → <b>${log.action}</b>\n`;
+                    message += `🎯 ${log.targetUserId ? `<code>${log.targetUserId}</code>` : 'N/A'}\n`;
+                    message += `📄 <code>${details}</code>\n\n`;
+                }
+            }
+
+            await this.replySuccess(ctx, message);
+        } catch (error) {
+            logger.error('Logs error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load logs.</b>');
+        }
+                        }
+                                   // ═══════════════════════════════════════════════════════════
+    //  BROADCAST (Fixed Flow)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleBroadcastCommand(ctx) {
+        const args = ctx.message.text.split(' ').slice(1);
+        const message = args.join(' ');
+
+        if (!message) {
+            return this.handleBroadcastMenu(ctx);
+        }
+
+        // Direct broadcast to all users
+        await this.executeBroadcast(ctx, {}, 'All Users', message);
+    }
+
+    async handleBroadcastMenu(ctx) {
+        try {
+            const stats = await this.getBroadcastStats();
+
+            await this.replySuccess(ctx, `
+<b>📢 Broadcast Menu</b>
+
+<b>👥 Audience Stats:</b>
+• Total Users: <code>${stats.total}</code>
+• VIP Users: <code>${stats.vip}</code>
+• Paying Users: <code>${stats.paying}</code>
+• Recent (7d): <code>${stats.recent}</code>
+
+<i>Select target audience or type /broadcast &lt;message&gt; to send to all immediately.</i>
+            `, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('📨 All Users', 'broadcast_all')],
+                    [Markup.button.callback('👑 VIP Only', 'broadcast_vip')],
+                    [Markup.button.callback('💰 Paying Users', 'broadcast_paying')],
+                    [Markup.button.callback('🆕 Recent (7d)', 'broadcast_recent')],
+                    [Markup.button.callback('❌ Cancel', 'broadcast_cancel')],
+                    [Markup.button.callback('🔙 Back', 'admin')]
+                ]).reply_markup
+            });
+        } catch (error) {
+            logger.error('Broadcast menu error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load broadcast menu.</b>');
+        }
+    }
+
+    async getBroadcastStats() {
+        const now = new Date();
+        const weekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
+
+        const [total, vip, paying, recent] = await Promise.all([
+            User.countDocuments({ isBlacklisted: false }),
+            User.countDocuments({ isBlacklisted: false, vipExpiry: { $gt: now } }),
+            User.countDocuments({ isBlacklisted: false, balance: { $gt: 0 } }),
+            User.countDocuments({ isBlacklisted: false, createdAt: { $gte: weekAgo } })
+        ]);
+
+        return { total, vip, paying, recent };
+    }
+
+    async executeBroadcast(ctx, filter, label, forcedMessage = null) {
+        try {
+            // If no message provided, ask admin to type it
+            if (!forcedMessage) {
+                if (!ctx.session) ctx.session = {};
+                ctx.session.awaitingBroadcast = { target: label, filter, label };
+                return this.replySuccess(ctx, `
+<b>📢 Broadcast to ${label}</b>
+
+Send the message you want to broadcast to <code>${label}</code>.
+
+<i>Type your message and send it. It will be delivered to all matching users.</i>
+                `);
+            }
+
+            // Acknowledge callback if present
+            if (ctx.answerCbQuery) {
+                await ctx.answerCbQuery(`Broadcasting to ${label}...`).catch(() => {});
+            }
+
+            const query = { isBlacklisted: false, ...filter };
+            const users = await User.find(query).select('userId').lean();
+            const results = { sent: 0, failed: 0, total: users.length };
+            const delay = 50; // ms between messages
+            const batchSize = 30;
+
+            logger.info('Broadcast started', { targetCount: users.length, label, filter });
+
+            for (let i = 0; i < users.length; i += batchSize) {
+                const batch = users.slice(i, i + batchSize);
+
+                await Promise.all(batch.map(async (user) => {
+                    try {
+                        await ctx.telegram.sendMessage(user.userId, `
+<b>📢 ${label}</b>
+
+${forcedMessage}
+
+---
+<i>OTP Bot Team</i>
+                        `, { parse_mode: 'HTML', disable_notification: false });
+                        results.sent++;
+                    } catch (error) {
+                        results.failed++;
+                        if (error.response?.error_code === 403) {
+                            // User blocked bot
+                            await User.updateOne({ userId: user.userId }, { $set: { blockedBot: true, isBlacklisted: true } }).catch(() => {});
+                        }
+                        logger.warn('Broadcast failed for user', { userId: user.userId, error: error.message });
+                    }
+                }));
+
+                // Rate limit protection between batches
+                if (i + batchSize < users.length) {
+                    await new Promise(r => setTimeout(r, 1000));
+                }
+
+                // Progress update every 5 batches
+                if ((i / batchSize) % 5 === 0 && i > 0) {
+                    await ctx.reply(`⏳ Broadcast progress: ${results.sent}/${results.total} sent...`).catch(() => {});
+                }
+            }
+
+            logger.info('Broadcast completed', results);
+
+            await this.replySuccess(ctx, `
+<b>📢 Broadcast Complete!</b>
+
+<b>Target:</b> <code>${label}</code>
+<b>Total:</b> <code>${results.total}</code>
+<b>✅ Sent:</b> <code>${results.sent}</code>
+<b>❌ Failed:</b> <code>${results.failed}</code>
+<b>Success Rate:</b> <code>${results.total > 0 ? ((results.sent / results.total) * 100).toFixed(1) : 0}%</code>
+            `);
+
+        } catch (error) {
+            logger.error('Broadcast execution error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Broadcast failed.</b>\n\nPlease check the logs.');
+        }
+    }
+
+    async handleBroadcastAll(ctx) {
+        await this.executeBroadcast(ctx, {}, 'All Users');
+    }
+
+    async handleBroadcastVip(ctx) {
+        const now = new Date();
+        await this.executeBroadcast(ctx, { vipExpiry: { $gt: now } }, 'VIP Users');
+    }
+
+    async handleBroadcastPaying(ctx) {
+        await this.executeBroadcast(ctx, { balance: { $gt: 0 } }, 'Paying Users');
+    }
+
+    async handleBroadcastRecent(ctx) {
+        const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        await this.executeBroadcast(ctx, { createdAt: { $gte: weekAgo } }, 'Recent Users');
+    }
+
+    async handleBroadcastCancel(ctx) {
+        if (ctx.session) {
+            delete ctx.session.awaitingBroadcast;
+        }
+        if (ctx.answerCbQuery) await ctx.answerCbQuery('Cancelled').catch(() => {});
+        await this.replySuccess(ctx, '❌ <b>Broadcast cancelled.</b>');
+                                                  }
+            
