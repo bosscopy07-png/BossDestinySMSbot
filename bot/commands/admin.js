@@ -146,7 +146,7 @@ class AdminCommands {
     }
 
     // ─── Admin middleware ───
-    get requireAdmin() {
+    requireAdmin() {
         return async (ctx, next) => {
             const adminIds = (config.bot?.adminId || '')
                 .toString()
@@ -165,7 +165,7 @@ class AdminCommands {
     }
 
     // ─── Maintenance middleware ───
-    get maintenanceGuard() {
+    maintenanceGuard() {
         return async (ctx, next) => {
             const adminIds = (config.bot?.adminId || '')
                 .toString()
@@ -198,89 +198,92 @@ class AdminCommands {
         } catch (error) {
             logger.error('Failed to log admin action', { adminId, action, error: error.message });
         }
-            }
-                           _registerCommands() {
+    }
+
+    _registerCommands() {
         // ─── Slash Commands ───
-        this.bot.command('admin', this.requireAdmin, this.handleAdmin.bind(this));
-        this.bot.command('users', this.requireAdmin, this.handleUsers.bind(this));
-        this.bot.command('user', this.requireAdmin, this.handleUserDetail.bind(this));
-        this.bot.command('profits', this.requireAdmin, this.handleProfits.bind(this));
-        this.bot.command('addbalance', this.requireAdmin, this.handleAddBalance.bind(this));
-        this.bot.command('deductbalance', this.requireAdmin, this.handleDeductBalance.bind(this));
-        this.bot.command('blacklist', this.requireAdmin, this.handleBlacklist.bind(this));
-        this.bot.command('whitelist', this.requireAdmin, this.handleWhitelist.bind(this));
-        this.bot.command('broadcast', this.requireAdmin, this.handleBroadcastCommand.bind(this));
-        this.bot.command('system', this.requireAdmin, this.handleSystem.bind(this));
-        this.bot.command('logs', this.requireAdmin, this.handleLogs.bind(this));
-        this.bot.command('approve_referral', this.requireAdmin, this.handleApproveReferral.bind(this));
-        this.bot.command('reject_referral', this.requireAdmin, this.handleRejectReferral.bind(this));
-        this.bot.command('master_balance', this.requireAdmin, this.handleMasterBalance.bind(this));
-        this.bot.command('withdraw_profits', this.requireAdmin, this.handleWithdrawProfits.bind(this));
-        this.bot.command('setprice', this.requireAdmin, this.handleSetPrice.bind(this));
-        this.bot.command('setvip', this.requireAdmin, this.handleSetVip.bind(this));
-        this.bot.command('setfree', this.requireAdmin, this.handleSetFree.bind(this));
-        this.bot.command('toggleprovider', this.requireAdmin, this.handleToggleProvider.bind(this));
-        this.bot.command('export_users', this.requireAdmin, this.handleExportUsers.bind(this));
-        this.bot.command('export_transactions', this.requireAdmin, this.handleExportTransactions.bind(this));
-        this.bot.command('message_user', this.requireAdmin, this.handleMessageUser.bind(this));
+        this.bot.command('admin', this.requireAdmin(), this.handleAdmin.bind(this));
+        this.bot.command('users', this.requireAdmin(), this.handleUsers.bind(this));
+        this.bot.command('user', this.requireAdmin(), this.handleUserDetail.bind(this));
+        this.bot.command('profits', this.requireAdmin(), this.handleProfits.bind(this));
+        this.bot.command('addbalance', this.requireAdmin(), this.handleAddBalance.bind(this));
+        this.bot.command('deductbalance', this.requireAdmin(), this.handleDeductBalance.bind(this));
+        this.bot.command('blacklist', this.requireAdmin(), this.handleBlacklist.bind(this));
+        this.bot.command('whitelist', this.requireAdmin(), this.handleWhitelist.bind(this));
+        this.bot.command('broadcast', this.requireAdmin(), this.handleBroadcastCommand.bind(this));
+        this.bot.command('system', this.requireAdmin(), this.handleSystem.bind(this));
+        this.bot.command('logs', this.requireAdmin(), this.handleLogs.bind(this));
+        this.bot.command('approve_referral', this.requireAdmin(), this.handleApproveReferral.bind(this));
+        this.bot.command('reject_referral', this.requireAdmin(), this.handleRejectReferral.bind(this));
+        this.bot.command('master_balance', this.requireAdmin(), this.handleMasterBalance.bind(this));
+        this.bot.command('withdraw_profits', this.requireAdmin(), this.handleWithdrawProfits.bind(this));
+        this.bot.command('setprice', this.requireAdmin(), this.handleSetPrice.bind(this));
+        this.bot.command('setvip', this.requireAdmin(), this.handleSetVip.bind(this));
+        this.bot.command('setfree', this.requireAdmin(), this.handleSetFree.bind(this));
+        this.bot.command('toggleprovider', this.requireAdmin(), this.handleToggleProvider.bind(this));
+        this.bot.command('export_users', this.requireAdmin(), this.handleExportUsers.bind(this));
+        this.bot.command('export_transactions', this.requireAdmin(), this.handleExportTransactions.bind(this));
+        this.bot.command('message_user', this.requireAdmin(), this.handleMessageUser.bind(this));
 
         // ─── Callback Actions ───
-        this.bot.action('admin_users', this.requireAdmin, this.handleUsers.bind(this));
-        this.bot.action('admin_profits', this.requireAdmin, this.handleProfits.bind(this));
-        this.bot.action('admin_system', this.requireAdmin, this.handleSystem.bind(this));
-        this.bot.action('admin_logs', this.requireAdmin, this.handleLogs.bind(this));
-        this.bot.action('admin_broadcast', this.requireAdmin, this.handleBroadcastMenu.bind(this));
-        this.bot.action('admin_settings', this.requireAdmin, this.handleSettings.bind(this));
-        this.bot.action('admin', this.requireAdmin, this.handleAdmin.bind(this));
+        this.bot.action('admin_users', this.requireAdmin(), this.handleUsers.bind(this));
+        this.bot.action('admin_profits', this.requireAdmin(), this.handleProfits.bind(this));
+        this.bot.action('admin_system', this.requireAdmin(), this.handleSystem.bind(this));
+        this.bot.action('admin_logs', this.requireAdmin(), this.handleLogs.bind(this));
+        this.bot.action('admin_broadcast', this.requireAdmin(), this.handleBroadcastMenu.bind(this));
+        this.bot.action('admin_settings', this.requireAdmin(), this.handleSettings.bind(this));
+        this.bot.action('admin', this.requireAdmin(), this.handleAdmin.bind(this));
 
         // Broadcast targets
-        this.bot.action('broadcast_all', this.requireAdmin, this.handleBroadcastAll.bind(this));
-        this.bot.action('broadcast_vip', this.requireAdmin, this.handleBroadcastVip.bind(this));
-        this.bot.action('broadcast_paying', this.requireAdmin, this.handleBroadcastPaying.bind(this));
-        this.bot.action('broadcast_recent', this.requireAdmin, this.handleBroadcastRecent.bind(this));
-        this.bot.action('broadcast_cancel', this.requireAdmin, this.handleBroadcastCancel.bind(this));
+        this.bot.action('broadcast_all', this.requireAdmin(), this.handleBroadcastAll.bind(this));
+        this.bot.action('broadcast_vip', this.requireAdmin(), this.handleBroadcastVip.bind(this));
+        this.bot.action('broadcast_paying', this.requireAdmin(), this.handleBroadcastPaying.bind(this));
+        this.bot.action('broadcast_recent', this.requireAdmin(), this.handleBroadcastRecent.bind(this));
+        this.bot.action('broadcast_cancel', this.requireAdmin(), this.handleBroadcastCancel.bind(this));
 
         // Settings submenus
-        this.bot.action('settings_prices', this.requireAdmin, this.handleSettingsPrices.bind(this));
-        this.bot.action('settings_vip', this.requireAdmin, this.handleSettingsVip.bind(this));
-        this.bot.action('settings_free', this.requireAdmin, this.handleSettingsFree.bind(this));
-        this.bot.action('settings_providers', this.requireAdmin, this.handleSettingsProviders.bind(this));
-        this.bot.action('settings_maintenance', this.requireAdmin, this.handleSettingsMaintenance.bind(this));
+        this.bot.action('settings_prices', this.requireAdmin(), this.handleSettingsPrices.bind(this));
+        this.bot.action('settings_vip', this.requireAdmin(), this.handleSettingsVip.bind(this));
+        this.bot.action('settings_free', this.requireAdmin(), this.handleSettingsFree.bind(this));
+        this.bot.action('settings_providers', this.requireAdmin(), this.handleSettingsProviders.bind(this));
+        this.bot.action('settings_maintenance', this.requireAdmin(), this.handleSettingsMaintenance.bind(this));
 
         // Profit actions
-        this.bot.action('export_profits', this.requireAdmin, this.handleExportProfits.bind(this));
-        this.bot.action('withdraw_profits', this.requireAdmin, this.handleWithdrawProfits.bind(this));
+        this.bot.action('export_profits', this.requireAdmin(), this.handleExportProfits.bind(this));
+        this.bot.action('withdraw_profits', this.requireAdmin(), this.handleWithdrawProfits.bind(this));
 
         // Pagination
-        this.bot.action(/admin_users_(\d+)/, this.requireAdmin, (ctx) => {
+        this.bot.action(/admin_users_(\d+)/, this.requireAdmin(), (ctx) => {
             ctx.match = ctx.match || [null, ctx.callbackQuery.data.match(/admin_users_(\d+)/)?.[1]];
             return this.handleUsers(ctx);
         });
 
         // User detail actions
-        this.bot.action(/user_detail_(.+)/, this.requireAdmin, (ctx) => {
+        this.bot.action(/user_detail_(.+)/, this.requireAdmin(), (ctx) => {
             const userId = ctx.match[1];
             return this.showUserDetailInline(ctx, userId);
         });
 
-        this.bot.action(/addbal_(.+)/, this.requireAdmin, this.handleAddBalanceAction.bind(this));
-        this.bot.action(/dedbal_(.+)/, this.requireAdmin, this.handleDeductBalanceAction.bind(this));
-        this.bot.action(/bl_(.+)/, this.requireAdmin, this.handleBlacklistAction.bind(this));
-        this.bot.action(/wl_(.+)/, this.requireAdmin, this.handleWhitelistAction.bind(this));
-        this.bot.action(/msg_(.+)/, this.requireAdmin, this.handleMessageUserAction.bind(this));
-        this.bot.action(/ban_(.+)/, this.requireAdmin, this.handleBanAction.bind(this));
-        this.bot.action(/unban_(.+)/, this.requireAdmin, this.handleUnbanAction.bind(this));
-        this.bot.action(/viewtx_(.+)/, this.requireAdmin, this.handleViewUserTransactions.bind(this));
-        this.bot.action(/viewsess_(.+)/, this.requireAdmin, this.handleViewUserSessions.bind(this));
-        this.bot.action(/back_user_(.+)/, this.requireAdmin, (ctx) => {
+        this.bot.action(/addbal_(.+)/, this.requireAdmin(), this.handleAddBalanceAction.bind(this));
+        this.bot.action(/dedbal_(.+)/, this.requireAdmin(), this.handleDeductBalanceAction.bind(this));
+        this.bot.action(/bl_(.+)/, this.requireAdmin(), this.handleBlacklistAction.bind(this));
+        this.bot.action(/wl_(.+)/, this.requireAdmin(), this.handleWhitelistAction.bind(this));
+        this.bot.action(/msg_(.+)/, this.requireAdmin(), this.handleMessageUserAction.bind(this));
+        this.bot.action(/ban_(.+)/, this.requireAdmin(), this.handleBanAction.bind(this));
+        this.bot.action(/unban_(.+)/, this.requireAdmin(), this.handleUnbanAction.bind(this));
+        this.bot.action(/viewtx_(.+)/, this.requireAdmin(), this.handleViewUserTransactions.bind(this));
+        this.bot.action(/viewsess_(.+)/, this.requireAdmin(), this.handleViewUserSessions.bind(this));
+        this.bot.action(/back_user_(.+)/, this.requireAdmin(), (ctx) => {
             return this.showUserDetailInline(ctx, ctx.match[1]);
         });
-        this.bot.action(/back_users_(\d+)/, this.requireAdmin, (ctx) => {
+        this.bot.action(/back_users_(\d+)/, this.requireAdmin(), (ctx) => {
             ctx.match = [null, ctx.match[1]];
             return this.handleUsers(ctx);
         });
     }
-
+    }
+            
+ 
     // ═══════════════════════════════════════════════════════════
     //  NEW FEATURE: BUTTON FLOWS REGISTRATION
     // ═══════════════════════════════════════════════════════════
