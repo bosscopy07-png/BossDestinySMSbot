@@ -20,29 +20,53 @@ class AdminCommands {
     }
 
     // ─── Load persisted settings on init ───
-    async _loadSettings() {
-        try {
-            const settings = await Settings.findOne();
-            if (settings) {
-                Object.assign(config, settings.toObject());
-                logger.info('Admin settings loaded from DB');
-            }
-        } catch (error) {
-            logger.warn('Failed to load settings from DB', { error: error.message });
-        }
-    }
 
+// AFTER:
+async _loadSettings() {
+    try {
+        const settings = await Settings.findOne().lean();
+        if (settings) {
+            const { _id, __v, ...settingsData } = settings;  // ← DESTRUCTURE OUT _id
+            Object.assign(config, settingsData);
+            logger.info('Admin settings loaded from DB');
+        }
+    } catch (error) {
+        logger.warn('Failed to load settings from DB', { error: error.message });
+    }
+    }
+    
     
         // ─── Persist settings to DB (uses Settings.merge for nested updates) ───
-    async _saveSettings() {
-        try {
-            await Settings.merge(config);
-            logger.info('Admin settings saved to DB');
-        } catch (error) {
-            logger.error('Failed to save settings', { error: error.message });
-            throw error; // Re-throw so caller knows it failed
+    
+async _saveSettings() {
+    try {
+        // Clone config and remove MongoDB-reserved fields
+        const settingsToSave = { ...config };
+        delete settingsToSave._id;           // ← REMOVE MongoDB _id
+        delete settingsToSave.__v;           // ← REMOVE version key if present
+        
+        // Also remove any non-serializable or unwanted top-level keys
+        const allowedKeys = ['prices', 'limits', 'providers', 'maintenance', 'registrationOpen', 'broadcast', 'referral'];
+        const cleaned = {};
+        for (const key of allowedKeys) {
+            if (settingsToSave[key] !== undefined) {
+                cleaned[key] = settingsToSave[key];
+            }
         }
+
+        await Settings.findOneAndUpdate(
+            {},
+            { $set: cleaned },
+            { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+        
+        logger.info('Admin settings saved to DB');
+    } catch (error) {
+        logger.error('Failed to save settings', { error: error.message });
+        throw error;
     }
+                }
+    
     
 
     // ─── Image reply helpers ───
