@@ -4,12 +4,12 @@ const transactionSchema = new mongoose.Schema({
     txId: {
         type: String,
         required: true,
-        unique: true    // ← Auto-creates unique index. NO explicit schema.index() for txId!
+        unique: true    // Auto-creates unique index — NO explicit schema.index() for txId!
     },
     userId: {
         type: String,
         required: true,
-        index: true     // ← Inline single-field index
+        index: true
     },
     
     // Transaction Details
@@ -23,8 +23,8 @@ const transactionSchema = new mongoose.Schema({
             'VIP_SUBSCRIPTION',
             'REFERRAL_REWARD',
             'REFUND',
-            'ADMIN_ADD',        // ← Aligned with AdminCommands
-            'ADMIN_DEDUCT',     // ← Aligned with AdminCommands
+            'ADMIN_ADD',
+            'ADMIN_DEDUCT',
             'WITHDRAWAL'
         ],
         required: true,
@@ -49,7 +49,11 @@ const transactionSchema = new mongoose.Schema({
     
     // Blockchain (for deposits)
     blockchain: {
-        txHash: { type: String, default: null, index: true },   // ← Inline for lookups
+        txHash: { 
+            type: String, 
+            default: null
+            // NO inline index here — handled by compound index below with sparse: true
+        },
         blockNumber: { type: Number, default: null },
         confirmations: { type: Number, default: 0 },
         fromAddress: { type: String, default: null },
@@ -102,9 +106,9 @@ transactionSchema.index({ status: 1, type: 1, createdAt: -1 });
 // Revenue calculations: completed transactions by type within date range
 transactionSchema.index({ type: 1, status: 1, createdAt: 1 });
 
-// Deposit tracking: find by txHash (sparse not needed since inline index handles nulls)
-// Note: txHash has inline index above. Compound for deposit scanner:
-transactionSchema.index({ 'blockchain.txHash': 1, status: 1 });
+// Deposit tracking: sparse compound index to match existing DB index
+transactionSchema.index({ 'blockchain.txHash': 1 }, { sparse: true });
+transactionSchema.index({ 'blockchain.txHash': 1, status: 1 }, { sparse: true });
 
 // Admin log: transactions processed by admin
 transactionSchema.index({ processedBy: 1, createdAt: -1 });
@@ -168,4 +172,4 @@ transactionSchema.statics.getPendingDepositsCount = async function() {
 const Transaction = mongoose.model('Transaction', transactionSchema);
 
 export default Transaction;
-    
+        
