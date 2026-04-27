@@ -424,11 +424,431 @@ class AdminCommands {
             // ─── Awaiting message to user ───
             if (ctx.session.awaitingMessageUser) {
                 const targetId = ctx.session.awaitingMessageUser;
-                delete ctx.session.a
+                delete ctx.session.awaitingMessageUser;
+                this._clearAdminState(ctx);
+                return this.processMessageUser(ctx, targetId, ctx.message.text);
+            }
 
+            // ═══════════════════════════════════════════════════════
+            //  NEW FEATURE: BUTTON FLOW HANDLERS
+            // ═══════════════════════════════════════════════════════
 
+            // ─── Search query ───
+            if (state === ADMIN_STATE.AWAITING_SEARCH_QUERY) {
+                this._clearAdminState(ctx);
+                return this.executeSearch(ctx, ctx.message.text.trim(), data.mode);
+            }
 
+            // ─── Reset Free user ID ───
+            if (state === ADMIN_STATE.AWAITING_RESET_FREE_USER) {
+                const userId = ctx.message.text.trim();
+                this._clearAdminState(ctx);
+                return this.showResetFreeConfirm(ctx, userId);
+            }
 
+            // ─── Give VIP user ID ───
+            if (state === ADMIN_STATE.AWAITING_GIVE_VIP_USER) {
+                const userId = ctx.message.text.trim();
+                this._clearAdminState(ctx);
+                return this.showGiveVipDaysInput(ctx, userId);
+            }
+
+            // ─── Give VIP days ───
+            if (state === ADMIN_STATE.AWAITING_GIVE_VIP_DAYS) {
+                const days = parseInt(ctx.message.text.trim());
+                this._clearAdminState(ctx);
+                if (isNaN(days) || days <= 0) {
+                    return this.replyError(ctx, '❌ <b>Invalid days.</b>\n\nMust be a positive integer.');
+                }
+                return this.executeGiveVip(ctx, data.userId, days);
+            }
+
+            return next();
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  SYSTEM STATS HELPER (NEW — fixes getSystemStats undefined)
+    // ═══════════════════════════════════════════════════════════
+
+    async getSystemStats() {
+        try {
+            const now = new Date();
+            const dayAgo = new Date(now - 24 * 60 * 60 * 1000);
+            const weekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
+            const monthAgo = new Date(now - 30 * 24 * 60 * 60 * 1000);
+
+            const [
+                revenue24h,
+                revenue7d,
+                revenue30d,
+                totalUsers,
+                payingUsers,
+                vipUsers,
+                activeToday,
+                otpRequests24h,
+                otpSuccess24h,
+                otpFailed24h
+            ] = await Promise.all([
+                this.calculateRevenue(dayAgo),
+                this.calculateRevenue(weekAgo),
+                this.calculateRevenue(monthAgo),
+                User.countDocuments(),
+                User.countDocuments({ balance: { $gt: 0 } }),
+                User.countDocuments({ vipExpiry: { $gt: now } }),
+                User.countDocuments({ lastActive: { $gte: dayAgo } }),
+                Session.countDocuments({ startTime: { $gte: dayAgo } }),
+                Session.countDocuments({ status: 'RECEIVED', startTime: { $gte: dayAgo } }),
+                Session.countDocuments({ status: { $in: ['TIMEOUT', 'CANCELLED', 'FAILED'] }, startTime: { $gte: dayAgo } })
+            ]);
+
+            const successRate24h = otpRequests24h > 0 ? ((otpSuccess24h / otpRequests24h) * 100).toFixed(1) : 0;
+
+            let masterBalance = 0;
+            try {
+                if (this.walletService?.getMasterBalance) {
+                    const bal = await this.walletService.getMasterBalance();
+                    masterBalance = typeof bal?.usdt === 'number' ? bal.usdt : 0;
+                }
+            } catch (error) {
+                logger.warn('Failed to get master balance for stats', { error: error.message });
+            }
+
+            const uptime = process.uptime();
+            const hours = Math.floor(uptime / 3600);
+            const mins = Math.floor((uptime % 3600) / 60);
+
+            return {
+                revenue24h,
+                revenue7d,
+                revenue30d,
+                totalUsers,
+                payingUsers,
+                vipUsers,
+                activeToday,
+                otpRequests24h,
+                otpSuccess24h,
+                otpFailed24h,
+                successRate24h,
+                masterBalance,
+                uptime: `${hours}h ${mins}m`
+            };
+        } catch (error) {
+            logger.error('Get system stats error', { error: error.message, stack: error.stack });
+            // Return safe defaults so dashboard doesn't crash
+            return {
+                revenue24h: 0, revenue7d: 0, revenue30d: 0,
+                totalUsers: 0, payingUsers: 0, vipUsers: 0, activeToday: 0,
+                otpRequests24h: 0, otpSuccess24h: 0, otpFailed24h: 0,
+                successRate24h: 0, masterBalance: 0, uptime: '0h 0m'
+            };
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  REVENUE CALCULATOR (NEW — fixes calculateRevenue undefined)
+    // ═══════════════════════════════════════════════════════════
+
+    async calculateRevenue(since) {
+        try {
+            const result = await Transaction.aggregate([
+                {
+                    $match: {
+                        type: { $in: [TX_TYPES.CHEAP_OTP, TX_TYPES.BUNDLE_PURCHASE, TX_TYPES.VIP_SUBSCRIPTION] },
+                        status: 'COMPLETED',
+                        createdAt: { $gte: since }
+                    }
+                },
+                {
+                    $group: {
+                        _id: null,
+                        total: { $sum: { $abs: '$amount' } }
+                    }
+                }
+            ]);
+            return result[0]?.total || 0;
+        } catch (error) {
+            logger.error('Calculate revenue error', { error: error.message, since });
+            return 0;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  DASHBOARD (Updated with new feature buttons)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleAdmin(ctx) {
+        try {
+            const stats = await this.getSystemStats();
+
+            const message = `
+<b>🔐 Admin Dashboard</b>
+
+<b>📊 Revenue</b>
+• 24h: <code>${formatCurrency(stats.revenue24h)}</code>
+• 7d: <code>${formatCurrency(stats.revenue7d)}</code>
+• 30d: <code>${formatCurrency(stats.revenue30d)}</code>
+
+<b>👥 Users</b>
+• Total: <code>${stats.totalUsers}</code>
+• Paying: <code>${stats.payingUsers}</code>
+• VIP: <code>${stats.vipUsers}</code>
+• Active Today: <code>${stats.activeToday}</code>
+
+<b>📈 OTP Stats (24h)</b>
+• Requests: <code>${stats.otpRequests24h}</code>
+• Success: <code>${stats.otpSuccess24h}</code> (${stats.successRate24h}%)
+• Failed: <code>${stats.otpFailed24h}</code>
+
+<b>⚡ System</b>
+• Master Balance: <code>${formatCurrency(stats.masterBalance)}</code>
+• Uptime: <code>${stats.uptime}</code>
+• Maintenance: <code>${config.maintenance ? '🔴 ON' : '🟢 OFF'}</code>
+            `;
+
+            const keyboard = Markup.inlineKeyboard([
+                [
+                    Markup.button.callback('👥 Users', 'admin_users'),
+                    Markup.button.callback('💰 Profits', 'admin_profits')
+                ],
+                [
+                    Markup.button.callback('⚙️ System', 'admin_system'),
+                    Markup.button.callback('📋 Logs', 'admin_logs')
+                ],
+                [
+                    Markup.button.callback('📢 Broadcast', 'admin_broadcast'),
+                    Markup.button.callback('🔧 Settings', 'admin_settings')
+                ],
+                // ─── NEW FEATURE BUTTONS ───
+                [
+                    Markup.button.callback('🔍 Search', 'admin_search'),
+                    Markup.button.callback('🏆 Top Users', 'admin_topusers')
+                ],
+                [
+                    Markup.button.callback('📊 Daily Report', 'admin_dailyreport'),
+                    Markup.button.callback('🔄 Reset Free', 'admin_resetfree')
+                ],
+                [
+                    Markup.button.callback('👑 Give VIP', 'admin_givevip')
+                ]
+            ]);
+
+            await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+        } catch (error) {
+            logger.error('Admin dashboard error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to load admin dashboard.</b>\n\nPlease check the logs for details.');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  USERS LIST (NEW — fixes handleUsers undefined / bind crash)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleUsers(ctx) {
+        try {
+            const page = parseInt(ctx.match?.[1]) || 1;
+            const limit = 10;
+            const skip = (page - 1) * limit;
+
+            const [users, totalUsers] = await Promise.all([
+                User.find()
+                    .sort({ createdAt: -1 })
+                    .skip(skip)
+                    .limit(limit)
+                    .lean(),
+                User.countDocuments()
+            ]);
+
+            const totalPages = Math.ceil(totalUsers / limit) || 1;
+
+            if (!users.length) {
+                return this.replyError(ctx, '<b>👥 No users found.</b>', {
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🔙 Back', 'admin')]
+                    ]).reply_markup
+                });
+            }
+
+            let message = `<b>👥 Users</b> (Page ${page} of ${totalPages}) — Total: <code>${totalUsers}</code>\n\n`;
+            const buttons = [];
+
+            for (const user of users) {
+                const status = user.isBlacklisted ? '🔴' :
+                    (user.vipExpiry && new Date(user.vipExpiry) > new Date()) ? '👑' :
+                        user.balance > 0 ? '💰' : '🆓';
+
+                const displayName = user.username ? `@${user.username}` : (user.firstName || 'Unknown');
+                message += `${status} <b>${displayName}</b> — <code>${user.userId}</code>\n`;
+                message += `   Balance: <code>${formatCurrency(user.balance)}</code> | Joined: ${user.createdAt ? new Date(user.createdAt).toLocaleDateString() : 'N/A'}\n\n`;
+
+                buttons.push([Markup.button.callback(
+                    `${status} View ${displayName.substring(0, 20)}`,
+                    `user_detail_${user.userId}`
+                )]);
+            }
+
+            // Pagination
+            const navButtons = [];
+            if (page > 1) {
+                navButtons.push(Markup.button.callback('⬅️ Prev', `admin_users_${page - 1}`));
+            }
+            if (skip + users.length < totalUsers) {
+                navButtons.push(Markup.button.callback('Next ➡️', `admin_users_${page + 1}`));
+            }
+            if (navButtons.length) {
+                buttons.push(navButtons);
+            }
+
+            buttons.push([Markup.button.callback('🔙 Back to Admin', 'admin')]);
+
+            await this.replySuccess(ctx, message, { reply_markup: { inline_keyboard: buttons } });
+        } catch (error) {
+            logger.error('Users list error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to load users.</b>');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  NEW FEATURE: SEARCH USER (Button Flow)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleSearchUserMenu(ctx) {
+        const message = `
+<b>🔍 Search Users</b>
+
+Select search method:
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🆔 By User ID', 'search_by_id')],
+            [Markup.button.callback('👤 By Username', 'search_by_username')],
+            [Markup.button.callback('📝 By Name', 'search_by_name')],
+            [Markup.button.callback('❌ Cancel', 'search_cancel')]
+        ]);
+
+        await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async executeSearch(ctx, query, mode) {
+        try {
+            let searchConditions = [];
+
+            if (mode === 'id') {
+                searchConditions.push({ userId: query });
+            } else if (mode === 'username') {
+                searchConditions.push({ username: { $regex: query, $options: 'i' } });
+            } else if (mode === 'name') {
+                searchConditions.push(
+                    { firstName: { $regex: query, $options: 'i' } },
+                    { lastName: { $regex: query, $options: 'i' } }
+                );
+            }
+
+            const users = await User.find({ $or: searchConditions }).limit(10).lean();
+
+            if (!users.length) {
+                return this.replyError(ctx, '🔍 <b>No users found.</b>\n\nTry a different search term.', {
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🔍 Search Again', 'admin_search')],
+                        [Markup.button.callback('🔙 Back', 'admin')]
+                    ]).reply_markup
+                });
+            }
+
+            let message = `<b>🔍 Search Results</b> (${users.length} found)\n\n`;
+            const buttons = [];
+
+            for (const user of users) {
+                const status = user.isBlacklisted ? '🔴' :
+                    (user.vipExpiry && new Date(user.vipExpiry) > new Date()) ? '👑' :
+                        user.balance > 0 ? '💰' : '🆓';
+
+                const displayName = user.username ? `@${user.username}` : (user.firstName || 'Unknown');
+                message += `${status} <b>${displayName}</b> — <code>${user.userId}</code>\n`;
+                message += `   Balance: <code>${formatCurrency(user.balance)}</code>\n\n`;
+
+                buttons.push([Markup.button.callback(
+                    `${status} View ${displayName.substring(0, 20)}`,
+                    `user_detail_${user.userId}`
+                )]);
+            }
+
+            buttons.push([Markup.button.callback('🔍 Search Again', 'admin_search')]);
+            buttons.push([Markup.button.callback('🔙 Back to Admin', 'admin')]);
+
+            await this.replySuccess(ctx, message, { reply_markup: { inline_keyboard: buttons } });
+        } catch (error) {
+            logger.error('Search user error', { error: error.message, query, mode });
+            await this.replyError(ctx, '❌ <b>Search failed.</b>');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  NEW FEATURE: TOP USERS (Button)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleTopUsers(ctx) {
+        try {
+            const topUsers = await Transaction.aggregate([
+                {
+                    $match: {
+                        type: { $in: [TX_TYPES.CHEAP_OTP, TX_TYPES.BUNDLE_PURCHASE, TX_TYPES.VIP_SUBSCRIPTION] },
+                        status: 'COMPLETED'
+                    }
+                },
+                {
+                    $group: {
+                        _id: '$userId',
+                        totalSpent: { $sum: { $abs: '$amount' } }
+                    }
+                },
+                { $sort: { totalSpent: -1 } },
+                { $limit: 10 }
+            ]);
+
+            if (!topUsers.length) {
+                return this.replyError(ctx, '<b>📊 No spending data yet.</b>', {
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🔙 Back', 'admin')]
+                    ]).reply_markup
+                });
+            }
+
+            const userIds = topUsers.map(u => u._id);
+            const users = await User.find({ userId: { $in: userIds } })
+                .select('userId username firstName balance')
+                .lean();
+
+            const userMap = new Map(users.map(u => [u.userId, u]));
+
+            let message = '<b>🏆 Top 10 Users by Spending</b>\n\n';
+
+            for (let i = 0; i < topUsers.length; i++) {
+                const tu = topUsers[i];
+                const u = userMap.get(tu._id);
+                const name = u?.username ? `@${u.username}` : (u?.firstName || tu._id);
+                const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '•';
+                message += `${medal} <b>${name}</b>\n`;
+                message += `   Spent: <code>${formatCurrency(tu.totalSpent)}</code> | Balance: <code>${formatCurrency(u?.balance || 0)}</code>\n\n`;
+            }
+
+            await this.replySuccess(ctx, message, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔙 Back', 'admin')]
+                ]).reply_markup
+            });
+        } catch (error) {
+            logger.error('Top users error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load top users.</b>');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  NEW FEATURE: DAILY REPORT (Button)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleDailyReport(ctx) {
+       
 
 
 
@@ -919,4 +1339,522 @@ You can now use the bot normally.
 
     async handleUnbanAction(ctx) {
         const targetId = ctx.match[1];
-        
+        await this.processWhitelist(ctx, targetId);
+    }
+
+    async handleMessageUser(ctx) {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 3) {
+            return this.replyError(ctx, '❌ <b>Usage:</b> <code>/message_user &lt;user_id&gt; &lt;message&gt;</code>');
+        }
+
+        const targetId = args[1];
+        const messageText = args.slice(2).join(' ');
+        await this.processMessageUser(ctx, targetId, messageText);
+    }
+
+    async handleMessageUserAction(ctx) {
+        const targetId = ctx.match[1];
+        this._ensureSession(ctx);
+        ctx.session.awaitingMessageUser = targetId;
+        await this.replySuccess(ctx, `📨 <b>Message User</b>\n\nSend the message to deliver to user <code>${targetId}</code>:\n\n<i>Type your message and send it.</i>`);
+    }
+
+    async processMessageUser(ctx, targetId, messageText) {
+        try {
+            const user = await User.findOne({ userId: targetId });
+            if (!user) throw new Error('USER_NOT_FOUND');
+
+            await ctx.telegram.sendMessage(targetId, `
+<b>📨 Message from Admin</b>
+
+<i>${messageText}</i>
+
+---
+<i>SWIFTSMS — The fastest SMS Service. Contact us if you need assistance.</i>
+            `, { parse_mode: 'HTML' });
+
+            await this.logAdminAction(
+                ctx.from.id.toString(),
+                'MESSAGE_USER',
+                targetId,
+                { message: messageText.substring(0, 500) }
+            );
+
+            await this.replySuccess(ctx, `✅ <b>Message Sent!</b>\n\nTo: <code>${targetId}</code>\nMessage: <i>${messageText.substring(0, 200)}${messageText.length > 200 ? '...' : ''}</i>`);
+
+        } catch (error) {
+            logger.error('Message user error', { targetId, error: error.message });
+            await this.replyError(ctx, `❌ <b>Error:</b> ${error.message}`);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  PROFITS
+    // ═══════════════════════════════════════════════════════════
+
+    async handleProfits(ctx) {
+        try {
+            const now = new Date();
+            const dayAgo = new Date(now - 24 * 60 * 60 * 1000);
+            const weekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
+            const monthAgo = new Date(now - 30 * 24 * 60 * 60 * 1000);
+
+            const [dayRevenue, weekRevenue, monthRevenue] = await Promise.all([
+                this.calculateRevenue(dayAgo),
+                this.calculateRevenue(weekAgo),
+                this.calculateRevenue(monthAgo)
+            ]);
+
+            let masterBalance = { usdt: 'N/A', bnb: 'N/A', address: 'N/A' };
+            try {
+                if (this.walletService?.getMasterBalance) {
+                    masterBalance = await this.walletService.getMasterBalance();
+                }
+                if (this.walletService?.getMasterAddress) {
+                    masterBalance.address = await this.walletService.getMasterAddress();
+                }
+            } catch (error) {
+                logger.warn('Failed to get master balance for profits', { error: error.message });
+            }
+
+            const message = `
+<b>💰 Profit Analytics</b>
+
+<b>📅 Revenue:</b>
+• 24h: <code>${formatCurrency(dayRevenue)}</code>
+• 7d: <code>${formatCurrency(weekRevenue)}</code>
+• 30d: <code>${formatCurrency(monthRevenue)}</code>
+
+<b>💎 Master Wallet:</b>
+• Address: <code>${masterBalance.address}</code>
+• USDT: <code>${masterBalance.usdt}</code>
+• BNB: <code>${masterBalance.bnb}</code>
+
+<b>📊 By Mode (30d):</b>
+${await this.getRevenueByMode(monthAgo)}
+
+<b>📊 By Service (30d):</b>
+${await this.getRevenueByService(monthAgo)}
+            `;
+
+            await this.replySuccess(ctx, message, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('📥 Export CSV', 'export_profits')],
+                    [Markup.button.callback('💸 Withdraw', 'withdraw_profits')],
+                    [Markup.button.callback('🔙 Back', 'admin')]
+                ]).reply_markup
+            });
+        } catch (error) {
+            logger.error('Profits error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to load profit data.</b>');
+        }
+    }
+
+    async getRevenueByMode(since) {
+        try {
+            const results = await Transaction.aggregate([
+                {
+                    $match: {
+                        type: { $in: [TX_TYPES.CHEAP_OTP, TX_TYPES.BUNDLE_PURCHASE, TX_TYPES.VIP_SUBSCRIPTION] },
+                        status: 'COMPLETED',
+                        createdAt: { $gte: since }
+                    }
+                },
+                {
+                    $group: {
+                        _id: '$type',
+                        total: { $sum: { $abs: '$amount' } }
+                    }
+                }
+            ]);
+            return results.map(r => `• ${r._id}: <code>${formatCurrency(r.total)}</code>`).join('\n') || '<i>No data</i>';
+        } catch (error) {
+            logger.error('Revenue by mode error', { error: error.message });
+            return '<i>Error loading data</i>';
+        }
+    }
+
+    async getRevenueByService(since) {
+        try {
+            const results = await Session.aggregate([
+                {
+                    $match: {
+                        status: 'RECEIVED',
+                        startTime: { $gte: since }
+                    }
+                },
+                {
+                    $group: {
+                        _id: '$service',
+                        count: { $sum: 1 },
+                        revenue: { $sum: '$cost' }
+                    }
+                },
+                { $sort: { revenue: -1 } },
+                { $limit: 5 }
+            ]);
+            return results.map(r => `• ${r._id}: <code>${formatCurrency(r.revenue)}</code> (${r.count} OTPs)`).join('\n') || '<i>No data</i>';
+        } catch (error) {
+            logger.error('Revenue by service error', { error: error.message });
+            return '<i>Error loading data</i>';
+        }
+    }
+
+    async handleExportProfits(ctx) {
+        try {
+            if (ctx.callbackQuery && ctx.answerCbQuery) {
+                await ctx.answerCbQuery('Generating export...').catch(() => {});
+            }
+
+            const monthAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+            const results = await Transaction.aggregate([
+                {
+                    $match: {
+                        type: { $in: [TX_TYPES.CHEAP_OTP, TX_TYPES.BUNDLE_PURCHASE, TX_TYPES.VIP_SUBSCRIPTION] },
+                        status: 'COMPLETED',
+                        createdAt: { $gte: monthAgo }
+                    }
+                },
+                {
+                    $group: {
+                        _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+                        total: { $sum: { $abs: '$amount' } }
+                    }
+                },
+                { $sort: { _id: 1 } }
+            ]);
+
+            if (results.length === 0) {
+                return this.replyError(ctx, '<b>📥 No profit data to export.</b>');
+            }
+
+            let csv = 'Date,Revenue\n';
+            for (const r of results) {
+                csv += `${r._id},${r.total.toFixed(2)}\n`;
+            }
+
+            await this.replySuccess(ctx, `<b>📥 Profit Export (Last 30 Days)</b>\n\n<pre>${csv}</pre>`);
+        } catch (error) {
+            logger.error('Export profits error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to export profits.</b>');
+        }
+    }
+
+    async handleWithdrawProfits(ctx) {
+        let address = 'N/A';
+        try {
+            if (this.walletService?.getMasterAddress) {
+                address = await this.walletService.getMasterAddress();
+            }
+        } catch (error) {
+            logger.warn('Failed to get master address', { error: error.message });
+        }
+
+        await this.replySuccess(ctx, `
+<b>💸 Withdraw Profits</b>
+
+To withdraw, send USDT from your master wallet manually or use your wallet app.
+
+<b>Master Address:</b> <code>${address}</code>
+
+⚠️ <i>Always keep some BNB for gas fees.</i>
+        `, { parse_mode: 'HTML' });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  SYSTEM STATUS
+    // ═══════════════════════════════════════════════════════════
+
+    async handleSystem(ctx) {
+        try {
+            let masterBalance = { usdt: 'N/A', bnb: 'N/A' };
+            let address = 'N/A';
+            try {
+                if (this.walletService?.getMasterBalance) {
+                    masterBalance = await this.walletService.getMasterBalance();
+                }
+                if (this.walletService?.getMasterAddress) {
+                    address = await this.walletService.getMasterAddress();
+                }
+            } catch (error) {
+                logger.warn('Failed to get master data for system status', { error: error.message });
+            }
+
+            const uptime = process.uptime();
+            const hours = Math.floor(uptime / 3600);
+            const mins = Math.floor((uptime % 3600) / 60);
+
+            const message = `
+<b>⚙️ System Status</b>
+
+🖥 <b>Server:</b> Online
+💾 <b>Database:</b> Connected
+⏱ <b>Uptime:</b> <code>${hours}h ${mins}m</code>
+
+<b>💎 Master Wallet:</b>
+• Address: <code>${address}</code>
+• USDT: <code>${masterBalance.usdt}</code>
+• BNB: <code>${masterBalance.bnb}</code>
+
+<b>📊 Memory:</b>
+• Used: <code>${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB</code>
+• Total: <code>${(process.memoryUsage().heapTotal / 1024 / 1024).toFixed(2)} MB</code>
+• RSS: <code>${(process.memoryUsage().rss / 1024 / 1024).toFixed(2)} MB</code>
+
+<b>🔧 Node.js:</b> <code>${process.version}</code>
+            `;
+
+            await this.replySuccess(ctx, message, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔙 Back', 'admin')]
+                ]).reply_markup
+            });
+        } catch (error) {
+            logger.error('System status error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to load system status.</b>');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ADMIN LOGS
+    // ═══════════════════════════════════════════════════════════
+
+    async handleLogs(ctx) {
+        try {
+            const logs = await AdminLog.find()
+                .sort({ timestamp: -1 })
+                .limit(20)
+                .lean();
+
+            let message = '<b>📋 Admin Logs</b> (Last 20)\n\n';
+
+            if (logs.length === 0) {
+                message += '<i>No logs yet.</i>';
+            } else {
+                for (const log of logs) {
+                    const time = log.timestamp ? new Date(log.timestamp).toLocaleString() : 'N/A';
+                    const details = JSON.stringify(log.details || {}).substring(0, 100);
+                    message += `<b>[${time}]</b>\n`;
+                    message += `👤 <code>${log.adminId}</code> → <b>${log.action}</b>\n`;
+                    message += `🎯 ${log.targetUserId ? `<code>${log.targetUserId}</code>` : 'N/A'}\n`;
+                    message += `📄 <code>${details}</code>\n\n`;
+                }
+            }
+
+            await this.replySuccess(ctx, message, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Refresh', 'admin_logs')],
+                    [Markup.button.callback('🔙 Back', 'admin')]
+                ]).reply_markup
+            });
+        } catch (error) {
+            logger.error('Logs error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load logs.</b>');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  BROADCAST (Fixed Flow)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleBroadcastCommand(ctx) {
+        const args = ctx.message.text.split(' ').slice(1);
+        const message = args.join(' ');
+
+        if (!message) {
+            return this.handleBroadcastMenu(ctx);
+        }
+
+        // Direct broadcast to all users
+        await this.executeBroadcast(ctx, {}, 'All Users', message);
+    }
+
+    async handleBroadcastMenu(ctx) {
+        try {
+            const stats = await this.getBroadcastStats();
+
+            await this.replySuccess(ctx, `
+<b>📢 Broadcast Menu</b>
+
+<b>👥 Audience Stats:</b>
+• Total Users: <code>${stats.total}</code>
+• VIP Users: <code>${stats.vip}</code>
+• Paying Users: <code>${stats.paying}</code>
+• Recent (7d): <code>${stats.recent}</code>
+
+<i>Select target audience or type /broadcast &lt;message&gt; to send to all immediately.</i>
+            `, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('📨 All Users', 'broadcast_all')],
+                    [Markup.button.callback('👑 VIP Only', 'broadcast_vip')],
+                    [Markup.button.callback('💰 Paying Users', 'broadcast_paying')],
+                    [Markup.button.callback('🆕 Recent (7d)', 'broadcast_recent')],
+                    [Markup.button.callback('❌ Cancel', 'broadcast_cancel')],
+                    [Markup.button.callback('🔙 Back', 'admin')]
+                ]).reply_markup
+            });
+        } catch (error) {
+            logger.error('Broadcast menu error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load broadcast menu.</b>');
+        }
+    }
+
+    async getBroadcastStats() {
+        const now = new Date();
+        const weekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
+
+        const [total, vip, paying, recent] = await Promise.all([
+            User.countDocuments({ isBlacklisted: false }),
+            User.countDocuments({ isBlacklisted: false, vipExpiry: { $gt: now } }),
+            User.countDocuments({ isBlacklisted: false, balance: { $gt: 0 } }),
+            User.countDocuments({ isBlacklisted: false, createdAt: { $gte: weekAgo } })
+        ]);
+
+        return { total, vip, paying, recent };
+    }
+
+    async executeBroadcast(ctx, filter, label, forcedMessage = null) {
+        try {
+            // If no message provided, ask admin to type it
+            if (!forcedMessage) {
+                this._ensureSession(ctx);
+                ctx.session.awaitingBroadcast = { target: label, filter, label };
+                return this.replySuccess(ctx, `
+<b>📢 Broadcast to ${label}</b>
+
+Send the message you want to broadcast to <code>${label}</code>.
+
+<i>Type your message and send it. It will be delivered to all matching users.</i>
+                `);
+            }
+
+            // Acknowledge callback if present
+            if (ctx.callbackQuery && ctx.answerCbQuery) {
+                await ctx.answerCbQuery(`Broadcasting to ${label}...`).catch(() => {});
+            }
+
+            const query = { isBlacklisted: false, ...filter };
+            const users = await User.find(query).select('userId').lean();
+            const results = { sent: 0, failed: 0, total: users.length };
+            const batchSize = 30;
+
+            logger.info('Broadcast started', { targetCount: users.length, label, filter });
+
+            for (let i = 0; i < users.length; i += batchSize) {
+                const batch = users.slice(i, i + batchSize);
+
+                await Promise.all(batch.map(async (user) => {
+                    try {
+                        await ctx.telegram.sendMessage(user.userId, `
+<b>📢 ${label}</b>
+
+${forcedMessage}
+
+---
+<i>OTP Bot Team</i>
+                        `, { parse_mode: 'HTML', disable_notification: false });
+                        results.sent++;
+                    } catch (error) {
+                        results.failed++;
+                        if (error.response?.error_code === 403) {
+                            // User blocked bot
+                            await User.updateOne(
+                                { userId: user.userId },
+                                { $set: { blockedBot: true, isBlacklisted: true } }
+                            ).catch(() => {});
+                        }
+                        logger.warn('Broadcast failed for user', { userId: user.userId, error: error.message });
+                    }
+                }));
+
+                // Rate limit protection between batches
+                if (i + batchSize < users.length) {
+                    await new Promise(r => setTimeout(r, 1000));
+                }
+
+                // Progress update every 5 batches
+                if ((i / batchSize) % 5 === 0 && i > 0) {
+                    await ctx.reply(`⏳ Broadcast progress: ${results.sent}/${results.total} sent...`).catch(() => {});
+                }
+            }
+
+            logger.info('Broadcast completed', results);
+
+            await this.replySuccess(ctx, `
+<b>📢 Broadcast Complete!</b>
+
+<b>Target:</b> <code>${label}</code>
+<b>Total:</b> <code>${results.total}</code>
+<b>✅ Sent:</b> <code>${results.sent}</code>
+<b>❌ Failed:</b> <code>${results.failed}</code>
+<b>Success Rate:</b> <code>${results.total > 0 ? ((results.sent / results.total) * 100).toFixed(1) : 0}%</code>
+            `);
+
+        } catch (error) {
+            logger.error('Broadcast execution error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Broadcast failed.</b>\n\nPlease check the logs.');
+        }
+    }
+
+    async handleBroadcastAll(ctx) {
+        await this.executeBroadcast(ctx, {}, 'All Users');
+    }
+
+    async handleBroadcastVip(ctx) {
+        const now = new Date();
+        await this.executeBroadcast(ctx, { vipExpiry: { $gt: now } }, 'VIP Users');
+    }
+
+    async handleBroadcastPaying(ctx) {
+        await this.executeBroadcast(ctx, { balance: { $gt: 0 } }, 'Paying Users');
+    }
+
+    async handleBroadcastRecent(ctx) {
+        const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        await this.executeBroadcast(ctx, { createdAt: { $gte: weekAgo } }, 'Recent Users');
+    }
+
+    async handleBroadcastCancel(ctx) {
+        if (ctx.session) {
+            delete ctx.session.awaitingBroadcast;
+        }
+        if (ctx.answerCbQuery) await ctx.answerCbQuery('Cancelled').catch(() => {});
+        await this.replySuccess(ctx, '❌ <b>Broadcast cancelled.</b>');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  REFERRAL MANAGEMENT
+    // ═══════════════════════════════════════════════════════════
+
+    async handleApproveReferral(ctx) {
+        try {
+            const args = ctx.message.text.split(' ');
+            if (args.length < 2) {
+                return this.replyError(ctx, '❌ <b>Usage:</b> <code>/approve_referral &lt;tx_id&gt;</code>');
+            }
+
+            const txId = args[1];
+            const tx = await Transaction.findOne({ txId, type: TX_TYPES.REFERRAL_REWARD, status: 'PENDING' });
+
+            if (!tx) {
+                return this.replyError(ctx, '❌ <b>Referral transaction not found or already processed.</b>');
+            }
+
+            await User.updateOne(
+                { userId: tx.userId },
+                { $inc: { balance: tx.amount, referralRewardsPending: -tx.amount } }
+            );
+
+            await Transaction.updateOne(
+                { txId },
+                {
+                    $set: {
+                        status: 'COMPLETED',
+                        approvedBy: ctx.from.id.toString(),
+                        approvedAt: new Date()
+                    }
+                }
+            );
+
+            await this.replySuccess(ctx, `✅ <b>Referral Reward Approved!</b>\n\nAmount: <code>${
