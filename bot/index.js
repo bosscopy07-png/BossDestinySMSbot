@@ -11,7 +11,7 @@ import { requireAuth } from './middleware/auth.js';
 import { rateLimit } from './middleware/rateLimit.js';
 import UserCommands from './commands/user.js';
 import OTPCommands from './commands/otp.js';
-import AdminCommands from './commands/admin/index.js';
+import AdminCommands from './commands/admin.js';
 import WalletService from '../services/wallet/index.js';
 
 // ─── Worker pool for CPU-intensive tasks ───
