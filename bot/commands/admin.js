@@ -986,7 +986,7 @@ You can now use the bot normally.
 <i>${messageText}</i>
 
 ---
-<i>Reply to this bot if you need assistance.</i>
+<i>SWIFTSMS The fastest SMS Service if you need assistance contact us.</i>
             `, { parse_mode: 'HTML' });
 
             await this.logAdminAction(
@@ -1117,8 +1117,10 @@ ${await this.getRevenueByService(monthAgo)}
 
     async handleExportProfits(ctx) {
         try {
-            if (ctx.answerCbQuery) await ctx.answerCbQuery('Generating export...');
-
+            if (ctx.callbackQuery && ctx.answerCbQuery) {
+    await ctx.answerCbQuery('Generating export...').catch(() => {});
+            }
+            
             const monthAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
             const results = await Transaction.aggregate([
                 {
@@ -1332,10 +1334,10 @@ Send the message you want to broadcast to <code>${label}</code>.
             }
 
             // Acknowledge callback if present
-            if (ctx.answerCbQuery) {
-                await ctx.answerCbQuery(`Broadcasting to ${label}...`).catch(() => {});
+            if (ctx.callbackQuery && ctx.answerCbQuery) {
+    await ctx.answerCbQuery(`Broadcasting to ${label}...`).catch(() => {});
             }
-
+            
             const query = { isBlacklisted: false, ...filter };
             const users = await User.find(query).select('userId').lean();
             const results = { sent: 0, failed: 0, total: users.length };
