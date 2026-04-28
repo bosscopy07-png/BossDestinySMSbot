@@ -259,7 +259,8 @@ class UserCommands {
             (isVip ? '👑 <b>VIP Active</b> — ' + vipRemaining + ' left today\n' : '') +
             '💰 Balance: <code>' + formatCurrency(user.balance || 0) + '</code>\n' +
             '📦 Bundle: <code>' + (user.bundleRemaining || 0) + '</code> OTPs\n' +
-            '🆓 Free Today: <code>' + freeRemaining + '/3</code>\n\n' +
+            '🆓 Free Today: <code>' + (3 - freeRemaining) + '/3</code> used\n\n' +
+            
             'Choose your mode or deposit to get started:';
 
         const keyboard = Markup.inlineKeyboard([
@@ -284,7 +285,7 @@ class UserCommands {
             '📋 <b>Main Menu</b>\n\n' +
             '💰 Balance: <code>' + formatCurrency(user.balance || 0) + '</code>\n' +
             '📦 Bundle: <code>' + (user.bundleRemaining || 0) + '</code> OTPs\n' +
-            '🆓 Free Today: <code>' + freeRemaining + '/3</code>\n' +
+            '🆓 Free Today: <code>' + (3 - freeRemaining) + '/3</code> used\n\n' +
             (isVip ? '👑 VIP: <code>' + vipRemaining + '/50</code> left\n' : '') +
             '\nWhat would you like to do?';
 
@@ -316,7 +317,7 @@ class UserCommands {
 
         const message =
             '🔢 <b>Request OTP</b>\n\n' +
-            '🆓 Free: <code>' + freeRemaining + '/3</code> left\n' +
+            '🆓 Free Today: <code>' + (3 - freeRemaining) + '/3</code> used\n\n' +
             '💵 Cheap: <code>' + formatCurrency(config.prices?.cheapOtp || 0.05) + '</code> per OTP\n' +
             '📦 Bundle: <code>' + (user.bundleRemaining || 0) + '</code> OTPs left\n' +
             (isVip ? '👑 VIP: <code>' + vipRemaining + '/50</code> left today\n' : '👑 VIP: <i>Inactive</i>\n') +
