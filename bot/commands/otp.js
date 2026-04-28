@@ -353,7 +353,7 @@ class OTPCommands {
         await this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message);
     }
 
-    async handleRevealOTP(ctx) {
+        async handleRevealOTP(ctx) {
         const sessionId = ctx.match[1];
         const userId = ctx.from.id.toString();
         try {
@@ -376,4 +376,59 @@ class OTPCommands {
             
             if (!result.found) {
                 const message = 
-                    '
+                    '⏳ <b>No Deposit Found</b>\n\n' +
+                    'Your deposit hasn\'t been detected yet.\n\n' +
+                    'Make sure you:\n' +
+                    '1️⃣ Sent to the correct address\n' +
+                    '2️⃣ Sent exactly the shown amount\n' +
+                    '3️⃣ Used BSC (BEP-20) network\n\n' +
+                    '⏱ Check again in 1-2 minutes.';
+                
+                return this.sendPhotoWithCaption(
+                    ctx, 
+                    IMAGES.default, 
+                    message,
+                    Markup.inlineKeyboard([
+                        [Markup.button.callback('🔄 Check Again', 'check_deposit')],
+                        [Markup.button.callback('🔙 Back', 'menu')]
+                    ]),
+                    'HTML'
+                );
+            }
+            
+            if (result.status === 'CONFIRMING') {
+                const message = 
+                    `⏳ <b>Deposit Confirming</b>\n\n` +
+                    `Amount: ${formatCurrency(result.amount)}\n` +
+                    `Confirmations: ${result.confirmations || 0}/${config.blockchain?.blockConfirmations || 12}\n\n` +
+                    `Please wait for full confirmation.`;
+                return this.sendPhotoWithCaption(ctx, IMAGES.default, message, null, 'HTML');
+            }
+            
+            if (result.status === 'CONFIRMED' || result.status === 'CREDITED') {
+                const message = 
+                    `✅ <b>Deposit Confirmed!</b>\n\n` +
+                    `Amount Credited: ${formatCurrency(result.amount)}\n` +
+                    (result.trackingFee > 0 ? `Tracking Fee: ${formatCurrency(result.trackingFee)}\n` : '') +
+                    `TX Hash: \`${result.txHash}\`\n\n` +
+                    `Your balance has been updated.`;
+                return this.sendPhotoWithCaption(ctx, IMAGES.depositConfirmed, message, null, 'Markdown');
+            }
+        } catch (error) {
+            logger.error('Check deposit failed', { userId, error: error.message });
+            await this.sendPhotoWithCaption(ctx, IMAGES.default, '❌ Error checking deposit. Please try again.');
+        }
+    }
+
+    async handleDepositInfo(ctx) {
+        const message = '💳 Deposit Information\n\nSend USDT (BEP-20) to your deposit address.\n\nYour deposit will be credited automatically after confirmation.\n\nUse /check_deposit to check status.';
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message);
+    }
+
+    async handleMenu(ctx) {
+        await ctx.reply('🏠 Main Menu');
+    }
+}
+
+export default OTPCommands;
+            
