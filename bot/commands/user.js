@@ -457,15 +457,15 @@ class UserCommands {
         }
         await this.showDepositDetails(ctx, userId, amount);
     }
-    async showDepositDetails(ctx, userId, requestedAmount) {
+        async showDepositDetails(ctx, userId, requestedAmount) {
         try {
             const depositInfo = await this.walletService.getDepositInfo(userId, requestedAmount);
             
             const trackingAmount = depositInfo.amount || depositInfo.trackingAmount || depositInfo.baseAmount || requestedAmount;
             const actualAmount = depositInfo.baseAmount || requestedAmount;
 
-            // REMOVED: Don't re-save here — getDepositInfo already saved everything atomically
-            // await User.updateOne(...)
+            // getDepositInfo already saved depositTrackingAmount + depositRequestedAmount atomically
+            // No need to re-save here
 
             let depositAddress = depositInfo.address;
             if (!depositAddress && this.walletService?.getMasterAddress) {
@@ -496,7 +496,7 @@ class UserCommands {
                 [Markup.button.callback('🔙 Back', 'menu')]
             ]);
 
-            const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, keyboard, 'HTML');
+            await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, keyboard, 'HTML');
             
         } catch (error) {
             logger.error('Show deposit details error', { userId, error: error.message });
@@ -508,9 +508,7 @@ class UserCommands {
             await ctx.reply('❌ Error generating deposit. Please try again.');
         }
     }
-    
-        
-    // ─── 5. OPTIONAL IMPROVEMENT: Share Address handler ───────────
+
     async handleShareAddress(ctx) {
         const address = ctx.match[1];
         await ctx.answerCbQuery('📤 Address ready!');
@@ -520,7 +518,6 @@ class UserCommands {
             { parse_mode: 'HTML' }
         );
     }
-
     
     async handleDepositQR(ctx) {
         const userId = ctx.from.id.toString();
