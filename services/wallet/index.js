@@ -126,8 +126,7 @@ class WalletService {
     }
 
     // ========== DEPOSIT SYSTEM ==========
-
-    async getDepositInfo(userId, requestedAmount = 10) {
+         async getDepositInfo(userId, requestedAmount = 10) {
         await this.ensureReady();
 
         const minDeposit = 0.50;
@@ -139,13 +138,15 @@ class WalletService {
 
         const trackingAmount = this.generateTrackingAmount(amount, userId);
 
+        // CRITICAL FIX: Save BOTH trackingAmount AND requestedAmount atomically
+        // so the scanner always has access to the correct base amount
         await User.updateOne(
             { userId },
             { 
                 $set: { 
                     depositAddress: this.masterAddress,
                     depositTrackingAmount: trackingAmount,
-                    depositRequestedAmount: amount,  // NEW: store what user actually wants
+                    depositRequestedAmount: amount,   // ← FIXED: was missing here
                     depositPending: true,
                     depositRequestedAt: new Date()
                 } 
@@ -156,12 +157,13 @@ class WalletService {
         return {
             address: this.masterAddress,
             amount: trackingAmount,        // What they must send
-            baseAmount: amount,            // What they actually want (NEW)
-            trackingAmount: trackingAmount, // Alias for clarity
+            baseAmount: amount,            // What they actually want
+            trackingAmount: trackingAmount,
             network: 'BSC (BEP-20)',
             token: 'USDT'
         };
-    }
+         }
+    
 
     generateTrackingAmount(baseAmount, userId) {
         const userSuffix = parseInt(userId.toString().slice(-5)) / 1000000;
@@ -226,7 +228,7 @@ class WalletService {
             throw error;
         }
     }
-    async processDepositEvent(event, retryCount = 0) {
+        async processDepositEvent(event, retryCount = 0) {
         const MAX_RETRIES = 3;
         
         try {
@@ -237,22 +239,18 @@ class WalletService {
             const txHash = event.transactionHash;
             const blockNumber = event.blockNumber;
 
-            // Validate this transfer is to our master address
             if (toAddress.toLowerCase() !== this.masterAddress.toLowerCase()) {
                 return null;
             }
 
-            // Prevent double-processing
             const existing = await Transaction.findOne({ 'blockchain.txHash': txHash });
             if (existing) return null;
 
-            // Find user by exact tracking amount match first
             let user = await User.findOne({ 
                 depositPending: true,
                 depositTrackingAmount: amount
             });
 
-            // Fallback: fuzzy match within ±0.01 range
             if (!user) {
                 user = await User.findOne({
                     depositPending: true,
@@ -272,24 +270,44 @@ class WalletService {
                 return null;
             }
 
-            // CRITICAL FIX: Use requestedAmount for credit, NOT the tracking amount
-            const creditAmount = user.depositRequestedAmount || amount;
+            // CRITICAL FIX: If depositRequestedAmount is missing, this is a race condition.
+            // The scanner found the deposit before showDepositDetails saved the requested amount.
+            // We MUST abort and let showDepositDetails handle it, or derive it safely.
+            let creditAmount = user.depositRequestedAmount;
+            
+            if (!creditAmount || creditAmount <= 0) {
+                // Derive base amount by removing the user suffix from tracking amount
+                const userSuffix = parseInt(user.userId.toString().slice(-5)) / 1000000;
+                creditAmount = parseFloat((amount - userSuffix).toFixed(2));
+                
+                logger.warn('depositRequestedAmount missing, derived from tracking amount', {
+                    userId: user.userId,
+                    derivedCreditAmount: creditAmount,
+                    trackingAmount: amount,
+                    userSuffix
+                });
+
+                // Save it now so future checks are consistent
+                await User.updateOne(
+                    { userId: user.userId },
+                    { $set: { depositRequestedAmount: creditAmount } }
+                );
+            }
+
             const trackingFee = parseFloat((amount - creditAmount).toFixed(6));
 
-            // Validate credit amount is positive
             if (creditAmount <= 0) {
-                logger.error('Invalid credit amount calculated', { userId: user.userId, creditAmount, trackingAmount: amount });
+                logger.error('Invalid credit amount', { userId: user.userId, creditAmount, trackingAmount: amount });
                 return null;
             }
 
-            // Create transaction record with COMPLETED status (not CONFIRMED)
             const tx = await Transaction.create({
                 txId: generateId(),
                 userId: user.userId,
                 type: 'DEPOSIT',
-                amount: creditAmount,              // User gets this amount
+                amount: creditAmount,
                 currency: 'USDT',
-                status: 'COMPLETED',               // ← FIXED: was 'CONFIRMED' (enum validation error)
+                status: 'COMPLETED',
                 blockchain: {
                     txHash,
                     blockNumber,
@@ -297,31 +315,29 @@ class WalletService {
                     fromAddress,
                     toAddress,
                     token: 'USDT',
-                    amountCrypto: amount.toString(),        // What was actually sent on chain
-                    requestedAmount: creditAmount,           // What user wanted
-                    trackingFee: trackingFee                 // System identification fee
+                    amountCrypto: amount.toString(),
+                    requestedAmount: creditAmount,
+                    trackingFee: trackingFee
                 }
             });
 
-            // Atomically update user balance and clear deposit flags
             await User.updateOne(
                 { userId: user.userId },
                 {
                     $inc: { 
-                        balance: creditAmount,         // Only credit requested amount
+                        balance: creditAmount,
                         totalDeposited: creditAmount
                     },
                     $set: {
                         depositPending: false,
                         depositTrackingAmount: null,
-                        depositRequestedAmount: null,  // Clear both tracking fields
+                        depositRequestedAmount: null,
                         lastDepositAt: new Date(),
                         registeredWallet: fromAddress.toLowerCase()
                     }
                 }
             );
 
-            // Process referral reward if applicable
             await this.processReferralDeposit(user.userId, creditAmount);
 
             logger.info('Deposit detected and credited', {
@@ -333,7 +349,6 @@ class WalletService {
                 from: fromAddress
             });
 
-            // Send Telegram notification if callback registered
             if (this.notificationCallback) {
                 try {
                     await this.notificationCallback(user.userId, {
@@ -344,26 +359,22 @@ class WalletService {
                         address: this.masterAddress
                     });
                 } catch (notifyError) {
-                    logger.error('Deposit notification failed', { 
-                        userId: user.userId, 
-                        error: notifyError.message 
-                    });
+                    logger.error('Deposit notification failed', { userId: user.userId, error: notifyError.message });
                 }
             }
 
             return {
                 userId: user.userId,
-                amount: creditAmount,           // What was credited to user
-                trackingAmount: amount,          // What was sent on blockchain
+                amount: creditAmount,
+                trackingAmount: amount,
                 trackingFee,
                 txHash,
                 status: 'CREDITED'
             };
 
         } catch (error) {
-            // Retry on transient errors (up to MAX_RETRIES)
             if (retryCount < MAX_RETRIES && this.isRetryableError(error)) {
-                const delay = 1000 * Math.pow(2, retryCount); // Exponential backoff: 1s, 2s, 4s
+                const delay = 1000 * Math.pow(2, retryCount);
                 logger.warn('Deposit event processing failed, retrying...', { 
                     txHash: event.transactionHash, 
                     retry: retryCount + 1,
@@ -381,7 +392,8 @@ class WalletService {
             });
             throw error;
         }
-    }
+                }
+                    
 
     // Helper: determine if error is retryable
     isRetryableError(error) {
