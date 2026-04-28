@@ -14,6 +14,8 @@ class WalletService {
         this.isReady = false;
         this.lastCheckedBlock = 0;
         this.scanInterval = null;
+        this.notificationCallback = null;
+        this.notifiedTxHashes = new Set();
         this.initializationPromise = null;
         this.notificationCallback = null; // NEW: hook for Telegram notifications
 
@@ -348,8 +350,10 @@ class WalletService {
                 txHash,
                 from: fromAddress
             });
-
-            if (this.notificationCallback) {
+                        // Send Telegram notification ONLY once per txHash
+            if (this.notificationCallback && !this.notifiedTxHashes.has(txHash)) {
+                this.notifiedTxHashes.add(txHash);
+                
                 try {
                     await this.notificationCallback(user.userId, {
                         type: 'DEPOSIT_CONFIRMED',
@@ -359,10 +363,15 @@ class WalletService {
                         address: this.masterAddress
                     });
                 } catch (notifyError) {
-                    logger.error('Deposit notification failed', { userId: user.userId, error: notifyError.message });
+                    logger.error('Deposit notification failed', { 
+                        userId: user.userId, 
+                        error: notifyError.message 
+                    });
+                    // Remove so it can retry on next scan
+                    this.notifiedTxHashes.delete(txHash);
                 }
             }
-
+        
             return {
                 userId: user.userId,
                 amount: creditAmount,
