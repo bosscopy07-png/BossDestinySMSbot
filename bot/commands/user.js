@@ -856,4 +856,204 @@ class UserCommands {
         const userId = ctx.from.id.toString();
         await User.updateOne({ userId }, { $set: { preferredCountry: countryCode } });
         await ctx.reply('🌍 Country set to <code>' + countryCode + '</code>', { parse_mode: 'HTML' });
-        await t
+        await this.handleSettings(ctx);
+    }
+
+    async handleSupport(ctx) {
+        try {
+            const message =
+                '🎧 <b>SwiftSupport</b> — Customer Service\n\n' +
+                'Need help? Our support team is here for you!\n\n' +
+                '💬 Contact: <code>@swiftsmssupport</code>\n' +
+                '⏱ Response Time: Usually within 5 minutes\n\n' +
+                '❓ <b>Common Issues:</b>\n' +
+                '• Deposit not showing? → Use <code>/deposit</code> then Check Deposit\n' +
+                '• OTP not received? → Cancel and retry\n' +
+                '• Wrong amount sent? → Contact support with TX hash\n\n' +
+                '⚠️ Please include your <b>User ID</b> when contacting support.';
+
+            const keyboard = {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '💬 Chat Support', url: 'https://t.me/swiftsmssupport' }],
+                        [{ text: '🔙 Back', callback_data: 'menu' }]
+                    ]
+                }
+            };
+
+            await this.sendPhotoWithCaption(ctx, IMAGES.support, message, keyboard, 'HTML');
+        } catch (error) {
+            logger.error('Support handler error', { error: error.message, userId: ctx.from?.id });
+            try {
+                await ctx.reply(
+                    '🎧 Customer Service\n\nContact @swiftsmssupport for help.',
+                    {
+                        reply_markup: {
+                            inline_keyboard: [[{ text: '💬 Chat Support', url: 'https://t.me/swiftsmssupport' }]]
+                        }
+                    }
+                );
+            } catch (e) {
+                logger.error('Support fallback failed', { error: e.message });
+            }
+        }
+    }
+
+    async handleHelp(ctx) {
+        const message =
+            '❓ <b>Help & FAQ</b>\n\n' +
+            '<b>How to request OTP:</b>\n' +
+            '1️⃣ Tap Request OTP or use /otp\n' +
+            '2️⃣ Select mode (FREE, CHEAP, VIP, or Bundle)\n' +
+            '3️⃣ Choose service (WhatsApp, Telegram, etc.)\n' +
+            '4️⃣ Select country\n' +
+            '5️⃣ Wait for OTP to arrive\n\n' +
+            '<b>How to deposit:</b>\n' +
+            '1️⃣ Tap Deposit or use /deposit\n' +
+            '2️⃣ Select amount\n' +
+            '3️⃣ Send USDT (BEP-20) to shown address\n' +
+            '4️⃣ Tap Check Deposit or wait 1-2 minutes\n\n' +
+            '👑 <b>VIP Benefits:</b>\n' +
+            '• 50 OTPs/day\n' +
+            '• Priority routing\n' +
+            '• Fastest delivery\n' +
+            '• $5/month\n\n' +
+            '📦 <b>Bundle:</b>\n' +
+            '• 100 OTPs for $5\n' +
+            '• Never expires\n\n' +
+            '<b>Commands:</b>\n' +
+            '/start — Welcome screen\n' +
+            '/menu — Main menu\n' +
+            '/balance — Check balance\n' +
+            '/deposit — Add funds\n' +
+            '/history — Transactions\n' +
+            '/referral — Earn rewards\n' +
+            '/stats — Your statistics\n' +
+            '/settings — Preferences\n' +
+            '/support — Customer service\n' +
+            '/otp — Request OTP\n' +
+            '/buybundle — Buy 100 OTPs\n' +
+            '/buyvip — Upgrade to VIP';
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'menu')]
+        ]), 'HTML');
+    }
+
+    async handleBuyBundle(ctx) {
+        const user = await this._ensureUserFresh(ctx);
+        const bundlePrice = config.prices?.bundlePrice || 5.00;
+        const bundleCount = config.prices?.bundleOtpCount || 100;
+
+        if (this._getAvailableBalance(user) < bundlePrice) {
+            const message =
+                '❌ <b>Insufficient Balance</b>\n\n' +
+                'Required: <code>' + formatCurrency(bundlePrice) + '</code>\n' +
+                'Available: <code>' + formatCurrency(this._getAvailableBalance(user)) + '</code>\n\n' +
+                'Deposit first with /deposit';
+
+            return this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, Markup.inlineKeyboard([
+                [Markup.button.callback('💳 Deposit', 'deposit')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]), 'HTML');
+        }
+
+        await User.updateOne(
+            { userId: user.userId },
+            {
+                $inc: {
+                    balance: -bundlePrice,
+                    bundleRemaining: bundleCount,
+                    totalSpent: bundlePrice
+                }
+            }
+        );
+
+        await Transaction.create({
+            txId: 'BUNDLE_' + Date.now() + '_' + user.userId,
+            userId: user.userId,
+            type: TX_TYPES.BUNDLE_PURCHASE,
+            amount: -bundlePrice,
+            status: 'COMPLETED',
+            metadata: {
+                bundleCount,
+                pricePerOtp: bundlePrice / bundleCount
+            },
+            createdAt: new Date()
+        });
+
+        const message =
+            '📦 <b>Bundle Purchased!</b>\n\n' +
+            '✅ <code>' + bundleCount + '</code> OTPs added\n' +
+            '💵 <code>' + formatCurrency(bundlePrice) + '</code> deducted\n' +
+            '📦 Total Available: <code>' + ((user.bundleRemaining || 0) + bundleCount) + '</code> OTPs\n\n' +
+            'Use /otp to start requesting.';
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, Markup.inlineKeyboard([
+            [Markup.button.callback('🔢 Request OTP', 'request_otp')],
+            [Markup.button.callback('🔙 Back', 'menu')]
+        ]), 'HTML');
+    }
+
+    async handleBuyVIP(ctx) {
+        const user = await this._ensureUserFresh(ctx);
+        const vipPrice = config.prices?.vipSubscription || 5.00;
+
+        if (this._getAvailableBalance(user) < vipPrice) {
+            const message =
+                '❌ <b>Insufficient Balance</b>\n\n' +
+                'Required: <code>' + formatCurrency(vipPrice) + '</code>\n' +
+                'Available: <code>' + formatCurrency(this._getAvailableBalance(user)) + '</code>\n\n' +
+                'Deposit first with /deposit';
+
+            return this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, Markup.inlineKeyboard([
+                [Markup.button.callback('💳 Deposit', 'deposit')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]), 'HTML');
+        }
+
+        const expiryDate = new Date();
+        expiryDate.setMonth(expiryDate.getMonth() + 1);
+
+        await User.updateOne(
+            { userId: user.userId },
+            {
+                $inc: { balance: -vipPrice, totalSpent: vipPrice },
+                $set: {
+                    mode: 'VIP',
+                    vipExpiry: expiryDate,
+                    vipDailyUsed: 0,
+                    vipDailyReset: new Date()
+                }
+            }
+        );
+
+        await Transaction.create({
+            txId: 'VIP_' + Date.now() + '_' + user.userId,
+            userId: user.userId,
+            type: TX_TYPES.VIP_SUBSCRIPTION,
+            amount: -vipPrice,
+            status: 'COMPLETED',
+            metadata: {
+                duration: '1 month',
+                expiryDate,
+                vipDailyLimit: config.limits?.vipDaily || 50
+            },
+            createdAt: new Date()
+        });
+
+        const message =
+            '👑 <b>VIP Activated!</b>\n\n' +
+            '✅ Valid until: <code>' + expiryDate.toLocaleDateString() + '</code>\n' +
+            '🔢 50 OTPs/day\n' +
+            '⚡ Priority delivery enabled\n\n' +
+            '🎉 Enjoy premium service!';
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, Markup.inlineKeyboard([
+            [Markup.button.callback('🔢 Request OTP', 'request_otp')],
+            [Markup.button.callback('🔙 Back', 'menu')]
+        ]), 'HTML');
+    }
+}
+
+export default UserCommands;
