@@ -397,14 +397,17 @@ class WalletService {
                     }
     
     // FIX: checkDeposit now actually queries blockchain for the specific user
-    async checkDeposit(userId) {
+        async checkDeposit(userId) {
+        // Ensure wallet service is initialized
         await this.ensureReady();
 
+        // Get user record
         const user = await User.findOne({ userId });
         if (!user) {
             return { found: false, message: 'User not found' };
         }
 
+        // Check if user even has a pending deposit
         if (!user.depositPending) {
             return { 
                 found: false, 
@@ -412,7 +415,7 @@ class WalletService {
             };
         }
 
-        // If user has no tracking amount set, nothing to check
+        // Must have a tracking amount to check against
         if (!user.depositTrackingAmount) {
             return { 
                 found: false, 
@@ -421,8 +424,8 @@ class WalletService {
         }
 
         try {
-            // Direct blockchain query: scan last 500 blocks for transfers to master address
-            // from ANY sender, then match by amount
+            // === DIRECT BLOCKCHAIN QUERY ===
+            // Scan last 500 blocks for transfers to master address
             const latestBlock = await this.provider.getBlockNumber();
             const scanRange = 500;
             let fromBlock = Math.max(0, latestBlock - scanRange);
@@ -435,7 +438,7 @@ class WalletService {
                 const amount = parseFloat(ethers.formatUnits(amountRaw, this.decimals));
                 const txHash = event.transactionHash;
 
-                // Skip already processed
+                // Skip already processed transactions
                 const existing = await Transaction.findOne({ 'blockchain.txHash': txHash });
                 if (existing) continue;
 
@@ -446,10 +449,11 @@ class WalletService {
                 if (matchExact) {
                     // Process this deposit immediately
                     const result = await this.processDepositEvent(event);
+                    
                     if (result && result.userId === userId) {
                         return {
                             found: true,
-                            status: 'CONFIRMED',
+                            status: 'COMPLETED',        // ← FIXED: was 'CONFIRMED'
                             amount: result.amount,
                             baseAmount: result.amount,
                             trackingAmount: result.trackingAmount,
@@ -461,7 +465,7 @@ class WalletService {
                 }
             }
 
-            // No matching deposit found in recent blocks
+            // === NO MATCHING DEPOSIT FOUND ===
             return { 
                 found: false, 
                 message: 'No deposit found yet. Send exactly ' + user.depositTrackingAmount + ' USDT (BEP-20) to your deposit address and check again.' 
@@ -470,7 +474,7 @@ class WalletService {
         } catch (error) {
             logger.error('Direct deposit check failed', { userId, error: error.message });
             
-            // Fallback: check if any transaction was already recorded for this user
+            // === FALLBACK: Check if transaction was already recorded ===
             const recentTx = await Transaction.findOne({
                 userId,
                 type: 'DEPOSIT',
@@ -480,7 +484,7 @@ class WalletService {
             if (recentTx) {
                 return {
                     found: true,
-                    status: recentTx.status,
+                    status: recentTx.status,                    // Uses DB status (COMPLETED)
                     amount: recentTx.amount,
                     baseAmount: recentTx.blockchain?.requestedAmount || recentTx.amount,
                     txHash: recentTx.blockchain?.txHash,
@@ -488,9 +492,11 @@ class WalletService {
                 };
             }
 
+            // Re-throw if we can't recover
             throw error;
         }
-    }
+        }
+    
 
     // ========== REFERRAL SYSTEM ==========
 
