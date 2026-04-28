@@ -182,34 +182,20 @@ class UserCommands {
         }
                 
     
-    _canUseFree(user) {
-        if (user.isBlacklisted) return false;
-        const limit = config.limits?.freeDaily || 3;
-        return (user.freeUsedToday || 0) < limit;
-    }
-
-    _freeRemaining(user) {
-        const limit = config.limits?.freeDaily || 3;
-        return Math.max(0, limit - (user.freeUsedToday || 0));
+        _canUseFree(user) {
+        return user.canUseFree();  // ← Instance method
     }
 
     _canUseVip(user) {
-        if (!user.vipExpiry || new Date(user.vipExpiry) <= new Date()) return false;
-        const limit = config.limits?.vipDaily || 50;
-        return (user.vipDailyUsed || 0) < limit;
-    }
-
-    _vipRemaining(user) {
-        const limit = config.limits?.vipDaily || 50;
-        return Math.max(0, limit - (user.vipDailyUsed || 0));
+        return user.canUseVip();   // ← Instance method
     }
 
     _isVipActive(user) {
-        return user.vipExpiry && new Date(user.vipExpiry) > new Date();
+        return user.isVipActive(); // ← Instance method
     }
 
     _getAvailableBalance(user) {
-        return (user.balance || 0) - (user.lockedBalance || 0);
+        return user.getAvailableBalance(); // ← Instance method
     }
     
     
