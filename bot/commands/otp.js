@@ -22,6 +22,8 @@ const IMAGES = {
     depositConfirmed: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777235826/file_000000001c0c720aa51ae407e6741ca5_steie1.png'
 };
 
+import { User } from '../../models/index.js';  // ← Add this import
+
 class OTPCommands {
     constructor(bot, walletService) {
         this.bot = bot;
@@ -30,37 +32,32 @@ class OTPCommands {
         this.walletService.onDepositNotification(this.handleDepositNotification.bind(this));
     }
 
-    // ─── Helper methods (mirrored from UserCommands) ───
+    // ─── Helper methods using User statics (works with plain objects) ───
     _canUseFree(user) {
-        if (user.isBlacklisted) return false;
-        const limit = config.limits?.freeDaily || 3;
-        return (user.freeUsedToday || 0) < limit;
-    }
-
-    _freeRemaining(user) {
-        const limit = config.limits?.freeDaily || 3;
-        return Math.max(0, limit - (user.freeUsedToday || 0));
+        return User.canUseFree(user);
     }
 
     _canUseVip(user) {
-        if (!user.vipExpiry || new Date(user.vipExpiry) <= new Date()) return false;
-        const limit = config.limits?.vipDaily || 50;
-        return (user.vipDailyUsed || 0) < limit;
-    }
-
-    _vipRemaining(user) {
-        const limit = config.limits?.vipDaily || 50;
-        return Math.max(0, limit - (user.vipDailyUsed || 0));
+        return User.canUseVip(user);
     }
 
     _isVipActive(user) {
-        return user.vipExpiry && new Date(user.vipExpiry) > new Date();
+        return User.isVipActive(user);
     }
 
     _getAvailableBalance(user) {
-        return (user.balance || 0) - (user.lockedBalance || 0);
+        return User.getAvailableBalance(user);
     }
 
+    _freeRemaining(user) {
+        const limit = 3;
+        return Math.max(0, limit - (user.freeUsedToday || 0));
+    }
+
+    _vipRemaining(user) {
+        const limit = 50;
+        return Math.max(0, limit - (user.vipDailyUsed || 0));
+    }
     
 
     // NEW: Handle deposit notifications from WalletService
