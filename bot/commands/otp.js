@@ -22,8 +22,6 @@ const IMAGES = {
     depositConfirmed: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777235826/file_000000001c0c720aa51ae407e6741ca5_steie1.png'
 };
 
-import { User } from '../../models/index.js';  // ← Add this import
-
 class OTPCommands {
     constructor(bot, walletService) {
         this.bot = bot;
