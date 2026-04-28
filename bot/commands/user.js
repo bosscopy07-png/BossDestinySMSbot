@@ -439,12 +439,272 @@ class UserCommands {
     async handleServiceSelected(ctx) {
         const service = ctx.match[1];
         const mode = ctx.session?.otpMode || 'FREE';
-        try { await
+        try { await ctx.answerCbQuery(service + ' selected'); } catch (e) {}
 
+        const message =
+            '📱 <b>' + service + '</b>\n' +
+            '🎮 Mode: <code>' + mode + '</code>\n\n' +
+            '<i>Service selection confirmed. The OTP request system will process this.</i>';
 
+        await this.sendPhotoWithCaption(
+            ctx,
+            IMAGES.default,
+            message,
+            Markup.inlineKeyboard([
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]),
+            'HTML'
+        );
+    }
 
+    async handleBalance(ctx) {
+        const userId = ctx.from.id.toString();
+        const user = await this._ensureUserFresh(ctx);
 
+        const pendingDeposit = await Transaction.findOne({
+            userId: user.userId,
+            type: TX_TYPES.DEPOSIT,
+            status: { $in: ['PENDING', 'CONFIRMING'] }
+        }).sort({ createdAt: -1 });
 
+        const isVip = this._isVipActive(user);
+        const freeRemaining = this._freeRemaining(user);
+        const vipRemaining = isVip ? this._vipRemaining(user) : 0;
+
+        let masterAddress = 'Loading...';
+        try {
+            if (this.walletService?.getMasterAddress) {
+                masterAddress = await this.walletService.getMasterAddress();
+            }
+        } catch (e) {
+            masterAddress = 'Unavailable';
+        }
+
+        const message =
+            '💰 <b>Your Balance</b>\n\n' +
+            '💵 Available: <code>' + formatCurrency(this._getAvailableBalance(user)) + '</code>\n' +
+            '🔒 Locked: <code>' + formatCurrency(user.lockedBalance || 0) + '</code>\n' +
+            '💳 Total Deposited: <code>' + formatCurrency(user.totalDeposited || 0) + '</code>\n' +
+            '📉 Total Spent: <code>' + formatCurrency(user.totalSpent || 0) + '</code>\n\n' +
+            '📦 Bundle OTPs: <code>' + (user.bundleRemaining || 0) + '</code>\n' +
+            '🆓 Free Today: <code>' + freeRemaining + '/3</code>\n' +
+            (isVip ? '👑 VIP: <code>' + vipRemaining + '/50</code> left\n' : '👑 VIP: <i>Inactive</i>\n') +
+            '\n' +
+            (pendingDeposit ? '⏳ Pending Deposit: <code>' + formatCurrency(pendingDeposit.metadata?.requestedAmount || pendingDeposit.amount) + '</code>\n\n' : '') +
+            '💎 <b>Deposit Address:</b>\n<code>' + masterAddress + '</code>';
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('💳 Deposit', 'deposit')],
+            [Markup.button.callback('📜 Transaction History', 'history')],
+            [Markup.button.callback('🔙 Back to Menu', 'menu')]
+        ]);
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.balance, message, keyboard, 'HTML');
+    }
+
+    async handleDeposit(ctx) {
+        const userId = ctx.from.id.toString();
+        try {
+            const message =
+                '💳 <b>Select Deposit Amount</b>\n\n' +
+                'Choose how much <b>USDT (BEP-20)</b> you want to deposit:';
+
+            const keyboard = Markup.inlineKeyboard([
+                [
+                    Markup.button.callback('💵 $5', 'deposit_5'),
+                    Markup.button.callback('💵 $10', 'deposit_10'),
+                    Markup.button.callback('💵 $20', 'deposit_20')
+                ],
+                [
+                    Markup.button.callback('💵 $50', 'deposit_50'),
+                    Markup.button.callback('💵 $100', 'deposit_100')
+                ],
+                [Markup.button.callback('✏️ Custom Amount', 'deposit_custom')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]);
+
+            await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, keyboard, 'HTML');
+        } catch (error) {
+            logger.error('Deposit handler error', { userId, error: error.message });
+            await ctx.reply('❌ Error. Please try /deposit again.');
+        }
+    }
+
+    async handlePresetDeposit(ctx, amount) {
+        const userId = ctx.from.id.toString();
+        try {
+            await ctx.answerCbQuery('Generating $' + amount + ' deposit...');
+            await this.showDepositDetails(ctx, userId, amount);
+        } catch (error) {
+            logger.error('Preset deposit error', { userId, amount, error: error.message });
+            await ctx.answerCbQuery('❌ Error');
+        }
+    }
+
+    async handleCustomDeposit(ctx) {
+        const userId = ctx.from.id.toString();
+        try {
+            ctx.session = ctx.session || {};
+            ctx.session.awaitingDepositAmount = true;
+            await ctx.answerCbQuery('Enter custom amount');
+            const message =
+                '✏️ <b>Custom Deposit</b>\n\n' +
+                'Send the amount you want to deposit (in USD):\n\n' +
+                '<i>Examples: 5, 10.50, 25</i>\n\n' +
+                'Minimum: <code>$0.50</code>';
+            await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, null, 'HTML');
+        } catch (error) {
+            logger.error('Custom deposit error', { userId, error: error.message });
+        }
+    }
+
+    async handleDepositAmountInput(ctx) {
+        const userId = ctx.from.id.toString();
+        const text = ctx.message.text.trim().replace(/[^0-9.]/g, '');
+        const amount = parseFloat(text);
+        if (isNaN(amount) || amount < 0.50) {
+            return this.sendPhotoWithCaption(
+                ctx,
+                IMAGES.deposit,
+                '❌ <b>Invalid amount.</b>\n\nMinimum deposit is <code>$0.50</code>.\nTry /deposit again.',
+                null,
+                'HTML'
+            );
+        }
+        await this.showDepositDetails(ctx, userId, amount);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  DEPOSIT DETAILS — CORE FIX: track requestedAmount separately
+    //  from trackingAmount so user gets credited the REQUESTED amount
+    //  not the blockchain tracking amount
+    // ═══════════════════════════════════════════════════════════
+
+    async showDepositDetails(ctx, userId, requestedAmount) {
+        try {
+            // requestedAmount = what user WANTS to deposit (e.g., $1.00)
+            // trackingAmount = what they MUST send on blockchain (e.g., $1.0680)
+            // The difference is the system tracking fee — invisible to user balance
+            const depositInfo = await this.walletService.getDepositInfo(userId, requestedAmount);
+            
+            // The amount user must send (with tracking suffix)
+            const trackingAmount = depositInfo.amount || depositInfo.trackingAmount || depositInfo.baseAmount || requestedAmount;
+            
+            // The amount user actually wants (what gets credited to balance)
+            const actualAmount = depositInfo.baseAmount || requestedAmount;
+
+            // Store BOTH values: requested for credit, tracking for blockchain identification
+            await User.updateOne(
+                { userId },
+                { 
+                    $set: { 
+                        depositTrackingAmount: trackingAmount,
+                        depositRequestedAmount: actualAmount
+                    }
+                }
+            );
+
+            let depositAddress = depositInfo.address;
+            if (!depositAddress && this.walletService?.getMasterAddress) {
+                depositAddress = await this.walletService.getMasterAddress();
+            }
+
+            const message =
+                '💳 <b>Deposit $' + actualAmount + '</b>\n\n' +
+                'Send <b>exactly</b> this amount of <b>USDT (BEP-20)</b>:\n\n' +
+                '💵 You will receive: <code>$' + actualAmount + '</code>\n' +
+                '📬 Send exactly: <code>' + trackingAmount + '</code> USDT\n' +
+                '🌐 Network: <code>' + (depositInfo.network || 'BSC (BEP-20)') + '</code>\n\n' +
+                '⚠️ <b>IMPORTANT:</b>\n' +
+                '• Send ONLY USDT on BSC (BEP-20)\n' +
+                '• Send EXACTLY <code>' + trackingAmount + '</code> USDT\n' +
+                '• The extra <code>' + (trackingAmount - actualAmount).toFixed(4) + '</code> is for deposit identification only\n\n' +
+                '✅ <code>$' + actualAmount + '</code> will be credited to your balance.\n' +
+                '⏱ Funds credited automatically in 1-2 minutes.';
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('📱 Show QR Code', 'deposit_qr')],
+                [Markup.button.callback('🔍 Check Deposit', 'check_deposit')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]);
+
+            await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, keyboard, 'HTML');
+
+        } catch (error) {
+            logger.error('Show deposit details error', { userId, error: error.message });
+            await ctx.reply('❌ Error generating deposit. Please try again.');
+        }
+    }
+
+    async handleDepositQR(ctx) {
+        const userId = ctx.from.id.toString();
+        try {
+            const user = await User.findOne({ userId });
+            const trackingAmount = user?.depositTrackingAmount;
+            const requestedAmount = user?.depositRequestedAmount || trackingAmount;
+
+            if (!trackingAmount) {
+                return ctx.answerCbQuery('⚠️ Click Deposit first');
+            }
+
+            let masterAddress = '';
+            try {
+                if (this.walletService?.getMasterAddress) {
+                    masterAddress = await this.walletService.getMasterAddress();
+                }
+            } catch (e) {
+                return ctx.answerCbQuery('❌ Address unavailable');
+            }
+
+            await ctx.answerCbQuery('📱 Generating QR...');
+
+            const qrBuffer = await QRCode.toBuffer(masterAddress, {
+                width: 280,
+                margin: 2,
+                color: { dark: '#00BCD4', light: '#FFFFFF' }
+            });
+
+            const caption =
+                '📱 <b>Scan to Deposit</b>\n\n' +
+                '💵 You receive: <code>$' + requestedAmount + '</code>\n' +
+                '📬 Send exactly: <code>' + trackingAmount + '</code> USDT\n' +
+                '📬 Address: <code>' + masterAddress + '</code>\n\n' +
+                '⚠️ Send EXACTLY <code>' + trackingAmount + '</code> USDT on BSC (BEP-20)\n' +
+                '💰 <code>$' + requestedAmount + '</code> will be credited to your balance.';
+
+            const walletUrl = 'https://bscscan.com/address/' + masterAddress;
+
+            const keyboard = {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔗 View on BSCScan', url: walletUrl }],
+                        [{ text: '📋 Copy Address', callback_data: 'copy_address_' + masterAddress }],
+                        [{ text: '🔍 Check Deposit', callback_data: 'check_deposit' }],
+                        [{ text: '🔙 Back', callback_data: 'menu' }]
+                    ]
+                }
+            };
+
+            await ctx.replyWithPhoto(
+                { source: qrBuffer },
+                { caption: caption, parse_mode: 'HTML', reply_markup: keyboard.reply_markup }
+            );
+
+        } catch (error) {
+            logger.error('QR generation failed', { userId, error: error.message });
+            await ctx.answerCbQuery('❌ Failed to generate QR');
+        }
+    }
+
+    async handleCopyAddress(ctx) {
+        const address = ctx.match[1];
+        await ctx.answerCbQuery('📋 Address: ' + address.substring(0, 10) + '...');
+        await ctx.reply(
+            '📋 <b>Copy this address:</b>\n\n<code>' + address + '</code>\n\n' +
+            'Tap the address above to copy it.',
+            { parse_mode: 'HTML' }
+        );
+                                      }
 
                 // ═══════════════════════════════════════════════════════════
     //  CHECK DEPOSIT — CORE FIX: credit requestedAmount, not trackingAmount
@@ -818,6 +1078,7 @@ class UserCommands {
         await this.handleSettings(ctx);
     }
 
+    
     async handleChangeCountry(ctx) {
         ctx.session = ctx.session || {};
         ctx.session.awaitingCustomCountry = false;
@@ -833,4 +1094,227 @@ class UserCommands {
             { code: 'NG', name: '🇳🇬 Nigeria', flag: '🇳🇬' }
         ];
 
-        const buttons 
+        const buttons = countries.map(c => [
+            Markup.button.callback(c.flag + ' ' + c.name, 'setcountry_' + c.code)
+        ]);
+        buttons.push([Markup.button.callback('✏️ Custom', 'custom_country')]);
+        buttons.push([Markup.button.callback('🔙 Back', 'settings')]);
+
+        const message = '🌍 <b>Select Your Preferred Country</b>\n\nChoose a country for your OTP numbers:';
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, Markup.inlineKeyboard(buttons), 'HTML');
+    }
+
+    async handleSetCountry(ctx) {
+        const countryCode = ctx.match[1];
+        const userId = ctx.from.id.toString();
+        await User.updateOne({ userId }, { $set: { preferredCountry: countryCode } });
+        await ctx.answerCbQuery('🌍 Country set to ' + countryCode);
+        await this.handleSettings(ctx);
+    }
+
+    async handleCustomCountryInput(ctx) {
+        const countryCode = ctx.message.text.trim().toUpperCase().substring(0, 2);
+        const userId = ctx.from.id.toString();
+        await User.updateOne({ userId }, { $set: { preferredCountry: countryCode } });
+        await ctx.reply('🌍 Country set to <code>' + countryCode + '</code>', { parse_mode: 'HTML' });
+        await this.handleSettings(ctx);
+    }
+
+    async handleSupport(ctx) {
+        try {
+            const message =
+                '🎧 <b>SwiftSupport</b> — Customer Service\n\n' +
+                'Need help? Our support team is here for you!\n\n' +
+                '💬 Contact: <code>@swiftsmssupport</code>\n' +
+                '⏱ Response Time: Usually within 5 minutes\n\n' +
+                '❓ <b>Common Issues:</b>\n' +
+                '• Deposit not showing? → Use <code>/deposit</code> then Check Deposit\n' +
+                '• OTP not received? → Cancel and retry\n' +
+                '• Wrong amount sent? → Contact support with TX hash\n\n' +
+                '⚠️ Please include your <b>User ID</b> when contacting support.';
+
+            const keyboard = {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '💬 Chat Support', url: 'https://t.me/swiftsmssupport' }],
+                        [{ text: '🔙 Back', callback_data: 'menu' }]
+                    ]
+                }
+            };
+
+            await this.sendPhotoWithCaption(ctx, IMAGES.support, message, keyboard, 'HTML');
+        } catch (error) {
+            logger.error('Support handler error', { error: error.message, userId: ctx.from?.id });
+            try {
+                await ctx.reply(
+                    '🎧 Customer Service\n\nContact @swiftsmssupport for help.',
+                    {
+                        reply_markup: {
+                            inline_keyboard: [[{ text: '💬 Chat Support', url: 'https://t.me/swiftsmssupport' }]]
+                        }
+                    }
+                );
+            } catch (e) {
+                logger.error('Support fallback failed', { error: e.message });
+            }
+        }
+    }
+
+    async handleHelp(ctx) {
+        const message =
+            '❓ <b>Help & FAQ</b>\n\n' +
+            '<b>How to request OTP:</b>\n' +
+            '1️⃣ Tap Request OTP or use /otp\n' +
+            '2️⃣ Select mode (FREE, CHEAP, VIP, or Bundle)\n' +
+            '3️⃣ Choose service (WhatsApp, Telegram, etc.)\n' +
+            '4️⃣ Select country\n' +
+            '5️⃣ Wait for OTP to arrive\n\n' +
+            '<b>How to deposit:</b>\n' +
+            '1️⃣ Tap Deposit or use /deposit\n' +
+            '2️⃣ Select amount\n' +
+            '3️⃣ Send USDT (BEP-20) to shown address\n' +
+            '4️⃣ Tap Check Deposit or wait 1-2 minutes\n\n' +
+            '👑 <b>VIP Benefits:</b>\n' +
+            '• 50 OTPs/day\n' +
+            '• Priority routing\n' +
+            '• Fastest delivery\n' +
+            '• $5/month\n\n' +
+            '📦 <b>Bundle:</b>\n' +
+            '• 100 OTPs for $5\n' +
+            '• Never expires\n\n' +
+            '<b>Commands:</b>\n' +
+            '/start — Welcome screen\n' +
+            '/menu — Main menu\n' +
+            '/balance — Check balance\n' +
+            '/deposit — Add funds\n' +
+            '/history — Transactions\n' +
+            '/referral — Earn rewards\n' +
+            '/stats — Your statistics\n' +
+            '/settings — Preferences\n' +
+            '/support — Customer service\n' +
+            '/otp — Request OTP\n' +
+            '/buybundle — Buy 100 OTPs\n' +
+            '/buyvip — Upgrade to VIP';
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'menu')]
+        ]), 'HTML');
+    }
+
+    async handleBuyBundle(ctx) {
+        const user = await this._ensureUserFresh(ctx);
+        const bundlePrice = config.prices?.bundlePrice || 5.00;
+        const bundleCount = config.prices?.bundleOtpCount || 100;
+
+        if (this._getAvailableBalance(user) < bundlePrice) {
+            const message =
+                '❌ <b>Insufficient Balance</b>\n\n' +
+                'Required: <code>' + formatCurrency(bundlePrice) + '</code>\n' +
+                'Available: <code>' + formatCurrency(this._getAvailableBalance(user)) + '</code>\n\n' +
+                'Deposit first with /deposit';
+
+            return this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, Markup.inlineKeyboard([
+                [Markup.button.callback('💳 Deposit', 'deposit')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]), 'HTML');
+        }
+
+        await User.updateOne(
+            { userId: user.userId },
+            {
+                $inc: {
+                    balance: -bundlePrice,
+                    bundleRemaining: bundleCount,
+                    totalSpent: bundlePrice
+                }
+            }
+        );
+
+        await Transaction.create({
+            txId: 'BUNDLE_' + Date.now() + '_' + user.userId,
+            userId: user.userId,
+            type: TX_TYPES.BUNDLE_PURCHASE,
+            amount: -bundlePrice,
+            status: 'COMPLETED',
+            metadata: {
+                bundleCount,
+                pricePerOtp: bundlePrice / bundleCount
+            },
+            createdAt: new Date()
+        });
+
+        const message =
+            '📦 <b>Bundle Purchased!</b>\n\n' +
+            '✅ <code>' + bundleCount + '</code> OTPs added\n' +
+            '💵 <code>' + formatCurrency(bundlePrice) + '</code> deducted\n' +
+            '📦 Total Available: <code>' + ((user.bundleRemaining || 0) + bundleCount) + '</code> OTPs\n\n' +
+            'Use /otp to start requesting.';
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, Markup.inlineKeyboard([
+            [Markup.button.callback('🔢 Request OTP', 'request_otp')],
+            [Markup.button.callback('🔙 Back', 'menu')]
+        ]), 'HTML');
+    }
+
+    async handleBuyVIP(ctx) {
+        const user = await this._ensureUserFresh(ctx);
+        const vipPrice = config.prices?.vipSubscription || 5.00;
+
+        if (this._getAvailableBalance(user) < vipPrice) {
+            const message =
+                '❌ <b>Insufficient Balance</b>\n\n' +
+                'Required: <code>' + formatCurrency(vipPrice) + '</code>\n' +
+                'Available: <code>' + formatCurrency(this._getAvailableBalance(user)) + '</code>\n\n' +
+                'Deposit first with /deposit';
+
+            return this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, Markup.inlineKeyboard([
+                [Markup.button.callback('💳 Deposit', 'deposit')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]), 'HTML');
+        }
+
+        const expiryDate = new Date();
+        expiryDate.setMonth(expiryDate.getMonth() + 1);
+
+        await User.updateOne(
+            { userId: user.userId },
+            {
+                $inc: { balance: -vipPrice, totalSpent: vipPrice },
+                $set: {
+                    mode: 'VIP',
+                    vipExpiry: expiryDate,
+                    vipDailyUsed: 0,
+                    vipDailyReset: new Date()
+                }
+            }
+        );
+
+        await Transaction.create({
+            txId: 'VIP_' + Date.now() + '_' + user.userId,
+            userId: user.userId,
+            type: TX_TYPES.VIP_SUBSCRIPTION,
+            amount: -vipPrice,
+            status: 'COMPLETED',
+            metadata: {
+                duration: '1 month',
+                expiryDate,
+                vipDailyLimit: config.limits?.vipDaily || 50
+            },
+            createdAt: new Date()
+        });
+
+        const message =
+            '👑 <b>VIP Activated!</b>\n\n' +
+            '✅ Valid until: <code>' + expiryDate.toLocaleDateString() + '</code>\n' +
+            '🔢 50 OTPs/day\n' +
+            '⚡ Priority delivery enabled\n\n' +
+            '🎉 Enjoy premium service!';
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, Markup.inlineKeyboard([
+            [Markup.button.callback('🔢 Request OTP', 'request_otp')],
+            [Markup.button.callback('🔙 Back', 'menu')]
+        ]), 'HTML');
+    }
+}
+
+export default UserCommands;
