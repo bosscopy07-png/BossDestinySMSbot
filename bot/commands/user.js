@@ -102,7 +102,8 @@ class UserCommands {
 
         // Copy address handler
         this.bot.action(/copy_address_(.+)/, this.handleCopyAddress.bind(this));
-
+        this.bot.action(/share_address_(.+)/, this.handleShareAddress.bind(this));
+        
         // Text handler for custom amount
         this.bot.on('text', async (ctx, next) => {
             if (ctx.session?.awaitingDepositAmount) {
@@ -457,7 +458,7 @@ class UserCommands {
         await this.showDepositDetails(ctx, userId, amount);
     }
 
-    async showDepositDetails(ctx, userId, requestedAmount) {
+        async showDepositDetails(ctx, userId, requestedAmount) {
         try {
             const depositInfo = await this.walletService.getDepositInfo(userId, requestedAmount);
             
@@ -474,14 +475,18 @@ class UserCommands {
                 }
             );
 
+            // Resolve deposit address with proper fallback chain
             let depositAddress = depositInfo.address;
             if (!depositAddress && this.walletService?.getMasterAddress) {
-                depositAddress = await this.walletService.getMasterAddress();
+                depositAddress = this.walletService.getMasterAddress();
+            }
+            if (!depositAddress || depositAddress === 'WALLET_NOT_READY') {
+                throw new Error('WALLET_ADDRESS_UNAVAILABLE');
             }
 
             const message =
                 '💳 <b>Deposit $' + actualAmount + '</b>\n\n' +
-                'Send <b>exactly</b> this amount of <b>USDT (BEP-20)</b>:\n\n' +
+                '📬 <b>Send to this address:</b>\n<code>' + depositAddress + '</code>\n\n' +
                 '💵 You will receive: <code>$' + actualAmount + '</code>\n' +
                 '📬 Send exactly: <code>' + trackingAmount + '</code> USDT\n' +
                 '🌐 Network: <code>' + (depositInfo.network || 'BSC (BEP-20)') + '</code>\n\n' +
@@ -492,19 +497,97 @@ class UserCommands {
                 '✅ <code>$' + actualAmount + '</code> will be credited to your balance.\n' +
                 '⏱ Funds credited automatically in 1-2 minutes.';
 
+            // ─── 5. OPTIONAL IMPROVEMENTS ─────────────────────────────
+            // Share Address button for easier copy on mobile devices
             const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('📋 Copy Address', 'copy_address_' + depositAddress)],
+                [Markup.button.callback('📤 Share Address', 'share_address_' + depositAddress)],
                 [Markup.button.callback('📱 Show QR Code', 'deposit_qr')],
                 [Markup.button.callback('🔍 Check Deposit', 'check_deposit')],
                 [Markup.button.callback('🔙 Back', 'menu')]
             ]);
 
-            await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, keyboard, 'HTML');
+            const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, keyboard, 'HTML');
+
+            // ─── 6. NEW FEATURE: Auto-refresh deposit status ──────────
+            // Silently check for deposit every 30s and notify user when detected
+            this._scheduleDepositCheck(ctx, userId, sentMessage?.message_id);
 
         } catch (error) {
             logger.error('Show deposit details error', { userId, error: error.message });
+            
+            if (error.message === 'WALLET_ADDRESS_UNAVAILABLE') {
+                return ctx.reply('❌ Wallet service is initializing. Please wait 10 seconds and try /deposit again.');
+            }
+            
             await ctx.reply('❌ Error generating deposit. Please try again.');
         }
     }
+
+    // ─── 5. OPTIONAL IMPROVEMENT: Share Address handler ───────────
+    async handleShareAddress(ctx) {
+        const address = ctx.match[1];
+        await ctx.answerCbQuery('📤 Address ready!');
+        await ctx.reply(
+            '📤 <b>Deposit Address</b>\n\n<code>' + address + '</code>\n\n' +
+            'Tap and hold to copy, then paste in your wallet app.',
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    // ─── 6. NEW FEATURE: Auto-refresh deposit checker ─────────────
+    _scheduleDepositCheck(ctx, userId, originalMessageId, attempt = 0) {
+        const MAX_ATTEMPTS = 10;      // Check for 5 minutes total (10 × 30s)
+        const CHECK_INTERVAL = 30000; // 30 seconds
+
+        if (attempt >= MAX_ATTEMPTS) return;
+
+        setTimeout(async () => {
+            try {
+                // Check if user still has pending deposit
+                const user = await User.findOne({ userId }).select('depositPending');
+                if (!user?.depositPending) return; // Already processed or cancelled
+
+                const result = await this.walletService.checkDeposit(userId);
+
+                if (result.found && (result.status === 'COMPLETED' || result.status === 'CREDITED')) {
+                    // Deposit detected! Notify user
+                    const notifyMessage =
+                        '✅ <b>Deposit Detected!</b>\n\n' +
+                        '💵 Amount: <code>' + formatCurrency(result.amount) + '</code>\n' +
+                        '🔗 TX: <code>' + (result.txHash || 'N/A') + '</code>\n\n' +
+                        'Your balance has been updated. Use /otp to start requesting!';
+
+                    await ctx.reply(notifyMessage, { parse_mode: 'HTML' });
+
+                    // Edit original deposit message to show confirmed status
+                    if (originalMessageId) {
+                        try {
+                            await ctx.telegram.editMessageCaption(
+                                ctx.chat.id,
+                                originalMessageId,
+                                undefined,
+                                '✅ <b>Deposit Confirmed</b>\n\n💵 Credited: <code>' + formatCurrency(result.amount) + '</code>\n⏱ Status: Completed',
+                                { parse_mode: 'HTML' }
+                            );
+                        } catch (editError) {
+                            // Message might be too old to edit, ignore
+                        }
+                    }
+                    return; // Stop checking
+                }
+
+                // Not found yet, schedule next check
+                this._scheduleDepositCheck(ctx, userId, originalMessageId, attempt + 1);
+
+            } catch (error) {
+                logger.error('Auto deposit check failed', { userId, attempt, error: error.message });
+                // Continue checking despite error
+                this._scheduleDepositCheck(ctx, userId, originalMessageId, attempt + 1);
+            }
+        }, CHECK_INTERVAL);
+            }
+            
 
     async handleDepositQR(ctx) {
         const userId = ctx.from.id.toString();
