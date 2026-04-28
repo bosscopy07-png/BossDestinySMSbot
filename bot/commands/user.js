@@ -1,4 +1,3 @@
-
 import { Markup } from 'telegraf';
 import QRCode from 'qrcode';
 import { User, Session, Transaction } from '../../models/index.js';
@@ -20,6 +19,15 @@ const IMAGES = {
     default: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777235807/file_000000002930724688cd84d89728bc31_gfgpbk.png'
 };
 
+// ─── Transaction type constants (local mirror for audit logging) ───
+const TX_TYPES = Object.freeze({
+    DEPOSIT: 'DEPOSIT',
+    BUNDLE_PURCHASE: 'BUNDLE_PURCHASE',
+    VIP_SUBSCRIPTION: 'VIP_SUBSCRIPTION',
+    CHEAP_OTP: 'CHEAP_OTP',
+    REFERRAL_REWARD: 'REFERRAL_REWARD'
+});
+
 class UserCommands {
     constructor(bot, walletService) {
         this.bot = bot;
@@ -37,7 +45,10 @@ class UserCommands {
         this.bot.command('stats', this.handleStats.bind(this));
         this.bot.command('settings', this.handleSettings.bind(this));
         this.bot.command('support', this.handleSupport.bind(this));
-        
+        this.bot.command('otp', this.handleRequestOTP.bind(this));
+        this.bot.command('buybundle', this.handleBuyBundle.bind(this));
+        this.bot.command('buyvip', this.handleBuyVIP.bind(this));
+
         // Callback handlers
         this.bot.action('menu', this.handleMenu.bind(this));
         this.bot.action('deposit', this.handleDeposit.bind(this));
@@ -51,21 +62,25 @@ class UserCommands {
         this.bot.action('deposit_qr', this.handleDepositQR.bind(this));
         this.bot.action('request_otp', this.handleRequestOTP.bind(this));
         this.bot.action('help', this.handleHelp.bind(this));
-        
-        // FIXED: Wire all mode buttons to actual handlers
+
+        // Mode buttons
         this.bot.action('mode_free', this.handleFreeMode.bind(this));
         this.bot.action('mode_cheap', this.handleCheapMode.bind(this));
         this.bot.action('mode_vip', this.handleVIPMode.bind(this));
         this.bot.action('mode_bundle', this.handleBuyBundle.bind(this));
-        
+
+        // Purchase confirmations
+        this.bot.action('buy_bundle', this.handleBuyBundle.bind(this));
+        this.bot.action('buy_vip', this.handleBuyVIP.bind(this));
+
         // Settings toggles
         this.bot.action('toggle_privacy', this.handleTogglePrivacy.bind(this));
         this.bot.action('toggle_notifications', this.handleToggleNotifications.bind(this));
         this.bot.action('change_country', this.handleChangeCountry.bind(this));
-        
+
         // History export
         this.bot.action('export_history', this.handleExportHistory.bind(this));
-        
+
         // Preset amount handlers
         this.bot.action('deposit_5', (ctx) => this.handlePresetDeposit(ctx, 5));
         this.bot.action('deposit_10', (ctx) => this.handlePresetDeposit(ctx, 10));
@@ -73,37 +88,137 @@ class UserCommands {
         this.bot.action('deposit_50', (ctx) => this.handlePresetDeposit(ctx, 50));
         this.bot.action('deposit_100', (ctx) => this.handlePresetDeposit(ctx, 100));
         this.bot.action('deposit_custom', this.handleCustomDeposit.bind(this));
-        
+
         // Referral share
         this.bot.action(/share_(.+)/, this.handleShareReferral.bind(this));
-        
+
         // Country selection for settings
         this.bot.action(/setcountry_(.+)/, this.handleSetCountry.bind(this));
-        
+
+        // Copy address handler
+        this.bot.action(/copy_address_(.+)/, this.handleCopyAddress.bind(this));
+
+        // Service selection (placeholder — wired for future OTPCommands integration)
+        this.bot.action(/service_(.+)/, this.handleServiceSelected.bind(this));
+
         // Text handler for custom amount
         this.bot.on('text', async (ctx, next) => {
             if (ctx.session?.awaitingDepositAmount) {
-                ctx.session.awaitingDepositAmount = false;
+                delete ctx.session.awaitingDepositAmount;
                 return this.handleDepositAmountInput(ctx);
             }
             if (ctx.session?.awaitingCustomCountry) {
-                ctx.session.awaitingCustomCountry = false;
+                delete ctx.session.awaitingCustomCountry;
                 return this.handleCustomCountryInput(ctx);
             }
             return next();
         });
     }
 
+    // ─── Helper: ensure user document exists and counters are fresh ───
+    async _ensureUserFresh(ctx) {
+        const userId = ctx.from.id.toString();
+        let user = await User.findOne({ userId }).lean();
+
+        if (!user) {
+            user = {
+                userId,
+                username: ctx.from.username || null,
+                firstName: ctx.from.first_name || '',
+                lastName: ctx.from.last_name || '',
+                balance: 0,
+                lockedBalance: 0,
+                bundleRemaining: 0,
+                freeUsedToday: 0,
+                freeResetDate: new Date(),
+                vipExpiry: null,
+                vipDailyUsed: 0,
+                vipDailyReset: new Date(),
+                mode: 'FREE',
+                isBlacklisted: false,
+                referralCode: generateReferralCode(),
+                referralCount: 0,
+                referralEarnings: 0,
+                referralRewardsPending: 0,
+                referralBonusReceived: false,
+                totalDeposited: 0,
+                totalSpent: 0,
+                privacyEnabled: false,
+                notificationsEnabled: true,
+                preferredCountry: 'US',
+                createdAt: new Date(),
+                lastActive: new Date()
+            };
+            await User.create(user);
+        }
+
+        const now = new Date();
+        let needsUpdate = false;
+        const updates = {};
+
+        if (isNewDay(user.freeResetDate)) {
+            updates.freeUsedToday = 0;
+            updates.freeResetDate = now;
+            needsUpdate = true;
+        }
+
+        if (user.vipDailyReset && isNewDay(user.vipDailyReset)) {
+            updates.vipDailyUsed = 0;
+            updates.vipDailyReset = now;
+            needsUpdate = true;
+        }
+
+        if (needsUpdate) {
+            await User.updateOne({ userId }, { $set: updates });
+            user = { ...user, ...updates };
+        }
+
+        await User.updateOne({ userId }, { $set: { lastActive: now } }).catch(() => {});
+
+        return user;
+    }
+
+    // ─── Safe counter helpers ───
+    _canUseFree(user) {
+        if (user.isBlacklisted) return false;
+        const limit = config.limits?.freeDaily || 3;
+        return (user.freeUsedToday || 0) < limit;
+    }
+
+    _freeRemaining(user) {
+        const limit = config.limits?.freeDaily || 3;
+        return Math.max(0, limit - (user.freeUsedToday || 0));
+    }
+
+    _canUseVip(user) {
+        if (!user.vipExpiry || new Date(user.vipExpiry) <= new Date()) return false;
+        const limit = config.limits?.vipDaily || 50;
+        return (user.vipDailyUsed || 0) < limit;
+    }
+
+    _vipRemaining(user) {
+        const limit = config.limits?.vipDaily || 50;
+        return Math.max(0, limit - (user.vipDailyUsed || 0));
+    }
+
+    _isVipActive(user) {
+        return user.vipExpiry && new Date(user.vipExpiry) > new Date();
+    }
+
+    _getAvailableBalance(user) {
+        return (user.balance || 0) - (user.lockedBalance || 0);
+    }
+
     async sendPhotoWithCaption(ctx, imageUrl, caption, keyboard = null, parseMode = null) {
         try {
             const payload = { caption: caption.trim() };
             if (parseMode) payload.parse_mode = parseMode;
-            if (keyboard) payload.reply_markup = keyboard.reply_markup;
+            if (keyboard) payload.reply_markup = keyboard.reply_markup || keyboard;
             return await ctx.replyWithPhoto(imageUrl, payload);
         } catch (error) {
             logger.error('Photo send failed', { error: error.message, url: imageUrl });
             if (keyboard) {
-                return await ctx.reply(caption, keyboard);
+                return await ctx.reply(caption, { reply_markup: keyboard.reply_markup || keyboard });
             }
             return await ctx.reply(caption);
         }
@@ -111,539 +226,578 @@ class UserCommands {
 
     async handleStart(ctx) {
         const userId = ctx.from.id.toString();
-        let user = ctx.state.user;
+        let user = await this._ensureUserFresh(ctx);
 
         const startPayload = ctx.startPayload;
         if (startPayload && !user.referredBy) {
             const referrerCode = startPayload.toUpperCase();
             const referrer = await User.findOne({ referralCode: referrerCode });
-            
+
             if (referrer && referrer.userId !== userId) {
                 await User.updateOne({ userId }, { $set: { referredBy: referrerCode } });
                 await User.updateOne(
                     { userId: referrer.userId },
-                    { $inc: { referralCount: 1 }, $push: { referrals: userId } }
+                    { $inc: { referralCount: 1 } }
                 );
-                
-                await this.sendPhotoWithCaption(ctx, IMAGES.referral, 'You were referred by ' + (referrer.username || 'a friend') + '!\n\nYou will get a bonus on your first deposit.');
-                user = await User.findOne({ userId });
+
+                await this.sendPhotoWithCaption(
+                    ctx,
+                    IMAGES.referral,
+                    '🎉 <b>You were referred!</b>\n\nYou were invited by ' + (referrer.username || 'a friend') + '!\n\nYou will receive a <b>bonus</b> on your first deposit.'
+                );
+                user = await User.findOne({ userId }).lean();
             }
         }
 
-        if (isNewDay(user.freeResetDate)) {
-            await User.updateOne({ userId }, { $set: { freeUsedToday: 0, freeResetDate: new Date() } });
-            user.freeUsedToday = 0;
-        }
+        const freeRemaining = this._freeRemaining(user);
+        const isVip = this._isVipActive(user);
+        const vipRemaining = isVip ? this._vipRemaining(user) : 0;
 
-        const welcomeMessage = 'Welcome to SwiftOTP, ' + (ctx.from.first_name || 'there') + '!\n\nGet verification codes instantly for any service.\n\n' +
-            (user.isVipActive?.() ? 'VIP Active\n' : '') +
-            'Balance: ' + formatCurrency(user.balance || 0) + '\n' +
-            'Bundle: ' + (user.bundleRemaining || 0) + ' OTPs\n' +
-            'Free Today: ' + Math.max(0, 3 - (user.freeUsedToday || 0)) + '/3\n\n' +
+        const welcomeMessage =
+            '👋 <b>Welcome to SwiftOTP</b>, ' + (ctx.from.first_name || 'there') + '!\n\n' +
+            '🔐 Get verification codes instantly for any service.\n\n' +
+            (isVip ? '👑 <b>VIP Active</b> — ' + vipRemaining + ' left today\n' : '') +
+            '💰 Balance: <code>' + formatCurrency(user.balance || 0) + '</code>\n' +
+            '📦 Bundle: <code>' + (user.bundleRemaining || 0) + '</code> OTPs\n' +
+            '🆓 Free Today: <code>' + freeRemaining + '/3</code>\n\n' +
             'Choose your mode or deposit to get started:';
 
         const keyboard = Markup.inlineKeyboard([
-            [Markup.button.callback('FREE OTP', 'mode_free'), Markup.button.callback('CHEAP OTP', 'mode_cheap')],
-            [Markup.button.callback('Buy Bundle', 'mode_bundle'), Markup.button.callback('Upgrade VIP', 'mode_vip')],
-            [Markup.button.callback('Deposit', 'deposit'), Markup.button.callback('My Stats', 'stats')],
-            [Markup.button.callback('Referral', 'referral'), Markup.button.callback('Settings', 'settings')],
-            [Markup.button.callback('Check Balance', 'balance'), Markup.button.callback('Customer Service', 'support')]
+            [Markup.button.callback('🆓 FREE OTP', 'mode_free'), Markup.button.callback('💵 CHEAP OTP', 'mode_cheap')],
+            [Markup.button.callback('📦 Buy Bundle', 'mode_bundle'), Markup.button.callback('👑 Upgrade VIP', 'mode_vip')],
+            [Markup.button.callback('💳 Deposit', 'deposit'), Markup.button.callback('📊 My Stats', 'stats')],
+            [Markup.button.callback('🎁 Referral', 'referral'), Markup.button.callback('⚙️ Settings', 'settings')],
+            [Markup.button.callback('💰 Check Balance', 'balance'), Markup.button.callback('🎧 Customer Service', 'support')]
         ]);
 
-        await this.sendPhotoWithCaption(ctx, IMAGES.welcome, welcomeMessage, keyboard);
+        await this.sendPhotoWithCaption(ctx, IMAGES.welcome, welcomeMessage, keyboard, 'HTML');
     }
 
     async handleMenu(ctx) {
-        const user = ctx.state.user || await User.findOne({ userId: ctx.from.id.toString() });
+        const user = await this._ensureUserFresh(ctx);
 
-        const menuText = 'Main Menu\n\n' +
-            'Balance: ' + formatCurrency(user.balance || 0) + '\n' +
-            'Bundle: ' + (user.bundleRemaining || 0) + ' OTPs\n' +
-            'Free Today: ' + Math.max(0, 3 - (user.freeUsedToday || 0)) + '/3\n' +
-            (user.isVipActive?.() ? 'VIP Until: ' + user.vipExpiry?.toLocaleDateString() + '\n' : '') +
+        const freeRemaining = this._freeRemaining(user);
+        const isVip = this._isVipActive(user);
+        const vipRemaining = isVip ? this._vipRemaining(user) : 0;
+
+        const menuText =
+            '📋 <b>Main Menu</b>\n\n' +
+            '💰 Balance: <code>' + formatCurrency(user.balance || 0) + '</code>\n' +
+            '📦 Bundle: <code>' + (user.bundleRemaining || 0) + '</code> OTPs\n' +
+            '🆓 Free Today: <code>' + freeRemaining + '/3</code>\n' +
+            (isVip ? '👑 VIP: <code>' + vipRemaining + '/50</code> left\n' : '') +
             '\nWhat would you like to do?';
 
         const keyboard = Markup.inlineKeyboard([
-            [Markup.button.callback('Request OTP', 'request_otp'), Markup.button.callback('Deposit', 'deposit')],
-            [Markup.button.callback('History', 'history'), Markup.button.callback('Stats', 'stats')],
-            [Markup.button.callback('Referral', 'referral'), Markup.button.callback('Settings', 'settings')],
-            [Markup.button.callback('Check Balance', 'balance'), Markup.button.callback('Customer Service', 'support')],
-            [Markup.button.callback('Help', 'help')]
+            [Markup.button.callback('🔢 Request OTP', 'request_otp'), Markup.button.callback('💳 Deposit', 'deposit')],
+            [Markup.button.callback('📜 History', 'history'), Markup.button.callback('📊 Stats', 'stats')],
+            [Markup.button.callback('🎁 Referral', 'referral'), Markup.button.callback('⚙️ Settings', 'settings')],
+            [Markup.button.callback('💰 Balance', 'balance'), Markup.button.callback('🎧 Support', 'support')],
+            [Markup.button.callback('❓ Help', 'help')]
         ]);
 
         try {
-            await ctx.editMessageText(menuText, keyboard);
+            await ctx.editMessageText(menuText, {
+                parse_mode: 'HTML',
+                reply_markup: keyboard.reply_markup
+            });
         } catch {
-            await this.sendPhotoWithCaption(ctx, IMAGES.mainMenu, menuText, keyboard);
+            await this.sendPhotoWithCaption(ctx, IMAGES.mainMenu, menuText, keyboard, 'HTML');
         }
     }
 
-    // FIXED: Actually routes to OTP - shows mode selection that WORKS
     async handleRequestOTP(ctx) {
         try { await ctx.answerCbQuery('Opening OTP...'); } catch (e) {}
-        
-        const message = 'Request OTP\n\nSelect your preferred mode:';
+
+        const user = await this._ensureUserFresh(ctx);
+        const freeRemaining = this._freeRemaining(user);
+        const isVip = this._isVipActive(user);
+        const vipRemaining = isVip ? this._vipRemaining(user) : 0;
+
+        const message =
+            '🔢 <b>Request OTP</b>\n\n' +
+            '🆓 Free: <code>' + freeRemaining + '/3</code> left\n' +
+            '💵 Cheap: <code>' + formatCurrency(config.prices?.cheapOtp || 0.05) + '</code> per OTP\n' +
+            '📦 Bundle: <code>' + (user.bundleRemaining || 0) + '</code> OTPs left\n' +
+            (isVip ? '👑 VIP: <code>' + vipRemaining + '/50</code> left today\n' : '👑 VIP: <i>Inactive</i>\n') +
+            '\nSelect your preferred mode:';
+
         const keyboard = Markup.inlineKeyboard([
-            [Markup.button.callback('FREE', 'mode_free'), Markup.button.callback('CHEAP', 'mode_cheap')],
-            [Markup.button.callback('BUNDLE', 'mode_bundle'), Markup.button.callback('VIP', 'mode_vip')],
-            [Markup.button.callback('Back', 'menu')]
+            [Markup.button.callback('🆓 FREE', 'mode_free'), Markup.button.callback('💵 CHEAP', 'mode_cheap')],
+            [Markup.button.callback('📦 BUNDLE', 'mode_bundle'), Markup.button.callback('👑 VIP', 'mode_vip')],
+            [Markup.button.callback('🔙 Back', 'menu')]
         ]);
 
-        await this.sendPhotoWithCaption(ctx, IMAGES.welcome, message, keyboard);
+        await this.sendPhotoWithCaption(ctx, IMAGES.welcome, message, keyboard, 'HTML');
     }
 
-    // FIXED: These now actually DO something instead of showing a menu
     async handleFreeMode(ctx) {
         try { await ctx.answerCbQuery('Loading FREE...'); } catch (e) {}
-        const user = ctx.state.user || await User.findOne({ userId: ctx.from.id.toString() });
-        
-        if (!user.canUseFree || !user.canUseFree()) {
-            const message = 'Free Limit Reached\n\nYou have used all 3 free OTPs today.\n\nDeposit to continue:\n- CHEAP: $0.05 per OTP\n- Bundle: $5 for 100 OTPs';
+        const user = await this._ensureUserFresh(ctx);
+
+        if (!this._canUseFree(user)) {
+            const message =
+                '🚫 <b>Free Limit Reached</b>\n\n' +
+                'You have used all 3 free OTPs today.\n\n' +
+                '💵 <b>Cheap:</b> <code>' + formatCurrency(config.prices?.cheapOtp || 0.05) + '</code> per OTP\n' +
+                '📦 <b>Bundle:</b> <code>' + formatCurrency(config.prices?.bundlePrice || 5.00) + '</code> for 100 OTPs\n' +
+                '👑 <b>VIP:</b> <code>' + formatCurrency(config.prices?.vipSubscription || 5.00) + '</code>/month';
+
             const keyboard = Markup.inlineKeyboard([
-                [Markup.button.callback('Deposit', 'deposit')],
-                [Markup.button.callback('Back', 'menu')]
+                [Markup.button.callback('💳 Deposit', 'deposit')],
+                [Markup.button.callback('🔙 Back', 'menu')]
             ]);
-            return this.sendPhotoWithCaption(ctx, IMAGES.default, message, keyboard);
+            return this.sendPhotoWithCaption(ctx, IMAGES.default, message, keyboard, 'HTML');
         }
-        
-        // Store mode and redirect to service selection (would be handled by OTPCommands or next step)
+
         ctx.session = ctx.session || {};
-ctx.session.otpMode = 'FREE';
-await this.showServiceSelection(ctx, 'FREE');
+        ctx.session.otpMode = 'FREE';
+        await this.showServiceSelection(ctx, 'FREE');
     }
-        
-        
 
     async handleCheapMode(ctx) {
         try { await ctx.answerCbQuery('Loading CHEAP...'); } catch (e) {}
-        const user = ctx.state.user || await User.findOne({ userId: ctx.from.id.toString() });
+        const user = await this._ensureUserFresh(ctx);
         const cheapPrice = config.prices?.cheapOtp || 0.05;
-        
-        if (user.getAvailableBalance && user.getAvailableBalance() < cheapPrice) {
-            const message = 'Insufficient Balance\n\nRequired: ' + formatCurrency(cheapPrice) + '\nAvailable: ' + formatCurrency(user.getAvailableBalance()) + '\n\nPlease deposit first.';
+
+        if (this._getAvailableBalance(user) < cheapPrice) {
+            const message =
+                '❌ <b>Insufficient Balance</b>\n\n' +
+                'Required: <code>' + formatCurrency(cheapPrice) + '</code>\n' +
+                'Available: <code>' + formatCurrency(this._getAvailableBalance(user)) + '</code>\n\n' +
+                'Please deposit first.';
+
             const keyboard = Markup.inlineKeyboard([
-                [Markup.button.callback('Deposit', 'deposit')],
-                [Markup.button.callback('Back', 'menu')]
+                [Markup.button.callback('💳 Deposit', 'deposit')],
+                [Markup.button.callback('🔙 Back', 'menu')]
             ]);
-            return this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, keyboard);
+            return this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, keyboard, 'HTML');
         }
-        
-        
+
         ctx.session = ctx.session || {};
-ctx.session.otpMode = 'CHEAP';
-await this.showServiceSelection(ctx, 'CHEAP');
+        ctx.session.otpMode = 'CHEAP';
+        await this.showServiceSelection(ctx, 'CHEAP');
     }
 
     async handleVIPMode(ctx) {
         try { await ctx.answerCbQuery('Loading VIP...'); } catch (e) {}
-        const user = ctx.state.user || await User.findOne({ userId: ctx.from.id.toString() });
-        
-        if (!user.isVipActive || !user.isVipActive()) {
-            const message = 'VIP Required\n\nYou need an active VIP subscription.\n\nPrice: ' + formatCurrency(config.prices?.vipSubscription || 5.00) + '/month\nIncludes: Unlimited OTPs (50/day max)\n\nUpgrade now?';
+        const user = await this._ensureUserFresh(ctx);
+
+        if (!this._isVipActive(user)) {
+            const message =
+                '👑 <b>VIP Required</b>\n\n' +
+                'You need an active VIP subscription.\n\n' +
+                'Price: <code>' + formatCurrency(config.prices?.vipSubscription || 5.00) + '/month</code>\n' +
+                'Includes: 50 OTPs/day, priority routing, fastest delivery\n\n' +
+                'Upgrade now?';
+
             const keyboard = Markup.inlineKeyboard([
-                [Markup.button.callback('Upgrade VIP', 'buy_vip')],
-                [Markup.button.callback('Back', 'menu')]
+                [Markup.button.callback('✅ Upgrade VIP', 'buy_vip')],
+                [Markup.button.callback('🔙 Back', 'menu')]
             ]);
-            return this.sendPhotoWithCaption(ctx, IMAGES.default, message, keyboard);
+            return this.sendPhotoWithCaption(ctx, IMAGES.default, message, keyboard, 'HTML');
         }
-        
-        if (!user.canUseVip || !user.canUseVip()) {
-            const message = 'VIP Daily Limit Reached\n\nYou have used 50/50 VIP OTPs today.\nResets at midnight UTC.';
-            return this.sendPhotoWithCaption(ctx, IMAGES.default, message);
+
+        if (!this._canUseVip(user)) {
+            const message =
+                '⏰ <b>VIP Daily Limit Reached</b>\n\n' +
+                'You have used <code>50/50</code> VIP OTPs today.\n' +
+                'Resets at midnight UTC.\n\n' +
+                'You can still use:\n' +
+                '🆓 Free: <code>' + this._freeRemaining(user) + '/3</code>\n' +
+                '💵 Cheap: <code>' + formatCurrency(config.prices?.cheapOtp || 0.05) + '</code>';
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]);
+            return this.sendPhotoWithCaption(ctx, IMAGES.default, message, keyboard, 'HTML');
         }
-        
+
         ctx.session = ctx.session || {};
-ctx.session.otpMode = 'VIP';
-await this.showServiceSelection(ctx, 'VIP');
+        ctx.session.otpMode = 'VIP';
+        await this.showServiceSelection(ctx, 'VIP');
     }
-    
+
     async showServiceSelection(ctx, mode) {
-    ctx.session = ctx.session || {};
-    ctx.session.otpMode = mode;
+        ctx.session = ctx.session || {};
+        ctx.session.otpMode = mode;
 
-    const message = mode + ' Mode Selected\n\nChoose the service you need OTP for:';
+        const message = '✅ <b>' + mode + ' Mode Selected</b>\n\nChoose the service you need an OTP for:';
 
-    const buttons = [];
-    for (let i = 0; i < SERVICES.length; i += 3) {
-        const row = SERVICES.slice(i, i + 3).map(service => 
-            Markup.button.callback(service, 'service_' + service)
-        );
-        buttons.push(row);
-    }
-    buttons.push([Markup.button.callback('Back', 'menu')]);
-
-    await this.sendPhotoWithCaption(ctx, IMAGES.default, message, Markup.inlineKeyboard(buttons));
-    }
-    
-
-    async handleBalance(ctx) {
-        const userId = ctx.from.id.toString();
-        const user = await User.findOne({ userId });
-        const pendingDeposit = await Transaction.findOne({
-            userId: user.userId,
-            type: 'DEPOSIT',
-            status: { $in: ['PENDING', 'CONFIRMING'] }
-        });
-
-        const message = 'Your Balance\n\n' +
-            'Available: ' + formatCurrency((user.balance || 0) - (user.lockedBalance || 0)) + '\n' +
-            'Locked: ' + formatCurrency(user.lockedBalance || 0) + '\n' +
-            'Total Deposited: ' + formatCurrency(user.totalDeposited || 0) + '\n' +
-            'Total Spent: ' + formatCurrency(user.totalSpent || 0) + '\n\n' +
-            'Bundle OTPs: ' + (user.bundleRemaining || 0) + '\n' +
-            (user.isVipActive?.() ? 'VIP Until: ' + user.vipExpiry?.toLocaleDateString() : 'VIP: Inactive') + '\n\n' +
-            (pendingDeposit ? 'Pending Deposit: ' + formatCurrency(pendingDeposit.amount) + '\n\n' : '') +
-            'Deposit to:\n' + this.walletService.getMasterAddress();
-
-        const keyboard = Markup.inlineKeyboard([
-            [Markup.button.callback('Deposit', 'deposit')],
-            [Markup.button.callback('Transaction History', 'history')],
-            [Markup.button.callback('Back to Menu', 'menu')]
-        ]);
-
-        await this.sendPhotoWithCaption(ctx, IMAGES.balance, message, keyboard);
-    }
-
-    async handleDeposit(ctx) {
-        const userId = ctx.from.id.toString();
-        try {
-            const message = 'Select Deposit Amount\n\nChoose how much USDT you want to deposit:';
-            const keyboard = Markup.inlineKeyboard([
-                [Markup.button.callback('$5', 'deposit_5'), Markup.button.callback('$10', 'deposit_10'), Markup.button.callback('$20', 'deposit_20')],
-                [Markup.button.callback('$50', 'deposit_50'), Markup.button.callback('$100', 'deposit_100')],
-                [Markup.button.callback('Custom Amount', 'deposit_custom')],
-                [Markup.button.callback('Back', 'menu')]
-            ]);
-            await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, keyboard);
-        } catch (error) {
-            logger.error('Deposit handler error', { userId, error: error.message });
-            await ctx.reply('Error. Please try /deposit again.');
-        }
-    }
-
-    async handlePresetDeposit(ctx, amount) {
-        const userId = ctx.from.id.toString();
-        try {
-            await ctx.answerCbQuery('Generating $' + amount + ' deposit...');
-            await this.showDepositDetails(ctx, userId, amount);
-        } catch (error) {
-            logger.error('Preset deposit error', { userId, amount, error: error.message });
-            await ctx.answerCbQuery('Error');
-        }
-    }
-
-    async handleCustomDeposit(ctx) {
-        const userId = ctx.from.id.toString();
-        try {
-            ctx.session = ctx.session || {};
-            ctx.session.awaitingDepositAmount = true;
-            await ctx.answerCbQuery('Enter custom amount');
-            const message = 'Custom Deposit\n\nSend the amount you want to deposit (in USD):\n\nExamples:\n- 5 (for $5)\n- 10.50 (for $10.50)\n- 25 (for $25)\n\nMinimum: $0.50';
-            await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message);
-        } catch (error) {
-            logger.error('Custom deposit error', { userId, error: error.message });
-        }
-    }
-
-    async handleDepositAmountInput(ctx) {
-        const userId = ctx.from.id.toString();
-        const text = ctx.message.text.trim().replace(/[^0-9.]/g, '');
-        const amount = parseFloat(text);
-        if (isNaN(amount) || amount < 0.50) {
-            return this.sendPhotoWithCaption(ctx, IMAGES.deposit, 'Invalid amount. Minimum is $0.50. Try /deposit again.');
-        }
-        await this.showDepositDetails(ctx, userId, amount);
-    }
-
-    async showDepositDetails(ctx, userId, amount) {
-        try {
-            const depositInfo = await this.walletService.getDepositInfo(userId, amount);
-            const displayAmount = depositInfo.amount || depositInfo.baseAmount || amount;
-            await User.updateOne({ userId }, { $set: { depositTrackingAmount: displayAmount } });
-
-            const message = 'Deposit $' + displayAmount + '\n\nSend exactly this amount of USDT (BEP-20):\n\n' +
-                'Amount: $' + displayAmount + '\n' +
-                'Address: ' + (depositInfo.address || this.walletService.getMasterAddress()) + '\n' +
-                'Network: ' + (depositInfo.network || 'BSC (BEP-20)') + '\n\n' +
-                'IMPORTANT:\n' +
-                '- Send ONLY USDT on BSC (BEP-20)\n' +
-                '- Send EXACTLY $' + displayAmount + '\n' +
-                '- This exact amount identifies your deposit\n\n' +
-                'Funds credited automatically in 1-2 minutes.';
-
-            const keyboard = Markup.inlineKeyboard([
-                [Markup.button.callback('Show QR Code', 'deposit_qr')],
-                [Markup.button.callback('Check Deposit', 'check_deposit')],
-                [Markup.button.callback('Back', 'menu')]
-            ]);
-
-            await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, keyboard);
-
-        } catch (error) {
-            logger.error('Show deposit details error', { userId, error: error.message });
-            await ctx.reply('Error generating deposit. Please try again.');
-        }
-    }
-
-// FIXED: Use https:// link instead of ethereum: scheme for button URL
-    async handleDepositQR(ctx) {
-        const userId = ctx.from.id.toString();
-        try {
-            const user = await User.findOne({ userId });
-            const trackingAmount = user?.depositTrackingAmount;
-            
-            if (!trackingAmount) {
-                return ctx.answerCbQuery('Click Deposit first');
-            }
-
-            const masterAddress = this.walletService.getMasterAddress();
-            
-            // FIXED: Use BSCScan or a web wallet URL instead of ethereum: scheme
-            // Telegram rejects ethereum: URLs in buttons. Use a web-based wallet opener.
-            const walletUrl = 'https://metamask.app.link/send/' + masterAddress + '?value=0&asset=c60_t0x55d398326f99059fF775485246999027B3197955';
-            
-            await ctx.answerCbQuery('Generating QR...');
-            
-            const qrBuffer = await QRCode.toBuffer(masterAddress, {
-                width: 400,
-                margin: 2,
-                color: { dark: '#00BCD4', light: '#FFFFFF' }
-            });
-
-            const caption = 'Scan to Deposit\n\n' +
-                'Amount: $' + trackingAmount + ' USDT\n' +
-                'Address: ' + masterAddress + '\n\n' +
-                'Send EXACTLY $' + trackingAmount + ' USDT on BSC (BEP-20)';
-
-            // FIXED: Use https URL in button, not ethereum: scheme
-            const keyboard = {
-                reply_markup: {
-                    inline_keyboard: [
-                        [{ text: 'Open in MetaMask', url: walletUrl }],
-                        [{ text: 'Copy Address', callback_data: 'copy_address_' + masterAddress }],
-                        [{ text: 'Check Deposit', callback_data: 'check_deposit' }],
-                        [{ text: 'Back', callback_data: 'menu' }]
-                    ]
-                }
-            };
-
-            await ctx.replyWithPhoto(
-                { source: qrBuffer },
-                { caption: caption, reply_markup: keyboard.reply_markup }
+        const buttons = [];
+        for (let i = 0; i < SERVICES.length; i += 3) {
+            const row = SERVICES.slice(i, i + 3).map(service =>
+                Markup.button.callback('📱 ' + service, 'service_' + service)
             );
-
-        } catch (error) {
-            logger.error('QR generation failed', { userId, error: error.message });
-            await ctx.answerCbQuery('Failed to generate QR');
+            buttons.push(row);
         }
+        buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, Markup.inlineKeyboard(buttons), 'HTML');
     }
+
+    async handleServiceSelected(ctx) {
+        const service = ctx.match[1];
+        const mode = ctx.session?.otpMode || 'FREE';
+        try { await
+
+
+
+
+
+
+                // ═══════════════════════════════════════════════════════════
+    //  CHECK DEPOSIT — CORE FIX: credit requestedAmount, not trackingAmount
+    //  The blockchain may show $1.0680 but user only gets $1.00 credited
+    //  The $0.0680 difference is the system tracking fee
+    // ═══════════════════════════════════════════════════════════
 
     async handleCheckDeposit(ctx) {
         const userId = ctx.from.id.toString();
         try {
-            await ctx.answerCbQuery('Checking...');
+            await ctx.answerCbQuery('🔍 Checking...');
+            
+            // Get the user's pending deposit info BEFORE calling wallet service
+            const user = await User.findOne({ userId });
+            const requestedAmount = user?.depositRequestedAmount;
+            const trackingAmount = user?.depositTrackingAmount;
+
+            // Call wallet service to check blockchain for the tracking amount
             const result = await this.walletService.checkDeposit(userId);
 
             if (result.found && result.status === 'CONFIRMED') {
-                if (result.amount && result.amount > 0) {
+                // CRITICAL FIX: Use requestedAmount for balance credit, NOT result.amount
+                // result.amount may be $1.0680 (tracking amount with suffix)
+                // requestedAmount is $1.00 (what user actually wanted)
+                const creditAmount = requestedAmount || result.baseAmount || result.amount;
+                
+                // Calculate tracking fee (what user sent minus what they get)
+                const trackingFee = parseFloat((result.amount - creditAmount).toFixed(4));
+
+                if (creditAmount && creditAmount > 0) {
+                    // Credit ONLY the requested amount to user balance
                     await User.updateOne(
                         { userId },
-                        { $inc: { balance: result.amount, totalDeposited: result.amount }, $set: { depositTrackingAmount: null } }
-                    );
-                    
-                    const user = await User.findOne({ userId });
-                    if (user?.referredBy && !user?.referralBonusReceived) {
-                        const bonusAmount = result.amount * ((config.referral?.percentage || 0.05));
-                        await User.updateOne(
-                            { userId },
-                            { $inc: { balance: bonusAmount, referralRewardsPending: bonusAmount }, $set: { referralBonusReceived: true } }
-                        );
-                        
-                        const referrer = await User.findOne({ referralCode: user.referredBy });
-                        if (referrer) {
-                            await User.updateOne(
-                                { userId: referrer.userId },
-                                { $inc: { referralEarnings: bonusAmount, referralRewardsPending: -bonusAmount } }
-                            );
-                            try {
-                                await ctx.telegram.sendMessage(
-                                    referrer.userId,
-                                    'Your referral ' + (ctx.from.username || userId) + ' made their first deposit!\n\nYou earned: ' + formatCurrency(bonusAmount)
-                                );
-                            } catch (e) {
-                                logger.warn('Failed to notify referrer', { referrerId: referrer.userId });
+                        {
+                            $inc: { balance: creditAmount, totalDeposited: creditAmount },
+                            $set: { 
+                                depositTrackingAmount: null,
+                                depositRequestedAmount: null
                             }
+                        }
+                    );
+
+                    // Mark transaction as completed with BOTH amounts recorded
+                    await Transaction.updateOne(
+                        { userId, type: TX_TYPES.DEPOSIT, status: 'PENDING' },
+                        {
+                            $set: {
+                                status: 'COMPLETED',
+                                amount: creditAmount,                    // What user gets
+                                metadata: {
+                                    requestedAmount: creditAmount,         // User requested
+                                    trackingAmount: result.amount,        // What was sent on chain
+                                    trackingFee: trackingFee,             // System fee
+                                    txHash: result.txHash,
+                                    depositAddress: result.address,
+                                    confirmedAt: new Date()
+                                }
+                            }
+                        }
+                    );
+
+                    // Process referral bonus (first deposit only) — based on CREDIT amount
+                    const refreshedUser = await User.findOne({ userId });
+                    if (refreshedUser?.referredBy && !refreshedUser?.referralBonusReceived) {
+                        const bonusPercent = config.referral?.percentage || 0.05;
+                        const bonusAmount = parseFloat((creditAmount * bonusPercent).toFixed(2));
+
+                        if (bonusAmount > 0) {
+                            // Credit bonus to new user
+                            await User.updateOne(
+                                { userId },
+                                {
+                                    $inc: { balance: bonusAmount },
+                                    $set: { referralBonusReceived: true }
+                                }
+                            );
+
+                            // Create bonus transaction for new user
+                            await Transaction.create({
+                                txId: 'REFBONUS_' + Date.now() + '_' + userId,
+                                userId,
+                                type: TX_TYPES.REFERRAL_REWARD,
+                                amount: bonusAmount,
+                                status: 'COMPLETED',
+                                metadata: {
+                                    source: 'first_deposit_bonus',
+                                    referrerCode: refreshedUser.referredBy,
+                                    depositAmount: creditAmount,
+                                    percentage: bonusPercent
+                                },
+                                createdAt: new Date()
+                            });
+
+                            // Credit referrer
+                            const referrer = await User.findOne({ referralCode: refreshedUser.referredBy });
+                            if (referrer) {
+                                await User.updateOne(
+                                    { userId: referrer.userId },
+                                    { $inc: { referralEarnings: bonusAmount, referralRewardsPending: bonusAmount } }
+                                );
+
+                                // Create referrer transaction
+                                await Transaction.create({
+                                    txId: 'REFERRAL_' + Date.now() + '_' + referrer.userId,
+                                    userId: referrer.userId,
+                                    type: TX_TYPES.REFERRAL_REWARD,
+                                    amount: bonusAmount,
+                                    status: 'PENDING',
+                                    metadata: {
+                                        source: 'referral_first_deposit',
+                                        referredUserId: userId,
+                                        depositAmount: creditAmount,
+                                        percentage: bonusPercent
+                                    },
+                                    createdAt: new Date()
+                                });
+
+                                try {
+                                    await ctx.telegram.sendMessage(
+                                        referrer.userId,
+                                        '🎉 <b>Referral Bonus!</b>\n\n' +
+                                        'Your referral ' + (ctx.from.username || userId) + ' made their first deposit!\n\n' +
+                                        '💰 You earned: <code>' + formatCurrency(bonusAmount) + '</code>\n' +
+                                        '⏳ Status: <i>Pending admin approval</i>',
+                                        { parse_mode: 'HTML' }
+                                    );
+                                } catch (e) {
+                                    logger.warn('Failed to notify referrer', { referrerId: referrer.userId });
+                                }
+                            }
+
+                            // Notify user of bonus
+                            await ctx.telegram.sendMessage(
+                                userId,
+                                '🎁 <b>Deposit Bonus!</b>\n\n' +
+                                'You received a <code>' + formatCurrency(bonusAmount) + '</code> bonus from your referral!\n\n' +
+                                '💰 New Balance: <code>' + formatCurrency((refreshedUser.balance || 0) + creditAmount + bonusAmount) + '</code>',
+                                { parse_mode: 'HTML' }
+                            ).catch(() => {});
                         }
                     }
                 }
 
-                const message = 'Deposit Confirmed!\n\n' +
-                    'Amount: ' + formatCurrency(result.amount) + '\n' +
-                    'Status: ' + result.status + '\n' +
-                    'TX: ' + result.txHash + '\n\n' +
-                    'Your balance has been updated.';
-                
-                return this.sendPhotoWithCaption(ctx, IMAGES.depositConfirmed, message);
-            } 
-            
-            if (result.found && result.status === 'CONFIRMING') {
-                const message = 'Deposit Confirming\n\n' +
-                    'Amount: ' + formatCurrency(result.amount) + '\n' +
-                    'Confirmations: ' + (result.confirmations || 0) + '/' + (config.blockchain?.blockConfirmations || 12) + '\n\n' +
-                    'Please wait for full confirmation.';
-                return this.sendPhotoWithCaption(ctx, IMAGES.deposit, message);
+                const message =
+                    '✅ <b>Deposit Confirmed!</b>\n\n' +
+                    '💵 Credited: <code>' + formatCurrency(creditAmount) + '</code>\n' +
+                    (trackingFee > 0 ? '🔧 Tracking Fee: <code>' + formatCurrency(trackingFee) + '</code>\n' : '') +
+                    '✅ Status: <code>' + result.status + '</code>\n' +
+                    '🔗 TX: <code>' + (result.txHash || 'N/A') + '</code>\n\n' +
+                    '💰 Your balance has been updated.';
+
+                return this.sendPhotoWithCaption(ctx, IMAGES.depositConfirmed, message, null, 'HTML');
             }
 
-            const message = 'No deposit found yet.\n\n' +
+            if (result.found && result.status === 'CONFIRMING') {
+                const message =
+                    '⏳ <b>Deposit Confirming</b>\n\n' +
+                    '💵 Amount: <code>' + formatCurrency(requestedAmount || result.amount) + '</code>\n' +
+                    '🔢 Confirmations: <code>' + (result.confirmations || 0) + '/' + (config.blockchain?.blockConfirmations || 12) + '</code>\n\n' +
+                    '⏱ Please wait for full confirmation.';
+
+                return this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, null, 'HTML');
+            }
+
+            let masterAddress = '';
+            try {
+                if (this.walletService?.getMasterAddress) {
+                    masterAddress = await this.walletService.getMasterAddress();
+                }
+            } catch (e) {}
+
+            const message =
+                '🔍 <b>No deposit found yet.</b>\n\n' +
                 'Make sure you:\n' +
-                '1. Sent to: ' + this.walletService.getMasterAddress() + '\n' +
-                '2. Sent exactly the shown amount\n' +
-                '3. Used BSC (BEP-20) network\n\n' +
-                'Check again in 1 minute.';
-            
-            await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message);
+                '1️⃣ Sent to: <code>' + masterAddress + '</code>\n' +
+                '2️⃣ Sent exactly <code>' + (trackingAmount || 'the shown') + '</code> USDT\n' +
+                '3️⃣ Used BSC (BEP-20) network\n\n' +
+                '⏱ Check again in 1 minute.';
+
+            await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, Markup.inlineKeyboard([
+                [Markup.button.callback('🔄 Check Again', 'check_deposit')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]), 'HTML');
 
         } catch (error) {
             logger.error('Check deposit failed', { userId, error: error.message });
-            await ctx.answerCbQuery('Check failed');
-            await ctx.reply('Error checking deposit. Try again later.');
+            await ctx.answerCbQuery('❌ Check failed');
+            await ctx.reply('❌ Error checking deposit. Try again later.');
         }
     }
 
     async handleHistory(ctx) {
         const userId = ctx.from.id.toString();
-        const transactions = await Transaction.find({ userId }).sort({ createdAt: -1 }).limit(10);
+        const transactions = await Transaction.find({ userId }).sort({ createdAt: -1 }).limit(15).lean();
 
-        let message = 'Recent Transactions\n\n';
-        if (transactions.length === 0) {
-            message += 'No transactions yet. Deposit to get started!';
+        let message = '📜 <b>Recent Transactions</b>\n\n';
+        if (!transactions.length) {
+            message += '<i>No transactions yet. Deposit to get started!</i>';
         } else {
             transactions.forEach((tx, index) => {
-                const icon = tx.amount > 0 ? '+' : '-';
-                const type = tx.type?.replace(/_/g, ' ') || 'Unknown';
-                message += (index + 1) + '. ' + icon + ' ' + type + '\n';
-                message += '   Amount: ' + formatCurrency(Math.abs(tx.amount || 0)) + '\n';
-                message += '   Status: ' + tx.status + '\n';
-                message += '   Date: ' + (tx.createdAt?.toLocaleDateString() || 'Unknown') + '\n\n';
+                const icon = tx.type === TX_TYPES.DEPOSIT ? '💳' :
+                    tx.type === TX_TYPES.BUNDLE_PURCHASE ? '📦' :
+                        tx.type === TX_TYPES.VIP_SUBSCRIPTION ? '👑' :
+                            tx.type === TX_TYPES.REFERRAL_REWARD ? '🎁' :
+                                tx.amount >= 0 ? '➕' : '➖';
+                const type = (tx.type || 'Unknown').replace(/_/g, ' ');
+                const amountPrefix = tx.amount >= 0 ? '+' : '';
+                
+                // Show tracking fee info for deposits
+                let extraInfo = '';
+                if (tx.type === TX_TYPES.DEPOSIT && tx.metadata?.trackingFee > 0) {
+                    extraInfo = ' (fee: ' + formatCurrency(tx.metadata.trackingFee) + ')';
+                }
+                
+                message += icon + ' <b>' + type + '</b>\n';
+                message += '   ' + amountPrefix + formatCurrency(Math.abs(tx.amount || 0)) + extraInfo + ' | ' + tx.status + '\n';
+                message += '   🕐 ' + (tx.createdAt ? new Date(tx.createdAt).toLocaleDateString() : 'Unknown') + '\n\n';
             });
         }
 
         const keyboard = Markup.inlineKeyboard([
-            [Markup.button.callback('Export CSV', 'export_history')],
-            [Markup.button.callback('Back', 'menu')]
+            [Markup.button.callback('📥 Export CSV', 'export_history')],
+            [Markup.button.callback('🔙 Back', 'menu')]
         ]);
 
-        await this.sendPhotoWithCaption(ctx, IMAGES.history, message, keyboard);
+        await this.sendPhotoWithCaption(ctx, IMAGES.history, message, keyboard, 'HTML');
     }
 
     async handleExportHistory(ctx) {
         const userId = ctx.from.id.toString();
         try {
-            await ctx.answerCbQuery('Generating CSV...');
-            const transactions = await Transaction.find({ userId }).sort({ createdAt: -1 });
-            
-            if (transactions.length === 0) {
-                return ctx.reply('No transactions to export.');
+            await ctx.answerCbQuery('📥 Generating CSV...');
+            const transactions = await Transaction.find({ userId }).sort({ createdAt: -1 }).lean();
+
+            if (!transactions.length) {
+                return ctx.reply('📭 No transactions to export.');
             }
-            
-            let csv = 'Date,Type,Amount,Status,TX Hash\n';
+
+            let csv = 'Date,Type,Amount,Status,TrackingFee,TX Hash\n';
             for (const tx of transactions) {
-                const date = tx.createdAt ? tx.createdAt.toISOString().split('T')[0] : 'N/A';
-                csv += date + ',' + (tx.type || 'Unknown') + ',' + (tx.amount || 0) + ',' + (tx.status || 'Unknown') + ',' + (tx.txHash || 'N/A') + '\n';
+                const date = tx.createdAt ? new Date(tx.createdAt).toISOString().split('T')[0] : 'N/A';
+                const trackingFee = tx.metadata?.trackingFee || 0;
+                csv += date + ',' + (tx.type || 'Unknown') + ',' + (tx.amount || 0) + ',' + (tx.status || 'Unknown') + ',' + trackingFee + ',' + (tx.txHash || 'N/A') + '\n';
             }
-            
+
             await ctx.replyWithDocument(
-                { source: Buffer.from(csv), filename: 'history_' + userId + '.csv' },
-                { caption: 'Your transaction history export.' }
+                { source: Buffer.from(csv), filename: 'history_' + userId + '_' + Date.now() + '.csv' },
+                { caption: '📥 Your transaction history export.' }
             );
         } catch (error) {
             logger.error('Export history failed', { userId, error: error.message });
-            await ctx.reply('Failed to export history.');
+            await ctx.reply('❌ Failed to export history.');
         }
     }
 
     async handleReferral(ctx) {
-        const user = await User.findOne({ userId: ctx.from.id.toString() });
+        const user = await User.findOne({ userId: ctx.from.id.toString() }).lean();
         const botUsername = ctx.botInfo?.username || 'SwiftOTPBot';
         const referralLink = 'https://t.me/' + botUsername + '?start=' + user.referralCode;
 
-        const message = 'Referral Program\n\n' +
-            'Your Code: ' + user.referralCode + '\n\n' +
-            'Share your link and earn ' + (((config.referral?.percentage || 0.05) * 100).toFixed(0)) + '% of your referrals deposits!\n\n' +
-            'Your Stats:\n' +
-            '- Referrals: ' + (user.referralCount || 0) + '\n' +
-            '- Total Earnings: ' + formatCurrency(user.referralEarnings || 0) + '\n' +
-            '- Pending Approval: ' + formatCurrency(user.referralRewardsPending || 0) + '\n\n' +
-            'Your Link:\n' + referralLink;
+        const message =
+            '🎁 <b>Referral Program</b>\n\n' +
+            '🔗 <b>Your Code:</b> <code>' + user.referralCode + '</code>\n\n' +
+            '💰 Earn <code>' + (((config.referral?.percentage || 0.05) * 100).toFixed(0)) + '%</code> of your referrals\' first deposits!\n\n' +
+            '📊 <b>Your Stats:</b>\n' +
+            '• Referrals: <code>' + (user.referralCount || 0) + '</code>\n' +
+            '• Total Earnings: <code>' + formatCurrency(user.referralEarnings || 0) + '</code>\n' +
+            '• Pending Approval: <code>' + formatCurrency(user.referralRewardsPending || 0) + '</code>\n\n' +
+            '🔗 <b>Your Link:</b>\n<code>' + referralLink + '</code>';
 
         const keyboard = Markup.inlineKeyboard([
-            [Markup.button.callback('Share Link', 'share_' + user.referralCode)],
-            [Markup.button.callback('Back', 'menu')]
+            [Markup.button.callback('📤 Share Link', 'share_' + user.referralCode)],
+            [Markup.button.callback('🔙 Back', 'menu')]
         ]);
 
-        await this.sendPhotoWithCaption(ctx, IMAGES.referral, message, keyboard);
+        await this.sendPhotoWithCaption(ctx, IMAGES.referral, message, keyboard, 'HTML');
     }
 
     async handleShareReferral(ctx) {
         const referralCode = ctx.match[1];
         const botUsername = ctx.botInfo?.username || 'SwiftOTPBot';
         const referralLink = 'https://t.me/' + botUsername + '?start=' + referralCode;
-        
-        await ctx.answerCbQuery('Link copied to clipboard!');
-        await ctx.reply('Share Your Referral Link\n\n' + referralLink + '\n\nTap and hold to copy, then share with friends!');
+
+        await ctx.answerCbQuery('📤 Link ready!');
+        await ctx.reply(
+            '📤 <b>Share Your Referral Link</b>\n\n' +
+            '<code>' + referralLink + '</code>\n\n' +
+            'Tap and hold to copy, then share with friends!',
+            { parse_mode: 'HTML' }
+        );
     }
 
     async handleStats(ctx) {
         const userId = ctx.from.id.toString();
-        const user = await User.findOne({ userId });
-        const sessions = await Session.find({ userId });
-        
+        const user = await User.findOne({ userId }).lean();
+        const sessions = await Session.find({ userId }).lean();
+
         const totalRequests = sessions.length;
         const successful = sessions.filter(s => s.status === 'RECEIVED').length;
-        const failed = sessions.filter(s => s.status === 'TIMEOUT').length;
+        const failed = sessions.filter(s => s.status === 'TIMEOUT' || s.status === 'FAILED').length;
         const successRate = totalRequests > 0 ? ((successful / totalRequests) * 100).toFixed(1) : 0;
 
-        const completedSessions = sessions.filter(s => s.endTime && s.startTime);
+        const completedSessions = sessions.filter(s => s.endTime && s.startTime && s.status === 'RECEIVED');
         const avgWaitTime = completedSessions.length > 0
-            ? (completedSessions.reduce((acc, s) => acc + (s.endTime - s.startTime), 0) / completedSessions.length / 1000)
+            ? (completedSessions.reduce((acc, s) => acc + (new Date(s.endTime) - new Date(s.startTime)), 0) / completedSessions.length / 1000)
             : 0;
 
-        const message = 'Your Statistics\n\n' +
-            'OTP Requests:\n' +
-            '- Total: ' + totalRequests + '\n' +
-            '- Successful: ' + successful + '\n' +
-            '- Failed: ' + failed + '\n' +
-            '- Success Rate: ' + successRate + '%\n\n' +
-            'Performance:\n' +
-            '- Avg Wait Time: ' + avgWaitTime.toFixed(1) + 's\n\n' +
-            'Financial:\n' +
-            '- Total Deposited: ' + formatCurrency(user?.totalDeposited || 0) + '\n' +
-            '- Total Spent: ' + formatCurrency(user?.totalSpent || 0) + '\n' +
-            '- Current Balance: ' + formatCurrency(user?.balance || 0) + '\n\n' +
-            'Member Since: ' + (user?.createdAt?.toLocaleDateString() || 'Unknown');
+        const isVip = this._isVipActive(user);
+        const freeRemaining = this._freeRemaining(user);
+        const vipRemaining = isVip ? this._vipRemaining(user) : 0;
+
+        const message =
+            '📊 <b>Your Statistics</b>\n\n' +
+            '🔢 <b>OTP Requests:</b>\n' +
+            '• Total: <code>' + totalRequests + '</code>\n' +
+            '• Successful: <code>' + successful + '</code>\n' +
+            '• Failed: <code>' + failed + '</code>\n' +
+            '• Success Rate: <code>' + successRate + '%</code>\n\n' +
+            '⚡ <b>Performance:</b>\n' +
+            '• Avg Wait: <code>' + avgWaitTime.toFixed(1) + 's</code>\n\n' +
+            '💰 <b>Financial:</b>\n' +
+            '• Deposited: <code>' + formatCurrency(user?.totalDeposited || 0) + '</code>\n' +
+            '• Spent: <code>' + formatCurrency(user?.totalSpent || 0) + '</code>\n' +
+            '• Balance: <code>' + formatCurrency(user?.balance || 0) + '</code>\n\n' +
+            '🎮 <b>Usage:</b>\n' +
+            '• Free: <code>' + freeRemaining + '/3</code>\n' +
+            '• Bundle: <code>' + (user?.bundleRemaining || 0) + '</code>\n' +
+            (isVip ? '• VIP: <code>' + vipRemaining + '/50</code>\n' : '') +
+            '\n📅 Member Since: ' + (user?.createdAt ? new Date(user.createdAt).toLocaleDateString() : 'Unknown');
 
         await this.sendPhotoWithCaption(ctx, IMAGES.stats, message, Markup.inlineKeyboard([
-            [Markup.button.callback('Back', 'menu')]
-        ]));
+            [Markup.button.callback('🔙 Back', 'menu')]
+        ]), 'HTML');
     }
 
     async handleSettings(ctx) {
-        const user = await User.findOne({ userId: ctx.from.id.toString() });
+        const user = await User.findOne({ userId: ctx.from.id.toString() }).lean();
 
-        const message = 'Settings\n\n' +
-            'Privacy: ' + (user.privacyEnabled ? 'Masked OTPs' : 'Full OTPs') + '\n' +
-            'Notifications: ' + (user.notificationsEnabled ? 'On' : 'Off') + '\n' +
-            'Country: ' + (user.preferredCountry || 'US') + '\n\n' +
+        const message =
+            '⚙️ <b>Settings</b>\n\n' +
+            '🔒 Privacy: <code>' + (user.privacyEnabled ? 'Masked OTPs' : 'Full OTPs') + '</code>\n' +
+            '🔔 Notifications: <code>' + (user.notificationsEnabled ? 'On' : 'Off') + '</code>\n' +
+            '🌍 Country: <code>' + (user.preferredCountry || 'US') + '</code>\n\n' +
             'Toggle settings below:';
 
         const keyboard = Markup.inlineKeyboard([
-            [Markup.button.callback(user.privacyEnabled ? 'Show Full OTPs' : 'Mask OTPs', 'toggle_privacy')],
-            [Markup.button.callback(user.notificationsEnabled ? 'Disable Notifications' : 'Enable Notifications', 'toggle_notifications')],
-            [Markup.button.callback('Change Country', 'change_country')],
-            [Markup.button.callback('Back', 'menu')]
+            [Markup.button.callback(user.privacyEnabled ? '👁 Show Full OTPs' : '🔒 Mask OTPs', 'toggle_privacy')],
+            [Markup.button.callback(user.notificationsEnabled ? '🔕 Disable Notifications' : '🔔 Enable Notifications', 'toggle_notifications')],
+            [Markup.button.callback('🌍 Change Country', 'change_country')],
+            [Markup.button.callback('🔙 Back', 'menu')]
         ]);
 
-        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, keyboard);
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, keyboard, 'HTML');
     }
 
     async handleTogglePrivacy(ctx) {
@@ -651,7 +805,7 @@ await this.showServiceSelection(ctx, 'VIP');
         const user = await User.findOne({ userId });
         const newValue = !user.privacyEnabled;
         await User.updateOne({ userId }, { $set: { privacyEnabled: newValue } });
-        await ctx.answerCbQuery(newValue ? 'Privacy ON' : 'Privacy OFF');
+        await ctx.answerCbQuery(newValue ? '🔒 Privacy ON' : '👁 Privacy OFF');
         await this.handleSettings(ctx);
     }
 
@@ -660,197 +814,23 @@ await this.showServiceSelection(ctx, 'VIP');
         const user = await User.findOne({ userId });
         const newValue = !user.notificationsEnabled;
         await User.updateOne({ userId }, { $set: { notificationsEnabled: newValue } });
-        await ctx.answerCbQuery(newValue ? 'Notifications ON' : 'Notifications OFF');
+        await ctx.answerCbQuery(newValue ? '🔔 Notifications ON' : '🔕 Notifications OFF');
         await this.handleSettings(ctx);
     }
 
     async handleChangeCountry(ctx) {
         ctx.session = ctx.session || {};
         ctx.session.awaitingCustomCountry = false;
-        
+
         const countries = [
-            { code: 'US', name: 'United States' },
-            { code: 'UK', name: 'United Kingdom' },
-            { code: 'CA', name: 'Canada' },
-            { code: 'AU', name: 'Australia' },
-            { code: 'DE', name: 'Germany' },
-            { code: 'FR', name: 'France' },
-            { code: 'IN', name: 'India' },
-            { code: 'NG', name: 'Nigeria' }
+            { code: 'US', name: '🇺🇸 United States', flag: '🇺🇸' },
+            { code: 'UK', name: '🇬🇧 United Kingdom', flag: '🇬🇧' },
+            { code: 'CA', name: '🇨🇦 Canada', flag: '🇨🇦' },
+            { code: 'AU', name: '🇦🇺 Australia', flag: '🇦🇺' },
+            { code: 'DE', name: '🇩🇪 Germany', flag: '🇩🇪' },
+            { code: 'FR', name: '🇫🇷 France', flag: '🇫🇷' },
+            { code: 'IN', name: '🇮🇳 India', flag: '🇮🇳' },
+            { code: 'NG', name: '🇳🇬 Nigeria', flag: '🇳🇬' }
         ];
-        
-        const buttons = countries.map(c => [
-            Markup.button.callback(c.name, 'setcountry_' + c.code)
-        ]);
-        buttons.push([Markup.button.callback('Custom', 'custom_country')]);
-        buttons.push([Markup.button.callback('Back', 'settings')]);
-        
-        const message = 'Select Your Preferred Country\n\nChoose a country for your OTP numbers:';
-        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, Markup.inlineKeyboard(buttons));
-    }
 
-    async handleSetCountry(ctx) {
-        const countryCode = ctx.match[1];
-        const userId = ctx.from.id.toString();
-        await User.updateOne({ userId }, { $set: { preferredCountry: countryCode } });
-        await ctx.answerCbQuery('Country set to ' + countryCode);
-        await this.handleSettings(ctx);
-    }
-
-    async handleCustomCountryInput(ctx) {
-        const countryCode = ctx.message.text.trim().toUpperCase().substring(0, 2);
-        const userId = ctx.from.id.toString();
-        await User.updateOne({ userId }, { $set: { preferredCountry: countryCode } });
-        await ctx.reply('Country set to ' + countryCode);
-        await this.handleSettings(ctx);
-    }
-
-    // FIXED: Removed all Markdown parse_mode. Using plain text to avoid entity errors.
-    // FIXED: URL button uses raw object syntax with https://t.me link.
-    async handleSupport(ctx) {
-        try {
-            const message = 'SwiftSupport - Customer Service\n\n' +
-                'Need help? Our support team is here for you!\n\n' +
-                'Contact: swiftsmssupport\n' +
-                'Response Time: Usually within 5 minutes\n\n' +
-                'Common Issues:\n' +
-                '- Deposit not showing? -> Use /check_deposit\n' +
-                '- OTP not received? -> Use /cancel and retry\n' +
-                '- Wrong amount sent? -> Contact support with TX hash\n\n' +
-                'Please include your User ID when contacting support.';
-            
-            // FIXED: Raw keyboard object with https URL, no Markdown parsing
-            const keyboard = {
-                reply_markup: {
-                    inline_keyboard: [
-                        [{ text: 'Chat Support', url: 'https://t.me/swiftsmssupport' }],
-                        [{ text: 'Back', callback_data: 'menu' }]
-                    ]
-                }
-            };
-
-            await this.sendPhotoWithCaption(ctx, IMAGES.support, message, keyboard);
-        } catch (error) {
-            logger.error('Support handler error', { error: error.message, userId: ctx.from?.id });
-            // Fallback without image if photo fails
-            try {
-                await ctx.reply('Customer Service\n\nContact @swiftsupport for help.', {
-                    reply_markup: {
-                        inline_keyboard: [[{ text: 'Chat Support', url: 'https://t.me/swiftsupport' }]]
-                    }
-                });
-            } catch (e) {
-                logger.error('Support fallback failed', { error: e.message });
-            }
-        }
-    }
-
-    async handleHelp(ctx) {
-        const message = 'Help & FAQ\n\n' +
-            'How to request OTP:\n' +
-            '1. Tap Request OTP or use /otp\n' +
-            '2. Select mode (FREE, CHEAP, VIP, or Bundle)\n' +
-            '3. Choose service (WhatsApp, Telegram, etc.)\n' +
-            '4. Select country\n' +
-            '5. Wait for OTP to arrive\n\n' +
-            'How to deposit:\n' +
-            '1. Tap Deposit or use /deposit\n' +
-            '2. Select amount\n' +
-            '3. Send USDT (BEP-20) to shown address\n' +
-            '4. Tap Check Deposit or wait 1-2 minutes\n\n' +
-            'VIP Benefits:\n' +
-            '- Unlimited OTPs (50/day)\n' +
-            '- Priority routing\n' +
-            '- Fastest delivery\n' +
-            '- $5/month\n\n' +
-            'Bundle:\n' +
-            '- 100 OTPs for $5\n' +
-            '- Never expires\n\n' +
-            'Commands:\n' +
-            '/start - Welcome screen\n' +
-            '/menu - Main menu\n' +
-            '/balance - Check balance\n' +
-            '/deposit - Add funds\n' +
-            '/history - Transactions\n' +
-            '/referral - Earn rewards\n' +
-            '/stats - Your statistics\n' +
-            '/settings - Preferences\n' +
-            '/support - Customer service';
-
-        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, Markup.inlineKeyboard([
-            [Markup.button.callback('Back', 'menu')]
-        ]));
-    }
-
-    async handleBuyBundle(ctx) {
-        const user = await User.findOne({ userId: ctx.from.id.toString() });
-        const bundlePrice = config.prices?.bundlePrice || 5.00;
-        const bundleCount = config.prices?.bundleOtpCount || 100;
-        
-        if (user.balance < bundlePrice) {
-            const message = 'Insufficient Balance\n\n' +
-                'Required: ' + formatCurrency(bundlePrice) + '\n' +
-                'Available: ' + formatCurrency(user.balance) + '\n\n' +
-                'Deposit first with /deposit';
-            return this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, Markup.inlineKeyboard([
-                [Markup.button.callback('Deposit', 'deposit')],
-                [Markup.button.callback('Back', 'menu')]
-            ]));
-        }
-        
-        await User.updateOne(
-            { userId: user.userId },
-            { $inc: { balance: -bundlePrice, bundleRemaining: bundleCount, totalSpent: bundlePrice } }
-        );
-        
-        const message = 'Bundle Purchased!\n\n' +
-            bundleCount + ' OTPs added\n' +
-            formatCurrency(bundlePrice) + ' deducted\n' +
-            'Total Available: ' + ((user.bundleRemaining || 0) + bundleCount) + ' OTPs\n\n' +
-            'Use /otp to start requesting.';
-        
-        await this.sendPhotoWithCaption(ctx, IMAGES.default, message);
-    }
-
-    async handleBuyVIP(ctx) {
-        const user = await User.findOne({ userId: ctx.from.id.toString() });
-        const vipPrice = config.prices?.vipSubscription || 5.00;
-        
-        if (user.balance < vipPrice) {
-            const message = 'Insufficient Balance\n\n' +
-                'Required: ' + formatCurrency(vipPrice) + '\n' +
-                'Available: ' + formatCurrency(user.balance) + '\n\n' +
-                'Deposit first with /deposit';
-            return this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, Markup.inlineKeyboard([
-                [Markup.button.callback('Deposit', 'deposit')],
-                [Markup.button.callback('Back', 'menu')]
-            ]));
-        }
-        
-        const expiryDate = new Date();
-        expiryDate.setMonth(expiryDate.getMonth() + 1);
-        
-        await User.updateOne(
-            { userId: user.userId },
-            {
-                $inc: { balance: -vipPrice, totalSpent: vipPrice },
-                $set: {
-                    mode: 'VIP',
-                    vipExpiry: expiryDate,
-                    vipDailyUsed: 0,
-                    vipDailyReset: new Date()
-                }
-            }
-        );
-        
-        const message = 'VIP Activated!\n\n' +
-            'Valid until: ' + expiryDate.toLocaleDateString() + '\n' +
-            'Unlimited OTPs (50/day)\n' +
-            'Priority delivery enabled\n\n' +
-            'Enjoy premium service!';
-        
-        await this.sendPhotoWithCaption(ctx, IMAGES.default, message);
-    }
-}
-
-export default UserCommands;
+        const buttons 
