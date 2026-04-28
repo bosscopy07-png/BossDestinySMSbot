@@ -658,16 +658,16 @@ class UserCommands {
             { parse_mode: 'HTML' }
         );
     }
-
-    // FIX: checkDeposit now properly delegates to WalletService and handles the response
     async handleCheckDeposit(ctx) {
         const userId = ctx.from.id.toString();
         try {
             await ctx.answerCbQuery('🔍 Checking...');
             
+            // WalletService.checkDeposit handles ALL blockchain scanning and DB updates
+            // This handler is PURELY for displaying results — NEVER modifies balance here
             const result = await this.walletService.checkDeposit(userId);
 
-            if (result.found && (result.status === 'CONFIRMED' || result.status === 'CREDITED')) {
+            if (result.found && (result.status === 'COMPLETED' || result.status === 'CREDITED')) {
                 const message =
                     '✅ <b>Deposit Confirmed!</b>\n\n' +
                     '💵 Credited: <code>' + formatCurrency(result.amount) + '</code>\n' +
@@ -696,7 +696,7 @@ class UserCommands {
             let masterAddress = '';
             try {
                 if (this.walletService?.getMasterAddress) {
-                    masterAddress = await this.walletService.getMasterAddress();
+                    masterAddress = this.walletService.getMasterAddress();
                 }
             } catch (e) {}
 
@@ -719,7 +719,7 @@ class UserCommands {
             await ctx.reply('❌ Error checking deposit. Try again later.');
         }
     }
-
+    
     async handleHistory(ctx) {
         const userId = ctx.from.id.toString();
         const transactions = await Transaction.find({ userId }).sort({ createdAt: -1 }).limit(15).lean();
