@@ -11,8 +11,10 @@ export const OTP_STATUS = {
 export const USER_MODES = {
     FREE: 'FREE',
     CHEAP: 'CHEAP',
-    VIP: 'VIP'
+    VIP: 'VIP',
+    BUNDLE: 'BUNDLE'  // ← FIXED: was missing
 };
+
 
 export const TRANSACTION_TYPES = {
     DEPOSIT: 'DEPOSIT',
