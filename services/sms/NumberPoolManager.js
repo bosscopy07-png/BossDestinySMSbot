@@ -1,4 +1,4 @@
-import { NumberModel } from '../../models/index.js';
+import { Number } from '../../models/index.js';
 import logger from '../../utils/logger.js';
 
 class NumberPoolManager {
