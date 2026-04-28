@@ -226,124 +226,176 @@ class WalletService {
             throw error;
         }
     }
+    async processDepositEvent(event, retryCount = 0) {
+        const MAX_RETRIES = 3;
+        
+        try {
+            const fromAddress = event.args.from;
+            const toAddress = event.args.to;
+            const amountRaw = event.args.value;
+            const amount = parseFloat(ethers.formatUnits(amountRaw, this.decimals));
+            const txHash = event.transactionHash;
+            const blockNumber = event.blockNumber;
 
-    async processDepositEvent(event) {
-        const fromAddress = event.args.from;
-        const toAddress = event.args.to;
-        const amountRaw = event.args.value;
-        const amount = parseFloat(ethers.formatUnits(amountRaw, this.decimals));
-        const txHash = event.transactionHash;
-        const blockNumber = event.blockNumber;
+            // Validate this transfer is to our master address
+            if (toAddress.toLowerCase() !== this.masterAddress.toLowerCase()) {
+                return null;
+            }
 
-        if (toAddress.toLowerCase() !== this.masterAddress.toLowerCase()) {
-            return null;
-        }
+            // Prevent double-processing
+            const existing = await Transaction.findOne({ 'blockchain.txHash': txHash });
+            if (existing) return null;
 
-        const existing = await Transaction.findOne({ 'blockchain.txHash': txHash });
-        if (existing) return null;
-
-        // FIX: Look for user by tracking amount first, then by range
-        let user = await User.findOne({ 
-            depositPending: true,
-            depositTrackingAmount: amount
-        });
-
-        if (!user) {
-            user = await User.findOne({
+            // Find user by exact tracking amount match first
+            let user = await User.findOne({ 
                 depositPending: true,
-                depositTrackingAmount: { 
-                    $gte: amount - 0.01, 
-                    $lte: amount + 0.01 
-                }
+                depositTrackingAmount: amount
             });
-        }
 
-        if (!user) {
-            logger.warn('Deposit received but no matching user found', {
-                from: fromAddress,
-                amount,
-                txHash
-            });
-            return null;
-        }
-
-        // FIX: Use requestedAmount for credit, not tracking amount
-        const creditAmount = user.depositRequestedAmount || amount;
-        const trackingFee = parseFloat((amount - creditAmount).toFixed(6));
-
-        const tx = await Transaction.create({
-            txId: generateId(),
-            userId: user.userId,
-            type: 'DEPOSIT',
-            amount: creditAmount,              // FIX: credit the requested amount
-            currency: 'USDT',
-            status: 'CONFIRMED',
-            blockchain: {
-                txHash,
-                blockNumber,
-                confirmations: 0,
-                fromAddress,
-                toAddress,
-                token: 'USDT',
-                amountCrypto: amount.toString(),        // What was actually sent
-                requestedAmount: creditAmount,           // What user wanted
-                trackingFee: trackingFee                 // System fee
-            }
-        });
-
-        await User.updateOne(
-            { userId: user.userId },
-            {
-                $inc: { 
-                    balance: creditAmount,         // FIX: only credit requested amount
-                    totalDeposited: creditAmount
-                },
-                $set: {
-                    depositPending: false,
-                    depositTrackingAmount: null,
-                    depositRequestedAmount: null,  // NEW: clear this too
-                    lastDepositAt: new Date(),
-                    registeredWallet: fromAddress.toLowerCase()
-                }
-            }
-        );
-
-        await this.processReferralDeposit(user.userId, creditAmount);
-
-        logger.info('Deposit detected and credited', {
-            userId: user.userId,
-            creditAmount,
-            trackingAmount: amount,
-            trackingFee,
-            txHash,
-            from: fromAddress
-        });
-
-        // NEW: Send notification if callback registered
-        if (this.notificationCallback) {
-            try {
-                await this.notificationCallback(user.userId, {
-                    type: 'DEPOSIT_CONFIRMED',
-                    amount: creditAmount,
-                    trackingFee,
-                    txHash,
-                    address: this.masterAddress
+            // Fallback: fuzzy match within ±0.01 range
+            if (!user) {
+                user = await User.findOne({
+                    depositPending: true,
+                    depositTrackingAmount: { 
+                        $gte: amount - 0.01, 
+                        $lte: amount + 0.01 
+                    }
                 });
-            } catch (notifyError) {
-                logger.error('Deposit notification failed', { userId: user.userId, error: notifyError.message });
             }
-        }
 
-        return {
-            userId: user.userId,
-            amount: creditAmount,           // FIX: return credited amount
-            trackingAmount: amount,          // What was sent
-            trackingFee,
-            txHash,
-            status: 'CREDITED'
-        };
+            if (!user) {
+                logger.warn('Deposit received but no matching user found', {
+                    from: fromAddress,
+                    amount,
+                    txHash
+                });
+                return null;
+            }
+
+            // CRITICAL FIX: Use requestedAmount for credit, NOT the tracking amount
+            const creditAmount = user.depositRequestedAmount || amount;
+            const trackingFee = parseFloat((amount - creditAmount).toFixed(6));
+
+            // Validate credit amount is positive
+            if (creditAmount <= 0) {
+                logger.error('Invalid credit amount calculated', { userId: user.userId, creditAmount, trackingAmount: amount });
+                return null;
+            }
+
+            // Create transaction record with COMPLETED status (not CONFIRMED)
+            const tx = await Transaction.create({
+                txId: generateId(),
+                userId: user.userId,
+                type: 'DEPOSIT',
+                amount: creditAmount,              // User gets this amount
+                currency: 'USDT',
+                status: 'COMPLETED',               // ← FIXED: was 'CONFIRMED' (enum validation error)
+                blockchain: {
+                    txHash,
+                    blockNumber,
+                    confirmations: 0,
+                    fromAddress,
+                    toAddress,
+                    token: 'USDT',
+                    amountCrypto: amount.toString(),        // What was actually sent on chain
+                    requestedAmount: creditAmount,           // What user wanted
+                    trackingFee: trackingFee                 // System identification fee
+                }
+            });
+
+            // Atomically update user balance and clear deposit flags
+            await User.updateOne(
+                { userId: user.userId },
+                {
+                    $inc: { 
+                        balance: creditAmount,         // Only credit requested amount
+                        totalDeposited: creditAmount
+                    },
+                    $set: {
+                        depositPending: false,
+                        depositTrackingAmount: null,
+                        depositRequestedAmount: null,  // Clear both tracking fields
+                        lastDepositAt: new Date(),
+                        registeredWallet: fromAddress.toLowerCase()
+                    }
+                }
+            );
+
+            // Process referral reward if applicable
+            await this.processReferralDeposit(user.userId, creditAmount);
+
+            logger.info('Deposit detected and credited', {
+                userId: user.userId,
+                creditAmount,
+                trackingAmount: amount,
+                trackingFee,
+                txHash,
+                from: fromAddress
+            });
+
+            // Send Telegram notification if callback registered
+            if (this.notificationCallback) {
+                try {
+                    await this.notificationCallback(user.userId, {
+                        type: 'DEPOSIT_CONFIRMED',
+                        amount: creditAmount,
+                        trackingFee,
+                        txHash,
+                        address: this.masterAddress
+                    });
+                } catch (notifyError) {
+                    logger.error('Deposit notification failed', { 
+                        userId: user.userId, 
+                        error: notifyError.message 
+                    });
+                }
+            }
+
+            return {
+                userId: user.userId,
+                amount: creditAmount,           // What was credited to user
+                trackingAmount: amount,          // What was sent on blockchain
+                trackingFee,
+                txHash,
+                status: 'CREDITED'
+            };
+
+        } catch (error) {
+            // Retry on transient errors (up to MAX_RETRIES)
+            if (retryCount < MAX_RETRIES && this.isRetryableError(error)) {
+                const delay = 1000 * Math.pow(2, retryCount); // Exponential backoff: 1s, 2s, 4s
+                logger.warn('Deposit event processing failed, retrying...', { 
+                    txHash: event.transactionHash, 
+                    retry: retryCount + 1,
+                    delay,
+                    error: error.message 
+                });
+                await new Promise(resolve => setTimeout(resolve, delay));
+                return this.processDepositEvent(event, retryCount + 1);
+            }
+
+            logger.error('Failed to process deposit event', {
+                txHash: event.transactionHash,
+                error: error.message,
+                retryCount
+            });
+            throw error;
+        }
     }
 
+    // Helper: determine if error is retryable
+    isRetryableError(error) {
+        const retryableMessages = [
+            'E11000',           // MongoDB duplicate key
+            'timeout',
+            'ECONNREFUSED',
+            'ENETUNREACH',
+            'socket hang up',
+            'Transaction validation failed'  // Include validation errors for retry
+        ];
+        return retryableMessages.some(msg => error.message?.includes(msg));
+                    }
+    
     // FIX: checkDeposit now actually queries blockchain for the specific user
     async checkDeposit(userId) {
         await this.ensureReady();
