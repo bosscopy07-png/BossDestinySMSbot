@@ -457,25 +457,16 @@ class UserCommands {
         }
         await this.showDepositDetails(ctx, userId, amount);
     }
-
-        async showDepositDetails(ctx, userId, requestedAmount) {
+    async showDepositDetails(ctx, userId, requestedAmount) {
         try {
             const depositInfo = await this.walletService.getDepositInfo(userId, requestedAmount);
             
             const trackingAmount = depositInfo.amount || depositInfo.trackingAmount || depositInfo.baseAmount || requestedAmount;
             const actualAmount = depositInfo.baseAmount || requestedAmount;
 
-            await User.updateOne(
-                { userId },
-                { 
-                    $set: { 
-                        depositTrackingAmount: trackingAmount,
-                        depositRequestedAmount: actualAmount
-                    }
-                }
-            );
+            // REMOVED: Don't re-save here — getDepositInfo already saved everything atomically
+            // await User.updateOne(...)
 
-            // Resolve deposit address with proper fallback chain
             let depositAddress = depositInfo.address;
             if (!depositAddress && this.walletService?.getMasterAddress) {
                 depositAddress = this.walletService.getMasterAddress();
@@ -497,8 +488,6 @@ class UserCommands {
                 '✅ <code>$' + actualAmount + '</code> will be credited to your balance.\n' +
                 '⏱ Funds credited automatically in 1-2 minutes.';
 
-            // ─── 5. OPTIONAL IMPROVEMENTS ─────────────────────────────
-            // Share Address button for easier copy on mobile devices
             const keyboard = Markup.inlineKeyboard([
                 [Markup.button.callback('📋 Copy Address', 'copy_address_' + depositAddress)],
                 [Markup.button.callback('📤 Share Address', 'share_address_' + depositAddress)],
@@ -508,9 +497,6 @@ class UserCommands {
             ]);
 
             const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, keyboard, 'HTML');
-
-            // ─── 6. NEW FEATURE: Auto-refresh deposit status ──────────
-            // Silently check for deposit every 30s and notify user when detected
             this._scheduleDepositCheck(ctx, userId, sentMessage?.message_id);
 
         } catch (error) {
@@ -523,7 +509,8 @@ class UserCommands {
             await ctx.reply('❌ Error generating deposit. Please try again.');
         }
     }
-
+    
+        
     // ─── 5. OPTIONAL IMPROVEMENT: Share Address handler ───────────
     async handleShareAddress(ctx) {
         const address = ctx.match[1];
