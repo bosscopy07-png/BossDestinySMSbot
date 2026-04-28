@@ -435,4 +435,425 @@ class UserCommands {
                 'Send the amount you want to deposit (in USD):\n\n' +
                 '<i>Examples: 5, 10.50, 25</i>\n\n' +
                 'Minimum: <code>$0.50</code>';
-            await this.sendPhotoWithCaption(ctx, 
+                        await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, null, 'HTML');
+        } catch (error) {
+            logger.error('Custom deposit error', { userId, error: error.message });
+        }
+    }
+
+    async handleDepositAmountInput(ctx) {
+        const userId = ctx.from.id.toString();
+        const text = ctx.message.text.trim().replace(/[^0-9.]/g, '');
+        const amount = parseFloat(text);
+        if (isNaN(amount) || amount < 0.50) {
+            return this.sendPhotoWithCaption(
+                ctx,
+                IMAGES.deposit,
+                '❌ <b>Invalid amount.</b>\n\nMinimum deposit is <code>$0.50</code>.\nTry /deposit again.',
+                null,
+                'HTML'
+            );
+        }
+        await this.showDepositDetails(ctx, userId, amount);
+    }
+
+    async showDepositDetails(ctx, userId, requestedAmount) {
+        try {
+            const depositInfo = await this.walletService.getDepositInfo(userId, requestedAmount);
+            
+            const trackingAmount = depositInfo.amount || depositInfo.trackingAmount || depositInfo.baseAmount || requestedAmount;
+            const actualAmount = depositInfo.baseAmount || requestedAmount;
+
+            await User.updateOne(
+                { userId },
+                { 
+                    $set: { 
+                        depositTrackingAmount: trackingAmount,
+                        depositRequestedAmount: actualAmount
+                    }
+                }
+            );
+
+            let depositAddress = depositInfo.address;
+            if (!depositAddress && this.walletService?.getMasterAddress) {
+                depositAddress = await this.walletService.getMasterAddress();
+            }
+
+            const message =
+                '💳 <b>Deposit $' + actualAmount + '</b>\n\n' +
+                'Send <b>exactly</b> this amount of <b>USDT (BEP-20)</b>:\n\n' +
+                '💵 You will receive: <code>$' + actualAmount + '</code>\n' +
+                '📬 Send exactly: <code>' + trackingAmount + '</code> USDT\n' +
+                '🌐 Network: <code>' + (depositInfo.network || 'BSC (BEP-20)') + '</code>\n\n' +
+                '⚠️ <b>IMPORTANT:</b>\n' +
+                '• Send ONLY USDT on BSC (BEP-20)\n' +
+                '• Send EXACTLY <code>' + trackingAmount + '</code> USDT\n' +
+                '• The extra <code>' + (trackingAmount - actualAmount).toFixed(4) + '</code> is for deposit identification only\n\n' +
+                '✅ <code>$' + actualAmount + '</code> will be credited to your balance.\n' +
+                '⏱ Funds credited automatically in 1-2 minutes.';
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('📱 Show QR Code', 'deposit_qr')],
+                [Markup.button.callback('🔍 Check Deposit', 'check_deposit')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]);
+
+            await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, keyboard, 'HTML');
+
+        } catch (error) {
+            logger.error('Show deposit details error', { userId, error: error.message });
+            await ctx.reply('❌ Error generating deposit. Please try again.');
+        }
+    }
+
+    async handleDepositQR(ctx) {
+        const userId = ctx.from.id.toString();
+        try {
+            const user = await User.findOne({ userId });
+            const trackingAmount = user?.depositTrackingAmount;
+            const requestedAmount = user?.depositRequestedAmount || trackingAmount;
+
+            if (!trackingAmount) {
+                return ctx.answerCbQuery('⚠️ Click Deposit first');
+            }
+
+            let masterAddress = '';
+            try {
+                if (this.walletService?.getMasterAddress) {
+                    masterAddress = await this.walletService.getMasterAddress();
+                }
+            } catch (e) {
+                return ctx.answerCbQuery('❌ Address unavailable');
+            }
+
+            await ctx.answerCbQuery('📱 Generating QR...');
+
+            const qrBuffer = await QRCode.toBuffer(masterAddress, {
+                width: 280,
+                margin: 2,
+                color: { dark: '#00BCD4', light: '#FFFFFF' }
+            });
+
+            const caption =
+                '📱 <b>Scan to Deposit</b>\n\n' +
+                '💵 You receive: <code>$' + requestedAmount + '</code>\n' +
+                '📬 Send exactly: <code>' + trackingAmount + '</code> USDT\n' +
+                '📬 Address: <code>' + masterAddress + '</code>\n\n' +
+                '⚠️ Send EXACTLY <code>' + trackingAmount + '</code> USDT on BSC (BEP-20)\n' +
+                '💰 <code>$' + requestedAmount + '</code> will be credited to your balance.';
+
+            const walletUrl = 'https://bscscan.com/address/' + masterAddress;
+
+            const keyboard = {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔗 View on BSCScan', url: walletUrl }],
+                        [{ text: '📋 Copy Address', callback_data: 'copy_address_' + masterAddress }],
+                        [{ text: '🔍 Check Deposit', callback_data: 'check_deposit' }],
+                        [{ text: '🔙 Back', callback_data: 'menu' }]
+                    ]
+                }
+            };
+
+            await ctx.replyWithPhoto(
+                { source: qrBuffer },
+                { caption: caption, parse_mode: 'HTML', reply_markup: keyboard.reply_markup }
+            );
+
+        } catch (error) {
+            logger.error('QR generation failed', { userId, error: error.message });
+            await ctx.answerCbQuery('❌ Failed to generate QR');
+        }
+    }
+
+    async handleCopyAddress(ctx) {
+        const address = ctx.match[1];
+        await ctx.answerCbQuery('📋 Address: ' + address.substring(0, 10) + '...');
+        await ctx.reply(
+            '📋 <b>Copy this address:</b>\n\n<code>' + address + '</code>\n\n' +
+            'Tap the address above to copy it.',
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    // FIX: checkDeposit now properly delegates to WalletService and handles the response
+    async handleCheckDeposit(ctx) {
+        const userId = ctx.from.id.toString();
+        try {
+            await ctx.answerCbQuery('🔍 Checking...');
+            
+            const result = await this.walletService.checkDeposit(userId);
+
+            if (result.found && (result.status === 'CONFIRMED' || result.status === 'CREDITED')) {
+                const message =
+                    '✅ <b>Deposit Confirmed!</b>\n\n' +
+                    '💵 Credited: <code>' + formatCurrency(result.amount) + '</code>\n' +
+                    (result.trackingFee > 0 ? '🔧 Tracking Fee: <code>' + formatCurrency(result.trackingFee) + '</code>\n' : '') +
+                    '✅ Status: <code>' + result.status + '</code>\n' +
+                    '🔗 TX: <code>' + (result.txHash || 'N/A') + '</code>\n\n' +
+                    '💰 Your balance has been updated.';
+
+                return this.sendPhotoWithCaption(ctx, IMAGES.depositConfirmed, message, null, 'HTML');
+            }
+
+            if (result.found && result.status === 'CONFIRMING') {
+                const message =
+                    '⏳ <b>Deposit Confirming</b>\n\n' +
+                    '💵 Amount: <code>' + formatCurrency(result.amount) + '</code>\n' +
+                    '🔢 Confirmations: <code>' + (result.confirmations || 0) + '/' + (config.blockchain?.blockConfirmations || 12) + '</code>\n\n' +
+                    '⏱ Please wait for full confirmation.';
+
+                return this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, null, 'HTML');
+            }
+
+            // Not found — show helpful message with current pending info
+            const user = await User.findOne({ userId });
+            const trackingAmount = user?.depositTrackingAmount;
+
+            let masterAddress = '';
+            try {
+                if (this.walletService?.getMasterAddress) {
+                    masterAddress = await this.walletService.getMasterAddress();
+                }
+            } catch (e) {}
+
+            const message =
+                '🔍 <b>No deposit found yet.</b>\n\n' +
+                'Make sure you:\n' +
+                '1️⃣ Sent to: <code>' + masterAddress + '</code>\n' +
+                '2️⃣ Sent exactly <code>' + (trackingAmount || 'the shown') + '</code> USDT\n' +
+                '3️⃣ Used BSC (BEP-20) network\n\n' +
+                '⏱ Check again in 1 minute.';
+
+            await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, Markup.inlineKeyboard([
+                [Markup.button.callback('🔄 Check Again', 'check_deposit')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]), 'HTML');
+
+        } catch (error) {
+            logger.error('Check deposit failed', { userId, error: error.message });
+            await ctx.answerCbQuery('❌ Check failed');
+            await ctx.reply('❌ Error checking deposit. Try again later.');
+        }
+    }
+
+    async handleHistory(ctx) {
+        const userId = ctx.from.id.toString();
+        const transactions = await Transaction.find({ userId }).sort({ createdAt: -1 }).limit(15).lean();
+
+        let message = '📜 <b>Recent Transactions</b>\n\n';
+        if (!transactions.length) {
+            message += '<i>No transactions yet. Deposit to get started!</i>';
+        } else {
+            transactions.forEach((tx, index) => {
+                const icon = tx.type === TX_TYPES.DEPOSIT ? '💳' :
+                    tx.type === TX_TYPES.BUNDLE_PURCHASE ? '📦' :
+                        tx.type === TX_TYPES.VIP_SUBSCRIPTION ? '👑' :
+                            tx.type === TX_TYPES.REFERRAL_REWARD ? '🎁' :
+                                tx.amount >= 0 ? '➕' : '➖';
+                const type = (tx.type || 'Unknown').replace(/_/g, ' ');
+                const amountPrefix = tx.amount >= 0 ? '+' : '';
+                
+                let extraInfo = '';
+                if (tx.type === TX_TYPES.DEPOSIT && tx.metadata?.trackingFee > 0) {
+                    extraInfo = ' (fee: ' + formatCurrency(tx.metadata.trackingFee) + ')';
+                }
+                
+                message += icon + ' <b>' + type + '</b>\n';
+                message += '   ' + amountPrefix + formatCurrency(Math.abs(tx.amount || 0)) + extraInfo + ' | ' + tx.status + '\n';
+                message += '   🕐 ' + (tx.createdAt ? new Date(tx.createdAt).toLocaleDateString() : 'Unknown') + '\n\n';
+            });
+        }
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('📥 Export CSV', 'export_history')],
+            [Markup.button.callback('🔙 Back', 'menu')]
+        ]);
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.history, message, keyboard, 'HTML');
+    }
+
+    async handleExportHistory(ctx) {
+        const userId = ctx.from.id.toString();
+        try {
+            await ctx.answerCbQuery('📥 Generating CSV...');
+            const transactions = await Transaction.find({ userId }).sort({ createdAt: -1 }).lean();
+
+            if (!transactions.length) {
+                return ctx.reply('📭 No transactions to export.');
+            }
+
+            let csv = 'Date,Type,Amount,Status,TrackingFee,TX Hash\n';
+            for (const tx of transactions) {
+                const date = tx.createdAt ? new Date(tx.createdAt).toISOString().split('T')[0] : 'N/A';
+                const trackingFee = tx.metadata?.trackingFee || 0;
+                csv += date + ',' + (tx.type || 'Unknown') + ',' + (tx.amount || 0) + ',' + (tx.status || 'Unknown') + ',' + trackingFee + ',' + (tx.txHash || 'N/A') + '\n';
+            }
+
+            await ctx.replyWithDocument(
+                { source: Buffer.from(csv), filename: 'history_' + userId + '_' + Date.now() + '.csv' },
+                { caption: '📥 Your transaction history export.' }
+            );
+        } catch (error) {
+            logger.error('Export history failed', { userId, error: error.message });
+            await ctx.reply('❌ Failed to export history.');
+        }
+    }
+
+    async handleReferral(ctx) {
+        const user = await User.findOne({ userId: ctx.from.id.toString() }).lean();
+        const botUsername = ctx.botInfo?.username || 'SwiftOTPBot';
+        const referralLink = 'https://t.me/' + botUsername + '?start=' + user.referralCode;
+
+        const message =
+            '🎁 <b>Referral Program</b>\n\n' +
+            '🔗 <b>Your Code:</b> <code>' + user.referralCode + '</code>\n\n' +
+            '💰 Earn <code>' + (((config.referral?.percentage || 0.05) * 100).toFixed(0)) + '%</code> of your referrals\' first deposits!\n\n' +
+            '📊 <b>Your Stats:</b>\n' +
+            '• Referrals: <code>' + (user.referralCount || 0) + '</code>\n' +
+            '• Total Earnings: <code>' + formatCurrency(user.referralEarnings || 0) + '</code>\n' +
+            '• Pending Approval: <code>' + formatCurrency(user.referralRewardsPending || 0) + '</code>\n\n' +
+            '🔗 <b>Your Link:</b>\n<code>' + referralLink + '</code>';
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('📤 Share Link', 'share_' + user.referralCode)],
+            [Markup.button.callback('🔙 Back', 'menu')]
+        ]);
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.referral, message, keyboard, 'HTML');
+    }
+
+    async handleShareReferral(ctx) {
+        const referralCode = ctx.match[1];
+        const botUsername = ctx.botInfo?.username || 'SwiftOTPBot';
+        const referralLink = 'https://t.me/' + botUsername + '?start=' + referralCode;
+
+        await ctx.answerCbQuery('📤 Link ready!');
+        await ctx.reply(
+            '📤 <b>Share Your Referral Link</b>\n\n' +
+            '<code>' + referralLink + '</code>\n\n' +
+            'Tap and hold to copy, then share with friends!',
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    async handleStats(ctx) {
+        const userId = ctx.from.id.toString();
+        const user = await User.findOne({ userId }).lean();
+        const sessions = await Session.find({ userId }).lean();
+
+        const totalRequests = sessions.length;
+        const successful = sessions.filter(s => s.status === 'RECEIVED').length;
+        const failed = sessions.filter(s => s.status === 'TIMEOUT' || s.status === 'FAILED').length;
+        const successRate = totalRequests > 0 ? ((successful / totalRequests) * 100).toFixed(1) : 0;
+
+        const completedSessions = sessions.filter(s => s.endTime && s.startTime && s.status === 'RECEIVED');
+        const avgWaitTime = completedSessions.length > 0
+            ? (completedSessions.reduce((acc, s) => acc + (new Date(s.endTime) - new Date(s.startTime)), 0) / completedSessions.length / 1000)
+            : 0;
+
+        const isVip = this._isVipActive(user);
+        const freeRemaining = this._freeRemaining(user);
+        const vipRemaining = isVip ? this._vipRemaining(user) : 0;
+
+        const message =
+            '📊 <b>Your Statistics</b>\n\n' +
+            '🔢 <b>OTP Requests:</b>\n' +
+            '• Total: <code>' + totalRequests + '</code>\n' +
+            '• Successful: <code>' + successful + '</code>\n' +
+            '• Failed: <code>' + failed + '</code>\n' +
+            '• Success Rate: <code>' + successRate + '%</code>\n\n' +
+            '⚡ <b>Performance:</b>\n' +
+            '• Avg Wait: <code>' + avgWaitTime.toFixed(1) + 's</code>\n\n' +
+            '💰 <b>Financial:</b>\n' +
+            '• Deposited: <code>' + formatCurrency(user?.totalDeposited || 0) + '</code>\n' +
+            '• Spent: <code>' + formatCurrency(user?.totalSpent || 0) + '</code>\n' +
+            '• Balance: <code>' + formatCurrency(user?.balance || 0) + '</code>\n\n' +
+            '🎮 <b>Usage:</b>\n' +
+            '• Free: <code>' + freeRemaining + '/3</code>\n' +
+            '• Bundle: <code>' + (user?.bundleRemaining || 0) + '</code>\n' +
+            (isVip ? '• VIP: <code>' + vipRemaining + '/50</code>\n' : '') +
+            '\n📅 Member Since: ' + (user?.createdAt ? new Date(user.createdAt).toLocaleDateString() : 'Unknown');
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.stats, message, Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'menu')]
+        ]), 'HTML');
+    }
+
+    async handleSettings(ctx) {
+        const user = await User.findOne({ userId: ctx.from.id.toString() }).lean();
+
+        const message =
+            '⚙️ <b>Settings</b>\n\n' +
+            '🔒 Privacy: <code>' + (user.privacyEnabled ? 'Masked OTPs' : 'Full OTPs') + '</code>\n' +
+            '🔔 Notifications: <code>' + (user.notificationsEnabled ? 'On' : 'Off') + '</code>\n' +
+            '🌍 Country: <code>' + (user.preferredCountry || 'US') + '</code>\n\n' +
+            'Toggle settings below:';
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback(user.privacyEnabled ? '👁 Show Full OTPs' : '🔒 Mask OTPs', 'toggle_privacy')],
+            [Markup.button.callback(user.notificationsEnabled ? '🔕 Disable Notifications' : '🔔 Enable Notifications', 'toggle_notifications')],
+            [Markup.button.callback('🌍 Change Country', 'change_country')],
+            [Markup.button.callback('🔙 Back', 'menu')]
+        ]);
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, keyboard, 'HTML');
+    }
+
+    async handleTogglePrivacy(ctx) {
+        const userId = ctx.from.id.toString();
+        const user = await User.findOne({ userId });
+        const newValue = !user.privacyEnabled;
+        await User.updateOne({ userId }, { $set: { privacyEnabled: newValue } });
+        await ctx.answerCbQuery(newValue ? '🔒 Privacy ON' : '👁 Privacy OFF');
+        await this.handleSettings(ctx);
+    }
+
+    async handleToggleNotifications(ctx) {
+        const userId = ctx.from.id.toString();
+        const user = await User.findOne({ userId });
+        const newValue = !user.notificationsEnabled;
+        await User.updateOne({ userId }, { $set: { notificationsEnabled: newValue } });
+        await ctx.answerCbQuery(newValue ? '🔔 Notifications ON' : '🔕 Notifications OFF');
+        await this.handleSettings(ctx);
+    }
+
+    async handleChangeCountry(ctx) {
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingCustomCountry = false;
+
+        const countries = [
+            { code: 'US', name: '🇺🇸 United States', flag: '🇺🇸' },
+            { code: 'UK', name: '🇬🇧 United Kingdom', flag: '🇬🇧' },
+            { code: 'CA', name: '🇨🇦 Canada', flag: '🇨🇦' },
+            { code: 'AU', name: '🇦🇺 Australia', flag: '🇦🇺' },
+            { code: 'DE', name: '🇩🇪 Germany', flag: '🇩🇪' },
+            { code: 'FR', name: '🇫🇷 France', flag: '🇫🇷' },
+            { code: 'IN', name: '🇮🇳 India', flag: '🇮🇳' },
+            { code: 'NG', name: '🇳🇬 Nigeria', flag: '🇳🇬' }
+        ];
+
+        const buttons = countries.map(c => [
+            Markup.button.callback(c.flag + ' ' + c.name, 'setcountry_' + c.code)
+        ]);
+        buttons.push([Markup.button.callback('✏️ Custom', 'custom_country')]);
+        buttons.push([Markup.button.callback('🔙 Back', 'settings')]);
+
+        const message = '🌍 <b>Select Your Preferred Country</b>\n\nChoose a country for your OTP numbers:';
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, Markup.inlineKeyboard(buttons), 'HTML');
+    }
+
+    async handleSetCountry(ctx) {
+        const countryCode = ctx.match[1];
+        const userId = ctx.from.id.toString();
+        await User.updateOne({ userId }, { $set: { preferredCountry: countryCode } });
+        await ctx.answerCbQuery('🌍 Country set to ' + countryCode);
+        await this.handleSettings(ctx);
+    }
+
+    async handleCustomCountryInput(ctx) {
+        const countryCode = ctx.message.text.trim().toUpperCase().substring(0, 2);
+        const userId = ctx.from.id.toString();
+        await User.updateOne({ userId }, { $set: { preferredCountry: countryCode } });
+        await ctx.reply('🌍 Country set to <code>' + countryCode + '</code>', { parse_mode: 'HTML' });
+        await t
