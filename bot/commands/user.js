@@ -117,13 +117,14 @@ class UserCommands {
             return next();
         });
     }
-
     async _ensureUserFresh(ctx) {
         const userId = ctx.from.id.toString();
-        let user = await User.findOne({ userId }).lean();
+        
+        // Use findOne() without .lean() to get Mongoose document with methods
+        let user = await User.findOne({ userId });
 
         if (!user) {
-            user = {
+            user = new User({
                 userId,
                 username: ctx.from.username || null,
                 firstName: ctx.from.first_name || '',
@@ -150,8 +151,8 @@ class UserCommands {
                 preferredCountry: 'US',
                 createdAt: new Date(),
                 lastActive: new Date()
-            };
-            await User.create(user);
+            });
+            await user.save();
         }
 
         const now = new Date();
@@ -172,14 +173,15 @@ class UserCommands {
 
         if (needsUpdate) {
             await User.updateOne({ userId }, { $set: updates });
-            user = { ...user, ...updates };
+            Object.assign(user, updates);
         }
 
         await User.updateOne({ userId }, { $set: { lastActive: now } }).catch(() => {});
 
-        return user;
-    }
-
+        return user;  // ← Now a Mongoose doc with .canUseVip(), .getAvailableBalance(), etc.
+        }
+                
+    
     _canUseFree(user) {
         if (user.isBlacklisted) return false;
         const limit = config.limits?.freeDaily || 3;
@@ -209,7 +211,8 @@ class UserCommands {
     _getAvailableBalance(user) {
         return (user.balance || 0) - (user.lockedBalance || 0);
     }
-
+    
+    
     async sendPhotoWithCaption(ctx, imageUrl, caption, keyboard = null, parseMode = null) {
         try {
             const payload = { caption: caption.trim() };
