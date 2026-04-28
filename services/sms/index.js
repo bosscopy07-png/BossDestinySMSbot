@@ -11,7 +11,6 @@ class SMSProviderManager {
     }
 
     initializeProviders() {
-        // Register all providers
         this.providers.set('TWILIO', new TwilioProvider());
         this.providers.set('TELNYX', new TelnyxProvider());
         this.providers.set('CHEAP_PANEL', new CheapPanelProvider());
@@ -22,16 +21,20 @@ class SMSProviderManager {
         });
     }
 
+    /**
+     * Get provider for tier — DOES NOT acquire number, just returns provider instance
+     */
     async getProviderForTier(tier, country = 'US', preferredProvider = null) {
         const tierMap = {
             'FREE': ['FREE_PUBLIC'],
             'CHEAP': ['CHEAP_PANEL', 'TELNYX', 'TWILIO'],
-            'VIP': ['TELNYX', 'TWILIO']
+            'VIP': ['TELNYX', 'TWILIO'],
+            'BUNDLE': ['CHEAP_PANEL', 'TELNYX', 'TWILIO']  // ← FIXED: BUNDLE uses cheap providers
         };
 
         const providerNames = tierMap[tier] || tierMap['CHEAP'];
 
-        // If preferred provider specified and available, try it first
+        // Preferred provider first
         if (preferredProvider && providerNames.includes(preferredProvider)) {
             const provider = this.providers.get(preferredProvider);
             if (provider && provider.isActive) {
@@ -39,29 +42,28 @@ class SMSProviderManager {
             }
         }
 
-        // Find first available provider with best stats
+        // Find first active provider
         for (const name of providerNames) {
             const provider = this.providers.get(name);
             if (provider && provider.isActive) {
-                // Check if provider has numbers for this country
-                try {
-                    await provider.getNumber(country);
-                    return provider;
-                } catch (err) {
-                    logger.warn(`Provider ${name} unavailable for ${country}`, {
-                        error: err.message
-                    });
-                    continue;
-                }
+                return provider;
             }
         }
 
-        throw new Error(`No available providers for tier ${tier} in ${country}`);
+        throw new Error(`No available providers for tier ${tier}`);
     }
 
+    /**
+     * Get number — single acquisition, no wasted calls
+     */
     async getNumber(tier, country, service, preferredProvider = null) {
         const provider = await this.getProviderForTier(tier, country, preferredProvider);
         const number = await provider.getNumber(country, service);
+
+        // Validate response
+        if (!number || !number.phoneNumber || number.phoneNumber.length < 7) {
+            throw new Error(`Invalid number from ${provider.name}: ${number?.phoneNumber}`);
+        }
 
         return {
             ...number,
@@ -74,28 +76,18 @@ class SMSProviderManager {
         if (!provider) {
             throw new Error(`Provider ${providerName} not found`);
         }
-
-        if (providerName === 'CHEAP_PANEL') {
-            return await provider.checkSMS(identifier); // activationId
-        }
-
-        if (providerName === 'FREE_PUBLIC') {
-            return await provider.checkSMS(identifier); // phoneNumber
-        }
-
-        // For Twilio/Telnyx, you'd check via their APIs or webhooks
-        return { success: false, status: 'CHECK_NOT_SUPPORTED' };
+        return provider.checkSMS(identifier);
     }
 
     async cancelNumber(providerName, identifier) {
         const provider = this.providers.get(providerName);
         if (!provider) return { success: false };
-
+        
         if (providerName === 'CHEAP_PANEL') {
-            return await provider.cancelNumber(identifier);
+            return provider.cancelNumber(identifier);
         }
-
-        return { success: true }; // Others auto-release
+        
+        return { success: true };
     }
 
     getAllStats() {
@@ -130,3 +122,4 @@ class SMSProviderManager {
 }
 
 export default SMSProviderManager;
+            
