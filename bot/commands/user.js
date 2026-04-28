@@ -497,8 +497,7 @@ class UserCommands {
             ]);
 
             const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, keyboard, 'HTML');
-            this._scheduleDepositCheck(ctx, userId, sentMessage?.message_id);
-
+            
         } catch (error) {
             logger.error('Show deposit details error', { userId, error: error.message });
             
@@ -522,60 +521,7 @@ class UserCommands {
         );
     }
 
-    // ─── 6. NEW FEATURE: Auto-refresh deposit checker ─────────────
-    _scheduleDepositCheck(ctx, userId, originalMessageId, attempt = 0) {
-        const MAX_ATTEMPTS = 10;      // Check for 5 minutes total (10 × 30s)
-        const CHECK_INTERVAL = 30000; // 30 seconds
-
-        if (attempt >= MAX_ATTEMPTS) return;
-
-        setTimeout(async () => {
-            try {
-                // Check if user still has pending deposit
-                const user = await User.findOne({ userId }).select('depositPending');
-                if (!user?.depositPending) return; // Already processed or cancelled
-
-                const result = await this.walletService.checkDeposit(userId);
-
-                if (result.found && (result.status === 'COMPLETED' || result.status === 'CREDITED')) {
-                    // Deposit detected! Notify user
-                    const notifyMessage =
-                        '✅ <b>Deposit Detected!</b>\n\n' +
-                        '💵 Amount: <code>' + formatCurrency(result.amount) + '</code>\n' +
-                        '🔗 TX: <code>' + (result.txHash || 'N/A') + '</code>\n\n' +
-                        'Your balance has been updated. Use /otp to start requesting!';
-
-                    await ctx.reply(notifyMessage, { parse_mode: 'HTML' });
-
-                    // Edit original deposit message to show confirmed status
-                    if (originalMessageId) {
-                        try {
-                            await ctx.telegram.editMessageCaption(
-                                ctx.chat.id,
-                                originalMessageId,
-                                undefined,
-                                '✅ <b>Deposit Confirmed</b>\n\n💵 Credited: <code>' + formatCurrency(result.amount) + '</code>\n⏱ Status: Completed',
-                                { parse_mode: 'HTML' }
-                            );
-                        } catch (editError) {
-                            // Message might be too old to edit, ignore
-                        }
-                    }
-                    return; // Stop checking
-                }
-
-                // Not found yet, schedule next check
-                this._scheduleDepositCheck(ctx, userId, originalMessageId, attempt + 1);
-
-            } catch (error) {
-                logger.error('Auto deposit check failed', { userId, attempt, error: error.message });
-                // Continue checking despite error
-                this._scheduleDepositCheck(ctx, userId, originalMessageId, attempt + 1);
-            }
-        }, CHECK_INTERVAL);
-            }
-            
-
+    
     async handleDepositQR(ctx) {
         const userId = ctx.from.id.toString();
         try {
@@ -645,27 +591,19 @@ class UserCommands {
             { parse_mode: 'HTML' }
         );
     }
-    async handleCheckDeposit(ctx) {
+        async handleCheckDeposit(ctx) {
         const userId = ctx.from.id.toString();
         try {
             await ctx.answerCbQuery('🔍 Checking...');
             
-            // WalletService.checkDeposit handles ALL blockchain scanning and DB updates
-            // This handler is PURELY for displaying results — NEVER modifies balance here
             const result = await this.walletService.checkDeposit(userId);
 
+            // Deposit already processed by scanner — user got notified already
             if (result.found && (result.status === 'COMPLETED' || result.status === 'CREDITED')) {
-                const message =
-                    '✅ <b>Deposit Confirmed!</b>\n\n' +
-                    '💵 Credited: <code>' + formatCurrency(result.amount) + '</code>\n' +
-                    (result.trackingFee > 0 ? '🔧 Tracking Fee: <code>' + formatCurrency(result.trackingFee) + '</code>\n' : '') +
-                    '✅ Status: <code>' + result.status + '</code>\n' +
-                    '🔗 TX: <code>' + (result.txHash || 'N/A') + '</code>\n\n' +
-                    '💰 Your balance has been updated.';
-
-                return this.sendPhotoWithCaption(ctx, IMAGES.depositConfirmed, message, null, 'HTML');
+                return ctx.answerCbQuery('✅ Deposit confirmed! Check /balance.');
             }
 
+            // Deposit is still confirming on-chain
             if (result.found && result.status === 'CONFIRMING') {
                 const message =
                     '⏳ <b>Deposit Confirming</b>\n\n' +
@@ -676,7 +614,7 @@ class UserCommands {
                 return this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, null, 'HTML');
             }
 
-            // Not found — show helpful message with current pending info
+            // No deposit found — show instructions
             const user = await User.findOne({ userId });
             const trackingAmount = user?.depositTrackingAmount;
 
@@ -705,7 +643,7 @@ class UserCommands {
             await ctx.answerCbQuery('❌ Check failed');
             await ctx.reply('❌ Error checking deposit. Try again later.');
         }
-    }
+        }
     
     async handleHistory(ctx) {
         const userId = ctx.from.id.toString();
