@@ -11,14 +11,14 @@ const sessionSchema = new mongoose.Schema({
         required: true,
         index: true
     },
-    
-    // Service Details
+
     mode: {
         type: String,
-        enum: ['FREE', 'CHEAP', 'VIP'],
+        enum: ['FREE', 'CHEAP', 'VIP', 'BUNDLE'],  // ← FIXED: added 'BUNDLE'
         required: true,
         index: true
     },
+    
     service: {
         type: String,
         required: true,
