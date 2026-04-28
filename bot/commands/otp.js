@@ -206,9 +206,17 @@ class OTPCommands {
         buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
         await this.sendPhotoWithCaption(ctx, imageUrl, message, Markup.inlineKeyboard(buttons));
     }
-
+    
     async handleServiceSelect(ctx) {
         const service = ctx.match[1];
+        
+        // Validate service exists
+        const validServices = SERVICES.map(s => s.toLowerCase());
+        if (!validServices.includes(service.toLowerCase())) {
+            logger.warn('Invalid service selected', { service, validServices });
+            return ctx.answerCbQuery('❌ Invalid service');
+        }
+        
         ctx.session = ctx.session || {};
         ctx.session.otpService = service;
         const message = `🌍 Select Country\n\nChoose number country for ${service}:`;
@@ -218,6 +226,7 @@ class OTPCommands {
         buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
         await this.sendPhotoWithCaption(ctx, IMAGES.countrySelect, message, Markup.inlineKeyboard(buttons));
     }
+    
 
     async handleCountrySelect(ctx) {
         const country = ctx.match[1];
