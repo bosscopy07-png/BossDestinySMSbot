@@ -27,6 +27,25 @@ class OTPCommands {
         this.bot = bot;
         this.walletService = walletService;
         this.registerCommands();
+        
+        // Register deposit notification handler
+        this.walletService.onDepositNotification(this.handleDepositNotification.bind(this));
+    }
+
+    // NEW: Handle deposit notifications from WalletService
+    async handleDepositNotification(userId, data) {
+        try {
+            const message = 
+                '✅ <b>Deposit Confirmed!</b>\n\n' +
+                '💵 Amount Credited: <code>' + formatCurrency(data.amount) + '</code>\n' +
+                (data.trackingFee > 0 ? '🔧 Tracking Fee: <code>' + formatCurrency(data.trackingFee) + '</code>\n' : '') +
+                '🔗 TX Hash: <code>' + data.txHash + '</code>\n\n' +
+                'Your balance has been updated. Use /otp to request OTPs!';
+
+            await this.bot.telegram.sendMessage(userId, message, { parse_mode: 'HTML' });
+        } catch (error) {
+            logger.error('Failed to send deposit notification', { userId, error: error.message });
+        }
     }
 
     registerCommands() {
@@ -35,7 +54,7 @@ class OTPCommands {
         this.bot.action('mode_free', this.handleFreeMode.bind(this));
         this.bot.action('mode_cheap', this.handleCheapMode.bind(this));
         this.bot.action('mode_vip', this.handleVIPMode.bind(this));
-        this.bot.action('mode_bundle', this.handleBuyBundle.bind(this));
+        this.bot.action('mode_bundle', this.handleBundleMode.bind(this));  // NEW
         this.bot.action(/service_(.+)/, this.handleServiceSelect.bind(this));
         this.bot.action(/country_(.+)/, this.handleCountrySelect.bind(this));
         this.bot.action('buy_bundle', this.handleBuyBundle.bind(this));
@@ -103,6 +122,33 @@ class OTPCommands {
         await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
     }
 
+    // NEW: Bundle mode — lets users consume bundle credits
+    async handleBundleMode(ctx) {
+        const user = ctx.state.user;
+        
+        // If user has no bundle credits, show buy screen
+        if (!user.bundleRemaining || user.bundleRemaining <= 0) {
+            const message = 
+                '📦 <b>No Bundle Credits</b>\n\n' +
+                'You don\'t have any bundle OTPs left.\n\n' +
+                '💰 Price: ' + formatCurrency(config.prices?.bundlePrice || 5.00) + '\n' +
+                '📦 Includes: ' + (config.prices?.bundleOtpCount || 100) + ' OTPs\n' +
+                '✅ Never expires\n\n' +
+                'Buy a bundle now?';
+            
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('✅ Buy Bundle', 'buy_bundle')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]);
+            return this.sendPhotoWithCaption(ctx, IMAGES.bundleFirst, message, keyboard, 'HTML');
+        }
+
+        // User has bundle credits — let them use it
+        ctx.session = ctx.session || {};
+        ctx.session.otpMode = 'BUNDLE';
+        await this.showServiceSelection(ctx, 'BUNDLE', IMAGES.bundleOther);
+    }
+
     async handleVIPMode(ctx) {
         const user = ctx.state.user;
         if (!user.isVipActive()) {
@@ -150,28 +196,81 @@ class OTPCommands {
         const userId = ctx.from.id.toString();
         const mode = ctx.session?.otpMode;
         const service = ctx.session?.otpService;
+        
         if (!mode || !service) {
             return this.sendPhotoWithCaption(ctx, IMAGES.default, '❌ Session expired. Please start over with /otp');
         }
+
         try {
             const loadingMsg = await ctx.reply('⏳ Assigning number...');
+
+            // NEW: For BUNDLE mode, deduct from bundleRemaining instead of balance
+            if (mode === 'BUNDLE') {
+                const user = await User.findOne({ userId });
+                if (!user || !user.bundleRemaining || user.bundleRemaining <= 0) {
+                    await ctx.deleteMessage(loadingMsg.message_id);
+                    return this.sendPhotoWithCaption(
+                        ctx, 
+                        IMAGES.bundleFirst,
+                        '❌ <b>No Bundle Credits</b>\n\nYour bundle OTPs have been exhausted. Buy a new bundle to continue.',
+                        Markup.inlineKeyboard([
+                            [Markup.button.callback('📦 Buy Bundle', 'buy_bundle')],
+                            [Markup.button.callback('🔙 Back', 'menu')]
+                        ]),
+                        'HTML'
+                    );
+                }
+
+                // Deduct one bundle credit
+                await User.updateOne(
+                    { userId },
+                    { $inc: { bundleRemaining: -1 } }
+                );
+            }
+
             const session = await sessionManager.createSession(userId, mode, service, country);
             await ctx.deleteMessage(loadingMsg.message_id);
-            const costText = mode === 'FREE' ? 'FREE' : formatCurrency(session.cost);
-            const message = `📱 OTP Request Started\n\n🌍 Mode: ${mode}\n📱 Number: \`${session.number}\`\n🎯 Service: ${service}\n⏳ Status: Waiting for OTP...\n💰 Cost: ${costText}\n⏱ Timeout: ${Math.floor((session.timeoutAt - new Date()) / 1000)}s\n\n⚠️ ${mode === 'FREE' ? 'Shared number. OTP not guaranteed.' : 'Funds locked. Will be deducted on delivery.'}`;
+
+            const costText = mode === 'FREE' ? 'FREE' : 
+                            mode === 'BUNDLE' ? 'BUNDLE (1 credit used)' : 
+                            formatCurrency(session.cost);
+
+            const message = 
+                `📱 OTP Request Started\n\n` +
+                `🌍 Mode: ${mode}\n` +
+                `📱 Number: \`${session.number}\`\n` +
+                `🎯 Service: ${service}\n` +
+                `⏳ Status: Waiting for OTP...\n` +
+                `💰 Cost: ${costText}\n` +
+                `⏱ Timeout: ${Math.floor((session.timeoutAt - new Date()) / 1000)}s\n\n` +
+                `⚠️ ${mode === 'FREE' ? 'Shared number. OTP not guaranteed.' : mode === 'BUNDLE' ? 'Bundle credit used. No additional charge.' : 'Funds locked. Will be deducted on delivery.'}`;
+
             const keyboard = Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'cancel_otp')]]);
             await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard);
+
         } catch (error) {
             logger.error('OTP session creation failed', { userId, mode, service, error: error.message });
+            
+            // If bundle deduction failed, restore it
+            if (mode === 'BUNDLE') {
+                await User.updateOne({ userId }, { $inc: { bundleRemaining: 1 } }).catch(() => {});
+            }
+
             const errorMessages = {
                 ACTIVE_SESSION_EXISTS: '⏳ You already have an active session. Use /cancel first.',
                 INSUFFICIENT_BALANCE: '💰 Insufficient balance. Deposit first with /deposit',
                 FREE_LIMIT_REACHED: '🆓 Free limit reached for today.',
                 USER_BLACKLISTED: '🚫 Your account is suspended.',
                 VIP_EXPIRED: '👑 VIP expired. Renew your subscription.',
-                VIP_DAILY_LIMIT_REACHED: '⚠️ VIP daily limit (50) reached.'
+                VIP_DAILY_LIMIT_REACHED: '⚠️ VIP daily limit (50) reached.',
+                BUNDLE_EMPTY: '📦 No bundle credits left. Buy a bundle first.'
             };
-            await this.sendPhotoWithCaption(ctx, IMAGES.otpFailed, errorMessages[error.message] || `❌ Error: ${error.message}`);
+            
+            await this.sendPhotoWithCaption(
+                ctx, 
+                IMAGES.otpFailed, 
+                errorMessages[error.message] || `❌ Error: ${error.message}`
+            );
         }
     }
 
@@ -183,7 +282,17 @@ class OTPCommands {
                 return this.sendPhotoWithCaption(ctx, IMAGES.default, '❌ No active session to cancel.');
             }
             await sessionManager.cancelSession(activeSession.sessionId, userId);
-            const message = `✅ Session Cancelled\n\n📱 Number: ${activeSession.number}\n${activeSession.cost > 0 ? '💰 Funds returned to your balance.\n' : ''}You can start a new request now.`;
+            
+            // NEW: If bundle session was cancelled, restore the credit
+            const refundText = activeSession.mode === 'BUNDLE' ? '💰 Bundle credit restored.\n' : 
+                              activeSession.cost > 0 ? '💰 Funds returned to your balance.\n' : '';
+            
+            const message = 
+                `✅ Session Cancelled\n\n` +
+                `📱 Number: ${activeSession.number}\n` +
+                `${refundText}` +
+                `You can start a new request now.`;
+            
             await this.sendPhotoWithCaption(ctx, IMAGES.default, message);
         } catch (error) {
             logger.error('Cancel failed', { userId, error: error.message });
@@ -264,33 +373,7 @@ class OTPCommands {
         const userId = ctx.from.id.toString();
         try {
             const result = await this.walletService.checkDeposit(userId);
+            
             if (!result.found) {
-                const message = '⏳ No Deposit Found\n\nYour deposit address hasn\'t received any confirmed deposits yet.\n\nSend USDT (BEP-20) to your address and check again.';
-                return this.sendPhotoWithCaption(ctx, IMAGES.default, message);
-            }
-            if (result.status === 'CONFIRMING') {
-                const message = `⏳ Deposit Confirming\n\nAmount: ${formatCurrency(result.amount)}\nConfirmations: ${result.confirmations || 0}/${config.blockchain?.blockConfirmations || 12}\n\nPlease wait for full confirmation.`;
-                return this.sendPhotoWithCaption(ctx, IMAGES.default, message);
-            }
-            if (result.status === 'CONFIRMED') {
-                const message = `✅ Deposit Confirmed!\n\nAmount: ${formatCurrency(result.amount)}\nTx Hash: \`${result.txHash}\`\n\nYour balance has been updated.`;
-                return this.sendPhotoWithCaption(ctx, IMAGES.depositConfirmed, message, null, 'Markdown');
-            }
-        } catch (error) {
-            logger.error('Check deposit failed', { userId, error: error.message });
-            await this.sendPhotoWithCaption(ctx, IMAGES.default, '❌ Error checking deposit. Please try again.');
-        }
-    }
-
-    async handleDepositInfo(ctx) {
-        const message = '💳 Deposit Information\n\nSend USDT (BEP-20) to your deposit address.\n\nYour deposit will be credited automatically after confirmation.\n\nUse /check_deposit to check status.';
-        await this.sendPhotoWithCaption(ctx, IMAGES.default, message);
-    }
-
-    async handleMenu(ctx) {
-        await ctx.reply('🏠 Main Menu');
-    }
-}
-
-export default OTPCommands;
-        
+                const message = 
+                    '
