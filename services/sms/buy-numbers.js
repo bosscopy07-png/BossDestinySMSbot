@@ -1,6 +1,6 @@
 
-import NumberPoolManager from '../NumberPoolManager.js';
-import TwilioProvider from '../TwilioProvider.js';
+import NumberPoolManager from './NumberPoolManager.js';
+import TwilioProvider from './TwilioProvider.js';
 import { connectDB, disconnectDB } from '../../../config/database.js';
 import logger from '../../../utils/logger.js';
 
