@@ -574,6 +574,235 @@ class WalletService {
         }
     }
 
-    async releaseFunds(txId, userId, reason) {
+        async releaseFunds(txId, userId, reason) {
         try {
-            const tx = await Transaction.find
+            const tx = await Transaction.findOne({ txId, userId });
+            if (!tx || tx.status !== 'PENDING') {
+                return false;
+            }
+
+            const amount = Math.abs(tx.amount);
+
+            await Transaction.updateOne(
+                { txId },
+                {
+                    $set: {
+                        status: 'CANCELLED',
+                        type: 'REFUND',
+                        'metadata.releasedAt': new Date(),
+                        'metadata.releaseReason': reason
+                    }
+                }
+            );
+
+            await User.updateOne(
+                { userId },
+                { $inc: { lockedBalance: -amount } }
+            );
+
+            logger.info('Funds released', { userId, amount, reason, txId });
+
+            return true;
+
+        } catch (error) {
+            logger.error('Failed to release funds', { txId, userId, error: error.message });
+            throw error;
+        }
+    }
+
+    // ========== ADMIN BALANCE OPERATIONS (M0-COMPATIBLE) ==========
+
+    async addBalance(userId, amount, adminId, reason) {
+        const txId = generateId();
+
+        if (isNaN(amount) || amount <= 0) {
+            throw new Error('INVALID_AMOUNT');
+        }
+
+        const user = await User.findOne({ userId }).select('_id userId');
+        if (!user) {
+            throw new Error('USER_NOT_FOUND');
+        }
+
+        let txCreated = false;
+
+        try {
+            await Transaction.create({
+                txId,
+                userId,
+                type: 'ADMIN_ADD',
+                amount,
+                currency: 'USD',
+                status: 'COMPLETED',
+                processedBy: adminId,
+                metadata: { reason, isCredit: true }
+            });
+            txCreated = true;
+
+            const userUpdate = await User.updateOne(
+                { userId },
+                { $inc: { balance: amount } }
+            );
+
+            if (userUpdate.matchedCount === 0) {
+                throw new Error('USER_UPDATE_FAILED');
+            }
+
+            logger.info('Balance added by admin', { userId, amount, adminId, reason, txId });
+
+            return txId;
+
+        } catch (error) {
+            if (txCreated) {
+                try {
+                    await Transaction.deleteOne({ txId });
+                    logger.warn('Rolled back orphaned transaction', { txId, reason: error.message });
+                } catch (rollbackError) {
+                    logger.error('Failed to rollback transaction', { txId, error: rollbackError.message });
+                }
+            }
+
+            logger.error('Failed to add balance', { userId, amount, adminId, error: error.message });
+            throw error;
+        }
+    }
+
+    async deductBalance(userId, amount, adminId, reason) {
+        const txId = generateId();
+
+        if (isNaN(amount) || amount <= 0) {
+            throw new Error('INVALID_AMOUNT');
+        }
+
+        let txCreated = false;
+
+        try {
+            const user = await User.findOneAndUpdate(
+                {
+                    userId,
+                    $expr: { $gte: ['$balance', amount] }
+                },
+                { $inc: { balance: -amount } },
+                { new: true }
+            );
+
+            if (!user) {
+                throw new Error('INSUFFICIENT_BALANCE');
+            }
+
+            await Transaction.create({
+                txId,
+                userId,
+                type: 'ADMIN_DEDUCT',
+                amount: -amount,
+                currency: 'USD',
+                status: 'COMPLETED',
+                processedBy: adminId,
+                metadata: { reason, isDebit: true }
+            });
+            txCreated = true;
+
+            logger.info('Balance deducted by admin', { userId, amount, adminId, reason, txId });
+
+            return txId;
+
+        } catch (error) {
+            if (txCreated === false && error.message !== 'INSUFFICIENT_BALANCE' && error.message !== 'INVALID_AMOUNT') {
+                try {
+                    await User.updateOne({ userId }, { $inc: { balance: amount } });
+                    logger.warn('Restored user balance after failed transaction creation', { userId, amount, txId });
+                } catch (rollbackError) {
+                    logger.error('CRITICAL: Failed to restore user balance', { userId, amount, txId, error: rollbackError.message });
+                }
+            }
+
+            if (txCreated) {
+                try {
+                    await Transaction.deleteOne({ txId });
+                    logger.warn('Rolled back orphaned transaction', { txId, reason: error.message });
+                } catch (rollbackError) {
+                    logger.error('Failed to rollback transaction', { txId, error: rollbackError.message });
+                }
+            }
+
+            logger.error('Failed to deduct balance', { userId, amount, adminId, error: error.message });
+            throw error;
+        }
+    }
+
+    async getDepositAddress(userId) {
+        const user = await User.findOne({ userId });
+        if (user && user.depositAddress) {
+            return user.depositAddress;
+        }
+        const info = await this.getDepositInfo(userId);
+        return info.address;
+    }
+
+    getMasterAddress() {
+        return this.masterAddress || 'WALLET_NOT_READY';
+    }
+
+    async getMasterBalance() {
+        await this.ensureReady();
+
+        try {
+            const bnbBalance = await this.provider.getBalance(this.masterWallet.address);
+            const usdtBalance = await this.usdtContract.balanceOf(this.masterWallet.address);
+            
+            return {
+                bnb: ethers.formatEther(bnbBalance),
+                usdt: ethers.formatUnits(usdtBalance, this.decimals)
+            };
+        } catch (error) {
+            logger.error('Failed to get master balance', { error: error.message });
+            throw new Error('BALANCE_CHECK_FAILED — ' + error.message);
+        }
+    }
+
+    // ========== BACKGROUND SCANNER ==========
+
+    startDepositScanner(intervalMs = 30000) {
+        if (!this.isReady) {
+            logger.warn('Cannot start scanner — wallet not ready');
+            return;
+        }
+
+        if (this.scanInterval) {
+            clearInterval(this.scanInterval);
+        }
+
+        logger.info('Starting deposit scanner', { interval: intervalMs });
+
+        this.scanInterval = setInterval(async () => {
+            try {
+                await this.checkAllDeposits();
+            } catch (error) {
+                logger.error('Deposit scanner error', { error: error.message });
+            }
+        }, intervalMs);
+
+        this.scanInterval.unref?.();
+    }
+
+    stopDepositScanner() {
+        if (this.scanInterval) {
+            clearInterval(this.scanInterval);
+            this.scanInterval = null;
+            logger.info('Deposit scanner stopped');
+        }
+    }
+
+    // ========== GRACEFUL SHUTDOWN ==========
+
+    async disconnect() {
+        this.stopDepositScanner();
+        this.provider?.removeAllListeners?.();
+        this.provider = null;
+        this.isReady = false;
+        logger.info('Wallet service disconnected');
+    }
+}
+
+export default WalletService;
+            
