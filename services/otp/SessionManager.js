@@ -4,33 +4,32 @@ import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
 
 class SessionManager {
-    constructor(providerManager, retryEngine, walletService) {
+    constructor(providerManager, retryEngine, walletService, numberPoolManager = null) {
         this.providerManager = providerManager;
         this.retryEngine = retryEngine;
         this.walletService = walletService;
+        this.numberPoolManager = numberPoolManager;
         this.activeSessions = new Map();
+        this.sessionTimeouts = new Map();
     }
 
     async createSession(userId, mode, service, country = 'US') {
-        // 1. Check existing active session
         const existing = await Session.findOne({
             userId,
             status: { $in: ['WAITING', 'CHECKING'] }
         }).lean();
 
         if (existing) {
+            logger.warn('Active session exists', { userId, existingSessionId: existing.sessionId });
             throw new Error('ACTIVE_SESSION_EXISTS');
         }
 
-        // 2. Fetch user as Mongoose doc for instance methods
         const user = await User.findOne({ userId });
         if (!user) throw new Error('USER_NOT_FOUND');
         if (user.isBlacklisted) throw new Error('USER_BLACKLISTED');
 
-        // 3. Mode validation
         await this.validateModeAccess(user, mode);
 
-        // 4. Validate service exists
         const validServices = config.services || [
             'WhatsApp', 'Telegram', 'Facebook', 'Instagram', 'Twitter',
             'TikTok', 'Binance', 'Coinbase', 'Gmail', 'Outlook',
@@ -40,22 +39,23 @@ class SessionManager {
             throw new Error('INVALID_SERVICE');
         }
 
-        // 5. ACQUIRE NUMBER FIRST (before locking funds)
         let numberData;
         try {
-            numberData = await this.providerManager.getNumber(mode, country, service);
+            if (mode === 'VIP' && this.numberPoolManager) {
+                numberData = await this.numberPoolManager.acquireNumber(country, service, userId);
+            } else {
+                numberData = await this.providerManager.getNumber(mode, country, service);
+            }
         } catch (error) {
             logger.error('Number acquisition failed', { userId, mode, service, country, error: error.message });
             throw new Error('NUMBER_UNAVAILABLE: ' + error.message);
         }
 
-        // 6. VALIDATE number is real (not "0201" or similar fakes)
         if (!numberData.phoneNumber || numberData.phoneNumber.length < 7) {
             logger.error('Invalid phone number received', { userId, phone: numberData.phoneNumber, provider: numberData.provider });
             throw new Error('INVALID_NUMBER_FROM_PROVIDER');
         }
 
-        // 7. Lock funds ONLY for CHEAP mode (AFTER number acquired)
         let cost = 0;
         let lockTxId = null;
 
@@ -64,40 +64,34 @@ class SessionManager {
             try {
                 lockTxId = await this.walletService.lockFunds(userId, cost, `OTP_${service}`);
             } catch (error) {
-                // Release the number since we can't pay
                 try {
-                    await this.providerManager.cancelNumber(numberData.provider, numberData.providerNumberId || numberData.phoneNumber);
+                    await this.releaseNumber(numberData, mode);
                 } catch (e) { /* ignore */ }
                 throw new Error('INSUFFICIENT_FUNDS');
             }
         }
 
-        // 8. Deduct bundle credit for BUNDLE mode
         if (mode === 'BUNDLE') {
             const bundleRemaining = user.bundleRemaining || 0;
             if (bundleRemaining <= 0) {
-                // Release number
                 try {
-                    await this.providerManager.cancelNumber(numberData.provider, numberData.providerNumberId || numberData.phoneNumber);
+                    await this.releaseNumber(numberData, mode);
                 } catch (e) { /* ignore */ }
                 throw new Error('BUNDLE_EMPTY');
             }
             await User.updateOne({ userId }, { $inc: { bundleRemaining: -1 } });
         }
 
-        // 9. Increment VIP usage for VIP mode
         if (mode === 'VIP') {
             await User.updateOne({ userId }, { $inc: { vipDailyUsed: 1 } });
         }
 
-        // 10. Increment FREE usage
         if (mode === 'FREE') {
             await User.updateOne({ userId }, { $inc: { freeUsedToday: 1 } });
         }
 
-        // 11. Create session
         const timeoutSeconds = mode === 'FREE' ? 120 : mode === 'CHEAP' ? 180 : 60;
-        
+
         const session = await Session.create({
             sessionId: generateId(),
             userId,
@@ -115,11 +109,11 @@ class SessionManager {
             maxRetries: mode === 'CHEAP' ? 2 : 0
         });
 
-        // 12. Store in memory and start monitoring
         this.activeSessions.set(session.sessionId, {
             session,
             providerInstance: numberData.providerInstance,
-            pollTimer: null
+            pollTimer: null,
+            lastPollAt: null
         });
 
         this.startMonitoring(session);
@@ -133,6 +127,14 @@ class SessionManager {
         });
 
         return session;
+    }
+
+    async releaseNumber(numberData, mode) {
+        if (mode === 'VIP' && this.numberPoolManager) {
+            await this.numberPoolManager.releaseNumber(numberData.providerNumberId, 'FUNDS_LOCK_FAILED');
+        } else {
+            await this.providerManager.cancelNumber(numberData.provider, numberData.providerNumberId || numberData.phoneNumber);
+        }
     }
 
     async validateModeAccess(user, mode) {
@@ -169,24 +171,38 @@ class SessionManager {
         const sessionData = this.activeSessions.get(session.sessionId);
         if (!sessionData) return;
 
-        const pollInterval = session.mode === 'VIP' ? 1000 : 
+        const pollInterval = session.mode === 'VIP' ? 1000 :
                             session.mode === 'CHEAP' ? 5000 : 10000;
+
+        const timeoutAt = new Date(session.timeoutAt);
+
+        this.sessionTimeouts.set(session.sessionId, setTimeout(async () => {
+            try {
+                const current = await Session.findOne({ sessionId: session.sessionId }).lean();
+                if (current && ['WAITING', 'CHECKING'].includes(current.status)) {
+                    await this.handleTimeout(current);
+                }
+            } catch (e) {
+                logger.error('Timeout handler error', { sessionId: session.sessionId, error: e.message });
+            }
+        }, timeoutAt - Date.now()));
 
         const checkOTP = async () => {
             try {
-                const current = await Session.findOne({ 
-                    sessionId: session.sessionId 
+                const current = await Session.findOne({
+                    sessionId: session.sessionId
                 }).lean();
 
-                if (!current || current.status !== 'WAITING') {
+                if (!current || !['WAITING', 'CHECKING'].includes(current.status)) {
                     this.cleanupSession(session.sessionId);
                     return;
                 }
 
                 if (new Date() > new Date(current.timeoutAt)) {
-                    await this.handleTimeout(current);
                     return;
                 }
+
+                sessionData.lastPollAt = new Date();
 
                 const result = await this.providerManager.checkSMS(
                     current.provider,
@@ -195,6 +211,11 @@ class SessionManager {
 
                 if (result.success && result.otp) {
                     await this.deliverOTP(current, result.otp);
+                    return;
+                }
+
+                if (result.status === 'CANCELLED' || result.status === 'TIMEOUT') {
+                    await this.handleProviderFailure(current, result.status);
                     return;
                 }
 
@@ -214,7 +235,7 @@ class SessionManager {
 
     async deliverOTP(session, otp) {
         const sessionData = this.activeSessions.get(session.sessionId);
-        
+
         await Session.updateOne(
             { sessionId: session.sessionId },
             {
@@ -249,8 +270,50 @@ class SessionManager {
         return session;
     }
 
+    async handleProviderFailure(session, providerStatus) {
+        const statusMap = {
+            'CANCELLED': 'CANCELLED',
+            'TIMEOUT': 'TIMEOUT'
+        };
+        const finalStatus = statusMap[providerStatus] || 'FAILED';
+
+        if (session.lockTxId) {
+            await this.walletService.releaseFunds(session.lockTxId, session.userId, `PROVIDER_${providerStatus}`);
+        }
+
+        if (session.mode === 'BUNDLE') {
+            await User.updateOne({ userId: session.userId }, { $inc: { bundleRemaining: 1 } });
+        }
+
+        if (session.mode === 'VIP') {
+            await User.updateOne({ userId: session.userId }, { $inc: { vipDailyUsed: -1 } });
+        }
+
+        if (session.mode === 'FREE') {
+            await User.updateOne({ userId: session.userId }, { $inc: { freeUsedToday: -1 } });
+        }
+
+        await Session.updateOne(
+            { sessionId: session.sessionId },
+            {
+                $set: {
+                    status: finalStatus,
+                    endTime: new Date()
+                }
+            }
+        );
+
+        this.cleanupSession(session.sessionId);
+
+        logger.info('Session ended due to provider failure', {
+            sessionId: session.sessionId,
+            userId: session.userId,
+            providerStatus,
+            finalStatus
+        });
+    }
+
     async handleTimeout(session) {
-        // Release locked funds for CHEAP
         if (session.lockTxId) {
             await this.walletService.releaseFunds(
                 session.lockTxId,
@@ -259,7 +322,6 @@ class SessionManager {
             );
         }
 
-        // Restore bundle credit for BUNDLE
         if (session.mode === 'BUNDLE') {
             await User.updateOne(
                 { userId: session.userId },
@@ -267,7 +329,6 @@ class SessionManager {
             );
         }
 
-        // Restore VIP usage for VIP (decrement)
         if (session.mode === 'VIP') {
             await User.updateOne(
                 { userId: session.userId },
@@ -275,7 +336,6 @@ class SessionManager {
             );
         }
 
-        // Restore FREE usage
         if (session.mode === 'FREE') {
             await User.updateOne(
                 { userId: session.userId },
@@ -293,9 +353,15 @@ class SessionManager {
             }
         );
 
-        // Retry for CHEAP mode
         if (session.mode === 'CHEAP' && session.retryCount < session.maxRetries) {
-            // Retry logic here if needed
+            logger.info('Retrying CHEAP session', { sessionId: session.sessionId, retryCount: session.retryCount + 1 });
+            try {
+                await Session.updateOne({ sessionId: session.sessionId }, { $inc: { retryCount: 1 } });
+                const newSession = await this.createSession(session.userId, session.mode, session.service, session.country);
+                return { retried: true, newSessionId: newSession.sessionId };
+            } catch (e) {
+                logger.error('Retry failed', { sessionId: session.sessionId, error: e.message });
+            }
         }
 
         this.cleanupSession(session.sessionId);
@@ -313,7 +379,6 @@ class SessionManager {
             throw new Error('SESSION_NOT_CANCELLABLE');
         }
 
-        // Release funds
         if (session.lockTxId) {
             await this.walletService.releaseFunds(
                 session.lockTxId,
@@ -322,7 +387,6 @@ class SessionManager {
             );
         }
 
-        // Restore bundle credit
         if (session.mode === 'BUNDLE') {
             await User.updateOne(
                 { userId },
@@ -330,7 +394,6 @@ class SessionManager {
             );
         }
 
-        // Restore VIP usage
         if (session.mode === 'VIP') {
             await User.updateOne(
                 { userId },
@@ -338,7 +401,6 @@ class SessionManager {
             );
         }
 
-        // Restore FREE usage
         if (session.mode === 'FREE') {
             await User.updateOne(
                 { userId },
@@ -346,12 +408,15 @@ class SessionManager {
             );
         }
 
-        // Cancel with provider
         try {
-            await this.providerManager.cancelNumber(
-                session.provider,
-                session.providerNumberId || session.number
-            );
+            if (session.mode === 'VIP' && this.numberPoolManager) {
+                await this.numberPoolManager.releaseNumber(session.providerNumberId, 'USER_CANCELLED');
+            } else {
+                await this.providerManager.cancelNumber(
+                    session.provider,
+                    session.providerNumberId || session.numbero
+                );
+            }
         } catch (error) {
             logger.warn('Provider cancel failed', { sessionId, error: error.message });
         }
@@ -381,6 +446,12 @@ class SessionManager {
             }
             this.activeSessions.delete(sessionId);
         }
+
+        const timeoutTimer = this.sessionTimeouts.get(sessionId);
+        if (timeoutTimer) {
+            clearTimeout(timeoutTimer);
+            this.sessionTimeouts.delete(sessionId);
+        }
     }
 
     maskOTP(otp) {
@@ -394,6 +465,39 @@ class SessionManager {
             status: { $in: ['WAITING', 'CHECKING'] }
         }).lean();
     }
+
+    async getSessionStatus(sessionId, userId) {
+        const session = await Session.findOne({ sessionId, userId }).lean();
+        if (!session) throw new Error('SESSION_NOT_FOUND');
+        return {
+            sessionId: session.sessionId,
+            status: session.status,
+            service: session.service,
+            number: session.number ? this.maskPhone(session.number) : null,
+            startTime: session.startTime,
+            timeoutAt: session.timeoutAt,
+            cost: session.cost,
+            otpCode: session.status === 'RECEIVED' ? session.maskedOtp : null
+        };
+    }
+
+    maskPhone(phone) {
+        if (!phone || phone.length < 4) return '****';
+        return phone.slice(0, -4).replace(/\d/g, '*') + phone.slice(-4);
+    }
+
+    async getActiveCount() {
+        return Session.countDocuments({ status: { $in: ['WAITING', 'CHECKING'] } });
+    }
+
+    getMemoryStats() {
+        return {
+            activeSessions: this.activeSessions.size,
+            sessionTimeouts: this.sessionTimeouts.size,
+            sessionIds: Array.from(this.activeSessions.keys())
+        };
+    }
 }
 
 export default SessionManager;
+                
