@@ -181,23 +181,94 @@ class UserCommands {
         return user;  // ← Now a Mongoose doc with .canUseVip(), .getAvailableBalance(), etc.
         }
                 
-    
-        _canUseFree(user) {
-        return user.canUseFree();  // ← Instance method
+        // ─── Safe Counter Helpers ─────────────────────────────────
+
+    _canUseFree(user) {
+        // Guard against null/undefined user
+        if (!user || user.isBlacklisted) return false;
+        
+        const limit = config.limits?.freeDaily ?? 3;
+        const used = Number(user.freeUsedToday) || 0;
+        
+        return used < limit;
+    }
+
+    _freeRemaining(user) {
+        if (!user) return 0;
+        
+        const limit = config.limits?.freeDaily ?? 3;
+        const used = Number(user.freeUsedToday) || 0;
+        
+        return Math.max(0, limit - used);
     }
 
     _canUseVip(user) {
-        return user.canUseVip();   // ← Instance method
+        if (!user) return false;
+        
+        // Check expiry exists and is valid
+        if (!user.vipExpiry) return false;
+        
+        const expiry = new Date(user.vipExpiry);
+        if (isNaN(expiry.getTime()) || expiry <= new Date()) return false;
+        
+        const limit = config.limits?.vipDaily ?? 50;
+        const used = Number(user.vipDailyUsed) || 0;
+        
+        return used < limit;
+    }
+
+    _vipRemaining(user) {
+        if (!user) return 0;
+        
+        const limit = config.limits?.vipDaily ?? 50;
+        const used = Number(user.vipDailyUsed) || 0;
+        
+        return Math.max(0, limit - used);
     }
 
     _isVipActive(user) {
-        return user.isVipActive(); // ← Instance method
+        if (!user || !user.vipExpiry) return false;
+        
+        const expiry = new Date(user.vipExpiry);
+        
+        // Guard against invalid date strings
+        if (isNaN(expiry.getTime())) return false;
+        
+        return expiry > new Date();
     }
 
     _getAvailableBalance(user) {
-        return user.getAvailableBalance(); // ← Instance method
+        if (!user) return 0;
+        
+        const balance = Number(user.balance) || 0;
+        const locked = Number(user.lockedBalance) || 0;
+        
+        return Math.max(0, balance - locked);
     }
+
+    _hasBundleCredits(user) {
+        if (!user) return false;
+        
+        const remaining = Number(user.bundleRemaining) || 0;
+        
+        return remaining > 0;
+    }
+
+    _bundleRemaining(user) {
+        if (!user) return 0;
+        
+        return Number(user.bundleRemaining) || 0;
+    }
+        _isOnCooldown(user, cooldownMinutes = 1) {
+        if (!user || !user.lastActive) return false;
+        
+        const lastActive = new Date(user.lastActive);
+        const cooldownMs = cooldownMinutes * 60 * 1000;
+        
+        return (Date.now() - lastActive.getTime()) < cooldownMs;
+        }
     
+        
     
     async sendPhotoWithCaption(ctx, imageUrl, caption, keyboard = null, parseMode = null) {
         try {
