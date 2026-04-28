@@ -27,10 +27,41 @@ class OTPCommands {
         this.bot = bot;
         this.walletService = walletService;
         this.registerCommands();
-        
-        // Register deposit notification handler
         this.walletService.onDepositNotification(this.handleDepositNotification.bind(this));
     }
+
+    // ─── Helper methods (mirrored from UserCommands) ───
+    _canUseFree(user) {
+        if (user.isBlacklisted) return false;
+        const limit = config.limits?.freeDaily || 3;
+        return (user.freeUsedToday || 0) < limit;
+    }
+
+    _freeRemaining(user) {
+        const limit = config.limits?.freeDaily || 3;
+        return Math.max(0, limit - (user.freeUsedToday || 0));
+    }
+
+    _canUseVip(user) {
+        if (!user.vipExpiry || new Date(user.vipExpiry) <= new Date()) return false;
+        const limit = config.limits?.vipDaily || 50;
+        return (user.vipDailyUsed || 0) < limit;
+    }
+
+    _vipRemaining(user) {
+        const limit = config.limits?.vipDaily || 50;
+        return Math.max(0, limit - (user.vipDailyUsed || 0));
+    }
+
+    _isVipActive(user) {
+        return user.vipExpiry && new Date(user.vipExpiry) > new Date();
+    }
+
+    _getAvailableBalance(user) {
+        return (user.balance || 0) - (user.lockedBalance || 0);
+    }
+
+    
 
     // NEW: Handle deposit notifications from WalletService
     async handleDepositNotification(userId, data) {
@@ -91,9 +122,9 @@ class OTPCommands {
         await this.sendPhotoWithCaption(ctx, IMAGES.otpMenu, message, keyboard);
     }
 
-    async handleFreeMode(ctx) {
+        async handleFreeMode(ctx) {
         const user = ctx.state.user;
-        if (!user.canUseFree()) {
+        if (!this._canUseFree(user)) {  // ← FIXED: was user.canUseFree()
             const message = '❌ Free Limit Reached\n\nYou\'ve used all 3 free OTPs today.\n\n💰 Deposit to continue:\n• CHEAP: $0.05 per OTP\n• Bundle: $5 for 100 OTPs';
             const keyboard = Markup.inlineKeyboard([
                 [Markup.button.callback('💳 Deposit', 'deposit')],
@@ -104,13 +135,14 @@ class OTPCommands {
         ctx.session = ctx.session || {};
         ctx.session.otpMode = 'FREE';
         await this.showServiceSelection(ctx, 'FREE', IMAGES.freeMode);
-    }
+        }
+    
 
-    async handleCheapMode(ctx) {
+        async handleCheapMode(ctx) {
         const user = ctx.state.user;
         const cheapPrice = config.prices?.cheapOtp || 0.05;
-        if (user.getAvailableBalance() < cheapPrice) {
-            const message = `💰 Insufficient Balance\n\nRequired: ${formatCurrency(cheapPrice)}\nAvailable: ${formatCurrency(user.getAvailableBalance())}\n\nPlease deposit first.`;
+        if (this._getAvailableBalance(user) < cheapPrice) {  // ← FIXED: was user.getAvailableBalance()
+            const message = `💰 Insufficient Balance\n\nRequired: ${formatCurrency(cheapPrice)}\nAvailable: ${formatCurrency(this._getAvailableBalance(user))}\n\nPlease deposit first.`;
             const keyboard = Markup.inlineKeyboard([
                 [Markup.button.callback('💳 Deposit', 'deposit')],
                 [Markup.button.callback('🔙 Back', 'menu')]
@@ -120,7 +152,8 @@ class OTPCommands {
         ctx.session = ctx.session || {};
         ctx.session.otpMode = 'CHEAP';
         await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
-    }
+        }
+    
 
     // NEW: Bundle mode — lets users consume bundle credits
     async handleBundleMode(ctx) {
@@ -148,10 +181,9 @@ class OTPCommands {
         ctx.session.otpMode = 'BUNDLE';
         await this.showServiceSelection(ctx, 'BUNDLE', IMAGES.bundleOther);
     }
-
     async handleVIPMode(ctx) {
         const user = ctx.state.user;
-        if (!user.isVipActive()) {
+        if (!this._isVipActive(user)) {  // ← FIXED: was user.isVipActive()
             const message = `👑 VIP Required\n\nYou need an active VIP subscription.\n\nPrice: ${formatCurrency(config.prices?.vipSubscription || 5.00)}/month\nIncludes: Unlimited OTPs (50/day max)\n\nUpgrade now?`;
             const keyboard = Markup.inlineKeyboard([
                 [Markup.button.callback('👑 Upgrade VIP', 'buy_vip')],
@@ -159,7 +191,7 @@ class OTPCommands {
             ]);
             return this.sendPhotoWithCaption(ctx, IMAGES.vipFirst, message, keyboard);
         }
-        if (!user.canUseVip()) {
+        if (!this._canUseVip(user)) {  // ← FIXED: was user.canUseVip()
             const message = '⚠️ VIP Daily Limit Reached\n\nYou\'ve used 50/50 VIP OTPs today.\nResets at midnight UTC.';
             return this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message);
         }
@@ -167,6 +199,7 @@ class OTPCommands {
         ctx.session.otpMode = 'VIP';
         await this.showServiceSelection(ctx, 'VIP', IMAGES.vipOther);
     }
+    
 
     async showServiceSelection(ctx, mode, imageUrl) {
         const message = `📱 ${mode} Mode\n\nChoose the service you need OTP for:`;
