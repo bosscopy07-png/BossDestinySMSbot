@@ -15,6 +15,7 @@ class WalletService {
         this.lastCheckedBlock = 0;
         this.scanInterval = null;
         this.initializationPromise = null;
+        this.notificationCallback = null; // NEW: hook for Telegram notifications
 
         this.usdtAbi = [
             'function balanceOf(address) view returns (uint256)',
@@ -24,6 +25,11 @@ class WalletService {
         ];
 
         this.initializationPromise = this.initialize();
+    }
+
+    // NEW: Allow bot to register notification callback
+    onDepositNotification(callback) {
+        this.notificationCallback = callback;
     }
 
     async initialize() {
@@ -139,6 +145,7 @@ class WalletService {
                 $set: { 
                     depositAddress: this.masterAddress,
                     depositTrackingAmount: trackingAmount,
+                    depositRequestedAmount: amount,  // NEW: store what user actually wants
                     depositPending: true,
                     depositRequestedAt: new Date()
                 } 
@@ -148,8 +155,9 @@ class WalletService {
 
         return {
             address: this.masterAddress,
-            amount: trackingAmount,
-            baseAmount: amount,
+            amount: trackingAmount,        // What they must send
+            baseAmount: amount,            // What they actually want (NEW)
+            trackingAmount: trackingAmount, // Alias for clarity
             network: 'BSC (BEP-20)',
             token: 'USDT'
         };
@@ -234,6 +242,7 @@ class WalletService {
         const existing = await Transaction.findOne({ 'blockchain.txHash': txHash });
         if (existing) return null;
 
+        // FIX: Look for user by tracking amount first, then by range
         let user = await User.findOne({ 
             depositPending: true,
             depositTrackingAmount: amount
@@ -258,13 +267,17 @@ class WalletService {
             return null;
         }
 
+        // FIX: Use requestedAmount for credit, not tracking amount
+        const creditAmount = user.depositRequestedAmount || amount;
+        const trackingFee = parseFloat((amount - creditAmount).toFixed(6));
+
         const tx = await Transaction.create({
             txId: generateId(),
             userId: user.userId,
             type: 'DEPOSIT',
-            amount: amount,
+            amount: creditAmount,              // FIX: credit the requested amount
             currency: 'USDT',
-            status: 'CONFIRMING',
+            status: 'CONFIRMED',
             blockchain: {
                 txHash,
                 blockNumber,
@@ -272,7 +285,9 @@ class WalletService {
                 fromAddress,
                 toAddress,
                 token: 'USDT',
-                amountCrypto: amount.toString()
+                amountCrypto: amount.toString(),        // What was actually sent
+                requestedAmount: creditAmount,           // What user wanted
+                trackingFee: trackingFee                 // System fee
             }
         });
 
@@ -280,35 +295,56 @@ class WalletService {
             { userId: user.userId },
             {
                 $inc: { 
-                    balance: amount,
-                    totalDeposited: amount
+                    balance: creditAmount,         // FIX: only credit requested amount
+                    totalDeposited: creditAmount
                 },
                 $set: {
                     depositPending: false,
                     depositTrackingAmount: null,
+                    depositRequestedAmount: null,  // NEW: clear this too
                     lastDepositAt: new Date(),
                     registeredWallet: fromAddress.toLowerCase()
                 }
             }
         );
 
-        await this.processReferralDeposit(user.userId, amount);
+        await this.processReferralDeposit(user.userId, creditAmount);
 
         logger.info('Deposit detected and credited', {
             userId: user.userId,
-            amount,
+            creditAmount,
+            trackingAmount: amount,
+            trackingFee,
             txHash,
             from: fromAddress
         });
 
+        // NEW: Send notification if callback registered
+        if (this.notificationCallback) {
+            try {
+                await this.notificationCallback(user.userId, {
+                    type: 'DEPOSIT_CONFIRMED',
+                    amount: creditAmount,
+                    trackingFee,
+                    txHash,
+                    address: this.masterAddress
+                });
+            } catch (notifyError) {
+                logger.error('Deposit notification failed', { userId: user.userId, error: notifyError.message });
+            }
+        }
+
         return {
             userId: user.userId,
-            amount,
+            amount: creditAmount,           // FIX: return credited amount
+            trackingAmount: amount,          // What was sent
+            trackingFee,
             txHash,
             status: 'CREDITED'
         };
     }
 
+    // FIX: checkDeposit now actually queries blockchain for the specific user
     async checkDeposit(userId) {
         await this.ensureReady();
 
@@ -317,22 +353,91 @@ class WalletService {
             return { found: false, message: 'User not found' };
         }
 
-        const results = await this.checkAllDeposits();
-        const userDeposit = results.find(r => r.userId === userId);
-
-        if (userDeposit) {
-            return {
-                found: true,
-                status: 'CREDITED',
-                amount: userDeposit.amount,
-                txHash: userDeposit.txHash
+        if (!user.depositPending) {
+            return { 
+                found: false, 
+                message: 'No pending deposit. Use /deposit to start one.' 
             };
         }
 
-        return { 
-            found: false, 
-            message: 'No pending deposit found. Send USDT to the address shown.' 
-        };
+        // If user has no tracking amount set, nothing to check
+        if (!user.depositTrackingAmount) {
+            return { 
+                found: false, 
+                message: 'No deposit address generated yet. Use /deposit first.' 
+            };
+        }
+
+        try {
+            // Direct blockchain query: scan last 500 blocks for transfers to master address
+            // from ANY sender, then match by amount
+            const latestBlock = await this.provider.getBlockNumber();
+            const scanRange = 500;
+            let fromBlock = Math.max(0, latestBlock - scanRange);
+
+            const filter = this.usdtContract.filters.Transfer(null, this.masterAddress);
+            const events = await this.usdtContract.queryFilter(filter, fromBlock, latestBlock);
+
+            for (const event of events) {
+                const amountRaw = event.args.value;
+                const amount = parseFloat(ethers.formatUnits(amountRaw, this.decimals));
+                const txHash = event.transactionHash;
+
+                // Skip already processed
+                const existing = await Transaction.findOne({ 'blockchain.txHash': txHash });
+                if (existing) continue;
+
+                // Check if this amount matches this user's pending deposit
+                const trackingAmount = user.depositTrackingAmount;
+                const matchExact = Math.abs(amount - trackingAmount) < 0.0001;
+
+                if (matchExact) {
+                    // Process this deposit immediately
+                    const result = await this.processDepositEvent(event);
+                    if (result && result.userId === userId) {
+                        return {
+                            found: true,
+                            status: 'CONFIRMED',
+                            amount: result.amount,
+                            baseAmount: result.amount,
+                            trackingAmount: result.trackingAmount,
+                            trackingFee: result.trackingFee,
+                            txHash: result.txHash,
+                            confirmations: 0
+                        };
+                    }
+                }
+            }
+
+            // No matching deposit found in recent blocks
+            return { 
+                found: false, 
+                message: 'No deposit found yet. Send exactly ' + user.depositTrackingAmount + ' USDT (BEP-20) to your deposit address and check again.' 
+            };
+
+        } catch (error) {
+            logger.error('Direct deposit check failed', { userId, error: error.message });
+            
+            // Fallback: check if any transaction was already recorded for this user
+            const recentTx = await Transaction.findOne({
+                userId,
+                type: 'DEPOSIT',
+                createdAt: { $gte: new Date(Date.now() - 3600000) } // Last hour
+            }).sort({ createdAt: -1 });
+
+            if (recentTx) {
+                return {
+                    found: true,
+                    status: recentTx.status,
+                    amount: recentTx.amount,
+                    baseAmount: recentTx.blockchain?.requestedAmount || recentTx.amount,
+                    txHash: recentTx.blockchain?.txHash,
+                    confirmations: recentTx.blockchain?.confirmations || 0
+                };
+            }
+
+            throw error;
+        }
     }
 
     // ========== REFERRAL SYSTEM ==========
@@ -471,250 +576,4 @@ class WalletService {
 
     async releaseFunds(txId, userId, reason) {
         try {
-            const tx = await Transaction.findOne({ txId, userId });
-            if (!tx || tx.status !== 'PENDING') {
-                return false;
-            }
-
-            const amount = Math.abs(tx.amount);
-
-            await Transaction.updateOne(
-                { txId },
-                {
-                    $set: {
-                        status: 'CANCELLED',
-                        type: 'REFUND',
-                        'metadata.releasedAt': new Date(),
-                        'metadata.releaseReason': reason
-                    }
-                }
-            );
-
-            await User.updateOne(
-                { userId },
-                { $inc: { lockedBalance: -amount } }
-            );
-
-            logger.info('Funds released', { userId, amount, reason, txId });
-
-            return true;
-
-        } catch (error) {
-            logger.error('Failed to release funds', { txId, userId, error: error.message });
-            throw error;
-        }
-    }
-
-    // ========== ADMIN BALANCE OPERATIONS (M0-COMPATIBLE) ==========
-
-    /**
-     * Add balance to a user (admin operation)
-     * M0-compatible: no transactions, manual rollback on failure
-     */
-                    async addBalance(userId, amount, adminId, reason) {
-        const txId = generateId();
-
-        // Validate inputs before any DB writes
-        if (isNaN(amount) || amount <= 0) {
-            throw new Error('INVALID_AMOUNT');
-        }
-
-        const user = await User.findOne({ userId }).select('_id userId');
-        if (!user) {
-            throw new Error('USER_NOT_FOUND');
-        }
-
-        let txCreated = false;
-
-        try {
-            // Step 1: Create transaction record
-            await Transaction.create({
-                txId,
-                userId,
-                type: 'ADMIN_ADD',           // ← FIXED: was 'ADMIN_ADJUSTMENT'
-                amount,
-                currency: 'USD',
-                status: 'COMPLETED',
-                processedBy: adminId,
-                metadata: { reason, isCredit: true }
-            });
-            txCreated = true;
-
-            // Step 2: Update user balance
-            const userUpdate = await User.updateOne(
-                { userId },
-                { $inc: { balance: amount } }
-            );
-
-            if (userUpdate.matchedCount === 0) {
-                throw new Error('USER_UPDATE_FAILED');
-            }
-
-            logger.info('Balance added by admin', { userId, amount, adminId, reason, txId });
-
-            return txId;
-
-        } catch (error) {
-            // Rollback: delete orphaned transaction if user update failed
-            if (txCreated) {
-                try {
-                    await Transaction.deleteOne({ txId });
-                    logger.warn('Rolled back orphaned transaction', { txId, reason: error.message });
-                } catch (rollbackError) {
-                    logger.error('Failed to rollback transaction', { txId, error: rollbackError.message });
-                }
-            }
-
-            logger.error('Failed to add balance', { userId, amount, adminId, error: error.message });
-            throw error;
-        }
-    }
-
-    /**
-     * Deduct balance from a user (admin operation)
-     * M0-compatible: no transactions, manual rollback on failure
-     * Uses atomic findOneAndUpdate to prevent race conditions
-     */
-    async deductBalance(userId, amount, adminId, reason) {
-        const txId = generateId();
-
-        // Validate inputs before any DB writes
-        if (isNaN(amount) || amount <= 0) {
-            throw new Error('INVALID_AMOUNT');
-        }
-
-        let txCreated = false;
-
-        try {
-            // Step 1: Atomically check balance and deduct
-            const user = await User.findOneAndUpdate(
-                {
-                    userId,
-                    $expr: { $gte: ['$balance', amount] }  // Atomic balance check
-                },
-                { $inc: { balance: -amount } },
-                { new: true }
-            );
-
-            if (!user) {
-                throw new Error('INSUFFICIENT_BALANCE');
-            }
-
-            // Step 2: Create transaction record
-            await Transaction.create({
-                txId,
-                userId,
-                type: 'ADMIN_DEDUCT',        // ← FIXED: was 'ADMIN_ADJUSTMENT'
-                amount: -amount,
-                currency: 'USD',
-                status: 'COMPLETED',
-                processedBy: adminId,
-                metadata: { reason, isDebit: true }
-            });
-            txCreated = true;
-
-            logger.info('Balance deducted by admin', { userId, amount, adminId, reason, txId });
-
-            return txId;
-
-        } catch (error) {
-            // Rollback: restore user balance if transaction creation failed
-            if (txCreated === false && error.message !== 'INSUFFICIENT_BALANCE' && error.message !== 'INVALID_AMOUNT') {
-                try {
-                    await User.updateOne({ userId }, { $inc: { balance: amount } });
-                    logger.warn('Restored user balance after failed transaction creation', { userId, amount, txId });
-                } catch (rollbackError) {
-                    logger.error('CRITICAL: Failed to restore user balance', { userId, amount, txId, error: rollbackError.message });
-                }
-            }
-
-            // If tx was created but something else failed, delete it
-            if (txCreated) {
-                try {
-                    await Transaction.deleteOne({ txId });
-                    logger.warn('Rolled back orphaned transaction', { txId, reason: error.message });
-                } catch (rollbackError) {
-                    logger.error('Failed to rollback transaction', { txId, error: rollbackError.message });
-                }
-            }
-
-            logger.error('Failed to deduct balance', { userId, amount, adminId, error: error.message });
-            throw error;
-        }
-    }
-
-    async getDepositAddress(userId) {
-        const user = await User.findOne({ userId });
-        if (user && user.depositAddress) {
-            return user.depositAddress;
-        }
-        const info = await this.getDepositInfo(userId);
-        return info.address;
-    }
-
-    getMasterAddress() {
-        return this.masterAddress || 'WALLET_NOT_READY';
-    }
-
-    async getMasterBalance() {
-        await this.ensureReady();
-
-        try {
-            const bnbBalance = await this.provider.getBalance(this.masterWallet.address);
-            const usdtBalance = await this.usdtContract.balanceOf(this.masterWallet.address);
-            
-            return {
-                bnb: ethers.formatEther(bnbBalance),
-                usdt: ethers.formatUnits(usdtBalance, this.decimals)
-            };
-        } catch (error) {
-            logger.error('Failed to get master balance', { error: error.message });
-            throw new Error('BALANCE_CHECK_FAILED — ' + error.message);
-        }
-    }
-
-    // ========== BACKGROUND SCANNER ==========
-
-    startDepositScanner(intervalMs = 30000) {
-        if (!this.isReady) {
-            logger.warn('Cannot start scanner — wallet not ready');
-            return;
-        }
-
-        if (this.scanInterval) {
-            clearInterval(this.scanInterval);
-        }
-
-        logger.info('Starting deposit scanner', { interval: intervalMs });
-
-        this.scanInterval = setInterval(async () => {
-            try {
-                await this.checkAllDeposits();
-            } catch (error) {
-                logger.error('Deposit scanner error', { error: error.message });
-            }
-        }, intervalMs);
-
-        this.scanInterval.unref?.();
-    }
-
-    stopDepositScanner() {
-        if (this.scanInterval) {
-            clearInterval(this.scanInterval);
-            this.scanInterval = null;
-            logger.info('Deposit scanner stopped');
-        }
-    }
-
-    // ========== GRACEFUL SHUTDOWN ==========
-
-    async disconnect() {
-        this.stopDepositScanner();
-        this.provider?.removeAllListeners?.();
-        this.provider = null;
-        this.isReady = false;
-        logger.info('Wallet service disconnected');
-    }
-}
-
-export default WalletService;
+            const tx = await Transaction.find
