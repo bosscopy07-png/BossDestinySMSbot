@@ -409,25 +409,41 @@ class WalletService {
                     }
     
     // FIX: checkDeposit now actually queries blockchain for the specific user
-        async checkDeposit(userId) {
-        // Ensure wallet service is initialized
+ async checkDeposit(userId) {
         await this.ensureReady();
 
-        // Get user record
         const user = await User.findOne({ userId });
         if (!user) {
             return { found: false, message: 'User not found' };
         }
 
-        // Check if user even has a pending deposit
+        // If deposit was already processed by scanner, return the transaction
         if (!user.depositPending) {
+            const recentTx = await Transaction.findOne({
+                userId,
+                type: 'DEPOSIT',
+                createdAt: { $gte: new Date(Date.now() - 3600000) }
+            }).sort({ createdAt: -1 });
+
+            if (recentTx) {
+                return {
+                    found: true,
+                    status: recentTx.status,
+                    amount: recentTx.amount,
+                    baseAmount: recentTx.blockchain?.requestedAmount || recentTx.amount,
+                    trackingAmount: recentTx.blockchain?.amountCrypto,
+                    trackingFee: recentTx.blockchain?.trackingFee || 0,
+                    txHash: recentTx.blockchain?.txHash,
+                    confirmations: recentTx.blockchain?.confirmations || 0
+                };
+            }
+
             return { 
                 found: false, 
                 message: 'No pending deposit. Use /deposit to start one.' 
             };
         }
 
-        // Must have a tracking amount to check against
         if (!user.depositTrackingAmount) {
             return { 
                 found: false, 
@@ -436,8 +452,6 @@ class WalletService {
         }
 
         try {
-            // === DIRECT BLOCKCHAIN QUERY ===
-            // Scan last 500 blocks for transfers to master address
             const latestBlock = await this.provider.getBlockNumber();
             const scanRange = 500;
             let fromBlock = Math.max(0, latestBlock - scanRange);
@@ -450,22 +464,19 @@ class WalletService {
                 const amount = parseFloat(ethers.formatUnits(amountRaw, this.decimals));
                 const txHash = event.transactionHash;
 
-                // Skip already processed transactions
                 const existing = await Transaction.findOne({ 'blockchain.txHash': txHash });
                 if (existing) continue;
 
-                // Check if this amount matches this user's pending deposit
                 const trackingAmount = user.depositTrackingAmount;
                 const matchExact = Math.abs(amount - trackingAmount) < 0.0001;
 
                 if (matchExact) {
-                    // Process this deposit immediately
                     const result = await this.processDepositEvent(event);
                     
                     if (result && result.userId === userId) {
                         return {
                             found: true,
-                            status: 'COMPLETED',        // ← FIXED: was 'CONFIRMED'
+                            status: 'COMPLETED',
                             amount: result.amount,
                             baseAmount: result.amount,
                             trackingAmount: result.trackingAmount,
@@ -477,7 +488,6 @@ class WalletService {
                 }
             }
 
-            // === NO MATCHING DEPOSIT FOUND ===
             return { 
                 found: false, 
                 message: 'No deposit found yet. Send exactly ' + user.depositTrackingAmount + ' USDT (BEP-20) to your deposit address and check again.' 
@@ -486,17 +496,16 @@ class WalletService {
         } catch (error) {
             logger.error('Direct deposit check failed', { userId, error: error.message });
             
-            // === FALLBACK: Check if transaction was already recorded ===
             const recentTx = await Transaction.findOne({
                 userId,
                 type: 'DEPOSIT',
-                createdAt: { $gte: new Date(Date.now() - 3600000) } // Last hour
+                createdAt: { $gte: new Date(Date.now() - 3600000) }
             }).sort({ createdAt: -1 });
 
             if (recentTx) {
                 return {
                     found: true,
-                    status: recentTx.status,                    // Uses DB status (COMPLETED)
+                    status: recentTx.status,
                     amount: recentTx.amount,
                     baseAmount: recentTx.blockchain?.requestedAmount || recentTx.amount,
                     txHash: recentTx.blockchain?.txHash,
@@ -504,12 +513,11 @@ class WalletService {
                 };
             }
 
-            // Re-throw if we can't recover
             throw error;
         }
-        }
+            }
     
-
+    
     // ========== REFERRAL SYSTEM ==========
 
     async processReferralDeposit(userId, amount) {
