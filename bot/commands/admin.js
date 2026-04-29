@@ -3366,4 +3366,537 @@ Contact support if you have questions.
     }
 
     async handleSettingsFree(ctx) {
-        const currentDaily = conf
+        const currentDaily = config.limits?.freeDaily || 3;
+        const currentPerNumber = config.limits?.freePerNumber || 1;
+
+        const message = `
+<b>🆓 Free OTP Limits</b>
+
+<b>Current:</b>
+• Daily per user: <code>${currentDaily}</code>
+• Per number: <code>${currentPerNumber}</code>
+
+<b>To update, use:</b>
+<code>/setfree daily &lt;number&gt;</code>
+<code>/setfree pernumber &lt;number&gt;</code>
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'admin_settings')]
+        ]);
+
+        await this.editCaption(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async handleSettingsProviders(ctx) {
+        const twilio = config.providers?.twilio !== false ? '✅' : '❌';
+        const telnyx = config.providers?.telnyx !== false ? '✅' : '❌';
+        const cheapPanel = config.providers?.cheapPanel !== false ? '✅' : '❌';
+        const freePublic = config.providers?.freePublic !== false ? '✅' : '❌';
+
+        const message = `
+<b>⚡ Provider Settings</b>
+
+<b>Current Status:</b>
+• Twilio: ${twilio}
+• Telnyx: ${telnyx}
+• Cheap Panel: ${cheapPanel}
+• Free Public: ${freePublic}
+
+<b>Toggle providers on/off:</b>
+<code>/toggleprovider twilio</code>
+<code>/toggleprovider telnyx</code>
+<code>/toggleprovider cheappanel</code>
+<code>/toggleprovider freepublic</code>
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'admin_settings')]
+        ]);
+
+        await this.editCaption(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async handleSettingsPool(ctx) {
+        const autoBuy = config.pool?.autoBuy !== false ? '✅' : '❌';
+        const minStock = config.pool?.minStock || 5;
+
+        const message = `
+<b>📦 Pool Settings</b>
+
+<b>Current:</b>
+• Auto-buy: ${autoBuy}
+• Min stock: <code>${minStock}</code>
+
+<i>Pool auto-buy triggers when available numbers fall below minimum stock.</i>
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'admin_settings')]
+        ]);
+
+        await this.editCaption(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async handleSettingsMaintenance(ctx) {
+        try {
+            const current = config.maintenance || false;
+            config.maintenance = !current;
+
+            // Persist to DB immediately
+            await this._saveSettings();
+
+            // Notify other admins about the change
+            const adminIds = (config.bot?.adminId || '')
+                .toString()
+                .split(',')
+                .map(id => id.trim())
+                .filter(Boolean);
+
+            for (const adminId of adminIds) {
+                if (adminId === ctx.from.id.toString()) continue;
+                await ctx.telegram.sendMessage(adminId, `
+<b>🛠 Maintenance Mode ${!current ? 'ENABLED' : 'DISABLED'}</b>
+
+Changed by admin: <code>${ctx.from.id}</code>
+
+Users will ${!current ? 'see a maintenance message' : 'have normal access'}.
+                `, { parse_mode: 'HTML' }).catch(() => {});
+            }
+
+            const message = `
+<b>🛠 Maintenance Mode ${!current ? 'ENABLED' : 'DISABLED'}</b>
+
+Users will ${!current ? 'see a maintenance message' : 'have normal access'}.
+
+<i>Setting has been saved to database.</i>
+            `;
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('🔙 Back', 'admin_settings')]
+            ]);
+
+            await this.editCaption(ctx, message, { reply_markup: keyboard.reply_markup });
+
+            logger.info('Maintenance mode toggled', {
+                admin: ctx.from.id,
+                enabled: !current
+            });
+        } catch (error) {
+            logger.error('Maintenance toggle error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to toggle maintenance mode.</b>');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  SET COMMANDS (with DB Persistence)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleSetPrice(ctx) {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 3) {
+            return this.replyError(ctx, '❌ <b>Usage:</b> <code>/setprice &lt;cheap|vip&gt; &lt;amount&gt;</code>');
+        }
+
+        const type = args[1].toLowerCase();
+        const amount = parseFloat(args[2]);
+
+        if (isNaN(amount) || amount < 0) {
+            return this.replyError(ctx, '❌ <b>Invalid amount.</b>\n\nAmount must be a non-negative number.');
+        }
+
+        if (!config.prices) config.prices = {};
+
+        if (type === 'cheap') {
+            config.prices.cheapOtp = amount;
+        } else if (type === 'vip') {
+            config.prices.vipOtp = amount;
+        } else {
+            return this.replyError(ctx, '❌ <b>Invalid type.</b>\n\nUse: <code>cheap</code> or <code>vip</code>');
+        }
+
+        // Persist to DB
+        await this._saveSettings();
+
+        await this.replySuccess(ctx, `✅ <b>Price Updated!</b>\n\n${type === 'cheap' ? 'Cheap' : 'VIP'} OTP price set to <code>${formatCurrency(amount)}</code>\n\n<i>Saved to database.</i>`);
+
+        await this.logAdminAction(
+            ctx.from.id.toString(),
+            'SET_PRICE',
+            null,
+            { type, amount }
+        );
+    }
+
+    async handleSetVip(ctx) {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 3) {
+            return this.replyError(ctx, '❌ <b>Usage:</b> <code>/setvip &lt;price|days&gt; &lt;value&gt;</code>');
+        }
+
+        const type = args[1].toLowerCase();
+        const value = parseFloat(args[2]);
+
+        if (isNaN(value) || value < 0) {
+            return this.replyError(ctx, '❌ <b>Invalid value.</b>\n\nValue must be a non-negative number.');
+        }
+
+        if (!config.prices) config.prices = {};
+
+        if (type === 'price') {
+            config.prices.vipSubscription = value;
+        } else if (type === 'days') {
+            config.prices.vipDuration = Math.floor(value);
+        } else {
+            return this.replyError(ctx, '❌ <b>Invalid type.</b>\n\nUse: <code>price</code> or <code>days</code>');
+        }
+
+        // Persist to DB
+        await this._saveSettings();
+
+        const displayValue = type === 'price' ? formatCurrency(value) : `${Math.floor(value)} days`;
+        await this.replySuccess(ctx, `✅ <b>VIP Config Updated!</b>\n\nVIP ${type === 'price' ? 'price' : 'duration'} set to <code>${displayValue}</code>\n\n<i>Saved to database.</i>`);
+
+        await this.logAdminAction(
+            ctx.from.id.toString(),
+            'SET_VIP',
+            null,
+            { type, value }
+        );
+    }
+
+    async handleSetFree(ctx) {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 3) {
+            return this.replyError(ctx, '❌ <b>Usage:</b> <code>/setfree &lt;daily|pernumber&gt; &lt;number&gt;</code>');
+        }
+
+        const type = args[1].toLowerCase();
+        const value = parseInt(args[2]);
+
+        if (isNaN(value) || value < 0) {
+            return this.replyError(ctx, '❌ <b>Invalid value.</b>\n\nValue must be a non-negative integer.');
+        }
+
+        if (!config.limits) config.limits = {};
+
+        if (type === 'daily') {
+            config.limits.freeDaily = value;
+        } else if (type === 'pernumber') {
+            config.limits.freePerNumber = value;
+        } else {
+            return this.replyError(ctx, '❌ <b>Invalid type.</b>\n\nUse: <code>daily</code> or <code>pernumber</code>');
+        }
+
+        // Persist to DB
+        await this._saveSettings();
+
+        const label = type === 'daily' ? 'daily limit' : 'per-number limit';
+        await this.replySuccess(ctx, `✅ <b>Free Limits Updated!</b>\n\nFree ${label} set to <code>${value}</code>\n\n<i>Saved to database.</i>`);
+
+        await this.logAdminAction(
+            ctx.from.id.toString(),
+            'SET_FREE',
+            null,
+            { type, value }
+        );
+    }
+
+    async handleToggleProvider(ctx) {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            return this.replyError(ctx, '❌ <b>Usage:</b> <code>/toggleprovider &lt;twilio|telnyx|cheappanel|freepublic&gt;</code>');
+        }
+
+        const name = args[1].toLowerCase();
+        const valid = ['twilio', 'telnyx', 'cheappanel', 'freepublic'];
+
+        if (!valid.includes(name)) {
+            return this.replyError(ctx, '❌ <b>Invalid provider name.</b>\n\nValid: <code>twilio, telnyx, cheappanel, freepublic</code>');
+        }
+
+        if (!config.providers) config.providers = {};
+
+        const current = config.providers[name] !== false;
+        config.providers[name] = !current;
+
+        // Persist to DB
+        await this._saveSettings();
+
+        const status = !current ? '✅ Enabled' : '❌ Disabled';
+        const displayName = name.charAt(0).toUpperCase() + name.slice(1);
+
+        await this.replySuccess(ctx, `✅ <b>Provider Updated!</b>\n\n${displayName}: <b>${status}</b>\n\n<i>Saved to database.</i>`);
+
+        await this.logAdminAction(
+            ctx.from.id.toString(),
+            'TOGGLE_PROVIDER',
+            null,
+            { provider: name, enabled: !current }
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  DATA EXPORT COMMANDS
+    // ═══════════════════════════════════════════════════════════
+
+    async handleExportUsers(ctx) {
+        try {
+            const users = await User.find().lean();
+
+            if (!users.length) {
+                return this.replyError(ctx, '<b>📥 No users to export.</b>');
+            }
+
+            const headers = [
+                'userId', 'username', 'firstName', 'lastName', 'balance',
+                'lockedBalance', 'bundleRemaining', 'mode', 'vipExpiry',
+                'isBlacklisted', 'referralCode', 'referredBy', 'referralCount',
+                'createdAt', 'lastActive'
+            ];
+
+            const rows = users.map(u => headers.map(h => this.escapeCSV(u[h])).join(','));
+            const csv = [headers.join(','), ...rows].join('\n');
+
+            // Send as document if too long, otherwise as text
+            if (csv.length > 4000) {
+                const buffer = Buffer.from(csv, 'utf-8');
+                await ctx.replyWithDocument(
+                    { source: buffer, filename: `users_export_${Date.now()}.csv` },
+                    { caption: '<b>📥 Users Export</b>', parse_mode: 'HTML' }
+                );
+            } else {
+                await this.replySuccess(ctx, `<b>📥 Users Export</b>\n\n<pre>${csv.substring(0, 4000)}</pre>`);
+            }
+
+            await this.logAdminAction(ctx.from.id.toString(), 'EXPORT_USERS', null, { count: users.length });
+
+        } catch (error) {
+            logger.error('Export users error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to export users.</b>');
+        }
+    }
+
+    async handleExportTransactions(ctx) {
+        try {
+            const args = ctx.message.text.split(' ');
+            const startDate = args[1] ? new Date(args[1]) : new Date(0);
+            const endDate = args[2] ? new Date(args[2]) : new Date();
+
+            if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+                return this.replyError(ctx, '❌ <b>Invalid date format.</b>\n\nUsage: <code>/export_transactions [YYYY-MM-DD] [YYYY-MM-DD]</code>');
+            }
+
+            const transactions = await Transaction.find({
+                createdAt: { $gte: startDate, $lte: endDate }
+            }).lean();
+
+            if (!transactions.length) {
+                return this.replyError(ctx, '<b>📥 No transactions found for the given period.</b>');
+            }
+
+            const headers = ['txId', 'userId', 'type', 'amount', 'status', 'metadata', 'createdAt'];
+            const rows = transactions.map(t => headers.map(h => {
+                if (h === 'metadata') return this.escapeCSV(JSON.stringify(t[h] || {}));
+                return this.escapeCSV(t[h]);
+            }).join(','));
+
+            const csv = [headers.join(','), ...rows].join('\n');
+
+            if (csv.length > 4000) {
+                const buffer = Buffer.from(csv, 'utf-8');
+                await ctx.replyWithDocument(
+                    { source: buffer, filename: `transactions_export_${Date.now()}.csv` },
+                    { caption: '<b>📥 Transactions Export</b>', parse_mode: 'HTML' }
+                );
+            } else {
+                await this.replySuccess(ctx, `<b>📥 Transactions Export</b>\n\n<pre>${csv.substring(0, 4000)}</pre>`);
+            }
+
+            await this.logAdminAction(ctx.from.id.toString(), 'EXPORT_TRANSACTIONS', null, { count: transactions.length, startDate, endDate });
+
+        } catch (error) {
+            logger.error('Export transactions error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to export transactions.</b>');
+        }
+    }
+
+    // ─── CSV Escaping Helper ───
+    escapeCSV(value) {
+        if (value === null || value === undefined) return '';
+        const str = String(value);
+        if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+            return '"' + str.replace(/"/g, '""') + '"';
+        }
+        return str;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  BULK ACTIONS (NEW FEATURE)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleBulkActionsMenu(ctx) {
+        const message = `
+<b>⚡ Bulk Actions</b>
+
+Perform actions on multiple users at once:
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('📢 Bulk Broadcast', 'bulk_broadcast')],
+            [Markup.button.callback('💰 Bulk Add Balance', 'bulk_add_balance')],
+            [Markup.button.callback('👑 Bulk Give VIP', 'bulk_give_vip')],
+            [Markup.button.callback('🔄 Bulk Reset Free', 'bulk_reset_free')],
+            [Markup.button.callback('🔙 Back', 'admin')]
+        ]);
+
+        await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async handleBulkBroadcastMenu(ctx) {
+        this._setAdminState(ctx, ADMIN_STATE.AWAITING_BROADCAST_MESSAGE, { mode: 'bulk' });
+        await this.replySuccess(ctx, `
+<b>📢 Bulk Broadcast</b>
+
+Send the message to broadcast to ALL users:
+
+<i>This will send to every non-blacklisted user. Use with caution.</i>
+        `);
+    }
+
+    async handleBulkAddBalanceMenu(ctx) {
+        await this.replySuccess(ctx, `
+<b>💰 Bulk Add Balance</b>
+
+Use the command:
+<code>/addbalance &lt;user_id&gt; &lt;amount&gt;</code>
+
+For multiple users, use the button flow for each user individually.
+        `, {
+            reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback('👥 Go to Users', 'admin_users')],
+                [Markup.button.callback('🔙 Back', 'admin_bulkactions')]
+            ]).reply_markup
+        });
+    }
+
+    async handleBulkGiveVipMenu(ctx) {
+        await this.replySuccess(ctx, `
+<b>👑 Bulk Give VIP</b>
+
+Use the <code>/user &lt;user_id&gt;</code> command to find users, then use the quick VIP button.
+
+Or grant VIP via:
+<code>/givevip &lt;user_id&gt; &lt;days&gt;</code>
+        `, {
+            reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback('👥 Go to Users', 'admin_users')],
+                [Markup.button.callback('🔙 Back', 'admin_bulkactions')]
+            ]).reply_markup
+        });
+    }
+
+    async handleBulkResetFreeMenu(ctx) {
+        await this.replySuccess(ctx, `
+<b>🔄 Bulk Reset Free</b>
+
+Use the <code>/user &lt;user_id&gt;</code> command to find users, then use the quick reset button.
+
+Or reset via:
+<code>/resetfree &lt;user_id&gt;</code>
+        `, {
+            reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback('👥 Go to Users', 'admin_users')],
+                [Markup.button.callback('🔙 Back', 'admin_bulkactions')]
+            ]).reply_markup
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ANALYTICS (NEW FEATURE)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleAnalyticsMenu(ctx) {
+        const message = `
+<b>📊 Advanced Analytics</b>
+
+Deep dive into bot performance metrics:
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('💰 Revenue Trends', 'analytics_revenue')],
+            [Markup.button.callback('👥 User Growth', 'analytics_users')],
+            [Markup.button.callback('🔥 Service Demand', 'analytics_services')],
+            [Markup.button.callback('🔄 Retention', 'analytics_retention')],
+            [Markup.button.callback('🔙 Back', 'admin')]
+        ]);
+
+        await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async handleAnalyticsRevenue(ctx) {
+        try {
+            const now = new Date();
+            const days7 = new Date(now - 7 * 24 * 60 * 60 * 1000);
+            const days30 = new Date(now - 30 * 24 * 60 * 60 * 1000);
+
+            const [weekData, monthData] = await Promise.all([
+                Transaction.aggregate([
+                    { $match: { status: 'COMPLETED', createdAt: { $gte: days7 } } },
+                    { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, total: { $sum: { $abs: '$amount' } } } },
+                    { $sort: { _id: 1 } }
+                ]),
+                Transaction.aggregate([
+                    { $match: { status: 'COMPLETED', createdAt: { $gte: days30 } } },
+                    { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, total: { $sum: { $abs: '$amount' } } } },
+                    { $sort: { _id: 1 } }
+                ])
+            ]);
+
+            let message = '<b>💰 Revenue Trends</b>\n\n<b>Last 7 Days:</b>\n';
+            weekData.forEach(d => {
+                message += `• ${d._id}: <code>${formatCurrency(d.total)}</code>\n`;
+            });
+
+            const monthTotal = monthData.reduce((sum, d) => sum + d.total, 0);
+            message += `\n<b>30-Day Total:</b> <code>${formatCurrency(monthTotal)}</code>\n`;
+            message += `<b>Daily Average:</b> <code>${formatCurrency(monthTotal / 30)}</code>`;
+
+            await this.replySuccess(ctx, message, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Refresh', 'analytics_revenue')],
+                    [Markup.button.callback('🔙 Back', 'admin_analytics')]
+                ]).reply_markup
+            });
+        } catch (error) {
+            logger.error('Analytics revenue error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load revenue analytics.</b>');
+        }
+    }
+
+    async handleAnalyticsUsers(ctx) {
+        try {
+            const now = new Date();
+            const intervals = [1, 7, 30, 90].map(d => new Date(now - d * 24 * 60 * 60 * 1000));
+
+            const [new1d, new7d, new30d, new90d, total, active7d, active30d] = await Promise.all([
+                User.countDocuments({ createdAt: { $gte: intervals[0] } }),
+                User.countDocuments({ createdAt: { $gte: intervals[1] } }),
+                User.countDocuments({ createdAt: { $gte: intervals[2] } }),
+                User.countDocuments({ createdAt: { $gte: intervals[3] } }),
+                User.countDocuments(),
+                User.countDocuments({ lastActive: { $gte: intervals[1] } }),
+                User.countDocuments({ lastActive: { $gte: intervals[2] } })
+            ]);
+
+            const message = `
+<b>👥 User Growth Analytics</b>
+
+<b>New Users:</b>
+• 24h: <code>${new1d}</code>
+• 7d: <code>${new7d}</code>
+• 30d: <code>${new30d}</code>
+• 90d: <code>${new90d}</code>
+
+<b>Active Users:</b>
+• 7d active: <code>${active7d}</code
