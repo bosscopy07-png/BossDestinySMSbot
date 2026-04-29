@@ -193,6 +193,7 @@ class OTPCommands {
         this.bot.action(/service_(.+)/, this.handleServiceSelect.bind(this));
         this.bot.action(/country_(.+)/, this.handleCountrySelect.bind(this));
         this.bot.action('buy_bundle', this.handleBuyBundle.bind(this));
+        this.bot.action('confirm_free_mode', this.handleConfirmFreeMode.bind(this));
         this.bot.action('buy_vip', this.handleBuyVIP.bind(this));
         this.bot.action('confirm_bundle', this.handleConfirmBundle.bind(this));
         this.bot.action('confirm_vip', this.handleConfirmVIP.bind(this));
@@ -522,19 +523,60 @@ class OTPCommands {
     }
 
     async handleFreeMode(ctx) {
-        const user = ctx.state.user;
-        if (!this._canUseFree(user)) {
-            const message = '❌ Free Limit Reached\n\nYou\'ve used all 3 free OTPs today.\n\n💰 Deposit to continue:\n• CHEAP: $0.05 per OTP\n• Bundle: $5 for 100 OTPs';
-            const keyboard = Markup.inlineKeyboard([
-                [Markup.button.callback('💳 Deposit', 'deposit')],
-                [Markup.button.callback('🔙 Back', 'menu')]
-            ]);
-            return this.sendPhotoWithCaption(ctx, IMAGES.freeMode, message, keyboard);
-        }
-        ctx.session = ctx.session || {};
-        ctx.session.otpMode = 'FREE';
-        await this.showServiceSelection(ctx, 'FREE', IMAGES.freeMode);
+    const user = ctx.state.user;
+    
+    if (!this._canUseFree(user)) {
+        const message = 
+            '❌ <b>Free Limit Reached</b>\n\n' +
+            'You\'ve used all 3 free OTPs today.\n\n' +
+            '💰 Deposit to continue:\n' +
+            '• CHEAP: $0.05 per OTP\n' +
+            '• Bundle: $5 for 100 OTPs';
+            
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('💳 Deposit', 'deposit')],
+            [Markup.button.callback('🔙 Back', 'menu')]
+        ]);
+        
+        return this.sendPhotoWithCaption(ctx, IMAGES.freeMode, message, keyboard, 'HTML');
     }
+
+    // ⭐ Show warning FIRST, then proceed on confirmation
+    const warningMessage = 
+        '⚠️ <b>Free Mode Notice</b>\n\n' +
+        '📵 Free numbers are <b>shared</b> and may be <b>blocked</b> by:\n' +
+        '• WhatsApp, Telegram\n' +
+        '• Google, Facebook, Instagram\n' +
+        '• Banks, Binance, PayPal\n\n' +
+        '✅ For <b>guaranteed</b> delivery, use:\n' +
+        '• 💰 CHEAP — $0.05/OTP\n' +
+        '• 📦 BUNDLE — $5 for 100 OTPs\n\n' +
+        '<i>Free mode is best effort only. No refunds for failed delivery.</i>';
+
+    const warningKeyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('✅ I Understand, Proceed', 'confirm_free_mode')],
+        [Markup.button.callback('💰 Switch to CHEAP', 'mode_cheap')],
+        [Markup.button.callback('📦 Buy Bundle', 'buy_bundle')],
+        [Markup.button.callback('🔙 Back', 'menu')]
+    ]);
+
+    return this.sendPhotoWithCaption(ctx, IMAGES.freeMode, warningMessage, warningKeyboard, 'HTML');
+}
+
+// ⭐ NEW HANDLER — Add to registerCommands()
+async handleConfirmFreeMode(ctx) {
+    ctx.session = ctx.session || {};
+    ctx.session.otpMode = 'FREE';
+    
+    // Edit the warning message to show "Proceeding..."
+    await ctx.editMessageCaption(
+        '⏳ <b>Loading Free Mode...</b>',
+        { parse_mode: 'HTML' }
+    );
+    
+    await this.showServiceSelection(ctx, 'FREE', IMAGES.freeMode);
+}
+    
 
     async handleCheapMode(ctx) {
         const user = ctx.state.user;
