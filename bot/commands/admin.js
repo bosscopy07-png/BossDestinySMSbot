@@ -499,6 +499,8 @@ class AdminCommands {
         this.bot.action('bulk_reset_free', this.requireAdmin, this.handleBulkResetFreeMenu.bind(this));
 
         // ─── NEW: Analytics ───
+        this.bot.action('admin_healthcheck', this.requireAdmin, this.handleHealthCheck.bind(this));
+
         this.bot.action('analytics_revenue', this.requireAdmin, this.handleAnalyticsRevenue.bind(this));
         this.bot.action('analytics_users', this.requireAdmin, this.handleAnalyticsUsers.bind(this));
         this.bot.action('analytics_services', this.requireAdmin, this.handleAnalyticsServices.bind(this));
@@ -782,7 +784,48 @@ class AdminCommands {
             return 0;
         }
     }
+    // Add to _registerButtonFlows()
+    
+    // Add method
+    async handleHealthCheck(ctx) {
+        const checks = [];
+        
+        // Check free providers
+        const freeProviders = ['smsreceivefree.com', 'receive-smss.com'];
+        for (const provider of freeProviders) {
+            try {
+                await fetch(`https://${provider}`, { method: 'HEAD', timeout: 5000 });
+                checks.push(`✅ ${provider}`);
+            } catch (e) {
+                checks.push(`❌ ${provider}: ${e.message}`);
+            }
+        }
 
+        // Check pool
+        checks.push(this.smsProviderManager?.numberPool ? '✅ Number Pool' : '❌ Number Pool: not configured');
+
+        // Check 5SIM/cheap panel
+        try {
+            if (this.smsProviderManager?.cheapProvider?.getBalance) {
+                await this.smsProviderManager.cheapProvider.getBalance();
+                checks.push('✅ Cheap Panel');
+            } else {
+                checks.push('⚠️ Cheap Panel: no getBalance method');
+            }
+        } catch (e) {
+            checks.push(`❌ Cheap Panel: ${e.message}`);
+        }
+
+        const message = `<b>🏥 Provider Health Check</b>\n\n${checks.join('\n')}`;
+
+        await this.replySuccess(ctx, message, {
+            reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback('🔄 Refresh', 'admin_healthcheck')],
+                [Markup.button.callback('🔙 Back', 'admin')]
+            ]).reply_markup
+        });
+    }
+    
     // ═══════════════════════════════════════════════════════════
     //  DASHBOARD (Updated with new feature buttons)
     // ═══════════════════════════════════════════════════════════
@@ -2874,6 +2917,7 @@ To withdraw, send USDT from your master wallet manually or use your wallet app.
 
             await this.replySuccess(ctx, message, {
                 reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🏥 Health', 'admin_healthcheck')]
                     [Markup.button.callback('🔙 Back', 'admin')]
                 ]).reply_markup
             });
