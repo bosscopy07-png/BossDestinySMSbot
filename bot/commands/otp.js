@@ -992,3 +992,216 @@ class OTPCommands {
         }
     }
     
+// ==================== PART 11: CANCEL HANDLER (UPDATED) ====================
+
+    async handleCancel(ctx) {
+        const userId = ctx.from.id.toString();
+        try {
+            const activeSession = await Session.findOne({ userId, status: { $in: ['WAITING', 'CHECKING'] } });
+            if (!activeSession) {
+                return this.sendPhotoWithCaption(ctx, IMAGES.default, '❌ No active session to cancel.');
+            }
+            
+            // Store mode before cancelling for refund logic
+            const sessionMode = activeSession.mode;
+            const sessionCost = activeSession.cost || 0;
+            
+            await sessionManager.cancelSession(activeSession.sessionId, userId);
+            
+            // ⭐ NEW: Restore credits based on mode
+            let refundText = '';
+            if (sessionMode === 'BUNDLE') {
+                await User.updateOne({ userId }, { $inc: { bundleRemaining: 1 } }).catch(() => {});
+                refundText = '💰 Bundle credit restored.\n';
+            } else if (sessionMode === 'VIP') {
+                await User.updateOne({ userId }, { $inc: { vipDailyUsed: -1 } }).catch(() => {});
+                refundText = '💰 VIP daily quota restored.\n';
+            } else if (sessionMode === 'CHEAP' && sessionCost > 0) {
+                await User.updateOne(
+                    { userId }, 
+                    { $inc: { lockedBalance: -sessionCost, balance: sessionCost } }
+                ).catch(() => {});
+                refundText = '💰 Funds returned to your balance.\n';
+            } else {
+                refundText = sessionCost > 0 ? '💰 Funds returned to your balance.\n' : '';
+            }
+            
+            const message = 
+                `✅ Session Cancelled\n\n` +
+                `📱 Number: ${activeSession.number}\n` +
+                `${refundText}` +
+                `You can start a new request now.`;
+            
+            await this.sendPhotoWithCaption(ctx, IMAGES.default, message);
+        } catch (error) {
+            logger.error('Cancel failed', { userId, error: error.message });
+            await this.sendPhotoWithCaption(ctx, IMAGES.default, '❌ Failed to cancel session. Please try again.');
+        }
+    }
+    // ==================== PART 12: BUNDLE & VIP PURCHASE ====================
+
+    async handleBuyBundle(ctx) {
+        const user = ctx.state.user;
+        const bundlePrice = config.prices?.bundlePrice || 5.00;
+        const bundleCount = config.prices?.bundleOtpCount || 100;
+        const message = `📦 Buy OTP Bundle\n\n💰 Price: ${formatCurrency(bundlePrice)}\n📦 Includes: ${bundleCount} OTPs\n✅ Never expires\n💡 Best value for regular users\n\nYour Balance: ${formatCurrency(user.balance)}`;
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Confirm Purchase', 'confirm_bundle')],
+            [Markup.button.callback('❌ Cancel', 'menu')]
+        ]);
+        await this.sendPhotoWithCaption(ctx, IMAGES.bundleFirst, message, keyboard);
+    }
+
+    async handleConfirmBundle(ctx) {
+        const user = ctx.state.user;
+        const bundlePrice = config.prices?.bundlePrice || 5.00;
+        const bundleCount = config.prices?.bundleOtpCount || 100;
+        if (user.balance < bundlePrice) {
+            const message = `❌ Insufficient Balance\n\nRequired: ${formatCurrency(bundlePrice)}\nAvailable: ${formatCurrency(user.balance)}\n\nDeposit first with /deposit`;
+            return this.sendPhotoWithCaption(ctx, IMAGES.bundleOther, message);
+        }
+        await User.updateOne({ userId: user.userId }, { $inc: { balance: -bundlePrice, bundleRemaining: bundleCount } });
+        const message = `✅ Bundle Purchased!\n\n📦 ${bundleCount} OTPs added\n💰 ${formatCurrency(bundlePrice)} deducted\n📦 Total Available: ${user.bundleRemaining + bundleCount} OTPs\n\nUse /otp to start requesting.`;
+        await this.sendPhotoWithCaption(ctx, IMAGES.bundleOther, message);
+    }
+
+    async handleBuyVIP(ctx) {
+        const user = ctx.state.user;
+        const vipPrice = config.prices?.vipSubscription || 5.00;
+        const message = `👑 Upgrade to VIP\n\n💰 Price: ${formatCurrency(vipPrice)}/month\n✅ Unlimited OTPs (50/day)\n⚡ Priority routing\n🚀 Fastest delivery\n\nYour Balance: ${formatCurrency(user.balance)}`;
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Confirm Upgrade', 'confirm_vip')],
+            [Markup.button.callback('❌ Cancel', 'menu')]
+        ]);
+        await this.sendPhotoWithCaption(ctx, IMAGES.vipFirst, message, keyboard);
+    }
+
+    async handleConfirmVIP(ctx) {
+        const user = ctx.state.user;
+        const vipPrice = config.prices?.vipSubscription || 5.00;
+        if (user.balance < vipPrice) {
+            const message = `❌ Insufficient Balance\n\nRequired: ${formatCurrency(vipPrice)}\nAvailable: ${formatCurrency(user.balance)}\n\nDeposit first with /deposit`;
+            return this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message);
+        }
+        
+        const expiryDate = new Date();
+        expiryDate.setMonth(expiryDate.getMonth() + 1);
+        
+        // Deduct balance and set VIP
+        await User.updateOne({ userId: user.userId }, {
+            $inc: { balance: -vipPrice },
+            $set: { 
+                mode: 'VIP', 
+                vipExpiry: expiryDate, 
+                vipDailyUsed: 0, 
+                vipDailyReset: new Date() 
+            }
+        });
+
+        // Auto-assign VIP number
+        const assignment = await this.assignVipNumber(user.userId, 'US');
+
+        let numberText = '';
+        if (assignment) {
+            numberText = `\n\n📱 <b>Your VIP Number:</b> <code>${assignment.phoneNumber}</code>\n🏢 Provider: ${assignment.provider}`;
+        } else {
+            numberText = '\n\n⚠️ Your VIP number is being assigned. Use /mynumber to check.';
+        }
+
+        const message = `👑 VIP Activated!\n\n⏰ Valid until: ${expiryDate.toLocaleDateString()}\n✅ Unlimited OTPs (50/day)\n⚡ Priority delivery enabled${numberText}\n\nEnjoy premium service!`;
+        await this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message);
+    }
+    // ==================== PART 13: SUPPORT, REVEAL, DEPOSIT & MENU ====================
+
+    async handleContactSupport(ctx) {
+        await ctx.reply(
+            '📞 <b>Contact Support</b>\n\n' +
+            'Need help? Contact us at @Swiftsmssupport\n\n' +
+            'Our team is available 24/7 to assist you.',
+            { 
+                parse_mode: 'HTML',
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.url('📞 Contact @Swiftsmssupport', 'https://t.me/Swiftsmssupport')]
+                ]).reply_markup
+            }
+        );
+    }
+
+    async handleRevealOTP(ctx) {
+        const sessionId = ctx.match[1];
+        const userId = ctx.from.id.toString();
+        try {
+            const session = await Session.findOne({ sessionId, userId });
+            if (!session || session.status !== 'RECEIVED') {
+                return ctx.answerCbQuery('❌ OTP not available');
+            }
+            await ctx.answerCbQuery();
+            const message = `🔓 Full OTP Revealed\n\n📱 Number: ${session.number}\n🔢 OTP: \`${session.otpCode}\`\n🕐 Delivered: ${session.endTime.toLocaleTimeString()}\n\n⚠️ Do not share this code with anyone.`;
+            await this.sendPhotoWithCaption(ctx, IMAGES.otpReceived, message, null, 'Markdown');
+        } catch (error) {
+            await ctx.answerCbQuery('❌ Error revealing OTP');
+        }
+    }
+
+    async handleCheckDeposit(ctx) {
+        const userId = ctx.from.id.toString();
+        try {
+            const result = await this.walletService.checkDeposit(userId);
+            
+            if (!result.found) {
+                const message = 
+                    '⏳ <b>No Deposit Found</b>\n\n' +
+                    'Your deposit hasn\'t been detected yet.\n\n' +
+                    'Make sure you:\n' +
+                    '1️⃣ Sent to the correct address\n' +
+                    '2️⃣ Sent exactly the shown amount\n' +
+                    '3️⃣ Used BSC (BEP-20) network\n\n' +
+                    '⏱ Check again in 1-2 minutes.';
+                
+                return this.sendPhotoWithCaption(
+                    ctx, 
+                    IMAGES.default, 
+                    message,
+                    Markup.inlineKeyboard([
+                        [Markup.button.callback('🔄 Check Again', 'check_deposit')],
+                        [Markup.button.callback('🔙 Back', 'menu')]
+                    ]),
+                    'HTML'
+                );
+            }
+            
+            if (result.status === 'CONFIRMING') {
+                const message = 
+                    `⏳ <b>Deposit Confirming</b>\n\n` +
+                    `Amount: ${formatCurrency(result.amount)}\n` +
+                    `Confirmations: ${result.confirmations || 0}/${config.blockchain?.blockConfirmations || 12}\n\n` +
+                    `Please wait for full confirmation.`;
+                return this.sendPhotoWithCaption(ctx, IMAGES.default, message, null, 'HTML');
+            }
+            
+            if (result.status === 'CONFIRMED' || result.status === 'CREDITED') {
+                const message = 
+                    `✅ <b>Deposit Confirmed!</b>\n\n` +
+                    `Amount Credited: ${formatCurrency(result.amount)}\n` +
+                    (result.trackingFee > 0 ? `Tracking Fee: ${formatCurrency(result.trackingFee)}\n` : '') +
+                    `TX Hash: \`${result.txHash}\`\n\n` +
+                    `Your balance has been updated.`;
+                return this.sendPhotoWithCaption(ctx, IMAGES.depositConfirmed, message, null, 'Markdown');
+            }
+        } catch (error) {
+            logger.error('Check deposit failed', { userId, error: error.message });
+            await this.sendPhotoWithCaption(ctx, IMAGES.default, '❌ Error checking deposit. Please try again.');
+        }
+    }
+
+    async handleDepositInfo(ctx) {
+        const message = '💳 Deposit Information\n\nSend USDT (BEP-20) to your deposit address.\n\nYour deposit will be credited automatically after confirmation.\n\nUse /check_deposit to check status.';
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message);
+    }
+
+    async handleMenu(ctx) {
+        await ctx.reply('🏠 Main Menu');
+    }
+}
+
+export default OTPCommands;
