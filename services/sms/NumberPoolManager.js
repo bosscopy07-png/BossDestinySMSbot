@@ -1,4 +1,4 @@
-import { Number } from '../../models/index.js';
+import { Number as NumberModel } from '../../models/index.js';
 import logger from '../../utils/logger.js';
 
 class NumberPoolManager {
@@ -105,6 +105,7 @@ class NumberPoolManager {
         );
 
         if (updateResult.modifiedCount === 0) {
+            // Put it back if DB update failed
             pool.unshift(number);
             throw new Error('CONCURRENT_ACQUIRE: Number was taken by another request');
         }
@@ -143,6 +144,7 @@ class NumberPoolManager {
         const assignment = this.activeAssignments.get(sessionIdOrNumberId);
 
         if (!assignment) {
+            // Try DB recovery if not in memory
             const dbDoc = await NumberModel.findOne({
                 $or: [
                     { _id: sessionIdOrNumberId },
@@ -246,7 +248,7 @@ class NumberPoolManager {
                 });
 
             } catch (error) {
-                errors.push({ index: i, error: error.message });
+                errors.push({ index: i, error: error.message, code: error.code });
                 logger.error('Failed to buy Twilio number', { country, index: i, error: error.message });
             }
         }
@@ -255,7 +257,11 @@ class NumberPoolManager {
             throw new Error(`All ${quantity} purchase attempts failed: ${errors[0].error}`);
         }
 
-        return { purchased: results, errors, totalCost: results.reduce((s, r) => s + (r.monthlyCost || 1.00), 0) };
+        return { 
+            purchased: results, 
+            errors, 
+            totalCost: results.reduce((s, r) => s + (r.monthlyCost || 1.00), 0) 
+        };
     }
 
     async retireNumber(numberId, reason = 'RETIRED') {
@@ -336,4 +342,4 @@ class NumberPoolManager {
 }
 
 export default NumberPoolManager;
-                
+            
