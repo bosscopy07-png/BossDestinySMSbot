@@ -582,11 +582,499 @@ class AdminCommands {
                 return this.executeSearch(ctx, ctx.message.text.trim(), data.mode);
             }
 
-            // ─── Reset Free user ID ───
+                        // ─── Reset Free user ID ───
             if (state === ADMIN_STATE.AWAITING_RESET_FREE_USER) {
                 const userId = ctx.message.text.trim();
+                this._clearAdminState(ctx);
+                return this.showResetFreeConfirm(ctx, userId);
+            }
 
+            // ─── Give VIP user ID ───
+            if (state === ADMIN_STATE.AWAITING_GIVE_VIP_USER) {
+                const userId = ctx.message.text.trim();
+                this._clearAdminState(ctx);
+                return this.showGiveVipDaysInput(ctx, userId);
+            }
 
+            // ─── Give VIP days ───
+            if (state === ADMIN_STATE.AWAITING_GIVE_VIP_DAYS) {
+                const days = parseInt(ctx.message.text.trim());
+                this._clearAdminState(ctx);
+                if (isNaN(days) || days <= 0) {
+                    return this.replyError(ctx, '❌ <b>Invalid days.</b>\n\nMust be a positive integer.');
+                }
+                return this.executeGiveVip(ctx, data.userId, days);
+            }
+
+            // Pool purchase country
+            if (state === ADMIN_STATE.AWAITING_POOL_PURCHASE_COUNTRY) {
+                const country = ctx.message.text.trim().toUpperCase();
+                this._clearAdminState(ctx);
+                if (country.length !== 2) {
+                    return this.replyError(ctx, '❌ <b>Invalid country code.</b>\n\nMust be 2 letters (e.g., US, GB, CA).');
+                }
+                ctx.session.poolPurchase = { ...ctx.session.poolPurchase, country };
+                this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_QTY, { country });
+                return this.replySuccess(ctx, 
+                    '📦 <b>Pool Purchase</b>\n\n' +
+                    `Country: <code>${country}</code>\n\n` +
+                    'Send quantity to purchase (1-50):'
+                );
+            }
+
+            // Pool purchase quantity
+            if (state === ADMIN_STATE.AWAITING_POOL_PURCHASE_QTY) {
+                const qty = parseInt(ctx.message.text.trim());
+                this._clearAdminState(ctx);
+                if (isNaN(qty) || qty < 1 || qty > 50) {
+                    return this.replyError(ctx, '❌ <b>Invalid quantity.</b>\n\nMust be 1-50.');
+                }
+                ctx.session.poolPurchase = { ...ctx.session.poolPurchase, quantity: qty };
+                return this.showPoolPurchaseConfirm(ctx);
+            }
+
+            // Cancel VIP user ID
+            if (state === ADMIN_STATE.AWAITING_CANCEL_VIP_USER) {
+                const userId = ctx.message.text.trim();
+                this._clearAdminState(ctx);
+                return this.showCancelVipConfirm(ctx, userId);
+            }
+
+            // Set bundle OTP prices
+            if (state === ADMIN_STATE.AWAITING_SET_BUNDLE_OTP_PRICE) {
+                this._clearAdminState(ctx);
+                return this.processSetBundleOtpPrices(ctx, ctx.message.text.trim());
+            }
+
+            // Set bundle pack price
+            if (state === ADMIN_STATE.AWAITING_SET_BUNDLE_PRICE) {
+                this._clearAdminState(ctx);
+                return this.processSetBundlePackPrice(ctx, ctx.message.text.trim());
+            }
+
+            // NEW: Retire number
+            if (state === ADMIN_STATE.AWAITING_RETIRE_NUMBER) {
+                this._clearAdminState(ctx);
+                return this.processRetireNumber(ctx, ctx.message.text.trim());
+            }
+
+            // NEW: Custom broadcast filter
+            if (state === ADMIN_STATE.AWAITING_CUSTOM_BROADCAST_FILTER) {
+                this._clearAdminState(ctx);
+                return this.executeBroadcast(ctx, {}, 'Custom Filter', ctx.message.text);
+            }
+
+            return next();
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  SYSTEM STATS HELPER
+    // ═══════════════════════════════════════════════════════════
+
+    async getSystemStats() {
+        try {
+            const now = new Date();
+            const dayAgo = new Date(now - 24 * 60 * 60 * 1000);
+            const weekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
+            const monthAgo = new Date(now - 30 * 24 * 60 * 60 * 1000);
+
+            const [
+                revenue24h,
+                revenue7d,
+                revenue30d,
+                totalUsers,
+                payingUsers,
+                vipUsers,
+                activeToday,
+                otpRequests24h,
+                otpSuccess24h,
+                otpFailed24h,
+                totalNumbers,
+                availableNumbers,
+                assignedNumbers
+            ] = await Promise.all([
+                this.calculateRevenue(dayAgo),
+                this.calculateRevenue(weekAgo),
+                this.calculateRevenue(monthAgo),
+                User.countDocuments(),
+                User.countDocuments({ balance: { $gt: 0 } }),
+                User.countDocuments({ vipExpiry: { $gt: now } }),
+                User.countDocuments({ lastActive: { $gte: dayAgo } }),
+                Session.countDocuments({ startTime: { $gte: dayAgo } }),
+                Session.countDocuments({ status: 'RECEIVED', startTime: { $gte: dayAgo } }),
+                Session.countDocuments({ status: { $in: ['TIMEOUT', 'CANCELLED', 'FAILED'] }, startTime: { $gte: dayAgo } }),
+                NumberModel?.countDocuments?.() || Promise.resolve(0),
+                NumberModel?.countDocuments?.({ status: NUMBER_STATUS.AVAILABLE }) || Promise.resolve(0),
+                NumberModel?.countDocuments?.({ status: NUMBER_STATUS.ASSIGNED }) || Promise.resolve(0)
+            ]);
+
+            const successRate24h = otpRequests24h > 0 ? ((otpSuccess24h / otpRequests24h) * 100).toFixed(1) : 0;
+
+            let masterBalance = 0;
+            try {
+                if (this.walletService?.getMasterBalance) {
+                    const bal = await this.walletService.getMasterBalance();
+                    masterBalance = typeof bal?.usdt === 'number' ? bal.usdt : 0;
+                }
+            } catch (error) {
+                logger.warn('Failed to get master balance for stats', { error: error.message });
+            }
+
+            const uptime = process.uptime();
+            const hours = Math.floor(uptime / 3600);
+            const mins = Math.floor((uptime % 3600) / 60);
+
+            return {
+                revenue24h,
+                revenue7d,
+                revenue30d,
+                totalUsers,
+                payingUsers,
+                vipUsers,
+                activeToday,
+                otpRequests24h,
+                otpSuccess24h,
+                otpFailed24h,
+                successRate24h,
+                masterBalance,
+                uptime: `${hours}h ${mins}m`,
+                totalNumbers,
+                availableNumbers,
+                assignedNumbers
+            };
+        } catch (error) {
+            logger.error('Get system stats error', { error: error.message, stack: error.stack });
+            return {
+                revenue24h: 0, revenue7d: 0, revenue30d: 0,
+                totalUsers: 0, payingUsers: 0, vipUsers: 0, activeToday: 0,
+                otpRequests24h: 0, otpSuccess24h: 0, otpFailed24h: 0,
+                successRate24h: 0, masterBalance: 0, uptime: '0h 0m',
+                totalNumbers: 0, availableNumbers: 0, assignedNumbers: 0
+            };
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  REVENUE CALCULATOR
+    // ═══════════════════════════════════════════════════════════
+
+    async calculateRevenue(since) {
+        try {
+            const result = await Transaction.aggregate([
+                {
+                    $match: {
+                        type: { $in: [TX_TYPES.CHEAP_OTP, TX_TYPES.BUNDLE_PURCHASE, TX_TYPES.VIP_SUBSCRIPTION, TX_TYPES.POOL_PURCHASE] },
+                        status: 'COMPLETED',
+                        createdAt: { $gte: since }
+                    }
+                },
+                {
+                    $group: {
+                        _id: null,
+                        total: { $sum: { $abs: '$amount' } }
+                    }
+                }
+            ]);
+            return result[0]?.total || 0;
+        } catch (error) {
+            logger.error('Calculate revenue error', { error: error.message, since });
+            return 0;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  DASHBOARD (Updated with new feature buttons)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleAdmin(ctx) {
+        try {
+            if (!this._checkCooldown(ctx.from.id, 'admin', 3000)) {
+                return ctx.answerCbQuery?.('Please wait...').catch(() => {});
+            }
+
+            const stats = await this.getSystemStats();
+
+            const message = `
+<b>🔐 Admin Dashboard</b>
+
+<b>📊 Revenue</b>
+• 24h: <code>${formatCurrency(stats.revenue24h)}</code>
+• 7d: <code>${formatCurrency(stats.revenue7d)}</code>
+• 30d: <code>${formatCurrency(stats.revenue30d)}</code>
+
+<b>👥 Users</b>
+• Total: <code>${stats.totalUsers}</code>
+• Paying: <code>${stats.payingUsers}</code>
+• VIP: <code>${stats.vipUsers}</code>
+• Active Today: <code>${stats.activeToday}</code>
+
+<b>📈 OTP Stats (24h)</b>
+• Requests: <code>${stats.otpRequests24h}</code>
+• Success: <code>${stats.otpSuccess24h}</code> (${stats.successRate24h}%)
+• Failed: <code>${stats.otpFailed24h}</code>
+
+<b>📦 Number Pool</b>
+• Total: <code>${stats.totalNumbers}</code>
+• Available: <code>${stats.availableNumbers}</code>
+• Assigned: <code>${stats.assignedNumbers}</code>
+
+<b>⚡ System</b>
+• Master Balance: <code>${formatCurrency(stats.masterBalance)}</code>
+• Uptime: <code>${stats.uptime}</code>
+• Maintenance: <code>${config.maintenance ? '🔴 ON' : '🟢 OFF'}</code>
+            `;
+
+            const keyboard = Markup.inlineKeyboard([
+                [
+                    Markup.button.callback('👥 Users', 'admin_users'),
+                    Markup.button.callback('💰 Profits', 'admin_profits')
+                ],
+                [
+                    Markup.button.callback('⚙️ System', 'admin_system'),
+                    Markup.button.callback('📋 Logs', 'admin_logs')
+                ],
+                [
+                    Markup.button.callback('📢 Broadcast', 'admin_broadcast'),
+                    Markup.button.callback('🔧 Settings', 'admin_settings')
+                ],
+                [
+                    Markup.button.callback('🔍 Search', 'admin_search'),
+                    Markup.button.callback('🏆 Top Users', 'admin_topusers')
+                ],
+                [
+                    Markup.button.callback('📊 Daily Report', 'admin_dailyreport'),
+                    Markup.button.callback('🔄 Reset Free', 'admin_resetfree')
+                ],
+                [
+                    Markup.button.callback('👑 Give VIP', 'admin_givevip'),
+                    Markup.button.callback('❌ Cancel VIP', 'admin_cancelvip')
+                ],
+                [
+                    Markup.button.callback('📦 Pool', 'admin_pool'),
+                    Markup.button.callback('💰 Bundle Prices', 'admin_bundleprices')
+                ],
+                [
+                    Markup.button.callback('📱 Numbers', 'admin_numberinventory'),
+                    Markup.button.callback('📊 Analytics', 'admin_analytics')
+                ],
+                [
+                    Markup.button.callback('⚡ Bulk Actions', 'admin_bulkactions')
+                ]
+            ]);
+
+            await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+        } catch (error) {
+            logger.error('Admin dashboard error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to load admin dashboard.</b>\n\nPlease check the logs for details.');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  POOL MANAGEMENT
+    // ═══════════════════════════════════════════════════════════
+
+    async handlePoolMenu(ctx) {
+        try {
+            const stats = this.smsProviderManager?.getPoolStats?.() || { available: false, pools: {} };
+            
+            let poolSummary = '';
+            if (stats.pools) {
+                for (const [country, data] of Object.entries(stats.pools)) {
+                    poolSummary += `• ${country}: <code>${data.available || 0}</code> avail / <code>${data.active || 0}</code> act\n`;
+                }
+            }
+
+            const message = `
+<b>📦 Number Pool Management</b>
+
+<b>Quick Stats:</b>
+${poolSummary || '<i>No pool data</i>'}
+
+Manage your Twilio/Telnyx number pool:
+            `;
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('🛒 Buy Numbers', 'pool_buy_numbers')],
+                [Markup.button.callback('📊 Pool Monitor', 'pool_monitor')],
+                [Markup.button.callback('👥 VIP Users', 'pool_vip_users')],
+                [Markup.button.callback('🗑 Retire Numbers', 'pool_retire')],
+                [Markup.button.callback('🔙 Back', 'admin')]
+            ]);
+
+            await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+        } catch (error) {
+            logger.error('Pool menu error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load pool menu.</b>');
+        }
+    }
+
+    async handlePoolBuyMenu(ctx) {
+        if (!this.smsProviderManager?.numberPool) {
+            return this.replyError(ctx, '❌ <b>Pool not available.</b>\n\nNumber pool is not configured.');
+        }
+
+        const message = `
+<b>🛒 Buy Numbers for Pool</b>
+
+Select provider:
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🏢 Twilio', 'pool_provider_twilio')],
+            [Markup.button.callback('🏢 Telnyx', 'pool_provider_telnyx')],
+            [Markup.button.callback('🎲 Any Available', 'pool_provider_any')],
+            [Markup.button.callback('🔙 Back', 'admin_pool')]
+        ]);
+
+        await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async handlePoolProviderSelect(ctx, provider) {
+        ctx.session = ctx.session || {};
+        ctx.session.poolPurchase = { preferredProvider: provider };
+        this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_COUNTRY, { provider });
+        
+        const message = `
+<b>🛒 Buy Numbers — ${provider || 'Any Provider'}</b>
+
+Send the country code (2 letters):
+<code>US</code>, <code>GB</code>, <code>CA</code>, etc.
+        `;
+
+        await this.replySuccess(ctx, message, {
+            reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback('❌ Cancel', 'admin_pool')]
+            ]).reply_markup
+        });
+    }
+
+    async handlePoolCountrySelect(ctx, country) {
+        ctx.session.poolPurchase = { ...ctx.session.poolPurchase, country };
+        this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_QTY, { country });
+        
+        const message = `
+<b>🛒 Buy Numbers — ${country}</b>
+
+Select quantity or send custom:
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('1', 'pool_qty_1'), Markup.button.callback('5', 'pool_qty_5'), Markup.button.callback('10', 'pool_qty_10')],
+            [Markup.button.callback('20', 'pool_qty_20'), Markup.button.callback('50', 'pool_qty_50')],
+            [Markup.button.callback('❌ Cancel', 'admin_pool')]
+        ]);
+
+        await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async handlePoolQuantitySelect(ctx, qty) {
+        ctx.session.poolPurchase = { ...ctx.session.poolPurchase, quantity: qty };
+        return this.showPoolPurchaseConfirm(ctx);
+    }
+
+    async showPoolPurchaseConfirm(ctx) {
+        const purchase = ctx.session.poolPurchase;
+        if (!purchase?.country || !purchase?.quantity) {
+            return this.replyError(ctx, '❌ <b>Invalid purchase data.</b>\n\nPlease start over.');
+        }
+
+        const message = `
+<b>✅ Confirm Pool Purchase</b>
+
+🌍 Country: <code>${purchase.country}</code>
+📦 Quantity: <code>${purchase.quantity}</code>
+🏢 Provider: <code>${purchase.preferredProvider || 'Any'}</code>
+
+Proceed with purchase?
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Confirm Purchase', 'confirm_pool_purchase')],
+            [Markup.button.callback('❌ Cancel', 'admin_pool')]
+        ]);
+
+        await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async executePoolPurchase(ctx) {
+        const purchase = ctx.session?.poolPurchase;
+        if (!purchase) {
+            return this.replyError(ctx, '❌ <b>Session expired.</b>\n\nPlease start over.');
+        }
+
+        try {
+            const result = await this.smsProviderManager.buyPoolNumbers(
+                purchase.country,
+                purchase.quantity,
+                purchase.preferredProvider
+            );
+
+            ctx.session.poolPurchase = null;
+
+            if (result.purchased?.length > 0) {
+                // Store purchased numbers in NumberModel
+                for (const num of result.purchased) {
+                    try {
+                        await NumberModel.create({
+                            numberId: generateId(),
+                            phoneNumber: num.phoneNumber,
+                            provider: num.provider,
+                            country: purchase.country,
+                            status: NUMBER_STATUS.AVAILABLE,
+                            purchasedAt: new Date(),
+                            cost: num.cost || 0,
+                            metadata: num
+                        });
+                    } catch (dbError) {
+                        logger.warn('Failed to store number in DB', { phone: num.phoneNumber, error: dbError.message });
+                    }
+                }
+
+                const numbersList = result.purchased.map(n => 
+                    `• <code>${n.phoneNumber}</code> (${n.provider})`
+                ).join('\n');
+
+                const message = `
+<b>✅ Pool Purchase Complete!</b>
+
+🌍 Country: <code>${purchase.country}</code>
+📦 Purchased: <code>${result.purchased.length}</code> numbers
+❌ Failed: <code>${result.failed || 0}</code>
+💰 Total Cost: <code>${formatCurrency(result.totalCost || 0)}</code>
+
+<b>Numbers:</b>
+${numbersList}
+                `;
+
+                await this.replySuccess(ctx, message, {
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🛒 Buy More', 'pool_buy_numbers')],
+                        [Markup.button.callback('📊 Pool Monitor', 'pool_monitor')],
+                        [Markup.button.callback('🔙 Back', 'admin_pool')]
+                    ]).reply_markup
+                });
+
+                await this.logAdminAction(
+                    ctx.from.id.toString(),
+                    'POOL_PURCHASE',
+                    null,
+                    { country: purchase.country, quantity: purchase.quantity, purchased: result.purchased.length }
+                );
+            } else {
+                await this.replyError(ctx, 
+                    `❌ <b>Purchase Failed</b>\n\nNo numbers were purchased.\nError: ${result.errors?.[0]?.error || 'Unknown error'}`, {
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('🔄 Retry', 'pool_buy_numbers')],
+                            [Markup.button.callback('🔙 Back', 'admin_pool')]
+                        ]).reply_markup
+                    });
+            }
+        } catch (error) {
+            logger.error('Pool purchase failed', { error: error.message, purchase });
+            await this.replyError(ctx, `❌ <b>Purchase Failed:</b> ${error.message}`, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Retry', 'pool_buy_nu
 
 
 
