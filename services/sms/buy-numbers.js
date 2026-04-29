@@ -119,6 +119,7 @@ class NumberBuyer {
 
             } catch (error) {
                 const isRateLimit = this._isRateLimitError(error);
+                const isInventory = this._isInventoryError(error);
                 const isLastAttempt = attempt === maxRetries;
 
                 logger.error('Purchase attempt failed', {
@@ -126,8 +127,20 @@ class NumberBuyer {
                     attempt: attempt + 1,
                     maxRetries: maxRetries + 1,
                     isRateLimit,
+                    isInventory,
                     error: error.message
                 });
+
+                // INVENTORY ERROR: Don't retry — stock won't appear instantly
+                if (isInventory) {
+                    return {
+                        success: false,
+                        error: error.message,
+                        country,
+                        attempts: attempt + 1,
+                        isInventoryError: true
+                    };
+                }
 
                 if (isLastAttempt) {
                     return {
@@ -338,8 +351,6 @@ class NumberBuyer {
         const msg = error.message?.toLowerCase() || '';
         const code = error.code;
 
-        // Twilio: 20429, 429
-        // Telnyx: 429, "rate limit", "too many requests"
         return (
             code === 20429 ||
             code === 429 ||
@@ -350,10 +361,24 @@ class NumberBuyer {
         );
     }
 
+    _isInventoryError(error) {
+        if (!error?.message) return false;
+        const msg = error.message.toLowerCase();
+        return (
+            msg.includes('no numbers available') ||
+            msg.includes('no available numbers') ||
+            msg.includes('telnyx_no_numbers') ||
+            msg.includes('not available in') ||
+            msg.includes('out of stock') ||
+            msg.includes('exhausted') ||
+            msg.includes('no numbers') ||
+            msg.includes('not available')
+        );
+    }
+
     _calculateBackoff(attemptIndex) {
-        // Exponential: 1s, 2s, 4s, 8s... capped at maxBackoffMs
         const base = 1000 * (2 ** attemptIndex);
-        const jitter = Math.floor(Math.random() * 500); // 0-499ms jitter
+        const jitter = Math.floor(Math.random() * 500);
         return Math.min(base + jitter, this.maxBackoffMs);
     }
 
@@ -401,4 +426,4 @@ export async function buyNumbers(configs, globalOptions = {}) {
 
 export { NumberBuyer };
 export default NumberBuyer;
-                        
+            
