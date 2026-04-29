@@ -3,7 +3,6 @@ import TelnyxProvider from './TelnyxProvider.js';
 import CheapPanelProvider from './CheapPanelProvider.js';
 import FreeProvider from './FreeProvider.js';
 import NumberPoolManager from './NumberPoolManager.js';
-import { purchaseNumbersBatch, disconnectBuyer } from './buy-numbers.js';
 import logger from '../../utils/logger.js';
 
 class SMSProviderManager {
@@ -119,6 +118,8 @@ class SMSProviderManager {
     }
 
     async finishNumber(providerName, identifier) {
+        if (!this.isInitialized) await this.initialize();
+
         const provider = this.providers.get(providerName);
         if (provider && provider.finishNumber) {
             return provider.finishNumber(identifier);
@@ -126,19 +127,16 @@ class SMSProviderManager {
         return { success: true };
     }
 
-    async buyPoolNumbers(config = {}) {
+    async buyPoolNumbers(country = 'US', quantity = 1) {
         if (!this.numberPool) {
             throw new Error('Number pool not available — Twilio not configured');
         }
 
         if (!this.isInitialized) await this.initialize();
 
-        const result = await purchaseNumbersBatch({
-            ...config,
-            poolManager: this.numberPool
-        });
+        const result = await this.numberPool.buyNewNumber(country, quantity);
 
-        if (result.success) {
+        if (result.purchased?.length > 0) {
             await this.numberPool.initialize();
         }
 
@@ -176,19 +174,27 @@ class SMSProviderManager {
     }
 
     async shutdown() {
-        this.providers.forEach(provider => {
-            if (provider.stopCleanupJob) provider.stopCleanupJob();
-        });
-
-        if (this.numberPool) {
-            this.numberPool.stopCleanupJob();
+        for (const provider of this.providers.values()) {
+            if (provider.stopCleanupJob) {
+                try {
+                    provider.stopCleanupJob();
+                } catch (e) {
+                    logger.warn(`Provider ${provider.name} cleanup failed`, { error: e.message });
+                }
+            }
         }
 
-        await disconnectBuyer();
+        if (this.numberPool) {
+            try {
+                this.numberPool.stopCleanupJob();
+            } catch (e) {
+                logger.warn('Pool cleanup failed', { error: e.message });
+            }
+        }
 
         logger.info('SMS Provider Manager shut down');
     }
 }
 
 export default SMSProviderManager;
-        
+            
