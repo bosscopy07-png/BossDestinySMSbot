@@ -2866,4 +2866,504 @@ To withdraw, send USDT from your master wallet manually or use your wallet app.
 
 <b>📊 Memory:</b>
 • Used: <code>${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB</code>
-• Total: <code>${(p
+• Total: <code>${(process.memoryUsage().heapTotal / 1024 / 1024).toFixed(2)} MB</code>
+• RSS: <code>${(process.memoryUsage().rss / 1024 / 1024).toFixed(2)} MB</code>
+
+<b>🔧 Node.js:</b> <code>${process.version}</code>
+            `;
+
+            await this.replySuccess(ctx, message, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔙 Back', 'admin')]
+                ]).reply_markup
+            });
+        } catch (error) {
+            logger.error('System status error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to load system status.</b>');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ADMIN LOGS
+    // ═══════════════════════════════════════════════════════════
+
+    async handleLogs(ctx) {
+        try {
+            const logs = await AdminLog.find()
+                .sort({ timestamp: -1 })
+                .limit(20)
+                .lean();
+
+            let message = '<b>📋 Admin Logs</b> (Last 20)\n\n';
+
+            if (logs.length === 0) {
+                message += '<i>No logs yet.</i>';
+            } else {
+                for (const log of logs) {
+                    const time = log.timestamp ? new Date(log.timestamp).toLocaleString() : 'N/A';
+                    const details = JSON.stringify(log.details || {}).substring(0, 100);
+                    message += `<b>[${time}]</b>\n`;
+                    message += `👤 <code>${log.adminId}</code> → <b>${log.action}</b>\n`;
+                    message += `🎯 ${log.targetUserId ? `<code>${log.targetUserId}</code>` : 'N/A'}\n`;
+                    message += `📄 <code>${details}</code>\n\n`;
+                }
+            }
+
+            await this.replySuccess(ctx, message, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Refresh', 'admin_logs')],
+                    [Markup.button.callback('🔙 Back', 'admin')]
+                ]).reply_markup
+            });
+        } catch (error) {
+            logger.error('Logs error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load logs.</b>');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  BROADCAST (Fixed Flow)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleBroadcastCommand(ctx) {
+        const args = ctx.message.text.split(' ').slice(1);
+        const message = args.join(' ');
+
+        if (!message) {
+            return this.handleBroadcastMenu(ctx);
+        }
+
+        // Direct broadcast to all users
+        await this.executeBroadcast(ctx, {}, 'All Users', message);
+    }
+
+    async handleBroadcastMenu(ctx) {
+        try {
+            const stats = await this.getBroadcastStats();
+
+            await this.replySuccess(ctx, `
+<b>📢 Broadcast Menu</b>
+
+<b>👥 Audience Stats:</b>
+• Total Users: <code>${stats.total}</code>
+• VIP Users: <code>${stats.vip}</code>
+• Paying Users: <code>${stats.paying}</code>
+• Recent (7d): <code>${stats.recent}</code>
+
+<i>Select target audience or type /broadcast &lt;message&gt; to send to all immediately.</i>
+            `, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('📨 All Users', 'broadcast_all')],
+                    [Markup.button.callback('👑 VIP Only', 'broadcast_vip')],
+                    [Markup.button.callback('💰 Paying Users', 'broadcast_paying')],
+                    [Markup.button.callback('🆕 Recent (7d)', 'broadcast_recent')],
+                    [Markup.button.callback('🎯 Custom', 'broadcast_custom')],
+                    [Markup.button.callback('❌ Cancel', 'broadcast_cancel')],
+                    [Markup.button.callback('🔙 Back', 'admin')]
+                ]).reply_markup
+            });
+        } catch (error) {
+            logger.error('Broadcast menu error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load broadcast menu.</b>');
+        }
+    }
+
+    async getBroadcastStats() {
+        const now = new Date();
+        const weekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
+
+        const [total, vip, paying, recent] = await Promise.all([
+            User.countDocuments({ isBlacklisted: false }),
+            User.countDocuments({ isBlacklisted: false, vipExpiry: { $gt: now } }),
+            User.countDocuments({ isBlacklisted: false, balance: { $gt: 0 } }),
+            User.countDocuments({ isBlacklisted: false, createdAt: { $gte: weekAgo } })
+        ]);
+
+        return { total, vip, paying, recent };
+    }
+
+    async executeBroadcast(ctx, filter, label, forcedMessage = null) {
+        try {
+            // If no message provided, ask admin to type it
+            if (!forcedMessage) {
+                this._ensureSession(ctx);
+                ctx.session.awaitingBroadcast = { target: label, filter, label };
+                return this.replySuccess(ctx, `
+<b>📢 Broadcast to ${label}</b>
+
+Send the message you want to broadcast to <code>${label}</code>.
+
+<i>Type your message and send it. It will be delivered to all matching users.</i>
+                `);
+            }
+
+            // Acknowledge callback if present
+            if (ctx.callbackQuery && ctx.answerCbQuery) {
+                await ctx.answerCbQuery(`Broadcasting to ${label}...`).catch(() => {});
+            }
+
+            const query = { isBlacklisted: false, ...filter };
+            const users = await User.find(query).select('userId').lean();
+            const results = { sent: 0, failed: 0, total: users.length };
+            const batchSize = 30;
+
+            logger.info('Broadcast started', { targetCount: users.length, label, filter });
+
+            for (let i = 0; i < users.length; i += batchSize) {
+                const batch = users.slice(i, i + batchSize);
+
+                await Promise.all(batch.map(async (user) => {
+                    try {
+                        await ctx.telegram.sendMessage(user.userId, `
+<b>📢 ${label}</b>
+
+${forcedMessage}
+
+---
+<i>OTP Bot Team</i>
+                        `, { parse_mode: 'HTML', disable_notification: false });
+                        results.sent++;
+                    } catch (error) {
+                        results.failed++;
+                        if (error.response?.error_code === 403) {
+                            // User blocked bot
+                            await User.updateOne(
+                                { userId: user.userId },
+                                { $set: { blockedBot: true, isBlacklisted: true } }
+                            ).catch(() => {});
+                        }
+                        logger.warn('Broadcast failed for user', { userId: user.userId, error: error.message });
+                    }
+                }));
+
+                // Rate limit protection between batches
+                if (i + batchSize < users.length) {
+                    await new Promise(r => setTimeout(r, 1000));
+                }
+
+                // Progress update every 5 batches (FIXED: i > 0 check)
+                if (i > 0 && (i / batchSize) % 5 === 0) {
+                    await ctx.reply(`⏳ Broadcast progress: ${results.sent}/${results.total} sent...`).catch(() => {});
+                }
+            }
+
+            logger.info('Broadcast completed', results);
+
+            await this.replySuccess(ctx, `
+<b>📢 Broadcast Complete!</b>
+
+<b>Target:</b> <code>${label}</code>
+<b>Total:</b> <code>${results.total}</code>
+<b>✅ Sent:</b> <code>${results.sent}</code>
+<b>❌ Failed:</b> <code>${results.failed}</code>
+<b>Success Rate:</b> <code>${results.total > 0 ? ((results.sent / results.total) * 100).toFixed(1) : 0}%</code>
+            `);
+
+        } catch (error) {
+            logger.error('Broadcast execution error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Broadcast failed.</b>\n\nPlease check the logs.');
+        }
+    }
+
+    async handleBroadcastAll(ctx) {
+        await this.executeBroadcast(ctx, {}, 'All Users');
+    }
+
+    async handleBroadcastVip(ctx) {
+        const now = new Date();
+        await this.executeBroadcast(ctx, { vipExpiry: { $gt: now } }, 'VIP Users');
+    }
+
+    async handleBroadcastPaying(ctx) {
+        await this.executeBroadcast(ctx, { balance: { $gt: 0 } }, 'Paying Users');
+    }
+
+    async handleBroadcastRecent(ctx) {
+        const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        await this.executeBroadcast(ctx, { createdAt: { $gte: weekAgo } }, 'Recent Users');
+    }
+
+    async handleBroadcastCustom(ctx) {
+        this._setAdminState(ctx, ADMIN_STATE.AWAITING_CUSTOM_BROADCAST_FILTER, {});
+        await this.replySuccess(ctx, `
+<b>🎯 Custom Broadcast</b>
+
+Send a MongoDB-style filter query as text.
+
+<i>Example: <code>{"balance": {"$gt": 10}}</code></i>
+
+Or just send a message to broadcast to all users with custom text.
+        `);
+    }
+
+    async handleBroadcastCancel(ctx) {
+        if (ctx.session) {
+            delete ctx.session.awaitingBroadcast;
+        }
+        if (ctx.answerCbQuery) await ctx.answerCbQuery('Cancelled').catch(() => {});
+        await this.replySuccess(ctx, '❌ <b>Broadcast cancelled.</b>');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  REFERRAL MANAGEMENT
+    // ═══════════════════════════════════════════════════════════
+
+    async handleApproveReferral(ctx) {
+        try {
+            const args = ctx.message.text.split(' ');
+            if (args.length < 2) {
+                return this.replyError(ctx, '❌ <b>Usage:</b> <code>/approve_referral &lt;tx_id&gt;</code>');
+            }
+
+            const txId = args[1];
+            const tx = await Transaction.findOne({ txId, type: TX_TYPES.REFERRAL_REWARD, status: 'PENDING' });
+
+            if (!tx) {
+                return this.replyError(ctx, '❌ <b>Referral transaction not found or already processed.</b>');
+            }
+
+            await User.updateOne(
+                { userId: tx.userId },
+                { $inc: { balance: tx.amount, referralRewardsPending: -tx.amount } }
+            );
+
+            await Transaction.updateOne(
+                { txId },
+                {
+                    $set: {
+                        status: 'COMPLETED',
+                        approvedBy: ctx.from.id.toString(),
+                        approvedAt: new Date()
+                    }
+                }
+            );
+
+            await this.replySuccess(ctx, `✅ <b>Referral Reward Approved!</b>\n\nAmount: <code>${formatCurrency(tx.amount)}</code>\nUser: <code>${tx.userId}</code>`);
+
+            // Notify user
+            await ctx.telegram.sendMessage(tx.userId, `
+<b>🎁 Referral Reward Approved!</b>
+
+Amount: <code>${formatCurrency(tx.amount)}</code>
+Status: <b>Credited to your balance</b>
+
+Thank you for referring users!
+            `, { parse_mode: 'HTML' }).catch(() => {});
+
+            await this.logAdminAction(ctx.from.id.toString(), 'APPROVE_REFERRAL', tx.userId, { txId, amount: tx.amount });
+
+        } catch (error) {
+            logger.error('Approve referral error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to approve referral.</b>');
+        }
+    }
+
+    async handleRejectReferral(ctx) {
+        try {
+            const args = ctx.message.text.split(' ');
+            if (args.length < 2) {
+                return this.replyError(ctx, '❌ <b>Usage:</b> <code>/reject_referral &lt;tx_id&gt; [reason]</code>');
+            }
+
+            const txId = args[1];
+            const reason = args.slice(2).join(' ') || 'Rejected by admin';
+
+            const tx = await Transaction.findOne({ txId, type: TX_TYPES.REFERRAL_REWARD, status: 'PENDING' });
+            if (!tx) {
+                return this.replyError(ctx, '❌ <b>Referral transaction not found or already processed.</b>');
+            }
+
+            await Transaction.updateOne(
+                { txId },
+                {
+                    $set: {
+                        status: 'REJECTED',
+                        rejectedBy: ctx.from.id.toString(),
+                        rejectedAt: new Date(),
+                        rejectionReason: reason
+                    }
+                }
+            );
+
+            await User.updateOne(
+                { userId: tx.userId },
+                { $inc: { referralRewardsPending: -tx.amount } }
+            );
+
+            await this.replySuccess(ctx, `❌ <b>Referral Reward Rejected</b>\n\nTxID: <code>${txId}</code>\nReason: <i>${reason}</i>`);
+
+            // Notify user
+            await ctx.telegram.sendMessage(tx.userId, `
+<b>❌ Referral Reward Rejected</b>
+
+Amount: <code>${formatCurrency(tx.amount)}</code>
+Reason: <i>${reason}</i>
+
+Contact support if you have questions.
+            `, { parse_mode: 'HTML' }).catch(() => {});
+
+            await this.logAdminAction(ctx.from.id.toString(), 'REJECT_REFERRAL', tx.userId, { txId, reason });
+
+        } catch (error) {
+            logger.error('Reject referral error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to reject referral.</b>');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  MASTER BALANCE
+    // ═══════════════════════════════════════════════════════════
+
+    async handleMasterBalance(ctx) {
+        try {
+            let balance = { usdt: 'N/A', bnb: 'N/A' };
+            let address = 'N/A';
+
+            try {
+                if (this.walletService?.getMasterBalance) {
+                    balance = await this.walletService.getMasterBalance();
+                }
+                if (this.walletService?.getMasterAddress) {
+                    address = await this.walletService.getMasterAddress();
+                }
+            } catch (error) {
+                logger.warn('Failed to get master balance', { error: error.message });
+            }
+
+            await this.replySuccess(ctx, `
+<b>💎 Master Wallet Balance</b>
+
+<b>Address:</b> <code>${address}</code>
+
+<b>USDT:</b> <code>${balance.usdt}</code>
+<b>BNB:</b> <code>${balance.bnb}</code>
+
+<i>This is your revenue wallet.</i>
+            `);
+        } catch (error) {
+            logger.error('Master balance error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to get master balance.</b>');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  SETTINGS (with DB Persistence)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleSettings(ctx) {
+        try {
+            const settings = await this.getCurrentSettings();
+
+            const message = `
+<b>🔧 Admin Settings</b>
+
+<b>💰 OTP Prices:</b>
+• Cheap OTP: <code>${formatCurrency(settings.cheapOtpPrice)}</code>
+• VIP OTP: <code>${formatCurrency(settings.vipOtpPrice)}</code>
+
+<b>👑 VIP Subscription:</b>
+• Price: <code>${formatCurrency(settings.vipPrice)}</code>
+• Duration: <code>${settings.vipDuration}</code> days
+
+<b>🆓 Free Limits:</b>
+• Daily: <code>${settings.freeDaily}</code> OTPs
+• Per Number: <code>${settings.freePerNumber}</code>
+
+<b>⚡ Providers:</b>
+• Twilio: ${settings.twilioEnabled ? '✅' : '❌'}
+• Telnyx: ${settings.telnyxEnabled ? '✅' : '❌'}
+• Cheap Panel: ${settings.cheapPanelEnabled ? '✅' : '❌'}
+• Free Public: ${settings.freePublicEnabled ? '✅' : '❌'}
+
+<b>📦 Pool:</b>
+• Auto-buy: ${settings.poolAutoBuy ? '✅' : '❌'}
+• Min stock: <code>${settings.poolMinStock}</code>
+
+<b>🛠 Maintenance:</b> ${settings.maintenanceMode ? '🔴 ON' : '🟢 OFF'}
+            `;
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('💰 OTP Prices', 'settings_prices')],
+                [Markup.button.callback('👑 VIP Config', 'settings_vip')],
+                [Markup.button.callback('🆓 Free Limits', 'settings_free')],
+                [Markup.button.callback('⚡ Providers', 'settings_providers')],
+                [Markup.button.callback('📦 Pool', 'settings_pool')],
+                [Markup.button.callback('🛠 Maintenance', 'settings_maintenance')],
+                [Markup.button.callback('🔙 Back', 'admin')]
+            ]);
+
+            await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+        } catch (error) {
+            logger.error('Settings error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to load settings.</b>');
+        }
+    }
+
+    async getCurrentSettings() {
+        return {
+            cheapOtpPrice: config.prices?.cheapOtp || 0.50,
+            vipOtpPrice: config.prices?.vipOtp || 0.30,
+            vipPrice: config.prices?.vipSubscription || 5.00,
+            vipDuration: config.prices?.vipDuration || 30,
+            freeDaily: config.limits?.freeDaily || 3,
+            freePerNumber: config.limits?.freePerNumber || 1,
+            twilioEnabled: config.providers?.twilio !== false,
+            telnyxEnabled: config.providers?.telnyx !== false,
+            cheapPanelEnabled: config.providers?.cheapPanel !== false,
+            freePublicEnabled: config.providers?.freePublic !== false,
+            poolAutoBuy: config.pool?.autoBuy !== false,
+            poolMinStock: config.pool?.minStock || 5,
+            maintenanceMode: config.maintenance || false
+        };
+    }
+
+    // ─── Settings Submenus ───
+
+    async handleSettingsPrices(ctx) {
+        const currentCheap = formatCurrency(config.prices?.cheapOtp || 0.50);
+        const currentVip = formatCurrency(config.prices?.vipOtp || 0.30);
+
+        const message = `
+<b>💰 Update OTP Prices</b>
+
+<b>Current:</b>
+• Cheap OTP: <code>${currentCheap}</code>
+• VIP OTP: <code>${currentVip}</code>
+
+<b>To update, use:</b>
+<code>/setprice cheap &lt;amount&gt;</code>
+<code>/setprice vip &lt;amount&gt;</code>
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'admin_settings')]
+        ]);
+
+        await this.editCaption(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async handleSettingsVip(ctx) {
+        const currentPrice = formatCurrency(config.prices?.vipSubscription || 5.00);
+        const currentDuration = config.prices?.vipDuration || 30;
+
+        const message = `
+<b>👑 VIP Configuration</b>
+
+<b>Current:</b>
+• Price: <code>${currentPrice}</code>
+• Duration: <code>${currentDuration}</code> days
+
+<b>To update, use:</b>
+<code>/setvip price &lt;amount&gt;</code>
+<code>/setvip days &lt;number&gt;</code>
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Back', 'admin_settings')]
+        ]);
+
+        await this.editCaption(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async handleSettingsFree(ctx) {
+        const currentDaily = conf
