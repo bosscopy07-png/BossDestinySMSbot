@@ -407,6 +407,447 @@ class AdminCommands {
             return this.executeResetFree(ctx, userId);
         });
 
-        // ─── Give VIP flow ───
-        this.bot.action('givevip_search', this.requireAdmin, (ctx) => {
-            this._setAdminState(ctx, ADMIN_ST
+                    // ─── Give VIP flow ───
+            this.bot.action('givevip_search', this.requireAdmin, (ctx) => {
+                this._setAdminState(ctx, ADMIN_STATE.AWAITING_GIVE_VIP_USER, { mode: 'search' });
+                return this.replySuccess(ctx, '👑 <b>Grant VIP</b>\n\nSend the user ID to grant VIP:');
+            });
+            this.bot.action('givevip_from_users', this.requireAdmin, (ctx) => {
+                this._setAdminState(ctx, ADMIN_STATE.AWAITING_GIVE_VIP_USER, { mode: 'from_list' });
+                return this.handleUsers(ctx);
+            });
+            this.bot.action('givevip_cancel', this.requireAdmin, (ctx) => {
+                this._clearAdminState(ctx);
+                return this.handleAdmin(ctx);
+            });
+            this.bot.action(/givevip_confirm_(.+)/, this.requireAdmin, (ctx) => {
+                const userId = ctx.match[1];
+                this._setAdminState(ctx, ADMIN_STATE.AWAITING_GIVE_VIP_DAYS, { userId });
+                return this.replySuccess(ctx, `👑 <b>Grant VIP to ${userId}</b>\n\nSend the number of days:`);
+            });
+
+            // ─── Quick action from user detail ───
+            this.bot.action(/quick_resetfree_(.+)/, this.requireAdmin, (ctx) => {
+                return this.executeResetFree(ctx, ctx.match[1]);
+            });
+            this.bot.action(/quick_givevip_(.+)/, this.requireAdmin, (ctx) => {
+                this._setAdminState(ctx, ADMIN_STATE.AWAITING_GIVE_VIP_DAYS, { userId: ctx.match[1] });
+                return this.replySuccess(ctx, `👑 <b>Grant VIP to ${ctx.match[1]}</b>\n\nSend the number of days:`);
+            });
+            
+            // NEW: Quick cancel VIP from user detail
+            this.bot.action(/quick_cancelvip_(.+)/, this.requireAdmin, (ctx) => {
+                return this.executeCancelVip(ctx, ctx.match[1]);
+            });
+        }
+
+        _registerTextHandlers() {
+            this.bot.on('text', async (ctx, next) => {
+                this._ensureSession(ctx);
+
+                const adminIds = (config.bot?.adminId || '')
+                    .toString()
+                    .split(',')
+                    .map(id => id.trim())
+                    .filter(Boolean);
+
+                if (!adminIds.includes(ctx.from.id.toString())) {
+                    return next();
+                }
+
+                const { state, data } = this._getAdminState(ctx);
+
+                // ─── Awaiting broadcast message ───
+                if (ctx.session.awaitingBroadcast) {
+                    const { target, filter, label } = ctx.session.awaitingBroadcast;
+                    delete ctx.session.awaitingBroadcast;
+                    this._clearAdminState(ctx);
+                    return this.executeBroadcast(ctx, filter, label, ctx.message.text);
+                }
+
+                // ─── Awaiting add balance amount ───
+                if (ctx.session.awaitingAddBalance) {
+                    const targetId = ctx.session.awaitingAddBalance;
+                    delete ctx.session.awaitingAddBalance;
+                    this._clearAdminState(ctx);
+                    const amount = parseFloat(ctx.message.text);
+                    if (isNaN(amount) || amount <= 0) {
+                        return this.replyError(ctx, '❌ <b>Invalid amount.</b>\n\nPlease send a valid positive number.');
+                    }
+                    return this.processAddBalance(ctx, targetId, amount, 'Admin credit via inline');
+                }
+
+                // ─── Awaiting deduct balance amount ───
+                if (ctx.session.awaitingDeductBalance) {
+                    const targetId = ctx.session.awaitingDeductBalance;
+                    delete ctx.session.awaitingDeductBalance;
+                    this._clearAdminState(ctx);
+                    const amount = parseFloat(ctx.message.text);
+                    if (isNaN(amount) || amount <= 0) {
+                        return this.replyError(ctx, '❌ <b>Invalid amount.</b>\n\nPlease send a valid positive number.');
+                    }
+                    return this.processDeductBalance(ctx, targetId, amount, 'Admin deduction via inline');
+                }
+
+                // ─── Awaiting blacklist reason ───
+                if (ctx.session.awaitingBlacklistReason) {
+                    const targetId = ctx.session.awaitingBlacklistReason;
+                    delete ctx.session.awaitingBlacklistReason;
+                    this._clearAdminState(ctx);
+                    const reason = ctx.message.text.trim().toLowerCase() === 'skip'
+                        ? 'Manual blacklist'
+                        : ctx.message.text.trim();
+                    return this.processBlacklist(ctx, targetId, reason);
+                }
+
+                // ─── Awaiting message to user ───
+                if (ctx.session.awaitingMessageUser) {
+                    const targetId = ctx.session.awaitingMessageUser;
+                    delete ctx.session.awaitingMessageUser;
+                    this._clearAdminState(ctx);
+                    return this.processMessageUser(ctx, targetId, ctx.message.text);
+                }
+
+                // ═══════════════════════════════════════════════════════
+                //  NEW FEATURE: BUTTON FLOW HANDLERS
+                // ═══════════════════════════════════════════════════════
+
+                // ─── Search query ───
+                if (state === ADMIN_STATE.AWAITING_SEARCH_QUERY) {
+                    this._clearAdminState(ctx);
+                    return this.executeSearch(ctx, ctx.message.text.trim(), data.mode);
+                }
+
+                // ─── Reset Free user ID ───
+                if (state === ADMIN_STATE.AWAITING_RESET_FREE_USER) {
+                    const userId = ctx.message.text.trim();
+                    this._clearAdminState(ctx);
+                    return this.showResetFreeConfirm(ctx, userId);
+                }
+
+                // ─── Give VIP user ID ───
+                if (state === ADMIN_STATE.AWAITING_GIVE_VIP_USER) {
+                    const userId = ctx.message.text.trim();
+                    this._clearAdminState(ctx);
+                    return this.showGiveVipDaysInput(ctx, userId);
+                }
+
+                // ─── Give VIP days ───
+                if (state === ADMIN_STATE.AWAITING_GIVE_VIP_DAYS) {
+                    const days = parseInt(ctx.message.text.trim());
+                    this._clearAdminState(ctx);
+                    if (isNaN(days) || days <= 0) {
+                        return this.replyError(ctx, '❌ <b>Invalid days.</b>\n\nMust be a positive integer.');
+                    }
+                    return this.executeGiveVip(ctx, data.userId, days);
+                }
+
+                // NEW: Pool purchase country
+                if (state === ADMIN_STATE.AWAITING_POOL_PURCHASE_COUNTRY) {
+                    const country = ctx.message.text.trim().toUpperCase();
+                    this._clearAdminState(ctx);
+                    if (country.length !== 2) {
+                        return this.replyError(ctx, '❌ <b>Invalid country code.</b>\n\nMust be 2 letters (e.g., US, GB, CA).');
+                    }
+                    ctx.session.poolPurchase = { ...ctx.session.poolPurchase, country };
+                    this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_QTY, { country });
+                    return this.replySuccess(ctx, 
+                        '📦 <b>Pool Purchase</b>\n\n' +
+                        `Country: <code>${country}</code>\n\n` +
+                        'Send quantity to purchase (1-50):'
+                    );
+                }
+
+                // NEW: Pool purchase quantity
+                if (state === ADMIN_STATE.AWAITING_POOL_PURCHASE_QTY) {
+                    const qty = parseInt(ctx.message.text.trim());
+                    this._clearAdminState(ctx);
+                    if (isNaN(qty) || qty < 1 || qty > 50) {
+                        return this.replyError(ctx, '❌ <b>Invalid quantity.</b>\n\nMust be 1-50.');
+                    }
+                    ctx.session.poolPurchase = { ...ctx.session.poolPurchase, quantity: qty };
+                    return this.showPoolPurchaseConfirm(ctx);
+                }
+
+                // NEW: Cancel VIP user ID
+                if (state === ADMIN_STATE.AWAITING_CANCEL_VIP_USER) {
+                    const userId = ctx.message.text.trim();
+                    this._clearAdminState(ctx);
+                    return this.showCancelVipConfirm(ctx, userId);
+                }
+
+                // NEW: Set bundle OTP prices
+                if (state === ADMIN_STATE.AWAITING_SET_BUNDLE_OTP_PRICE) {
+                    this._clearAdminState(ctx);
+                    return this.processSetBundleOtpPrices(ctx, ctx.message.text.trim());
+                }
+
+                // NEW: Set bundle pack price
+                if (state === ADMIN_STATE.AWAITING_SET_BUNDLE_PRICE) {
+                    this._clearAdminState(ctx);
+                    return this.processSetBundlePackPrice(ctx(ctx, ctx.message.text.trim());
+                }
+
+                return next();
+            });
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        //  SYSTEM STATS HELPER (NEW — fixes getSystemStats undefined)
+        // ═══════════════════════════════════════════════════════════
+
+        async getSystemStats() {
+            try {
+                const now = new Date();
+                const dayAgo = new Date(now - 24 * 60 * 60 * 1000);
+                const weekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
+                const monthAgo = new Date(now - 30 * 24 * 60 * 60 * 1000);
+
+                const [
+                    revenue24h,
+                    revenue7d,
+                    revenue30d,
+                    totalUsers,
+                    payingUsers,
+                    vipUsers,
+                    activeToday,
+                    otpRequests24h,
+                    otpSuccess24h,
+                    otpFailed24h
+                ] = await Promise.all([
+                    this.calculateRevenue(dayAgo),
+                    this.calculateRevenue(weekAgo),
+                    this.calculateRevenue(monthAgo),
+                    User.countDocuments(),
+                    User.countDocuments({ balance: { $gt: 0 } }),
+                    User.countDocuments({ vipExpiry: { $gt: now } }),
+                    User.countDocuments({ lastActive: { $gte: dayAgo } }),
+                    Session.countDocuments({ startTime: { $gte: dayAgo } }),
+                    Session.countDocuments({ status: 'RECEIVED', startTime: { $gte: dayAgo } }),
+                    Session.countDocuments({ status: { $in: ['TIMEOUT', 'CANCELLED', 'FAILED'] }, startTime: { $gte: dayAgo } })
+                ]);
+
+                const successRate24h = otpRequests24h > 0 ? ((otpSuccess24h / otpRequests24h) * 100).toFixed(1) : 0;
+
+                let masterBalance = 0;
+                try {
+                    if (this.walletService?.getMasterBalance) {
+                        const bal = await this.walletService.getMasterBalance();
+                        masterBalance = typeof bal?.usdt === 'number' ? bal.usdt : 0;
+                    }
+                } catch (error) {
+                    logger.warn('Failed to get master balance for stats', { error: error.message });
+                }
+
+                const uptime = process.uptime();
+                const hours = Math.floor(uptime / 3600);
+                const mins = Math.floor((uptime % 3600) / 60);
+
+                return {
+                    revenue24h,
+                    revenue7d,
+                    revenue30d,
+                    totalUsers,
+                    payingUsers,
+                    vipUsers,
+                    activeToday,
+                    otpRequests24h,
+                    otpSuccess24h,
+                    otpFailed24h,
+                    successRate24h,
+                    masterBalance,
+                    uptime: `${hours}h ${mins}m`
+                };
+            } catch (error) {
+                logger.error('Get system stats error', { error: error.message, stack: error.stack });
+                return {
+                    revenue24h: 0, revenue7d: 0, revenue30d: 0,
+                    totalUsers: 0, payingUsers: 0, vipUsers: 0, activeToday: 0,
+                    otpRequests24h: 0, otpSuccess24h: 0, otpFailed24h: 0,
+                    successRate24h: 0, masterBalance: 0, uptime: '0h 0m'
+                };
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        //  REVENUE CALCULATOR (NEW — fixes calculateRevenue undefined)
+        // ═══════════════════════════════════════════════════════════
+
+        async calculateRevenue(since) {
+            try {
+                const result = await Transaction.aggregate([
+                    {
+                        $match: {
+                            type: { $in: [TX_TYPES.CHEAP_OTP, TX_TYPES.BUNDLE_PURCHASE, TX_TYPES.VIP_SUBSCRIPTION] },
+                            status: 'COMPLETED',
+                            createdAt: { $gte: since }
+                        }
+                    },
+                    {
+                        $group: {
+                            _id: null,
+                            total: { $sum: { $abs: '$amount' } }
+                        }
+                    }
+                ]);
+                return result[0]?.total || 0;
+            } catch (error) {
+                logger.error('Calculate revenue error', { error: error.message, since });
+                return 0;
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        //  DASHBOARD (Updated with new feature buttons)
+        // ═══════════════════════════════════════════════════════════
+
+        async handleAdmin(ctx) {
+            try {
+                const stats = await this.getSystemStats();
+
+                const message = `
+<b>🔐 Admin Dashboard</b>
+
+<b>📊 Revenue</b>
+• 24h: <code>${formatCurrency(stats.revenue24h)}</code>
+• 7d: <code>${formatCurrency(stats.revenue7d)}</code>
+• 30d: <code>${formatCurrency(stats.revenue30d)}</code>
+
+<b>👥 Users</b>
+• Total: <code>${stats.totalUsers}</code>
+• Paying: <code>${stats.payingUsers}</code>
+• VIP: <code>${stats.vipUsers}</code>
+• Active Today: <code>${stats.activeToday}</code>
+
+<b>📈 OTP Stats (24h)</b>
+• Requests: <code>${stats.otpRequests24h}</code>
+• Success: <code>${stats.otpSuccess24h}</code> (${stats.successRate24h}%)
+• Failed: <code>${stats.otpFailed24h}</code>
+
+<b>⚡ System</b>
+• Master Balance: <code>${formatCurrency(stats.masterBalance)}</code>
+• Uptime: <code>${stats.uptime}</code>
+• Maintenance: <code>${config.maintenance ? '🔴 ON' : '🟢 OFF'}</code>
+                `;
+
+                const keyboard = Markup.inlineKeyboard([
+                    [
+                        Markup.button.callback('👥 Users', 'admin_users'),
+                        Markup.button.callback('💰 Profits', 'admin_profits')
+                    ],
+                    [
+                        Markup.button.callback('⚙️ System', 'admin_system'),
+                        Markup.button.callback('📋 Logs', 'admin_logs')
+                    ],
+                    [
+                        Markup.button.callback('📢 Broadcast', 'admin_broadcast'),
+                        Markup.button.callback('🔧 Settings', 'admin_settings')
+                    ],
+                    // ─── NEW FEATURE BUTTONS ───
+                    [
+                        Markup.button.callback('🔍 Search', 'admin_search'),
+                        Markup.button.callback('🏆 Top Users', 'admin_topusers')
+                    ],
+                    [
+                        Markup.button.callback('📊 Daily Report', 'admin_dailyreport'),
+                        Markup.button.callback('🔄 Reset Free', 'admin_resetfree')
+                    ],
+                    [
+                        Markup.button.callback('👑 Give VIP', 'admin_givevip')
+                    ],
+                    // NEW: Pool management
+                    [
+                        Markup.button.callback('📦 Pool', 'admin_pool'),
+                        Markup.button.callback('❌ Cancel VIP', 'admin_cancelvip')
+                    ],
+                    [
+                        Markup.button.callback('💰 Bundle Prices', 'admin_bundleprices')
+                    ]
+                ]);
+
+                await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+            } catch (error) {
+                logger.error('Admin dashboard error', { error: error.message, stack: error.stack });
+                await this.replyError(ctx, '❌ <b>Failed to load admin dashboard.</b>\n\nPlease check the logs for details.');
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        //  POOL MANAGEMENT (NEW)
+        // ═══════════════════════════════════════════════════════════
+
+        async handlePoolMenu(ctx) {
+            const message = `
+<b>📦 Number Pool Management</b>
+
+Manage your Twilio/Telnyx number pool:
+            `;
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('🛒 Buy Numbers', 'pool_buy_numbers')],
+                [Markup.button.callback('📊 Pool Monitor', 'pool_monitor')],
+                [Markup.button.callback('👥 VIP Users', 'pool_vip_users')],
+                [Markup.button.callback('🗑 Retire Numbers', 'pool_retire')],
+                [Markup.button.callback('🔙 Back', 'admin')]
+            ]);
+
+            await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+        }
+
+        async handlePoolBuyMenu(ctx) {
+            if (!this.smsProviderManager?.numberPool) {
+                return this.replyError(ctx, '❌ <b>Pool not available.</b>\n\nNumber pool is not configured.');
+            }
+
+            const message = `
+<b>🛒 Buy Numbers for Pool</b>
+
+Select provider:
+            `;
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('🏢 Twilio', 'pool_provider_twilio')],
+                [Markup.button.callback('🏢 Telnyx', 'pool_provider_telnyx')],
+                [Markup.button.callback('🎲 Any Available', 'pool_provider_any')],
+                [Markup.button.callback('🔙 Back', 'admin_pool')]
+            ]);
+
+            await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+        }
+
+        async handlePoolProviderSelect(ctx, provider) {
+            ctx.session = ctx.session || {};
+            ctx.session.poolPurchase = { preferredProvider: provider };
+            this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_COUNTRY, { provider });
+            
+            const message = `
+<b>🛒 Buy Numbers — ${provider || 'Any Provider'}</b>
+
+Send the country code (2 letters):
+<code>US</code>, <code>GB</code>, <code>CA</code>, etc.
+            `;
+
+            await this.replySuccess(ctx, message, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('❌ Cancel', 'admin_pool')]
+                ]).reply_markup
+            });
+        }
+
+        async handlePoolCountrySelect(ctx, country) {
+            ctx.session.poolPurchase = { ...ctx.session.poolPurchase, country };
+            this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_QTY, { country });
+            
+            const message = `
+<b>🛒 Buy Numbers — ${country}</b>
+
+Select quantity or send custom:
+            `;
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('1', 'pool_qty_1'), Markup.button.callback('5', 'pool_qty_5'), Markup.button.callback('10', 'pool_qty_10')],
+                [Markup.button.callback('20', 'pool_qty_20'), Markup.button.callback('50', 'pool_qty_50')],
+                [Markup.button.callback('❌ Cancel', 'admin_pool')]
+            ]);
+
+            await this.replySuccess(ctx, message, { reply_markup: keybo
