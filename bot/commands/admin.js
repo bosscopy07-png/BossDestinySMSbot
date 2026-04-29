@@ -834,20 +834,491 @@ Send the country code (2 letters):
             });
         }
 
-        async handlePoolCountrySelect(ctx, country) {
-            ctx.session.poolPurchase = { ...ctx.session.poolPurchase, country };
-            this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_QTY, { country });
-            
-            const message = `
+            async handlePoolCountrySelect(ctx, country) {
+        ctx.session.poolPurchase = { ...ctx.session.poolPurchase, country };
+        this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_QTY, { country });
+        
+        const message = `
 <b>🛒 Buy Numbers — ${country}</b>
 
 Select quantity or send custom:
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('1', 'pool_qty_1'), Markup.button.callback('5', 'pool_qty_5'), Markup.button.callback('10', 'pool_qty_10')],
+            [Markup.button.callback('20', 'pool_qty_20'), Markup.button.callback('50', 'pool_qty_50')],
+            [Markup.button.callback('❌ Cancel', 'admin_pool')]
+        ]);
+
+        await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async handlePoolQuantitySelect(ctx, qty) {
+        ctx.session.poolPurchase = { ...ctx.session.poolPurchase, quantity: qty };
+        return this.showPoolPurchaseConfirm(ctx);
+    }
+
+    async showPoolPurchaseConfirm(ctx) {
+        const purchase = ctx.session.poolPurchase;
+        if (!purchase?.country || !purchase?.quantity) {
+            return this.replyError(ctx, '❌ <b>Invalid purchase data.</b>\n\nPlease start over.');
+        }
+
+        const message = `
+<b>✅ Confirm Pool Purchase</b>
+
+🌍 Country: <code>${purchase.country}</code>
+📦 Quantity: <code>${purchase.quantity}</code>
+🏢 Provider: <code>${purchase.preferredProvider || 'Any'}</code>
+
+Proceed with purchase?
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Confirm Purchase', 'confirm_pool_purchase')],
+            [Markup.button.callback('❌ Cancel', 'admin_pool')]
+        ]);
+
+        await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async executePoolPurchase(ctx) {
+        const purchase = ctx.session?.poolPurchase;
+        if (!purchase) {
+            return this.replyError(ctx, '❌ <b>Session expired.</b>\n\nPlease start over.');
+        }
+
+        try {
+            const result = await this.smsProviderManager.buyPoolNumbers(
+                purchase.country,
+                purchase.quantity,
+                purchase.preferredProvider
+            );
+
+            ctx.session.poolPurchase = null;
+
+            if (result.purchased?.length > 0) {
+                const numbersList = result.purchased.map(n => 
+                    `• <code>${n.phoneNumber}</code> (${n.provider})`
+                ).join('\n');
+
+                const message = `
+<b>✅ Pool Purchase Complete!</b>
+
+🌍 Country: <code>${purchase.country}</code>
+📦 Purchased: <code>${result.purchased.length}</code> numbers
+❌ Failed: <code>${result.failed || 0}</code>
+💰 Total Cost: <code>${formatCurrency(result.totalCost || 0)}</code>
+
+<b>Numbers:</b>
+${numbersList}
+                `;
+
+                await this.replySuccess(ctx, message, {
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🛒 Buy More', 'pool_buy_numbers')],
+                        [Markup.button.callback('📊 Pool Monitor', 'pool_monitor')],
+                        [Markup.button.callback('🔙 Back', 'admin_pool')]
+                    ]).reply_markup
+                });
+
+                await this.logAdminAction(
+                    ctx.from.id.toString(),
+                    'POOL_PURCHASE',
+                    null,
+                    { country: purchase.country, quantity: purchase.quantity, purchased: result.purchased.length }
+                );
+            } else {
+                await this.replyError(ctx, 
+                    `❌ <b>Purchase Failed</b>\n\nNo numbers were purchased.\nError: ${result.errors?.[0]?.error || 'Unknown error'}`, {
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('🔄 Retry', 'pool_buy_numbers')],
+                            [Markup.button.callback('🔙 Back', 'admin_pool')]
+                        ]).reply_markup
+                    });
+            }
+        } catch (error) {
+            logger.error('Pool purchase failed', { error: error.message, purchase });
+            await this.replyError(ctx, `❌ <b>Purchase Failed:</b> ${error.message}`, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Retry', 'pool_buy_numbers')],
+                    [Markup.button.callback('🔙 Back', 'admin_pool')]
+                ]).reply_markup
+            });
+        }
+    }
+
+    async handlePoolMonitor(ctx) {
+        try {
+            if (!this.smsProviderManager?.numberPool) {
+                return this.replyError(ctx, '❌ <b>Pool not available.</b>');
+            }
+
+            const stats = this.smsProviderManager.getPoolStats();
+            const detailed = this.smsProviderManager.numberPool?.getDetailedStats?.();
+
+            let message = `
+<b>📊 Pool Monitor</b>
+
+<b>Pool Status:</b> ${stats.available ? '✅ Active' : '❌ Inactive'}
+            `;
+
+            if (stats.pools) {
+                message += '\n\n<b>By Country:</b>\n';
+                for (const [country, data] of Object.entries(stats.pools)) {
+                    message += `• ${country}: <code>${data.available}</code> available / <code>${data.active}</code> active / <code>${data.total}</code> total\n`;
+                }
+            }
+
+            if (detailed) {
+                message += `\n<b>Total Active Assignments:</b> <code>${detailed.totalActive || 0}</code>\n`;
+                message += `<b>Max Hold Time:</b> <code>${detailed.maxHoldMinutes || 30}</code> min\n`;
+                
+                if (detailed.activeAssignments?.length > 0) {
+                    message += '\n<b>Active Assignments (top 5):</b>\n';
+                    detailed.activeAssignments.slice(0, 5).forEach(a => {
+                        message += `• <code>${a.phone}</code> | ${a.country} | ${a.service} | ${a.heldMinutes}min\n`;
+                    });
+                }
+            }
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('🔄 Refresh', 'pool_monitor')],
+                [Markup.button.callback('🛒 Buy Numbers', 'pool_buy_numbers')],
+                [Markup.button.callback('🔙 Back', 'admin_pool')]
+            ]);
+
+            await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+        } catch (error) {
+            logger.error('Pool monitor error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load pool stats.</b>');
+        }
+    }
+
+    async handlePoolVipUsers(ctx) {
+        try {
+            const vipUsers = await User.find({
+                vipExpiry: { $gt: new Date() },
+                vipPhoneNumber: { $ne: null }
+            }).select('userId username firstName vipPhoneNumber vipProvider vipExpiry vipNumberAssignedAt').lean();
+
+            if (!vipUsers.length) {
+                return this.replyError(ctx, '<b>👥 No VIP users with assigned numbers.</b>', {
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🔙 Back', 'admin_pool')]
+                    ]).reply_markup
+                });
+            }
+
+            let message = `<b>👑 VIP Users with Numbers</b> (${vipUsers.length} total)\n\n`;
+            const buttons = [];
+
+            for (const user of vipUsers) {
+                const daysLeft = Math.ceil((new Date(user.vipExpiry) - new Date()) / (1000 * 60 * 60 * 24));
+                const displayName = user.username ? `@${user.username}` : (user.firstName || user.userId);
+                
+                message += `👑 <b>${displayName}</b>\n`;
+                message += `   📞 <code>${user.vipPhoneNumber}</code> (${user.vipProvider})\n`;
+                message += `   ⏰ ${daysLeft} days left | ID: <code>${user.userId}</code>\n\n`;
+
+                buttons.push([Markup.button.callback(
+                    `❌ Cancel VIP ${displayName.substring(0, 15)}`,
+                    `quick_cancelvip_${user.userId}`
+                )]);
+            }
+
+            buttons.push([Markup.button.callback('🔙 Back', 'admin_pool')]);
+
+            await this.replySuccess(ctx, message, { reply_markup: { inline_keyboard: buttons } });
+        } catch (error) {
+            logger.error('Pool VIP users error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load VIP users.</b>');
+        }
+    }
+
+    async handlePoolRetireMenu(ctx) {
+        await this.replySuccess(ctx, 
+            '<b>🗑 Retire Numbers</b>\n\nUse /retire_number &lt;number_id&gt; command or select from pool monitor.',
+            { reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback('📊 Go to Monitor', 'pool_monitor')],
+                [Markup.button.callback('🔙 Back', 'admin_pool')]
+            ]).reply_markup }
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  CANCEL VIP (NEW)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleCancelVipMenu(ctx) {
+        const message = `
+<b>❌ Cancel VIP Subscription</b>
+
+Choose how to select the user:
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🆔 Enter User ID', 'cancelvip_search')],
+            [Markup.button.callback('👥 Pick from User List', 'cancelvip_from_users')],
+            [Markup.button.callback('🔙 Back', 'admin')]
+        ]);
+
+        await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async handleCancelVipCommand(ctx) {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            return this.replyError(ctx, '❌ <b>Usage:</b> <code>/cancelvip &lt;user_id&gt;</code>');
+        }
+        return this.showCancelVipConfirm(ctx, args[1]);
+    }
+
+    async showCancelVipConfirm(ctx, userId) {
+        try {
+            const user = await User.findOne({ userId }).lean();
+            if (!user) {
+                return this.replyError(ctx, `❌ <b>User not found:</b> <code>${userId}</code>`);
+            }
+
+            if (!user.vipExpiry || new Date(user.vipExpiry) <= new Date()) {
+                return this.replyError(ctx, `❌ <b>User is not VIP:</b> <code>${userId}</code>`);
+            }
+
+            const displayName = user.username ? `@${user.username}` : (user.firstName || userId);
+            const daysLeft = Math.ceil((new Date(user.vipExpiry) - new Date()) / (1000 * 60 * 60 * 24));
+
+            const message = `
+<b>❌ Confirm Cancel VIP</b>
+
+<b>User:</b> <code>${displayName}</code>
+<b>ID:</b> <code>${userId}</code>
+<b>Number:</b> <code>${user.vipPhoneNumber || 'N/A'}</code>
+<b>Expires:</b> <code>${new Date(user.vipExpiry).toLocaleDateString()}</code>
+<b>Days Left:</b> <code>${daysLeft}</code>
+
+⚠️ This will immediately release their dedicated number and remove VIP status.
             `;
 
             const keyboard = Markup.inlineKeyboard([
-                [Markup.button.callback('1', 'pool_qty_1'), Markup.button.callback('5', 'pool_qty_5'), Markup.button.callback('10', 'pool_qty_10')],
-                [Markup.button.callback('20', 'pool_qty_20'), Markup.button.callback('50', 'pool_qty_50')],
-                [Markup.button.callback('❌ Cancel', 'admin_pool')]
+                [Markup.button.callback('✅ Yes, Cancel VIP', `cancelvip_confirm_${userId}`)],
+                [Markup.button.callback('❌ No, Keep VIP', 'admin_cancelvip')]
             ]);
 
-            await this.replySuccess(ctx, message, { reply_markup: keybo
+            await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+        } catch (error) {
+            logger.error('Cancel VIP confirm error', { error: error.message, userId });
+            await this.replyError(ctx, '❌ <b>Failed to load user.</b>');
+        }
+    }
+
+    async executeCancelVip(ctx, userId) {
+        try {
+            const user = await User.findOne({ userId }).lean();
+            if (!user?.vipExpiry || new Date(user.vipExpiry) <= new Date()) {
+                return this.replyError(ctx, `❌ <b>User is not VIP or already expired.</b>`);
+            }
+
+            // Release VIP number via pool manager
+            if (this.smsProviderManager?.numberPool && user.vipNumberId) {
+                try {
+                    await this.smsProviderManager.numberPool.releaseNumber(user.vipNumberId, 'ADMIN_CANCELLED');
+                } catch (e) {
+                    logger.warn('Failed to release VIP number', { userId, error: e.message });
+                }
+            }
+
+            // Update user
+            await User.updateOne(
+                { userId },
+                {
+                    $set: {
+                        vipExpiry: new Date(0),
+                        vipNumberId: null,
+                        vipPhoneNumber: null,
+                        vipProvider: null,
+                        vipNumberAssignedAt: null,
+                        vipNumberCountry: null,
+                        mode: 'CHEAP'
+                    }
+                }
+            );
+
+            await this.logAdminAction(
+                ctx.from.id.toString(),
+                'CANCEL_VIP',
+                userId,
+                { previousExpiry: user.vipExpiry, phoneNumber: user.vipPhoneNumber }
+            );
+
+            await this.replySuccess(ctx, `✅ <b>VIP Cancelled!</b>\n\nUser: <code>${userId}</code>\nNumber released and VIP status removed.`, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('❌ Cancel Another', 'admin_cancelvip')],
+                    [Markup.button.callback('🔙 Back', 'admin')]
+                ]).reply_markup
+            });
+
+            // Notify user with contact support button
+            await ctx.telegram.sendMessage(userId, `
+<b>❌ VIP Subscription Cancelled</b>
+
+Your VIP subscription has been cancelled by an admin.
+
+Your dedicated number has been released.
+
+Contact @Swiftsmssupport if you have questions.
+            `, { 
+                parse_mode: 'HTML',
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.url('📞 Contact Support', 'https://t.me/Swiftsmssupport')]
+                ]).reply_markup
+            }).catch(() => {});
+
+        } catch (error) {
+            logger.error('Cancel VIP error', { error: error.message, userId });
+            await this.replyError(ctx, '❌ <b>Failed to cancel VIP.</b>');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  BUNDLE PRICES (NEW)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleBundlePricesMenu(ctx) {
+        const prices = config.prices || {};
+        const bundleOtpPrices = prices.bundleOtp || { 5: 0.50, 10: 0.90, 25: 2.00, 50: 3.50 };
+        const bundlePack = { price: prices.bundlePrice || 5.00, count: prices.bundleOtpCount || 100 };
+
+        let otpPricesText = '';
+        for (const [qty, price] of Object.entries(bundleOtpPrices)) {
+            otpPricesText += `• ${qty} OTPs: <code>${formatCurrency(price)}</code>\n`;
+        }
+
+        const message = `
+<b>💰 Bundle Price Settings</b>
+
+<b>Bundle Pack:</b>
+• Price: <code>${formatCurrency(bundlePack.price)}</code>
+• Includes: <code>${bundlePack.count}</code> OTPs
+
+<b>Individual Bundle OTPs:</b>
+${otpPricesText}
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('✏️ Set Pack Price', 'set_bundle_pack_price')],
+            [Markup.button.callback('✏️ Set OTP Prices', 'set_bundle_otp_prices')],
+            [Markup.button.callback('🔙 Back', 'admin')]
+        ]);
+
+        await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async processSetBundleOtpPrices(ctx, text) {
+        try {
+            const pairs = text.split(',').map(p => p.trim());
+            const prices = {};
+            
+            for (const pair of pairs) {
+                const [qty, price] = pair.split(':').map(s => s.trim());
+                const quantity = parseInt(qty);
+                const cost = parseFloat(price);
+                
+                if (isNaN(quantity) || isNaN(cost) || quantity < 1 || cost < 0) {
+                    return this.replyError(ctx, '❌ <b>Invalid format.</b>\n\nUse: <code>5:0.50,10:0.90</code>');
+                }
+                prices[quantity] = cost;
+            }
+
+            if (!config.prices) config.prices = {};
+            config.prices.bundleOtp = prices;
+            await this._saveSettings();
+
+            await this.replySuccess(ctx, `✅ <b>Bundle OTP Prices Updated!</b>\n\n${Object.entries(prices).map(([q, p]) => `• ${q} OTPs: ${formatCurrency(p)}`).join('\n')}`, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔙 Back', 'admin_bundleprices')]
+                ]).reply_markup
+            });
+
+            await this.logAdminAction(ctx.from.id.toString(), 'SET_BUNDLE_OTP_PRICES', null, { prices });
+
+        } catch (error) {
+            logger.error('Set bundle OTP prices error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to update prices.</b>');
+        }
+    }
+
+    async processSetBundlePackPrice(ctx, text) {
+        try {
+            const pairs = text.split(',').map(p => p.trim());
+            let price, count;
+
+            for (const pair of pairs) {
+                const [key, value] = pair.split(':').map(s => s.trim());
+                if (key === 'price') price = parseFloat(value);
+                if (key === 'count') count = parseInt(value);
+            }
+
+            if (isNaN(price) || isNaN(count) || price < 0 || count < 1) {
+                return this.replyError(ctx, '❌ <b>Invalid format.</b>\n\nUse: <code>price:5.00,count:100</code>');
+            }
+
+            if (!config.prices) config.prices = {};
+            config.prices.bundlePrice = price;
+            config.prices.bundleOtpCount = count;
+            await this._saveSettings();
+
+            await this.replySuccess(ctx, `✅ <b>Bundle Pack Price Updated!</b>\n\nPrice: <code>${formatCurrency(price)}</code>\nCount: <code>${count}</code> OTPs`, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔙 Back', 'admin_bundleprices')]
+                ]).reply_markup
+            });
+
+            await this.logAdminAction(ctx.from.id.toString(), 'SET_BUNDLE_PACK_PRICE', null, { price, count });
+
+        } catch (error) {
+            logger.error('Set bundle pack price error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to update price.</b>');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  USERS LIST
+    // ═══════════════════════════════════════════════════════════
+
+    async handleUsers(ctx) {
+        try {
+            const page = parseInt(ctx.match?.[1]) || 1;
+            const limit = 10;
+            const skip = (page - 1) * limit;
+
+            const [users, totalUsers] = await Promise.all([
+                User.find()
+                    .sort({ createdAt: -1 })
+                    .skip(skip)
+                    .limit(limit)
+                    .lean(),
+                User.countDocuments()
+            ]);
+
+            const totalPages = Math.ceil(totalUsers / limit) || 1;
+
+            if (!users.length) {
+                return this.replyError(ctx, '<b>👥 No users found.</b>', {
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🔙 Back', 'admin')]
+                    ]).reply_markup
+                });
+            }
+
+            let message = `<b>👥 Users</b> (Page ${page} of ${totalPages}) — Total: <code>${totalUsers}</code>\n\n`;
+            const buttons = [];
+
+            for (const user of users) {
+                const status = user.isBlacklisted ? '🔴' :
+                    (user.vipExpiry && new Date(user.vipExpiry) > new Date()) ? '👑' :
+                        user.balance > 0 ? '💰' : '🆓';
+
+                const displayName = user.username ? `@${user.username}` : (user.firstName || 'Unknown');
+                message += `${status} <b>${displayName}</b> — <code>${user.userId}</code>\n`;
+                message += `   Balance: <code>${formatCurrency(user.balance)}</code> | Joined: ${user.createdAt ? new Date(user.createdAt).to
