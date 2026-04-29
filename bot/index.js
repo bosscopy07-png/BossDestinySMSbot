@@ -13,7 +13,7 @@ import UserCommands from './commands/user.js';
 import OTPCommands from './commands/otp.js';
 import AdminCommands from './commands/admin.js';
 import WalletService from '../services/wallet/index.js';
-import SMSProviderManager from '../services/sms/SMSProviderManager.js';
+import SMSProviderManager from '../services/sms/index.js';
 
 // ─── Worker pool for CPU-intensive tasks ───
 import { Worker } from 'worker_threads';
