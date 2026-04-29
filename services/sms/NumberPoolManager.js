@@ -7,6 +7,7 @@ import logger from '../../utils/logger.js';
  * Providers must implement:
  *   - buyNumber(country) -> { phoneNumber, sid, monthlyCost }
  *   - releaseNumber(sid) -> { success }
+ *   - hasAvailableNumbers(country) -> Promise<boolean>  [optional but recommended]
  */
 class NumberPoolManager {
     constructor(twilioProvider, telnyxProvider = null) {
@@ -14,11 +15,15 @@ class NumberPoolManager {
 
         // Provider registry
         this.providers = new Map();
-        if (twilioProvider) this.providers.set('TWILIO', twilioProvider);
-        if (telnyxProvider?.isActive) this.providers.set('TELNYX', telnyxProvider);
+        if (twilioProvider?.isActive && typeof twilioProvider.buyNumber === 'function') {
+            this.providers.set('TWILIO', twilioProvider);
+        }
+        if (telnyxProvider?.isActive && typeof telnyxProvider.buyNumber === 'function') {
+            this.providers.set('TELNYX', telnyxProvider);
+        }
 
         if (this.providers.size === 0) {
-            throw new Error('NO_PROVIDERS: At least one active provider required');
+            throw new Error('NO_PROVIDERS: At least one active provider with buyNumber() required');
         }
 
         this.availableNumbers = new Map();   // country -> [{ _id, phoneNumber, ... }]
@@ -26,7 +31,8 @@ class NumberPoolManager {
         this.isInitialized = false;
         this.maxHoldMinutes = 30;
         this.cleanupInterval = null;
-        this.acquireLock = new Map();        // _id -> Promise (prevents double-acquire race)
+        this.acquireLock = new Map();        // _id -> boolean (prevents double-acquire race)
+        this.cleanupRunning = false;         // Prevents overlapping cleanup runs
     }
 
     // ─── Lifecycle ───────────────────────────────────────────────────────
@@ -61,7 +67,11 @@ class NumberPoolManager {
 
     startCleanupJob() {
         if (this.cleanupInterval) return;
-        this.cleanupInterval = setInterval(() => this.cleanupStaleAssignments(), 60000);
+        this.cleanupInterval = setInterval(() => {
+            this.cleanupStaleAssignments().catch(err => {
+                logger.error('Cleanup job failed', { error: err.message });
+            });
+        }, 60000);
     }
 
     stopCleanupJob() {
@@ -77,6 +87,7 @@ class NumberPoolManager {
         this.availableNumbers.clear();
         this.activeAssignments.clear();
         this.acquireLock.clear();
+        this.cleanupRunning = false;
         logger.info('NumberPoolManager uninitialized');
     }
 
@@ -118,11 +129,14 @@ class NumberPoolManager {
 
         // Prevent concurrent acquire of same number in this process
         if (this.acquireLock.has(numberIdStr)) {
-            // Recurse to try next number
-            pool.splice(numberIndex, 1); // Remove contested number temporarily
-            const result = await this.acquireNumber(country, service, userId, preferredProvider);
-            pool.splice(numberIndex, 0, number); // Put back
-            return result;
+            // Remove contested number temporarily and recurse to try next
+            pool.splice(numberIndex, 1);
+            try {
+                return await this.acquireNumber(country, service, userId, preferredProvider);
+            } finally {
+                // Always restore the contested number to pool
+                pool.splice(numberIndex, 0, number);
+            }
         }
 
         this.acquireLock.set(numberIdStr, true);
@@ -143,13 +157,17 @@ class NumberPoolManager {
             );
 
             if (updateResult.modifiedCount === 0) {
-                // Number was taken by another process/request
+                // Number was taken by another process/request — remove and recurse
                 pool.splice(numberIndex, 1);
-                const result = await this.acquireNumber(country, service, userId, preferredProvider);
-                return result;
+                try {
+                    return await this.acquireNumber(country, service, userId, preferredProvider);
+                } finally {
+                    // Always restore the number to pool for next attempt
+                    pool.splice(numberIndex, 0, number);
+                }
             }
 
-            // Success: remove from pool
+            // Success: remove from pool permanently
             pool.splice(numberIndex, 1);
 
             const assignment = {
@@ -217,9 +235,6 @@ class NumberPoolManager {
                 }
             );
         } catch (dbError) {
-            // If DB fails, we already removed from activeAssignments — log and continue
-            // The number remains IN_USE in DB but is no longer tracked in memory.
-            // Next initialization will correct this.
             logger.error('DB release failed after memory removal', {
                 numberId: sessionIdOrNumberId,
                 error: dbError.message
@@ -227,16 +242,17 @@ class NumberPoolManager {
             throw dbError;
         }
 
-        // Add back to pool (as lean object, consistent with initialize)
+        // Add back to pool with consistent shape (lean doc)
         pool.push({
             _id: assignment._id,
             phoneNumber: assignment.phoneNumber,
-            twilioSid: assignment.twilioSid,
-            telnyxSid: assignment.telnyxSid,
+            twilioSid: assignment.twilioSid || null,
+            telnyxSid: assignment.telnyxSid || null,
             provider: assignment.provider,
             country: assignment.country,
-            monthlyCost: assignment.monthlyCost,
-            status: 'AVAILABLE'
+            monthlyCost: assignment.monthlyCost || 0,
+            status: 'AVAILABLE',
+            totalAssignments: assignment.totalAssignments || 0
         });
 
         logger.info('Pool number released', {
@@ -279,7 +295,18 @@ class NumberPoolManager {
             }
         );
 
-        pool.push(dbDoc);
+        // Add back with consistent lean shape
+        pool.push({
+            _id: dbDoc._id,
+            phoneNumber: dbDoc.phoneNumber,
+            twilioSid: dbDoc.twilioSid || null,
+            telnyxSid: dbDoc.telnyxSid || null,
+            provider: dbDoc.provider,
+            country: dbDoc.country,
+            monthlyCost: dbDoc.monthlyCost || 0,
+            status: 'AVAILABLE',
+            totalAssignments: dbDoc.totalAssignments || 0
+        });
 
         logger.info('Pool number released (DB recovery)', {
             phone: this.maskPhone(dbDoc.phoneNumber),
@@ -308,6 +335,14 @@ class NumberPoolManager {
 
             for (const providerName of providerNames) {
                 const provider = this.providers.get(providerName);
+
+                // Pre-check: skip provider if it reports no inventory
+                if (provider.hasAvailableNumbers && !(await provider.hasAvailableNumbers(country))) {
+                    errors.push({ index: i, provider: providerName, error: `No numbers available in ${country}` });
+                    logger.warn('Provider reports no inventory, skipping', { provider: providerName, country });
+                    continue;
+                }
+
                 try {
                     const providerNumber = await provider.buyNumber(country);
 
@@ -370,7 +405,6 @@ class NumberPoolManager {
     async retireNumber(numberId, reason = 'RETIRED') {
         const assignment = this.activeAssignments.get(numberId);
         if (assignment) {
-            // Cannot retire an actively assigned number
             logger.warn('Cannot retire active assignment', {
                 numberId,
                 assignedTo: assignment.assignedTo,
@@ -406,10 +440,12 @@ class NumberPoolManager {
 
         // Release from provider
         const provider = this.providers.get(doc.provider);
+        let providerReleaseSuccess = true;
         if (provider) {
             try {
                 await provider.releaseNumber(doc.twilioSid || doc.telnyxSid);
             } catch (e) {
+                providerReleaseSuccess = false;
                 logger.warn('Provider release failed for retired number', {
                     numberId,
                     provider: doc.provider,
@@ -422,39 +458,50 @@ class NumberPoolManager {
             phone: this.maskPhone(doc.phoneNumber),
             country,
             provider: doc.provider,
-            reason
+            reason,
+            providerReleaseSuccess
         });
 
-        return { success: true, doc };
+        return { success: true, doc, providerReleaseSuccess };
     }
 
     // ─── Cleanup ─────────────────────────────────────────────────────────
 
     async cleanupStaleAssignments() {
-        const now = new Date();
-        const staleIds = [];
+        // Prevent overlapping cleanup runs
+        if (this.cleanupRunning) return;
+        if (this.activeAssignments.size === 0) return;
 
-        for (const [id, assignment] of this.activeAssignments) {
-            const assignedAt = new Date(assignment.assignedAt);
-            const minutesHeld = (now - assignedAt) / (1000 * 60);
+        this.cleanupRunning = true;
 
-            if (minutesHeld > this.maxHoldMinutes) {
-                staleIds.push(id);
-                logger.warn('Releasing stale assignment', {
-                    phone: this.maskPhone(assignment.phoneNumber),
-                    heldMinutes: Math.round(minutesHeld),
-                    country: assignment.country,
-                    provider: assignment.provider
-                });
+        try {
+            const now = new Date();
+            const staleIds = [];
+
+            for (const [id, assignment] of this.activeAssignments) {
+                const assignedAt = new Date(assignment.assignedAt);
+                const minutesHeld = (now - assignedAt) / (1000 * 60);
+
+                if (minutesHeld > this.maxHoldMinutes) {
+                    staleIds.push(id);
+                    logger.warn('Releasing stale assignment', {
+                        phone: this.maskPhone(assignment.phoneNumber),
+                        heldMinutes: Math.round(minutesHeld),
+                        country: assignment.country,
+                        provider: assignment.provider
+                    });
+                }
             }
-        }
 
-        for (const id of staleIds) {
-            try {
-                await this.releaseNumber(id, 'STALE_RELEASE');
-            } catch (e) {
-                logger.error('Failed to release stale assignment', { id, error: e.message });
+            for (const id of staleIds) {
+                try {
+                    await this.releaseNumber(id, 'STALE_RELEASE');
+                } catch (e) {
+                    logger.error('Failed to release stale assignment', { id, error: e.message });
+                }
             }
+        } finally {
+            this.cleanupRunning = false;
         }
     }
 
@@ -512,4 +559,4 @@ class NumberPoolManager {
 }
 
 export default NumberPoolManager;
-                
+            
