@@ -8,6 +8,7 @@ import config from '../../config/env.js';
  * Required env/config:
  *   TELNYX_API_KEY (must start with "KEY", 40+ chars)
  *   TELNYX_MESSAGING_PROFILE_ID (optional, for SMS)
+ *   TELNYX_CONNECTION_ID (optional, for number purchase)
  * 
  * Number management requires:
  *   TELNYX_API_KEY with scope: phone_numbers, messaging
@@ -39,6 +40,7 @@ class TelnyxProvider {
 
         this.apiKey = apiKey;
         this.messagingProfileId = config.telnyx?.messagingProfileId || null;
+        this.connectionId = config.telnyx?.connectionId || null;
         this.isActive = true;
 
         this.stats = {
@@ -49,7 +51,10 @@ class TelnyxProvider {
             avgResponseTime: 0
         };
 
-        logger.info('TelnyxProvider initialized', { hasMessagingProfile: !!this.messagingProfileId });
+        logger.info('TelnyxProvider initialized', { 
+            hasMessagingProfile: !!this.messagingProfileId,
+            hasConnectionId: !!this.connectionId
+        });
     }
 
     getHeaders() {
@@ -187,25 +192,53 @@ class TelnyxProvider {
 
         const numberData = available[0];
         const phoneNumber = numberData.phone_number;
-        const numberId = numberData.id;
 
         // Step 2: Purchase the number
+        // FIXED: Use /phone_numbers/orders endpoint with correct payload structure
+        // Fallback to legacy /phone_numbers if 404
         let purchaseResponse;
         try {
             purchaseResponse = await axios.post(
-                `${this.baseUrl}/phone_numbers`,
+                `${this.baseUrl}/phone_numbers/orders`,
                 {
                     data: {
-                        phone_number: phoneNumber,
+                        phone_numbers: [phoneNumber],
                         messaging_profile_id: this.messagingProfileId || undefined,
-                        connection_id: config.telnyx?.connectionId || undefined
+                        connection_id: this.connectionId || undefined,
+                        billing_group_id: config.telnyx?.billingGroupId || undefined,
+                        customer_reference: `otp-pool-${Date.now()}`
                     }
                 },
                 { headers: this.getHeaders(), timeout: 30000 }
             );
         } catch (error) {
             const msg = error.response?.data?.errors?.[0]?.detail || error.message;
-            throw new Error(`TELNYX_PURCHASE_FAILED: ${msg}`);
+            const code = error.response?.status;
+            
+            // FALLBACK: If /orders fails with 404, try legacy /phone_numbers endpoint
+            if (code === 404) {
+                logger.warn('Telnyx /phone_numbers/orders returned 404, trying fallback /phone_numbers', {
+                    error: msg
+                });
+                try {
+                    purchaseResponse = await axios.post(
+                        `${this.baseUrl}/phone_numbers`,
+                        {
+                            data: {
+                                phone_number: phoneNumber,
+                                messaging_profile_id: this.messagingProfileId || undefined,
+                                connection_id: this.connectionId || undefined
+                            }
+                        },
+                        { headers: this.getHeaders(), timeout: 30000 }
+                    );
+                } catch (fallbackError) {
+                    const fallbackMsg = fallbackError.response?.data?.errors?.[0]?.detail || fallbackError.message;
+                    throw new Error(`TELNYX_PURCHASE_FAILED: ${fallbackMsg}`);
+                }
+            } else {
+                throw new Error(`TELNYX_PURCHASE_FAILED: ${msg}`);
+            }
         }
 
         const purchased = purchaseResponse.data?.data;
@@ -213,15 +246,19 @@ class TelnyxProvider {
             throw new Error('TELNYX_PURCHASE_EMPTY: No data returned after purchase');
         }
 
+        // Handle both single object and array responses
+        const purchaseRecord = Array.isArray(purchased) ? purchased[0] : purchased;
+        const sid = purchaseRecord.id || purchaseRecord.phone_number_id;
+
         logger.info('Telnyx number purchased', {
             phone: this.maskPhone(phoneNumber),
             country,
-            id: purchased.id
+            id: sid
         });
 
         return {
             phoneNumber,
-            sid: purchased.id,
+            sid,
             monthlyCost: this.estimateMonthlyCost(country)
         };
     }
@@ -320,4 +357,4 @@ class TelnyxProvider {
 }
 
 export default TelnyxProvider;
-        
+                
