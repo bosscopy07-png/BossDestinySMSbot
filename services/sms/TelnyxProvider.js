@@ -6,7 +6,7 @@ import config from '../../config/env.js';
  * TelnyxProvider — SMS sending + number lifecycle management
  * 
  * Required env/config:
- *   TELNYX_API_KEY
+ *   TELNYX_API_KEY (must start with "KEY", 40+ chars)
  *   TELNYX_MESSAGING_PROFILE_ID (optional, for SMS)
  * 
  * Number management requires:
@@ -19,10 +19,21 @@ class TelnyxProvider {
         this.isActive = false;
         this.baseUrl = 'https://api.telnyx.com/v2';
 
-        const apiKey = config.telnyx?.apiKey;
+        const rawKey = config.telnyx?.apiKey;
+        const apiKey = rawKey ? rawKey.trim() : null;
 
         if (!apiKey) {
-            logger.warn('TelnyxProvider disabled — no API key');
+            logger.warn('TelnyxProvider disabled — no API key configured');
+            return;
+        }
+
+        // VALIDATE: Telnyx keys start with "KEY" and are 40+ chars
+        if (!apiKey.startsWith('KEY') || apiKey.length < 20) {
+            logger.error('TelnyxProvider disabled — API key malformed', {
+                startsWith: apiKey.slice(0, 3),
+                length: apiKey.length,
+                hint: 'Key must start with "KEY" and be 40+ characters. Check env config.'
+            });
             return;
         }
 
@@ -38,7 +49,7 @@ class TelnyxProvider {
             avgResponseTime: 0
         };
 
-        logger.info('TelnyxProvider initialized');
+        logger.info('TelnyxProvider initialized', { hasMessagingProfile: !!this.messagingProfileId });
     }
 
     getHeaders() {
@@ -100,6 +111,37 @@ class TelnyxProvider {
         }
     }
 
+    // ─── Number Availability Check ───────────────────────────────────────
+
+    /**
+     * Check if numbers are available in a country before attempting purchase.
+     * @param {string} country — ISO country code
+     * @returns {Promise<boolean>}
+     */
+    async hasAvailableNumbers(country = 'US') {
+        if (!this.isActive) return false;
+
+        try {
+            const response = await axios.get(
+                `${this.baseUrl}/available_phone_numbers`,
+                {
+                    headers: this.getHeaders(),
+                    params: {
+                        'filter[country_code]': country,
+                        'filter[limit]': 1,
+                        'filter[phone_number_type]': 'local'
+                    },
+                    timeout: 10000
+                }
+            );
+            const available = response.data?.data;
+            return available && available.length > 0;
+        } catch (error) {
+            logger.warn('Telnyx availability check failed', { country, error: error.message });
+            return false;
+        }
+    }
+
     // ─── Number Lifecycle (Pool Manager Interface) ───────────────────────
 
     /**
@@ -110,6 +152,12 @@ class TelnyxProvider {
     async buyNumber(country = 'US') {
         if (!this.isActive) {
             throw new Error('TELNYX_NOT_CONFIGURED');
+        }
+
+        // Pre-check: avoid API call if no inventory
+        const hasStock = await this.hasAvailableNumbers(country);
+        if (!hasStock) {
+            throw new Error(`TELNYX_NO_NUMBERS: No available numbers in ${country}`);
         }
 
         // Step 1: Search available numbers
@@ -272,4 +320,4 @@ class TelnyxProvider {
 }
 
 export default TelnyxProvider;
-                
+        
