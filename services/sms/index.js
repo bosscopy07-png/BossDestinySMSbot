@@ -3,7 +3,7 @@ import TelnyxProvider from './TelnyxProvider.js';
 import CheapPanelProvider from './CheapPanelProvider.js';
 import FreeProvider from './FreeProvider.js';
 import NumberPoolManager from './NumberPoolManager.js';
-import NumberBuyer from './NumberBuyer.js';
+import NumberBuyer from './buy-numbers.js';
 import logger from '../../utils/logger.js';
 
 /**
