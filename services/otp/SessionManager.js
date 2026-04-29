@@ -591,6 +591,7 @@ class SessionManager {
     //  INTERNAL - Finances
     // ═══════════════════════════════════════════════════════════
 
+    
     async _handleFinances(user, userId, mode, numberData, service) {
         let cost = 0;
         let lockTxId = null;
@@ -601,4 +602,302 @@ class SessionManager {
                 try {
                     lockTxId = await this.walletService.lockFunds(userId, cost, `OTP_${service}`);
                 } catch (error) {
-                    await th
+                    await this._releaseProviderNumber({ ...numberData, mode }, 'FUNDS_LOCK_FAILED');
+                    throw new Error('INSUFFICIENT_FUNDS');
+                }
+                break;
+            }
+
+            case 'BUNDLE': {
+                const bundleRemaining = user.bundleRemaining || 0;
+                if (bundleRemaining <= 0) {
+                    await this._releaseProviderNumber({ ...numberData, mode }, 'BUNDLE_EMPTY');
+                    throw new Error('BUNDLE_EMPTY');
+                }
+                await User.updateOne({ userId }, { $inc: { bundleRemaining: -1 } });
+                break;
+            }
+
+            case 'VIP': {
+                await User.updateOne({ userId }, { $inc: { vipDailyUsed: 1 } });
+                break;
+            }
+
+            case 'FREE': {
+                await User.updateOne({ userId }, { $inc: { freeUsedToday: 1 } });
+                break;
+            }
+        }
+
+        return { cost, lockTxId };
+    }
+
+    async _restoreCredits(session) {
+        const restoreConfig = CreditRestoreConfig[session.mode];
+        if (!restoreConfig) return;
+
+        try {
+            await User.updateOne(
+                { userId: session.userId },
+                { $inc: { [restoreConfig.field]: restoreConfig.amount } }
+            );
+            logger.info('Credits restored', {
+                sessionId: session.sessionId,
+                mode: session.mode,
+                field: restoreConfig.field,
+                amount: restoreConfig.amount
+            });
+        } catch (error) {
+            logger.error('Credit restoration failed', {
+                sessionId: session.sessionId,
+                error: error.message
+            });
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  INTERNAL - Provider Management
+    // ═══════════════════════════════════════════════════════════
+
+    async _releaseProviderNumber(session, reason) {
+        try {
+            if (session.mode === 'VIP' && this.numberPoolManager && session.providerNumberId) {
+                await this.numberPoolManager.releaseNumber(session.providerNumberId, reason);
+            } else if (this.providerManager) {
+                await this.providerManager.cancelNumber(
+                    session.provider,
+                    session.providerNumberId || session.number
+                );
+            }
+        } catch (error) {
+            logger.warn('Provider release failed', {
+                sessionId: session.sessionId || 'unknown',
+                reason,
+                error: error.message
+            });
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  INTERNAL - Validation
+    // ═══════════════════════════════════════════════════════════
+
+    async _validateModeAccess(user, mode) {
+        const checks = {
+            FREE: () => {
+                if (typeof user.canUseFree === 'function' ? !user.canUseFree() : (user.freeUsedToday || 0) >= (config.limits?.freeDaily || 3)) {
+                    throw new Error('FREE_LIMIT_REACHED');
+                }
+            },
+            CHEAP: () => {
+                const minBalance = config.pricing?.cheapOtp || 0.05;
+                const available = typeof user.getAvailableBalance === 'function'
+                    ? user.getAvailableBalance()
+                    : (user.balance || 0) - (user.lockedBalance || 0);
+                if (available < minBalance) {
+                    throw new Error('INSUFFICIENT_BALANCE');
+                }
+            },
+            VIP: () => {
+                const isActive = typeof user.isVipActive === 'function'
+                    ? user.isVipActive()
+                    : !!(user.vipExpiry && new Date(user.vipExpiry) > new Date());
+                if (!isActive) throw new Error('VIP_EXPIRED');
+
+                const canUse = typeof user.canUseVip === 'function'
+                    ? user.canUseVip()
+                    : (user.vipDailyUsed || 0) < (config.limits?.vipDaily || 50);
+                if (!canUse) throw new Error('VIP_DAILY_LIMIT_REACHED');
+            },
+            BUNDLE: () => {
+                if ((user.bundleRemaining || 0) <= 0) {
+                    throw new Error('BUNDLE_EMPTY');
+                }
+            }
+        };
+
+        const check = checks[mode];
+        if (!check) throw new Error('INVALID_MODE');
+
+        await check();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  INTERNAL - Monitoring
+    // ═══════════════════════════════════════════════════════════
+
+    _startMonitoring(session, providerInstance) {
+        const sessionId = session.sessionId;
+
+        // Store in memory
+        this.activeSessions.set(sessionId, {
+            session,
+            providerInstance,
+            state: SessionState.CREATED,
+            lastPollAt: null,
+            pollCount: 0
+        });
+
+        // Schedule timeout
+        const timeoutMs = new Date(session.timeoutAt) - Date.now();
+        const timeoutTimer = setTimeout(async () => {
+            try {
+                const current = await Session.findOne({ sessionId }).lean();
+                if (current && ['WAITING', 'CHECKING'].includes(current.status)) {
+                    await this.handleTimeout(current);
+                }
+            } catch (error) {
+                logger.error('Timeout handler error', { sessionId, error: error.message });
+            }
+        }, Math.max(timeoutMs, 0));
+
+        this.sessionTimeouts.set(sessionId, timeoutTimer);
+
+        // Start polling
+        const pollInterval = this.config.pollIntervals[session.mode] || 5000;
+        this._schedulePoll(sessionId, pollInterval);
+    }
+
+    _schedulePoll(sessionId, interval) {
+        const timer = setTimeout(async () => {
+            await this._pollProvider(sessionId, interval);
+        }, interval);
+
+        this.pollTimers.set(sessionId, timer);
+    }
+
+    async _pollProvider(sessionId, interval) {
+        const sessionData = this.activeSessions.get(sessionId);
+        if (!sessionData) return;
+
+        try {
+            const current = await Session.findOne({ sessionId }).lean();
+            if (!current || !['WAITING', 'CHECKING'].includes(current.status)) {
+                this._cleanupSession(sessionId);
+                return;
+            }
+
+            // Check timeout
+            if (new Date() > new Date(current.timeoutAt)) {
+                return; // Timeout handler will take care of this
+            }
+
+            sessionData.lastPollAt = new Date();
+            sessionData.pollCount++;
+            sessionData.state = SessionState.MONITORING;
+
+            // Update to CHECKING after first poll
+            if (current.status === 'WAITING') {
+                await Session.updateOne(
+                    { sessionId },
+                    { $set: { status: 'CHECKING' } }
+                );
+            }
+
+            // Poll provider
+            const result = await this.providerManager.checkSMS(
+                current.provider,
+                current.providerNumberId || current.number
+            );
+
+            if (result.success && result.otp) {
+                await this.deliverOTP(current, result.otp);
+                return;
+            }
+
+            if (result.status && ['CANCELLED', 'TIMEOUT', 'EXPIRED', 'ERROR', 'BANNED'].includes(result.status)) {
+                await this.handleProviderFailure(current, result.status);
+                return;
+            }
+
+            // Schedule next poll
+            this._schedulePoll(sessionId, interval);
+
+        } catch (error) {
+            logger.error('Poll error', {
+                sessionId,
+                error: error.message,
+                pollCount: sessionData.pollCount
+            });
+
+            // Continue polling on error
+            this._schedulePoll(sessionId, interval);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  INTERNAL - Cleanup
+    // ═══════════════════════════════════════════════════════════
+
+    _cleanupSession(sessionId) {
+        // Clear poll timer
+        const pollTimer = this.pollTimers.get(sessionId);
+        if (pollTimer) {
+            clearTimeout(pollTimer);
+            this.pollTimers.delete(sessionId);
+        }
+
+        // Clear timeout timer
+        const timeoutTimer = this.sessionTimeouts.get(sessionId);
+        if (timeoutTimer) {
+            clearTimeout(timeoutTimer);
+            this.sessionTimeouts.delete(sessionId);
+        }
+
+        // Remove from active sessions
+        const sessionData = this.activeSessions.get(sessionId);
+        if (sessionData) {
+            sessionData.state = SessionState.CLEANED;
+            this.activeSessions.delete(sessionId);
+        }
+
+        logger.debug('Session cleaned up', { sessionId });
+    }
+
+    async _gracefulShutdown() {
+        logger.info('SessionManager shutting down...', {
+            activeSessions: this.activeSessions.size
+        });
+
+        // Cancel all active sessions
+        const promises = [];
+        for (const [sessionId, sessionData] of this.activeSessions) {
+            promises.push(
+                this.handleProviderFailure(sessionData.session, 'CANCELLED').catch(err => {
+                    logger.error('Shutdown cleanup error', { sessionId, error: err.message });
+                })
+            );
+        }
+
+        await Promise.allSettled(promises);
+
+        // Clear all timers
+        for (const timer of this.pollTimers.values()) clearTimeout(timer);
+        for (const timer of this.sessionTimeouts.values()) clearTimeout(timer);
+
+        this.activeSessions.clear();
+        this.pollTimers.clear();
+        this.sessionTimeouts.clear();
+
+        process.removeListener('SIGINT', this._shutdownHandler);
+        process.removeListener('SIGTERM', this._shutdownHandler);
+
+        logger.info('SessionManager shutdown complete');
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  UTILITIES
+    // ═══════════════════════════════════════════════════════════
+
+    maskOTP(otp) {
+        if (!otp || otp.length <= 3) return '***';
+        return '*'.repeat(otp.length - 3) + otp.slice(-3);
+    }
+
+    maskPhone(phone) {
+        if (!phone || phone.length < 4) return '****';
+        return phone.slice(0, -4).replace(/\d/g, '*') + phone.slice(-4);
+    }
+}
+
+export default SessionManager;
