@@ -1797,7 +1797,7 @@ Enjoy premium benefits!
             const isVip = user.vipExpiry && new Date(user.vipExpiry) > new Date();
             const statusEmoji = user.isBlacklisted ? '🔴 BANNED' : isVip ? '👑 VIP' : '✅ Active';
 
-            const message = `
+                        const message = `
 <b>👤 User Details</b>
 
 <b>🆔 ID:</b> <code>${user.userId}</code>
@@ -1821,4 +1821,128 @@ ${user.isBlacklisted ? `<b>Reason:</b> ${user.blacklistReason || 'N/A'}\n` : ''}
 • Ref Earnings: <code>${formatCurrency(stats.totalRefEarnings)}</code>
 • Total Sessions: <code>${sessionCounts}</code>
 • Referrals: <code>${referrals.length}</code>
-• Net Balance: <code>${formatCurrency((user.balance || 0) - (user.locked
+• Net Balance: <code>${formatCurrency((user.balance || 0) - (user.lockedBalance || 0))}</code>
+• Lifetime Value: <code>${formatCurrency(stats.totalSpent + (user.bundleRemaining || 0) * (config.prices?.cheapOtp || 0.05))}</code>
+
+<b>📞 Recent Sessions:</b> <code>${recentSessions.length}</code> shown
+<b>📜 Recent Transactions:</b> <code>${recentTransactions.length}</code> shown
+            `;
+
+            const keyboard = Markup.inlineKeyboard([
+                [
+                    Markup.button.callback('➕ Add Balance', `addbal_${userId}`),
+                    Markup.button.callback('➖ Deduct Balance', `dedbal_${userId}`)
+                ],
+                [
+                    Markup.button.callback('📨 Message', `msg_${userId}`),
+                    Markup.button.callback('📜 Transactions', `viewtx_${userId}`)
+                ],
+                [
+                    Markup.button.callback('📞 Sessions', `viewsess_${userId}`),
+                    user.isBlacklisted
+                        ? Markup.button.callback('🟢 Unban', `unban_${userId}`)
+                        : Markup.button.callback('🔴 Ban', `ban_${userId}`)
+                ],
+                [
+                    user.isBlacklisted
+                        ? Markup.button.callback('🟢 Whitelist', `wl_${userId}`)
+                        : Markup.button.callback('🔴 Blacklist', `bl_${userId}`)
+                ],
+                [
+                    Markup.button.callback('🔄 Reset Free', `quick_resetfree_${userId}`),
+                    Markup.button.callback('👑 Give VIP', `quick_givevip_${userId}`)
+                ],
+                isVip ? [Markup.button.callback('❌ Cancel VIP', `quick_cancelvip_${userId}`)] : [],
+                [Markup.button.callback('🔙 Back to Users', 'admin_users')]
+            ].filter(row => row.length > 0));
+
+            await this.editCaption(ctx, message, { reply_markup: keyboard.reply_markup });
+        } catch (error) {
+            logger.error('User detail inline error', { userId, error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to load user details.</b>');
+        }
+    }
+
+    async handleUserDetail(ctx) {
+        try {
+            const args = ctx.message.text.split(' ');
+            if (args.length < 2) {
+                return this.replyError(ctx, '❌ <b>Usage:</b> <code>/user &lt;user_id&gt;</code>');
+            }
+
+            const targetId = args[1];
+            await this.showUserDetailInline(ctx, targetId);
+        } catch (error) {
+            logger.error('User detail error', { error: error.message, stack: error.stack });
+            await this.replyError(ctx, '❌ <b>Failed to load user details.</b>');
+        }
+    }
+
+    async handleViewUserTransactions(ctx) {
+        try {
+            const userId = ctx.match[1];
+            const transactions = await Transaction.find({ userId })
+                .sort({ createdAt: -1 })
+                .limit(15)
+                .lean();
+
+            if (!transactions.length) {
+                return this.editCaption(ctx, '<b>📜 No transactions found.</b>', {
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🔙 Back', `back_user_${userId}`)]
+                    ]).reply_markup
+                });
+            }
+
+            let message = `<b>📜 Recent Transactions</b> for <code>${userId}</code>\n\n`;
+            for (const tx of transactions) {
+                const emoji = tx.status === 'COMPLETED' || tx.status === 'completed' ? '✅' : tx.status === 'PENDING' || tx.status === 'pending' ? '⏳' : '❌';
+                message += `${emoji} <b>${tx.type}</b> | <code>${formatCurrency(Math.abs(tx.amount || 0))}</code>\n`;
+                message += `   Status: <code>${tx.status}</code> | ${tx.createdAt ? new Date(tx.createdAt).toLocaleDateString() : 'N/A'}\n\n`;
+            }
+
+            await this.editCaption(ctx, message, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔙 Back to User', `back_user_${userId}`)]
+                ]).reply_markup
+            });
+        } catch (error) {
+            logger.error('View transactions error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load transactions.</b>');
+        }
+    }
+
+    async handleViewUserSessions(ctx) {
+        try {
+            const userId = ctx.match[1];
+            const sessions = await Session.find({ userId })
+                .sort({ startTime: -1 })
+                .limit(15)
+                .lean();
+
+            if (!sessions.length) {
+                return this.editCaption(ctx, '<b>📞 No sessions found.</b>', {
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🔙 Back', `back_user_${userId}`)]
+                    ]).reply_markup
+                });
+            }
+
+            let message = `<b>📞 Recent Sessions</b> for <code>${userId}</code>\n\n`;
+            for (const s of sessions) {
+                const emoji = s.status === 'RECEIVED' ? '✅' : s.status === 'TIMEOUT' ? '⏰' : '❌';
+                message += `${emoji} <b>${s.service || 'N/A'}</b> (${s.country || 'N/A'})\n`;
+                message += `   Status: <code>${s.status}</code> | Cost: <code>${formatCurrency(s.cost || 0)}</code>\n`;
+                message += `   ${s.startTime ? new Date(s.startTime).toLocaleString() : 'N/A'}\n\n`;
+            }
+
+            await this.editCaption(ctx, message, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔙 Back to User', `back_user_${userId}`)]
+                ]).reply_markup
+            });
+        } catch (error) {
+            logger.error('View sessions error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load sessions.</b>');
+        }
+    }
