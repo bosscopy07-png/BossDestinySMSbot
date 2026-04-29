@@ -270,7 +270,7 @@ class SMSProviderManager {
 
         const result = await this.numberBuyer.buyMultiple(configs, { abortOnError: false });
 
-        if (result.totalSuccess > > 0) 0) {
+        if (result.totalSuccess > 0) {
             await this.numberPool.initialize();
         }
 
@@ -351,3 +351,4 @@ class SMSProviderManager {
 }
 
 export default SMSProviderManager;
+                    
