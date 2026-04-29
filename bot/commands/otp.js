@@ -430,7 +430,7 @@ class OTPCommands {
         );
     }
 
-    async handleConfirmBundlePurchase(ctx) {
+        async handleConfirmBundlePurchase(ctx) {
         const user = ctx.state.user;
         const purchase = ctx.session?.bundlePurchase;
         
@@ -447,4 +447,422 @@ class OTPCommands {
             );
 
             // Create transaction record
-            const { default: Transaction } = await import('../../models/index.js'
+            const { Transaction } = await import('../../models/index.js');
+            await Transaction.create({
+                txId: `BUNDLE_${Date.now()}_${user.userId}`,
+                userId: user.userId,
+                type: 'BUNDLE_PURCHASE',
+                amount: -purchase.price,
+                status: 'COMPLETED',
+                metadata: { 
+                    quantity: purchase.quantity, 
+                    pricePerOtp: purchase.price / purchase.quantity,
+                    source: 'BUNDLE_OTP_MENU'
+                },
+                createdAt: new Date()
+            });
+
+            ctx.session.bundlePurchase = null;
+
+            const message = 
+                `✅ <b>Bundle Purchased!</b>\n\n` +
+                `📦 <code>${purchase.quantity}</code> OTPs added\n` +
+                `💰 <code>${formatCurrency(purchase.price)}</code> deducted\n` +
+                `📦 Total Available: <code>${(user.bundleRemaining || 0) + purchase.quantity}</code> OTPs\n\n` +
+                `Use /otp to start requesting.`;
+
+            await this.sendPhotoWithCaption(
+                ctx,
+                IMAGES.bundleOther,
+                message,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 View My Number', 'view_my_number')],
+                    [Markup.button.callback('🔙 Main Menu', 'menu')]
+                ]),
+                'HTML'
+            );
+
+        } catch (error) {
+            logger.error('Bundle purchase failed', { userId: user.userId, error: error.message });
+            await this.sendPhotoWithCaption(
+                ctx,
+                IMAGES.otpFailed,
+                '❌ <b>Purchase Failed</b>\n\nPlease try again or contact support.',
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Retry', 'buy_bundle_otp')],
+                    [Markup.button.callback('📞 Contact Support', 'contact_support')]
+                ]),
+                'HTML'
+            );
+        }
+    }
+
+    // ─── Cancel VIP Subscription ─────────────────────────────────────────
+
+    async handleCancelVipSubscription(ctx) {
+        const user = ctx.state.user;
+        
+        if (!this._isVipActive(user)) {
+            return ctx.answerCbQuery('❌ No active VIP subscription');
+        }
+
+        const message = 
+            `❌ <b>Cancel VIP Subscription?</b>\n\n` +
+            `📞 Your number: <code>${user.vipPhoneNumber || 'N/A'}</code>\n` +
+            `⏰ Expires: <code>${user.vipExpiry ? new Date(user.vipExpiry).toLocaleDateString() : 'N/A'}</code>\n\n` +
+            `⚠️ <b>Warning:</b> Your dedicated number will be released and you will lose VIP benefits immediately.\n\n` +
+            `Are you sure?`;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Yes, Cancel VIP', 'confirm_vip_cancel')],
+            [Markup.button.callback('❌ No, Keep VIP', 'view_my_number')]
+        ]);
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message, keyboard, 'HTML');
+    }
+
+    // ─── Free Mode ───────────────────────────────────────────────────────
+
+    async handleFreeMode(ctx) {
+        const user = ctx.state.user;
+        if (!this._canUseFree(user)) {
+            const message = '❌ Free Limit Reached\n\nYou\'ve used all 3 free OTPs today.\n\n💰 Deposit to continue:\n• CHEAP: $0.05 per OTP\n• Bundle: $5 for 100 OTPs';
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('💳 Deposit', 'deposit')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]);
+            return this.sendPhotoWithCaption(ctx, IMAGES.freeMode, message, keyboard);
+        }
+        ctx.session = ctx.session || {};
+        ctx.session.otpMode = 'FREE';
+        await this.showServiceSelection(ctx, 'FREE', IMAGES.freeMode);
+    }
+
+    // ─── Cheap Mode ──────────────────────────────────────────────────────
+
+    async handleCheapMode(ctx) {
+        const user = ctx.state.user;
+        const cheapPrice = config.prices?.cheapOtp || 0.05;
+        if (this._getAvailableBalance(user) < cheapPrice) {
+            const message = `💰 Insufficient Balance\n\nRequired: ${formatCurrency(cheapPrice)}\nAvailable: ${formatCurrency(this._getAvailableBalance(user))}\n\nPlease deposit first.`;
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('💳 Deposit', 'deposit')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]);
+            return this.sendPhotoWithCaption(ctx, IMAGES.cheapMode, message, keyboard);
+        }
+        ctx.session = ctx.session || {};
+        ctx.session.otpMode = 'CHEAP';
+        await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
+    }
+
+    // ─── Bundle Mode ─────────────────────────────────────────────────────
+
+    async handleBundleMode(ctx) {
+        const user = ctx.state.user;
+        
+        // If user has no bundle credits, show buy screen
+        if (!user.bundleRemaining || user.bundleRemaining <= 0) {
+            return this.handleBuyBundle(ctx);
+        }
+
+        // Check if VIP number exists for bundle usage
+        if (this._isVipActive(user) && user.vipPhoneNumber) {
+            ctx.session = ctx.session || {};
+            ctx.session.otpMode = 'BUNDLE';
+            ctx.session.useVipNumber = true;
+            return this.showServiceSelection(ctx, 'BUNDLE (VIP Number)', IMAGES.bundleOther);
+        }
+
+        // Non-VIP bundle usage (uses cheap panel)
+        ctx.session = ctx.session || {};
+        ctx.session.otpMode = 'BUNDLE';
+        ctx.session.useVipNumber = false;
+        await this.showServiceSelection(ctx, 'BUNDLE', IMAGES.bundleOther);
+    }
+
+    // ─── VIP Mode ────────────────────────────────────────────────────────
+
+    async handleVIPMode(ctx) {
+        const user = ctx.state.user;
+        if (!this._isVipActive(user)) {
+            const message = `👑 VIP Required\n\nYou need an active VIP subscription.\n\nPrice: ${formatCurrency(config.prices?.vipSubscription || 5.00)}/month\nIncludes: Unlimited OTPs (50/day max)\n\nUpgrade now?`;
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('👑 Upgrade VIP', 'buy_vip')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]);
+            return this.sendPhotoWithCaption(ctx, IMAGES.vipFirst, message, keyboard);
+        }
+        if (!this._canUseVip(user)) {
+            const message = '⚠️ VIP Daily Limit Reached\n\nYou\'ve used 50/50 VIP OTPs today.\nResets at midnight UTC.';
+            return this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message);
+        }
+        
+        // Ensure VIP number is assigned
+        if (!user.vipPhoneNumber) {
+            const assignment = await this.assignVipNumber(user.userId, 'US');
+            if (!assignment) {
+                return this.sendPhotoWithCaption(
+                    ctx,
+                    IMAGES.vipOther,
+                    '⚠️ <b>Number Assignment Pending</b>\n\nWe\'re setting up your VIP number. Please try again shortly.',
+                    Markup.inlineKeyboard([
+                        [Markup.button.callback('🔄 Retry', 'mode_vip')],
+                        [Markup.button.callback('🔙 Back', 'menu')]
+                    ]),
+                    'HTML'
+                );
+            }
+            user.vipPhoneNumber = assignment.phoneNumber;
+        }
+
+        ctx.session = ctx.session || {};
+        ctx.session.otpMode = 'VIP';
+        ctx.session.useVipNumber = true;
+        await this.showServiceSelection(ctx, 'VIP', IMAGES.vipOther);
+    }
+
+    // ─── Service & Country Selection ─────────────────────────────────────
+
+    async showServiceSelection(ctx, mode, imageUrl) {
+        const message = `📱 ${mode} Mode\n\nChoose the service you need OTP for:`;
+        const buttons = [];
+        for (let i = 0; i < SERVICES.length; i += 3) {
+            const row = SERVICES.slice(i, i + 3).map(s => Markup.button.callback(s, `service_${s}`));
+            buttons.push(row);
+        }
+        buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
+        await this.sendPhotoWithCaption(ctx, imageUrl, message, Markup.inlineKeyboard(buttons));
+    }
+
+    async handleServiceSelect(ctx) {
+        const service = ctx.match[1];
+        
+        const validServices = SERVICES.map(s => s.toLowerCase());
+        if (!validServices.includes(service.toLowerCase())) {
+            logger.warn('Invalid service selected', { service, validServices });
+            return ctx.answerCbQuery('❌ Invalid service');
+        }
+        
+        ctx.session = ctx.session || {};
+        ctx.session.otpService = service;
+        const message = `🌍 Select Country\n\nChoose number country for ${service}:`;
+        const buttons = COUNTRIES.map(c => [
+            Markup.button.callback(`${c.flag} ${c.name}${c.priceModifier > 0 ? ` (+$${c.priceModifier})` : ''}`, `country_${c.code}`)
+        ]);
+        buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
+        await this.sendPhotoWithCaption(ctx, IMAGES.countrySelect, message, Markup.inlineKeyboard(buttons));
+    }
+
+    async handleCountrySelect(ctx) {
+        const country = ctx.match[1];
+        const userId = ctx.from.id.toString();
+        const mode = ctx.session?.otpMode;
+        const service = ctx.session?.otpService;
+        const useVipNumber = ctx.session?.useVipNumber;
+        
+        if (!mode || !service) {
+            return this.sendPhotoWithCaption(ctx, IMAGES.default, '❌ Session expired. Please start over with /otp');
+        }
+
+        try {
+            const loadingMsg = await ctx.reply('⏳ Assigning number...');
+
+            // VIP/BUNDLE with VIP number: use dedicated number directly
+            if (useVipNumber && this._isVipActive(ctx.state.user) && ctx.state.user.vipPhoneNumber) {
+                const user = ctx.state.user;
+                
+                // Deduct VIP daily or bundle credit
+                if (mode === 'VIP') {
+                    await User.updateOne(
+                        { userId },
+                        { $inc: { vipDailyUsed: 1 } }
+                    );
+                } else if (mode === 'BUNDLE') {
+                    await User.updateOne(
+                        { userId },
+                        { $inc: { bundleRemaining: -1 } }
+                    );
+                }
+
+                await ctx.deleteMessage(loadingMsg.message_id);
+
+                const costText = mode === 'VIP' ? 'VIP (daily quota)' : 'BUNDLE (1 credit)';
+
+                const message = 
+                    `📱 OTP Request Started\n\n` +
+                    `🌍 Mode: ${mode}\n` +
+                    `📱 Number: \`${user.vipPhoneNumber}\`\n` +
+                    `🎯 Service: ${service}\n` +
+                    `⏳ Status: Waiting for OTP...\n` +
+                    `💰 Cost: ${costText}\n\n` +
+                    `⚠️ Your dedicated VIP number. OTP will arrive shortly.`;
+
+                const keyboard = Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'cancel_otp')]]);
+                await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard);
+
+                // Create session with VIP number
+                const session = await sessionManager.createSessionWithNumber(
+                    userId,
+                    mode,
+                    service,
+                    country,
+                    user.vipPhoneNumber,
+                    user.vipProvider
+                );
+
+                return;
+            }
+
+            // Standard flow for FREE, CHEAP, or BUNDLE without VIP number
+            if (mode === 'BUNDLE') {
+                const user = await User.findOne({ userId });
+                if (!user || !user.bundleRemaining || user.bundleRemaining <= 0) {
+                    await ctx.deleteMessage(loadingMsg.message_id);
+                    return this.sendPhotoWithCaption(
+                        ctx, 
+                        IMAGES.bundleFirst,
+                        '❌ <b>No Bundle Credits</b>\n\nYour bundle OTPs have been exhausted. Buy a new bundle to continue.',
+                        Markup.inlineKeyboard([
+                            [Markup.button.callback('📦 Buy Bundle', 'buy_bundle')],
+                            [Markup.button.callback('🔙 Back', 'menu')]
+                        ]),
+                        'HTML'
+                    );
+                }
+
+                await User.updateOne(
+                    { userId },
+                    { $inc: { bundleRemaining: -1 } }
+                );
+            }
+
+            const session = await sessionManager.createSession(userId, mode, service, country);
+            await ctx.deleteMessage(loadingMsg.message_id);
+
+            const costText = mode === 'FREE' ? 'FREE' : 
+                            mode === 'BUNDLE' ? 'BUNDLE (1 credit used)' : 
+                            formatCurrency(session.cost);
+
+            const message = 
+                `📱 OTP Request Started\n\n` +
+                `🌍 Mode: ${mode}\n` +
+                `📱 Number: \`${session.number}\`\n` +
+                `🎯 Service: ${service}\n` +
+                `⏳ Status: Waiting for OTP...\n` +
+                `💰 Cost: ${costText}\n` +
+                `⏱ Timeout: ${Math.floor((session.timeoutAt - new Date()) / 1000)}s\n\n` +
+                `⚠️ ${mode === 'FREE' ? 'Shared number. OTP not guaranteed.' : mode === 'BUNDLE' ? 'Bundle credit used. No additional charge.' : 'Funds locked. Will be deducted on delivery.'}`;
+
+            const keyboard = Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'cancel_otp')]]);
+            await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard);
+
+        } catch (error) {
+            logger.error('OTP session creation failed', { userId, mode, service, error: error.message });
+            
+            // Restore credits on failure
+            if (mode === 'BUNDLE') {
+                await User.updateOne({ userId }, { $inc: { bundleRemaining: 1 } }).catch(() => {});
+            } else if (mode === 'VIP' && useVipNumber) {
+                await User.updateOne({ userId }, { $inc: { vipDailyUsed: -1 } }).catch(() => {});
+            }
+
+            const errorMessages = {
+                ACTIVE_SESSION_EXISTS: '⏳ You already have an active session. Use /cancel first.',
+                INSUFFICIENT_BALANCE: '💰 Insufficient balance. Deposit first with /deposit',
+                FREE_LIMIT_REACHED: '🆓 Free limit reached for today.',
+                USER_BLACKLISTED: '🚫 Your account is suspended.',
+                VIP_EXPIRED: '👑 VIP expired. Renew your subscription.',
+                VIP_DAILY_LIMIT_REACHED: '⚠️ VIP daily limit (50) reached.',
+                BUNDLE_EMPTY: '📦 No bundle credits left. Buy a bundle first.'
+            };
+            
+            await this.sendPhotoWithCaption(
+                ctx, 
+                IMAGES.otpFailed, 
+                errorMessages[error.message] || `❌ Error: ${error.message}`
+            );
+        }
+    }
+
+    // ─── Cancel ──────────────────────────────────────────────────────────
+
+    async handleCancel(ctx) {
+        const userId = ctx.from.id.toString();
+        try {
+            const activeSession = await Session.findOne({ userId, status: { $in: ['WAITING', 'CHECKING'] } });
+            if (!activeSession) {
+                return this.sendPhotoWithCaption(ctx, IMAGES.default, '❌ No active session to cancel.');
+            }
+            await sessionManager.cancelSession(activeSession.sessionId, userId);
+            
+            const refundText = activeSession.mode === 'BUNDLE' ? '💰 Bundle credit restored.\n' : 
+                              activeSession.mode === 'VIP' ? '💰 VIP daily quota restored.\n' :
+                              activeSession.cost > 0 ? '💰 Funds returned to your balance.\n' : '';
+            
+            const message = 
+                `✅ Session Cancelled\n\n` +
+                `📱 Number: ${activeSession.number}\n` +
+                `${refundText}` +
+                `You can start a new request now.`;
+            
+            await this.sendPhotoWithCaption(ctx, IMAGES.default, message);
+        } catch (error) {
+            logger.error('Cancel failed', { userId, error: error.message });
+            await this.sendPhotoWithCaption(ctx, IMAGES.default, '❌ Failed to cancel session. Please try again.');
+        }
+    }
+
+    // ─── Bundle Purchase (Original) ──────────────────────────────────────
+
+    async handleBuyBundle(ctx) {
+        const user = ctx.state.user;
+        const bundlePrice = config.prices?.bundlePrice || 5.00;
+        const bundleCount = config.prices?.bundleOtpCount || 100;
+        const message = `📦 Buy OTP Bundle\n\n💰 Price: ${formatCurrency(bundlePrice)}\n📦 Includes: ${bundleCount} OTPs\n✅ Never expires\n💡 Best value for regular users\n\nYour Balance: ${formatCurrency(user.balance)}`;
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Confirm Purchase', 'confirm_bundle')],
+            [Markup.button.callback('❌ Cancel', 'menu')]
+        ]);
+        await this.sendPhotoWithCaption(ctx, IMAGES.bundleFirst, message, keyboard);
+    }
+
+    async handleConfirmBundle(ctx) {
+        const user = ctx.state.user;
+        const bundlePrice = config.prices?.bundlePrice || 5.00;
+        const bundleCount = config.prices?.bundleOtpCount || 100;
+        if (user.balance < bundlePrice) {
+            const message = `❌ Insufficient Balance\n\nRequired: ${formatCurrency(bundlePrice)}\nAvailable: ${formatCurrency(user.balance)}\n\nDeposit first with /deposit`;
+            return this.sendPhotoWithCaption(ctx, IMAGES.bundleOther, message);
+        }
+        await User.updateOne({ userId: user.userId }, { $inc: { balance: -bundlePrice, bundleRemaining: bundleCount } });
+        const message = `✅ Bundle Purchased!\n\n📦 ${bundleCount} OTPs added\n💰 ${formatCurrency(bundlePrice)} deducted\n📦 Total Available: ${user.bundleRemaining + bundleCount} OTPs\n\nUse /otp to start requesting.`;
+        await this.sendPhotoWithCaption(ctx, IMAGES.bundleOther, message);
+    }
+
+    // ─── VIP Purchase ────────────────────────────────────────────────────
+
+    async handleBuyVIP(ctx) {
+        const user = ctx.state.user;
+        const vipPrice = config.prices?.vipSubscription || 5.00;
+        const message = `👑 Upgrade to VIP\n\n💰 Price: ${formatCurrency(vipPrice)}/month\n✅ Unlimited OTPs (50/day)\n⚡ Priority routing\n🚀 Fastest delivery\n\nYour Balance: ${formatCurrency(user.balance)}`;
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Confirm Upgrade', 'confirm_vip')],
+            [Markup.button.callback('❌ Cancel', 'menu')]
+        ]);
+        await this.sendPhotoWithCaption(ctx, IMAGES.vipFirst, message, keyboard);
+    }
+
+    async handleConfirmVIP(ctx) {
+        const user = ctx.state.user;
+        const vipPrice = config.prices?.vipSubscription || 5.00;
+        if (user.balance < vipPrice) {
+            const message = `❌ Insufficient Balance\n\nRequired: ${formatCurrency(vipPrice)}\nAvailable: ${formatCurrency(user.balance)}\n\nDeposit first with /deposit`;
+            return this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message);
+        }
+        
+        const expiryDate = new Date();
+        expiryDate.setMonth(expiryDate.getMonth() + 1);
+        
+        // Deduct balance and set VIP
+        await User.updateOne({ userId:
