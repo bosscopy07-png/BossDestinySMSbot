@@ -997,6 +997,7 @@ Proceed with purchase?
         await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
     }
 
+
     async executePoolPurchase(ctx) {
         const purchase = ctx.session?.poolPurchase;
         if (!purchase) {
@@ -1074,8 +1075,302 @@ ${numbersList}
             logger.error('Pool purchase failed', { error: error.message, purchase });
             await this.replyError(ctx, `❌ <b>Purchase Failed:</b> ${error.message}`, {
                 reply_markup: Markup.inlineKeyboard([
-                    [Markup.button.callback('🔄 Retry', 'pool_buy_nu
+                    [Markup.button.callback('🔄 Retry', 'pool_buy_numbers')],
+                    [Markup.button.callback('🔙 Back', 'admin_pool')]
+                ]).reply_markup
+            });
+        }
+    }
 
+    async handlePoolMonitor(ctx) {
+        try {
+            if (!this.smsProviderManager?.numberPool) {
+                return this.replyError(ctx, '❌ <b>Pool not available.</b>');
+            }
+
+            const stats = this.smsProviderManager.getPoolStats();
+            const detailed = this.smsProviderManager.numberPool?.getDetailedStats?.();
+
+            let message = `
+<b>📊 Pool Monitor</b>
+
+<b>Pool Status:</b> ${stats.available ? '✅ Active' : '❌ Inactive'}
+            `;
+
+            if (stats.pools) {
+                message += '\n\n<b>By Country:</b>\n';
+                for (const [country, data] of Object.entries(stats.pools)) {
+                    message += `• ${country}: <code>${data.available}</code> available / <code>${data.active}</code> active / <code>${data.total}</code> total\n`;
+                }
+            }
+
+            if (detailed) {
+                message += `\n<b>Total Active Assignments:</b> <code>${detailed.totalActive || 0}</code>\n`;
+                message += `<b>Max Hold Time:</b> <code>${detailed.maxHoldMinutes || 30}</code> min\n`;
+                
+                if (detailed.activeAssignments?.length > 0) {
+                    message += '\n<b>Active Assignments (top 5):</b>\n';
+                    detailed.activeAssignments.slice(0, 5).forEach(a => {
+                        message += `• <code>${a.phone}</code> | ${a.country} | ${a.service} | ${a.heldMinutes}min\n`;
+                    });
+                }
+            }
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('🔄 Refresh', 'pool_monitor')],
+                [Markup.button.callback('🛒 Buy Numbers', 'pool_buy_numbers')],
+                [Markup.button.callback('🔙 Back', 'admin_pool')]
+            ]);
+
+            await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+        } catch (error) {
+            logger.error('Pool monitor error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load pool stats.</b>');
+        }
+    }
+
+    async handlePoolVipUsers(ctx) {
+        try {
+            const vipUsers = await User.find({
+                vipExpiry: { $gt: new Date() },
+                vipPhoneNumber: { $ne: null }
+            }).select('userId username firstName vipPhoneNumber vipProvider vipExpiry vipNumberAssignedAt').lean();
+
+            if (!vipUsers.length) {
+                return this.replyError(ctx, '<b>👥 No VIP users with assigned numbers.</b>', {
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🔙 Back', 'admin_pool')]
+                    ]).reply_markup
+                });
+            }
+
+            let message = `<b>👑 VIP Users with Numbers</b> (${vipUsers.length} total)\n\n`;
+            const buttons = [];
+
+            for (const user of vipUsers) {
+                const daysLeft = Math.ceil((new Date(user.vipExpiry) - new Date()) / (1000 * 60 * 60 * 24));
+                const displayName = user.username ? `@${user.username}` : (user.firstName || user.userId);
+                
+                message += `👑 <b>${displayName}</b>\n`;
+                message += `   📞 <code>${user.vipPhoneNumber}</code> (${user.vipProvider})\n`;
+                message += `   ⏰ ${daysLeft} days left | ID: <code>${user.userId}</code>\n\n`;
+
+                buttons.push([Markup.button.callback(
+                    `❌ Cancel VIP ${displayName.substring(0, 15)}`,
+                    `quick_cancelvip_${user.userId}`
+                )]);
+            }
+
+            buttons.push([Markup.button.callback('🔙 Back', 'admin_pool')]);
+
+            await this.replySuccess(ctx, message, { reply_markup: { inline_keyboard: buttons } });
+        } catch (error) {
+            logger.error('Pool VIP users error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load VIP users.</b>');
+        }
+    }
+
+    async handlePoolRetireMenu(ctx) {
+        await this.replySuccess(ctx, 
+            '<b>🗑 Retire Numbers</b>\n\nSelect a number from inventory or use /retire_number &lt;number_id&gt;',
+            { reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback('📱 View Inventory', 'number_inventory_all')],
+                [Markup.button.callback('📊 Go to Monitor', 'pool_monitor')],
+                [Markup.button.callback('🔙 Back', 'admin_pool')]
+            ]).reply_markup }
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  NUMBER INVENTORY (NEW FEATURE)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleNumberInventory(ctx) {
+        const message = `
+<b>📱 Number Inventory</b>
+
+View and manage all numbers in the system:
+        `;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('📋 All Numbers', 'number_inventory_all')],
+            [Markup.button.callback('✅ Available', 'number_inventory_available')],
+            [Markup.button.callback('🔒 Assigned', 'number_inventory_assigned')],
+            [Markup.button.callback('🗑 Retired', 'number_inventory_retired')],
+            [Markup.button.callback('🔙 Back', 'admin')]
+        ]);
+
+        await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+    }
+
+    async handleNumberInventoryList(ctx, filter) {
+        try {
+            const query = {};
+            if (filter !== 'all') query.status = filter.toUpperCase();
+
+            const numbers = await NumberModel.find(query)
+                .sort({ updatedAt: -1 })
+                .limit(20)
+                .lean();
+
+            if (!numbers.length) {
+                return this.replyError(ctx, `<b>📱 No ${filter} numbers found.</b>`, {
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🔙 Back', 'admin_numberinventory')]
+                    ]).reply_markup
+                });
+            }
+
+            let message = `<b>📱 ${filter.charAt(0).toUpperCase() + filter.slice(1)} Numbers</b> (${numbers.length} shown)\n\n`;
+            const buttons = [];
+
+            for (const num of numbers) {
+                const statusEmoji = num.status === NUMBER_STATUS.AVAILABLE ? '✅' :
+                    num.status === NUMBER_STATUS.ASSIGNED ? '🔒' :
+                    num.status === NUMBER_STATUS.RETIRED ? '🗑' : '⚪';
+
+                message += `${statusEmoji} <code>${num.phoneNumber}</code>\n`;
+                message += `   ${num.provider} | ${num.country} | ${num.status}\n`;
+                if (num.assignedTo) message += `   👤 <code>${num.assignedTo}</code>\n`;
+                message += '\n';
+
+                buttons.push([Markup.button.callback(
+                    `🔍 ${num.phoneNumber}`,
+                    `number_detail_${num.numberId}`
+                )]);
+            }
+
+            buttons.push([Markup.button.callback('🔙 Back', 'admin_numberinventory')]);
+
+            await this.replySuccess(ctx, message, { reply_markup: { inline_keyboard: buttons } });
+        } catch (error) {
+            logger.error('Number inventory error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load number inventory.</b>');
+        }
+    }
+
+    async showNumberDetail(ctx, numberId) {
+        try {
+            const num = await NumberModel.findOne({ numberId }).lean();
+            if (!num) {
+                return this.replyError(ctx, '❌ <b>Number not found.</b>');
+            }
+
+            const message = `
+<b>📱 Number Detail</b>
+
+<b>Phone:</b> <code>${num.phoneNumber}</code>
+<b>Provider:</b> <code>${num.provider}</code>
+<b>Country:</b> <code>${num.country}</code>
+<b>Status:</b> <code>${num.status}</code>
+<b>Purchased:</b> <code>${num.purchasedAt ? new Date(num.purchasedAt).toLocaleDateString() : 'N/A'}</code>
+<b>Cost:</b> <code>${formatCurrency(num.cost || 0)}</code>
+${num.assignedTo ? `<b>Assigned To:</b> <code>${num.assignedTo}</code>\n` : ''}
+${num.assignedAt ? `<b>Assigned At:</b> <code>${new Date(num.assignedAt).toLocaleDateString()}</code>\n` : ''}
+${num.retiredAt ? `<b>Retired At:</b> <code>${new Date(num.retiredAt).toLocaleDateString()}</code>\n` : ''}
+            `;
+
+            const buttons = [];
+            if (num.status !== NUMBER_STATUS.RETIRED) {
+                buttons.push([Markup.button.callback('🗑 Retire Number', `number_retire_confirm_${num.numberId}`)]);
+            }
+            buttons.push([Markup.button.callback('🔙 Back', 'number_inventory_all')]);
+
+            await this.replySuccess(ctx, message, { reply_markup: { inline_keyboard: buttons } });
+        } catch (error) {
+            logger.error('Number detail error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load number detail.</b>');
+        }
+    }
+
+    async handleRetireNumberCommand(ctx) {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 2) {
+            return this.replyError(ctx, '❌ <b>Usage:</b> <code>/retire_number &lt;number_id&gt;</code>');
+        }
+        return this.executeRetireNumber(ctx, args[1]);
+    }
+
+    async executeRetireNumber(ctx, numberId) {
+        try {
+            const num = await NumberModel.findOne({ numberId });
+            if (!num) {
+                return this.replyError(ctx, `❌ <b>Number not found:</b> <code>${numberId}</code>`);
+            }
+
+            if (num.status === NUMBER_STATUS.RETIRED) {
+                return this.replyError(ctx, `❌ <b>Number already retired:</b> <code>${numberId}</code>`);
+            }
+
+            // Release from provider if assigned
+            if (num.status === NUMBER_STATUS.ASSIGNED && this.smsProviderManager?.numberPool) {
+                try {
+                    await this.smsProviderManager.numberPool.releaseNumber(numberId, 'ADMIN_RETIRED');
+                } catch (e) {
+                    logger.warn('Failed to release from provider pool', { numberId, error: e.message });
+                }
+            }
+
+            // Update user if assigned
+            if (num.assignedTo) {
+                await User.updateOne(
+                    { userId: num.assignedTo },
+                    { $unset: { vipPhoneNumber: 1, vipNumberId: 1, vipProvider: 1 } }
+                );
+            }
+
+            await NumberModel.updateOne(
+                { numberId },
+                {
+                    $set: {
+                        status: NUMBER_STATUS.RETIRED,
+                        retiredAt: new Date(),
+                        retiredBy: ctx.from.id.toString()
+                    }
+                }
+            );
+
+            await Transaction.create({
+                txId: generateId(),
+                type: TX_TYPES.NUMBER_RETIRE,
+                amount: 0,
+                status: 'COMPLETED',
+                metadata: { numberId, phoneNumber: num.phoneNumber, adminId: ctx.from.id.toString() },
+                createdAt: new Date()
+            });
+
+            await this.logAdminAction(
+                ctx.from.id.toString(),
+                'RETIRE_NUMBER',
+                num.assignedTo,
+                { numberId, phoneNumber: num.phoneNumber }
+            );
+
+            await this.replySuccess(ctx, `🗑 <b>Number Retired!</b>\n\n<code>${num.phoneNumber}</code> has been retired.`, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 Inventory', 'admin_numberinventory')],
+                    [Markup.button.callback('🔙 Back', 'admin')]
+                ]).reply_markup
+            });
+
+        } catch (error) {
+            logger.error('Retire number error', { error: error.message, numberId });
+            await this.replyError(ctx, '❌ <b>Failed to retire number.</b>');
+        }
+    }
+
+    async processRetireNumber(ctx, input) {
+        // Input can be numberId or phone number
+        const num = await NumberModel.findOne({
+            $or: [{ numberId: input }, { phoneNumber: input }]
+        }).lean();
+
+        if (!num) {
+            return this.replyError(ctx, `❌ <b>Number not found:</b> <code>${input}</code>`);
+        }
+
+        return this.executeRetireNumber(ctx, num.numberId);
+                                                   }
 
 
                 // ═══════════════════════════════════════════════════════════
