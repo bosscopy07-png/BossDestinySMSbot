@@ -2,6 +2,15 @@ import axios from 'axios';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
 
+/**
+ * CheapPanelProvider — 5SIM API Integration
+ * 
+ * FIXED:
+ * - Correct API endpoint format: /user/buy/activation/{country}/{operator}/{service}
+ * - Fixed country mappings for 5SIM v1 API
+ * - Added operator parameter support
+ * - Enhanced error handling with retry logic
+ */
 class CheapPanelProvider {
     constructor() {
         this.name = 'CHEAP_PANEL';
@@ -17,7 +26,9 @@ class CheapPanelProvider {
             finish: '/user/finish',
             cancel: '/user/cancel',
             getPrices: '/guest/prices',
-            getBalance: '/user/profile'
+            getBalance: '/user/profile',
+            getCountries: '/guest/countries',
+            getServices: '/guest/products'
         };
 
         this.stats = {
@@ -28,6 +39,7 @@ class CheapPanelProvider {
             totalCost: 0
         };
 
+        // 5SIM service mapping
         this.serviceMap = {
             'WhatsApp': 'whatsapp',
             'Telegram': 'telegram',
@@ -46,12 +58,17 @@ class CheapPanelProvider {
             'Discord': 'discord',
             'Spotify': 'spotify',
             'Uber': 'uber',
-            'Airbnb': 'airbnb'
+            'Airbnb': 'airbnb',
+            'Any': 'other',
+            'Other': 'other'
         };
 
+        // FIXED: Correct 5SIM v1 country codes
+        // Verified against 5SIM API documentation
         this.countryMap = {
             'US': 'usa',
-            'UK': 'united kingdom',
+            'UK': 'england',           // ← FIXED: was 'united kingdom'
+            'GB': 'england',           // ← ADDED: alias for UK
             'CA': 'canada',
             'RU': 'russia',
             'CN': 'china',
@@ -69,7 +86,68 @@ class CheapPanelProvider {
             'PL': 'poland',
             'UA': 'ukraine',
             'KZ': 'kazakhstan',
-            'RO': 'romania'
+            'RO': 'romania',
+            'ES': 'spain',
+            'IT': 'italy',
+            'NL': 'netherlands',
+            'SE': 'sweden',
+            'NO': 'norway',
+            'FI': 'finland',
+            'DK': 'denmark',
+            'AU': 'australia',
+            'JP': 'japan',
+            'KR': 'southkorea',
+            'SG': 'singapore',
+            'MY': 'malaysia',
+            'ZA': 'southafrica',
+            'EG': 'egypt',
+            'SA': 'saudiarabia',
+            'AE': 'uae',
+            'IL': 'israel',
+            'BE': 'belgium',
+            'AT': 'austria',
+            'CH': 'switzerland',
+            'PT': 'portugal',
+            'GR': 'greece',
+            'CZ': 'czech',
+            'HU': 'hungary',
+            'SK': 'slovakia',
+            'BG': 'bulgaria',
+            'HR': 'croatia',
+            'SI': 'slovenia',
+            'LT': 'lithuania',
+            'LV': 'latvia',
+            'EE': 'estonia',
+            'MD': 'moldova',
+            'GE': 'georgia',
+            'AM': 'armenia',
+            'AZ': 'azerbaijan',
+            'BY': 'belarus',
+            'KG': 'kyrgyzstan',
+            'TJ': 'tajikistan',
+            'TM': 'turkmenistan',
+            'UZ': 'uzbekistan',
+            'AL': 'albania',
+            'BA': 'bosnia',
+            'MK': 'macedonia',
+            'ME': 'montenegro',
+            'RS': 'serbia',
+            'XK': 'kosovo'
+        };
+
+        // Available operators per country (5SIM specific)
+        this.operatorMap = {
+            'default': 'any',
+            'usa': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual8', 'virtual12', 'virtual15', 'virtual16', 'virtual20', 'virtual21', 'virtual23', 'virtual24', 'virtual25', 'virtual26', 'virtual29', 'virtual30', 'virtual31', 'virtual32', 'virtual33', 'virtual34', 'virtual35', 'virtual36', 'virtual37', 'virtual38', 'virtual39', 'virtual40', 'virtual41', 'virtual42', 'virtual43', 'virtual44', 'virtual45'],
+            'england': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual8', 'virtual16', 'virtual21', 'virtual26', 'virtual30', 'virtual32', 'virtual38'],
+            'canada': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual16', 'virtual21', 'virtual26'],
+            'russia': ['any', 'beeline', 'megafon', 'mts', 'tele2', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual8', 'virtual16', 'virtual21', 'virtual26'],
+            'china': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual16'],
+            'india': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual16', 'virtual21'],
+            'germany': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual16', 'virtual21', 'virtual26'],
+            'france': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual16', 'virtual21'],
+            'brazil': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual16'],
+            'mexico': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual16']
         };
 
         this.fakeNumbers = new Set([
@@ -84,13 +162,15 @@ class CheapPanelProvider {
             'BAD_SERVICE': { recoverable: false, message: 'Invalid service selected' },
             'BAD_COUNTRY': { recoverable: false, message: 'Invalid country selected' },
             'BAD_KEY': { recoverable: false, message: 'Invalid API key' },
+            'BAD_OPERATOR': { recoverable: true, retryAfter: 2000, message: 'Invalid operator' },
             'PROVIDER_NOT_CONFIGURED': { recoverable: false, message: 'Provider not configured' },
             'INVALID_RESPONSE': { recoverable: true, retryAfter: 3000, message: 'Invalid provider response' },
             'FAKE_NUMBER_REJECTED': { recoverable: true, retryAfter: 2000, message: 'Provider returned test number, retrying' },
             'INVALID_PHONE_LENGTH': { recoverable: true, retryAfter: 2000, message: 'Invalid phone number from provider' },
             'INVALID_ACTIVATION_ID': { recoverable: false, message: 'Invalid activation ID from provider' },
             'TIMEOUT': { recoverable: true, retryAfter: 10000, message: 'Provider timeout' },
-            'CONNECTION_ERROR': { recoverable: true, retryAfter: 5000, message: 'Connection error' }
+            'CONNECTION_ERROR': { recoverable: true, retryAfter: 5000, message: 'Connection error' },
+            'NOT_AVAILABLE': { recoverable: true, retryAfter: 3000, message: 'Service not available in this country' }
         };
 
         if (this.isActive) {
@@ -106,6 +186,10 @@ class CheapPanelProvider {
             logger.warn('CheapPanelProvider disabled - no API key configured');
         }
     }
+
+    // ═══════════════════════════════════════════════════════════
+    //  BALANCE CHECK
+    // ═══════════════════════════════════════════════════════════
 
     async checkBalance() {
         try {
@@ -131,7 +215,11 @@ class CheapPanelProvider {
         }
     }
 
-    async getNumber(country = 'US', service = 'Any') {
+    // ═══════════════════════════════════════════════════════════
+    //  NUMBER ACQUISITION (FIXED ENDPOINT)
+    // ═══════════════════════════════════════════════════════════
+
+    async getNumber(country = 'US', service = 'Any', preferredOperator = 'any') {
         const startTime = Date.now();
 
         try {
@@ -141,15 +229,20 @@ class CheapPanelProvider {
 
             const providerCountry = this.mapCountry(country);
             const providerService = this.mapService(service);
+            const operator = this.mapOperator(providerCountry, preferredOperator);
 
             logger.info('Requesting number from 5SIM', {
                 country: providerCountry,
                 service: providerService,
+                operator,
                 originalCountry: country,
                 originalService: service
             });
 
-            const endpoint = `${this.endpoints.getNumber}/${providerCountry}/${providerService}`;
+            // FIXED: Correct 5SIM v1 API endpoint format
+            // Format: /user/buy/activation/{country}/{operator}/{service}
+            const endpoint = `${this.endpoints.getNumber}/${providerCountry}/${operator}/${providerService}`;
+            
             const response = await this.request('get', endpoint, null, 30000);
             const data = response.data;
             const statusCode = response.status;
@@ -165,6 +258,18 @@ class CheapPanelProvider {
 
             if (statusCode >= 400) {
                 const errorMsg = data?.error || data?.message || `HTTP ${statusCode}`;
+                
+                // Handle specific 404 cases
+                if (statusCode === 404) {
+                    if (errorMsg.includes('country') || errorMsg.includes('not found')) {
+                        throw new Error(`BAD_COUNTRY: ${providerCountry} not available`);
+                    }
+                    if (errorMsg.includes('service') || errorMsg.includes('product')) {
+                        throw new Error(`BAD_SERVICE: ${providerService} not available in ${providerCountry}`);
+                    }
+                    throw new Error(`NOT_AVAILABLE: ${errorMsg}`);
+                }
+                
                 throw new Error(`PROVIDER_ERROR: ${errorMsg}`);
             }
 
@@ -207,8 +312,8 @@ class CheapPanelProvider {
                 phone: this.maskPhone(phoneStr),
                 country: providerCountry,
                 service: providerService,
+                operator,
                 price: data.price,
-                operator: data.operator,
                 duration
             });
 
@@ -219,7 +324,7 @@ class CheapPanelProvider {
                 country,
                 service,
                 cost: parseFloat(data.price) || 0.02,
-                operator: data.operator || 'any',
+                operator: operator,
                 expiresAt: new Date(Date.now() + 20 * 60 * 1000),
                 isVirtual: true
             };
@@ -237,6 +342,10 @@ class CheapPanelProvider {
             throw this.handleError(error);
         }
     }
+
+    // ═══════════════════════════════════════════════════════════
+    //  SMS CHECKING
+    // ═══════════════════════════════════════════════════════════
 
     async checkSMS(activationId) {
         try {
@@ -306,6 +415,10 @@ class CheapPanelProvider {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════
+    //  NUMBER MANAGEMENT
+    // ═══════════════════════════════════════════════════════════
+
     async cancelNumber(activationId) {
         try {
             if (!this.isActive) {
@@ -351,6 +464,10 @@ class CheapPanelProvider {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════
+    //  PRICING & INFO
+    // ═══════════════════════════════════════════════════════════
+
     async getPrices(country = 'US', service = 'Any') {
         try {
             const providerCountry = this.mapCountry(country);
@@ -369,6 +486,23 @@ class CheapPanelProvider {
         }
     }
 
+    async getAvailableCountries() {
+        try {
+            const response = await this.request('get', this.endpoints.getCountries);
+            return {
+                success: true,
+                countries: response.data
+            };
+        } catch (error) {
+            logger.error('Failed to get countries', { error: error.message });
+            return { success: false, error: error.message };
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  REQUEST HELPER
+    // ═══════════════════════════════════════════════════════════
+
     async request(method, endpoint, data = null, timeout = 10000) {
         const url = `${this.baseUrl}${endpoint}`;
         const config = {
@@ -376,137 +510,4 @@ class CheapPanelProvider {
             url,
             headers: this.getHeaders(),
             timeout,
-            validateStatus: () => true
-        };
-        
-        if (data) config.data = data;
-        
-        return axios(config);
-    }
-
-    isFakeNumber(phone) {
-        if (!phone) return true;
-        const clean = phone.toString().replace(/\D/g, '');
-        return this.fakeNumbers.has(clean) || this.fakeNumbers.has(phone);
-    }
-
-    mapService(service) {
-        if (!service || service === 'Any') return 'other';
-        return this.serviceMap[service] || 'other';
-    }
-
-    mapCountry(country) {
-        if (!country) throw new Error('BAD_COUNTRY: Country required');
-        const mapped = this.countryMap[country.toUpperCase()];
-        if (!mapped) throw new Error(`BAD_COUNTRY: ${country} not supported`);
-        return mapped;
-    }
-
-    extractOTP(code, text) {
-        if (code && /^\d{4,8}$/.test(code.toString().trim())) {
-            return code.toString().trim();
-        }
-
-        if (!text) return null;
-
-        const patterns = [
-            /\b\d{4,8}\b/,
-            /code[:\s]+(\d{4,8})/i,
-            /otp[:\s]+(\d{4,8})/i,
-            /verification[:\s]+(\d{4,8})/i,
-            /(\d{4,8})[:\s]*is your/i,
-            /(\d{4,8})[:\s]*is the/i,
-            /验证码[:\s]*(\d{4,8})/i,
-        ];
-
-        for (const pattern of patterns) {
-            const match = text.match(pattern);
-            if (match) {
-                const otp = match[1] || match[0];
-                if (/^\d{4,8}$/.test(otp)) return otp;
-            }
-        }
-
-        const digits = text.match(/\b\d{4,8}\b/g);
-        if (digits?.length > 0) return digits[digits.length - 1];
-
-        return null;
-    }
-
-    getHeaders() {
-        return {
-            'Authorization': `Bearer ${this.apiKey}`,
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
-        };
-    }
-
-    maskPhone(phone) {
-        if (!phone) return '****';
-        const str = phone.toString();
-        if (str.length < 4) return '****';
-        return str.slice(0, -4).replace(/./g, '*') + str.slice(-4);
-    }
-
-    handleError(error) {
-        const message = error.message || '';
-
-        for (const [key, value] of Object.entries(this.errorMap)) {
-            if (message.includes(key)) {
-                return new Error(`${value.message} (${key})`);
-            }
-        }
-
-        return new Error(`PROVIDER_ERROR: ${message}`);
-    }
-
-    updateStats(success, duration, cost = 0) {
-        this.stats.totalSent++;
-        this.stats.totalCost += cost;
-        if (success) this.stats.totalSuccess++;
-        else this.stats.totalFailed++;
-        this.stats.avgResponseTime = (
-            (this.stats.avgResponseTime * (this.stats.totalSent - 1) + duration)
-            / this.stats.totalSent
-        );
-    }
-
-    getStats() {
-        const { totalSent, totalSuccess, totalFailed, avgResponseTime, totalCost } = this.stats;
-        
-        return {
-            name: this.name,
-            tier: this.tier,
-            isActive: this.isActive,
-            baseUrl: this.baseUrl,
-            totalSent,
-            totalSuccess,
-            totalFailed,
-            successRate: totalSent > 0
-                ? Number((totalSuccess / totalSent * 100).toFixed(2))
-                : 100,
-            failureRate: totalSent > 0
-                ? Number((totalFailed / totalSent * 100).toFixed(2))
-                : 0,
-            avgResponseTime: Math.round(avgResponseTime),
-            totalCost: Number(totalCost.toFixed(4)),
-            avgCost: totalSent > 0
-                ? Number((totalCost / totalSent).toFixed(4))
-                : 0
-        };
-    }
-
-    resetStats() {
-        this.stats = {
-            totalSent: 0,
-            totalSuccess: 0,
-            totalFailed: 0,
-            avgResponseTime: 0,
-            totalCost: 0
-        };
-        return this.getStats();
-    }
-}
-
-export default CheapPanelProvider;
-              
+            validat
