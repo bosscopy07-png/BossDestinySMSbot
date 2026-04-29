@@ -3899,4 +3899,129 @@ Deep dive into bot performance metrics:
 • 90d: <code>${new90d}</code>
 
 <b>Active Users:</b>
-• 7d active: <code>${active7d}</code
+• 7d active: <code>${active7d}</code>
+• 30d active: <code>${active30d}</code>
+
+<b>Total Users:</b> <code>${total}</code>
+<b>Retention (7d/30d):</b> <code>${new30d > 0 ? ((active7d / new30d) * 100).toFixed(1) : 0}%</code>
+            `;
+
+            await this.replySuccess(ctx, message, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Refresh', 'analytics_users')],
+                    [Markup.button.callback('🔙 Back', 'admin_analytics')]
+                ]).reply_markup
+            });
+        } catch (error) {
+            logger.error('Analytics users error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load user analytics.</b>');
+        }
+    }
+
+    async handleAnalyticsServices(ctx) {
+        try {
+            const monthAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+            const services = await Session.aggregate([
+                { $match: { status: 'RECEIVED', startTime: { $gte: monthAgo } } },
+                { $group: { _id: '$service', count: { $sum: 1 }, revenue: { $sum: '$cost' }, avgTime: { $avg: '$duration' } } },
+                { $sort: { count: -1 } },
+                { $limit: 10 }
+            ]);
+
+            let message = '<b>🔥 Service Demand (30d)</b>\n\n';
+            services.forEach((s, i) => {
+                const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '•';
+                message += `${medal} <b>${s._id}</b>\n`;
+                message += `   Requests: <code>${s.count}</code> | Revenue: <code>${formatCurrency(s.revenue)}</code>\n`;
+                message += `   Avg Time: <code>${(s.avgTime || 0).toFixed(1)}s</code>\n\n`;
+            });
+
+            await this.replySuccess(ctx, message, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Refresh', 'analytics_services')],
+                    [Markup.button.callback('🔙 Back', 'admin_analytics')]
+                ]).reply_markup
+            });
+        } catch (error) {
+            logger.error('Analytics services error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load service analytics.</b>');
+        }
+    }
+
+    async handleAnalyticsRetention(ctx) {
+        try {
+            const now = new Date();
+            const cohorts = [];
+            const weeks = 4;
+
+            for (let i = 0; i < weeks; i++) {
+                const weekStart = new Date(now - (i + 1) * 7 * 24 * 60 * 60 * 1000);
+                const weekEnd = new Date(now - i * 7 * 24 * 60 * 60 * 1000);
+
+                const newUsers = await User.countDocuments({ createdAt: { $gte: weekStart, $lt: weekEnd } });
+                const retained = await User.countDocuments({
+                    createdAt: { $gte: weekStart, $lt: weekEnd },
+                    lastActive: { $gte: new Date(now - 7 * 24 * 60 * 60 * 1000) }
+                });
+
+                cohorts.push({
+                    week: `Week ${weeks - i}`,
+                    newUsers,
+                    retained,
+                    rate: newUsers > 0 ? ((retained / newUsers) * 100).toFixed(1) : 0
+                });
+            }
+
+            let message = '<b>🔄 Retention Cohorts</b>\n\n';
+            cohorts.forEach(c => {
+                message += `<b>${c.week}</b>: <code>${c.newUsers}</code> new → <code>${c.retained}</code> retained (<code>${c.rate}%</code>)\n`;
+            });
+
+            await this.replySuccess(ctx, message, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Refresh', 'analytics_retention')],
+                    [Markup.button.callback('🔙 Back', 'admin_analytics')]
+                ]).reply_markup
+            });
+        } catch (error) {
+            logger.error('Analytics retention error', { error: error.message });
+            await this.replyError(ctx, '❌ <b>Failed to load retention analytics.</b>');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  HANDLE BUY POOL COMMAND (Missing implementation)
+    // ═══════════════════════════════════════════════════════════
+
+    async handleBuyPoolCommand(ctx) {
+        const args = ctx.message.text.split(' ');
+        if (args.length < 3) {
+            return this.replyError(ctx, '❌ <b>Usage:</b> <code>/buypool &lt;country&gt; &lt;quantity&gt; [provider]</code>');
+        }
+
+        const country = args[1].toUpperCase();
+        const quantity = parseInt(args[2]);
+        const provider = args[3] || null;
+
+        if (country.length !== 2) {
+            return this.replyError(ctx, '❌ <b>Invalid country code.</b>\n\nMust be 2 letters (e.g., US, GB).');
+        }
+        if (isNaN(quantity) || quantity < 1 || quantity > 50) {
+            return this.replyError(ctx, '❌ <b>Invalid quantity.</b>\n\nMust be 1-50.');
+        }
+
+        ctx.session.poolPurchase = { country, quantity, preferredProvider: provider };
+        return this.showPoolPurchaseConfirm(ctx);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  HANDLE POOL STATS COMMAND (Missing implementation)
+    // ═══════════════════════════════════════════════════════════
+
+    async handlePoolStatsCommand(ctx) {
+        return this.handlePoolMonitor(ctx);
+    }
+}
+
+export default AdminCommands;
