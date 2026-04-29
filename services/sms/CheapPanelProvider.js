@@ -437,6 +437,7 @@ class CheapPanelProvider {
 
     // ─── Number Management ───────────────────────────────────────────────
 
+                
     async cancelNumber(activationId) {
         try {
             if (!this.isActive) {
@@ -509,4 +510,183 @@ class CheapPanelProvider {
                 success: true,
                 countries: response.data
             };
-        } ca
+        } catch (error) {
+            logger.error('Failed to get countries', { error: error.message });
+            return { success: false, error: error.message };
+        }
+    }
+
+    // ─── Request Helper ──────────────────────────────────────────────────
+
+    async request(method, endpoint, data = null, timeout = 10000) {
+        const url = `${this.baseUrl}${endpoint}`;
+        const config = {
+            method,
+            url,
+            headers: this.getHeaders(),
+            timeout,
+            validateStatus: () => true
+        };
+        
+        if (data) config.data = data;
+        
+        const response = await axios(config);
+        
+        // LOG 400+ responses for debugging
+        if (response.status >= 400) {
+            logger.error('5SIM API error response', {
+                url,
+                status: response.status,
+                statusText: response.statusText,
+                data: response.data,
+                headers: response.headers
+            });
+        }
+        
+        return response;
+    }
+
+    // ─── Mapping Helpers ─────────────────────────────────────────────────
+
+    mapService(service) {
+        if (!service || service === 'Any') return 'other';
+        return this.serviceMap[service] || 'other';
+    }
+
+    mapCountry(country) {
+        if (!country) throw new Error('BAD_COUNTRY: Country required');
+        const mapped = this.countryMap[country.toUpperCase()];
+        if (!mapped) throw new Error(`BAD_COUNTRY: ${country} not supported`);
+        return mapped;
+    }
+
+    mapOperator(country, preferred) {
+        if (preferred && preferred !== 'any') {
+            const operators = this.operatorMap[country] || this.operatorMap['default'];
+            if (operators.includes(preferred)) return preferred;
+        }
+        return 'any';
+    }
+
+    // ─── Validation Helpers ──────────────────────────────────────────────
+
+    isFakeNumber(phone) {
+        if (!phone) return true;
+        const clean = phone.toString().replace(/\D/g, '');
+        return this.fakeNumbers.has(clean) || this.fakeNumbers.has(phone);
+    }
+
+    extractOTP(code, text) {
+        if (code && /^\d{4,8}$/.test(code.toString().trim())) {
+            return code.toString().trim();
+        }
+
+        if (!text) return null;
+
+        const patterns = [
+            /\b\d{4,8}\b/,
+            /code[:\s]+(\d{4,8})/i,
+            /otp[:\s]+(\d{4,8})/i,
+            /verification[:\s]+(\d{4,8})/i,
+            /(\d{4,8})[:\s]*is your/i,
+            /(\d{4,8})[:\s]*is the/i,
+            /验证码[:\s]*(\d{4,8})/i,
+            /код[:\s]+(\d{4,8})/i,
+            /code[:\s]*(\d{4,8})/i,
+            /(\d{4,8})[:\s]*код/i,
+            /pin[:\s]+(\d{4,8})/i,
+            /password[:\s]+(\d{4,8})/i
+        ];
+
+        for (const pattern of patterns) {
+            const match = text.match(pattern);
+            if (match) {
+                const otp = match[1] || match[0];
+                if (/^\d{4,8}$/.test(otp)) return otp;
+            }
+        }
+
+        const digits = text.match(/\b\d{4,8}\b/g);
+        if (digits?.length > 0) return digits[digits.length - 1];
+
+        return null;
+    }
+
+    getHeaders() {
+        return {
+            'Authorization': `Bearer ${this.apiKey}`,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        };
+    }
+
+    maskPhone(phone) {
+        if (!phone) return '****';
+        const str = phone.toString();
+        if (str.length < 4) return '****';
+        return str.slice(0, -4).replace(/./g, '*') + str.slice(-4);
+    }
+
+    handleError(error) {
+        const message = error.message || '';
+
+        for (const [key, value] of Object.entries(this.errorMap)) {
+            if (message.includes(key)) {
+                return new Error(`${value.message} (${key})`);
+            }
+        }
+
+        return new Error(`PROVIDER_ERROR: ${message}`);
+    }
+
+    // ─── Stats ───────────────────────────────────────────────────────────
+
+    updateStats(success, duration, cost = 0) {
+        this.stats.totalSent++;
+        this.stats.totalCost += cost;
+        if (success) this.stats.totalSuccess++;
+        else this.stats.totalFailed++;
+        this.stats.avgResponseTime = (
+            (this.stats.avgResponseTime * (this.stats.totalSent - 1) + duration)
+            / this.stats.totalSent
+        );
+    }
+
+    getStats() {
+        const { totalSent, totalSuccess, totalFailed, avgResponseTime, totalCost } = this.stats;
+        
+        return {
+            name: this.name,
+            tier: this.tier,
+            isActive: this.isActive,
+            baseUrl: this.baseUrl,
+            totalSent,
+            totalSuccess,
+            totalFailed,
+            successRate: totalSent > 0
+                ? Number((totalSuccess / totalSent * 100).toFixed(2))
+                : 100,
+            failureRate: totalSent > 0
+                ? Number((totalFailed / totalSent * 100).toFixed(2))
+                : 0,
+            avgResponseTime: Math.round(avgResponseTime),
+            totalCost: Number(totalCost.toFixed(4)),
+            avgCost: totalSent > 0
+                ? Number((totalCost / totalSent).toFixed(4))
+                : 0
+        };
+    }
+
+    resetStats() {
+        this.stats = {
+            totalSent: 0,
+            totalSuccess: 0,
+            totalFailed: 0,
+            avgResponseTime: 0,
+            totalCost: 0
+        };
+        return this.getStats();
+    }
+}
+
+export default CheapPanelProvider;
