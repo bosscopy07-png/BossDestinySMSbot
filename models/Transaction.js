@@ -25,7 +25,11 @@ const transactionSchema = new mongoose.Schema({
             'REFUND',
             'ADMIN_ADD',
             'ADMIN_DEDUCT',
-            'WITHDRAWAL'
+            'WITHDRAWAL',
+            'POOL_PURCHASE',
+            'NUMBER_ASSIGN',
+            'NUMBER_RELEASE',
+            'NUMBER_RETIRE'
         ],
         required: true,
         index: true
@@ -136,7 +140,7 @@ transactionSchema.statics.getUserHistory = async function(userId, page = 1, limi
     return { transactions, total, page, pages: Math.ceil(total / limit) };
 };
 
-transactionSchema.statics.calculateRevenue = async function(since, types = ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION']) {
+transactionSchema.statics.calculateRevenue = async function(since, types = ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION', 'POOL_PURCHASE']) {
     const result = await this.aggregate([
         {
             $match: {
@@ -164,7 +168,7 @@ transactionSchema.statics.getPendingDepositsCount = async function() {
 };
 
 // ═══════════════════════════════════════════════════════════
-//  NEW: User Stats Aggregation (used by AdminCommands)
+//  User Stats Aggregation (used by AdminCommands)
 // ═══════════════════════════════════════════════════════════
 
 transactionSchema.statics.getUserStats = async function(userId) {
@@ -176,7 +180,7 @@ transactionSchema.statics.getUserStats = async function(userId) {
                 totalSpent: {
                     $sum: {
                         $cond: [
-                            { $in: ['$type', ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION']] },
+                            { $in: ['$type', ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION', 'POOL_PURCHASE']] },
                             { $abs: '$amount' },
                             0
                         ]
@@ -199,7 +203,7 @@ transactionSchema.statics.getUserStats = async function(userId) {
 };
 
 // ═══════════════════════════════════════════════════════════
-//  NEW: Financial Report Aggregation
+//  Financial Report Aggregation
 // ═══════════════════════════════════════════════════════════
 
 transactionSchema.statics.getFinancialReport = async function(startDate, endDate) {
@@ -212,7 +216,7 @@ transactionSchema.statics.getFinancialReport = async function(startDate, endDate
 
     const [revenue, expenses, deposits, withdrawals] = await Promise.all([
         this.aggregate([
-            { $match: { ...query, type: { $in: ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION'] }, status: 'COMPLETED' } },
+            { $match: { ...query, type: { $in: ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION', 'POOL_PURCHASE'] }, status: 'COMPLETED' } },
             { $group: { _id: null, total: { $sum: { $abs: '$amount' } } } }
         ]),
         this.aggregate([
@@ -240,14 +244,14 @@ transactionSchema.statics.getFinancialReport = async function(startDate, endDate
 };
 
 // ═══════════════════════════════════════════════════════════
-//  NEW: Revenue by Type Breakdown
+//  Revenue by Type Breakdown
 // ═══════════════════════════════════════════════════════════
 
 transactionSchema.statics.getRevenueByType = async function(since) {
     const results = await this.aggregate([
         {
             $match: {
-                type: { $in: ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION'] },
+                type: { $in: ['CHEAP_OTP', 'BUNDLE_PURCHASE', 'VIP_SUBSCRIPTION', 'POOL_PURCHASE'] },
                 status: 'COMPLETED',
                 createdAt: { $gte: since }
             }
@@ -270,7 +274,7 @@ transactionSchema.statics.getRevenueByType = async function(since) {
 };
 
 // ═══════════════════════════════════════════════════════════
-//  NEW: Export Data Helper
+//  Export Data Helper
 // ═══════════════════════════════════════════════════════════
 
 transactionSchema.statics.exportForPeriod = async function(startDate, endDate, format = 'csv') {
@@ -309,4 +313,4 @@ transactionSchema.statics.exportForPeriod = async function(startDate, endDate, f
 const Transaction = mongoose.model('Transaction', transactionSchema);
 
 export default Transaction;
-       
+            
