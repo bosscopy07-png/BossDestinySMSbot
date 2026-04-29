@@ -2917,8 +2917,8 @@ To withdraw, send USDT from your master wallet manually or use your wallet app.
 
             await this.replySuccess(ctx, message, {
                 reply_markup: Markup.inlineKeyboard([
-                    Markup.button.callback('🏥 Health', 'admin_healthcheck')
-                    [Markup.button.callback('🔙 Back', 'admin')]
+                [Markup.button.callback('🏥 Health', 'admin_healthcheck')],
+                [Markup.button.callback('🔙 Back', 'admin')]     
                 ]).reply_markup
             });
         } catch (error) {
