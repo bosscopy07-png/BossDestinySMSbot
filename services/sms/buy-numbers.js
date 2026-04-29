@@ -1,207 +1,404 @@
 import NumberPoolManager from './NumberPoolManager.js';
 import TwilioProvider from './TwilioProvider.js';
+import TelnyxProvider from './TelnyxProvider.js';
 import connectDatabase from '../../config/database.js';
 import logger from '../../utils/logger.js';
 
-class BatchNumberBuyer {
-    constructor(poolManager) {
-        this.pool = poolManager;
-        this.isConnected = false;
-        this.abortController = new AbortController();
+/**
+ * NumberBuyer — Single or bulk number purchases across multiple providers & countries
+ * 
+ * Usage:
+ *   const buyer = new NumberBuyer();
+ *   await buyer.init();
+ *   
+ *   // Single purchase
+ *   const one = await buyer.buy('US', { preferredProvider: 'TELNYX' });
+ *   
+ *   // Multiple countries
+ *   const many = await buyer.buyMultiple([
+ *     { country: 'US', count: 5, preferredProvider: 'TWILIO' },
+ *     { country: 'GB', count: 3, preferredProvider: 'TELNYX' }
+ *   ]);
+ *   
+ *   await buyer.shutdown();
+ */
+class NumberBuyer {
+    constructor(options = {}) {
+        this.pool = null;
+        this.isInitialized = false;
+        this.abortController = null;
+        this.defaultDelayMs = options.delayMs || 1000;
+        this.defaultPauseMs = options.pauseMs || 2000;
+        this.maxBackoffMs = options.maxBackoffMs || 60000;
     }
 
-    async ensureConnection() {
-        if (this.isConnected) return;
+    // ─── Lifecycle ───────────────────────────────────────────────────────
+
+    /**
+     * Initialize with provider configuration.
+     * @param {Object} providers — { twilio: TwilioProvider, telnyx: TelnyxProvider }
+     */
+    async init(providers = {}) {
+        if (this.isInitialized) return;
+
+        const twilio = providers.twilio || new TwilioProvider();
+        const telnyx = providers.telnyx || new TelnyxProvider();
+
+        this.pool = new NumberPoolManager(twilio, telnyx);
+
         await connectDatabase();
         await this.pool.initialize();
-        this.isConnected = true;
+
+        this.isInitialized = true;
+        logger.info('NumberBuyer initialized', {
+            providers: Array.from(this.pool.providers.keys())
+        });
     }
 
-    async buyBatch(country, count, delayMs = 1000) {
-        const results = { success: 0, failed: 0, errors: [], numbers: [] };
+    /**
+     * Graceful shutdown.
+     */
+    async shutdown() {
+        if (!this.isInitialized) return;
 
-        logger.info('Starting batch purchase', { country, count, delayMs });
+        this.abort();
+        await this.pool.uninitialize();
+        this.isInitialized = false;
+        this.pool = null;
 
-        for (let i = 0; i < count; i++) {
-            // Check for cancellation
-            if (this.abortController.signal.aborted) {
-                logger.warn('Batch purchase aborted', { country, processed: i });
+        logger.info('NumberBuyer shut down');
+    }
+
+    // ─── Single Purchase ─────────────────────────────────────────────────
+
+    /**
+     * Buy a single number.
+     * @param {string} country — ISO country code
+     * @param {Object} options — { preferredProvider, retries }
+     * @returns {Promise<{success: boolean, number?: Object, error?: string}>}
+     */
+    async buy(country, options = {}) {
+        this._ensureReady();
+        this._validateCountry(country);
+
+        const preferredProvider = options.preferredProvider || null;
+        const maxRetries = options.retries ?? 2;
+
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                const result = await this.pool.buyNewNumber(country, 1, preferredProvider);
+
+                if (result.purchased.length === 0) {
+                    const err = result.errors[0]?.error || 'Unknown purchase failure';
+                    throw new Error(err);
+                }
+
+                const doc = result.purchased[0];
+                const provider = doc.provider;
+
+                logger.info('Number purchased', {
+                    country,
+                    provider,
+                    phone: this.maskPhone(doc.phoneNumber),
+                    cost: doc.monthlyCost,
+                    attempt: attempt + 1
+                });
+
+                return {
+                    success: true,
+                    number: {
+                        id: doc._id.toString(),
+                        phoneNumber: doc.phoneNumber,
+                        provider,
+                        providerSid: doc.twilioSid || doc.telnyxSid,
+                        country: doc.country,
+                        monthlyCost: doc.monthlyCost,
+                        purchasedAt: doc.purchasedAt
+                    }
+                };
+
+            } catch (error) {
+                const isRateLimit = this._isRateLimitError(error);
+                const isLastAttempt = attempt === maxRetries;
+
+                logger.error('Purchase attempt failed', {
+                    country,
+                    attempt: attempt + 1,
+                    maxRetries: maxRetries + 1,
+                    isRateLimit,
+                    error: error.message
+                });
+
+                if (isLastAttempt) {
+                    return {
+                        success: false,
+                        error: error.message,
+                        country,
+                        attempts: attempt + 1
+                    };
+                }
+
+                if (isRateLimit) {
+                    const backoff = this._calculateBackoff(attempt);
+                    logger.warn(`Rate limited, backing off ${backoff}ms...`);
+                    await this._delay(backoff);
+                }
+            }
+        }
+
+        // Unreachable, but satisfies lint
+        return { success: false, error: 'Exhausted all retries' };
+    }
+
+    // ─── Multiple Purchases ──────────────────────────────────────────────
+
+    /**
+     * Buy numbers across multiple countries/configurations.
+     * @param {Array} configs — [{ country, count, preferredProvider, delayMs }]
+     * @param {Object} globalOptions — { abortOnError, pauseBetweenMs }
+     * @returns {Promise<{success: boolean, totalSuccess, totalFailed, totalCost, results: Array}>}
+     */
+    async buyMultiple(configs, globalOptions = {}) {
+        this._ensureReady();
+
+        if (!Array.isArray(configs) || configs.length === 0) {
+            throw new Error('INVALID_CONFIG: configs must be a non-empty array');
+        }
+
+        const abortOnError = globalOptions.abortOnError ?? false;
+        const pauseBetweenMs = globalOptions.pauseBetweenMs || this.defaultPauseMs;
+
+        this.abortController = new AbortController();
+        const startTime = Date.now();
+
+        const allResults = [];
+        let totalSuccess = 0;
+        let totalFailed = 0;
+        let totalCost = 0;
+
+        for (let idx = 0; idx < configs.length; idx++) {
+            const cfg = configs[idx];
+            this._validateConfig(cfg);
+
+            // Check abort before each country batch
+            if (this._isAborted()) {
+                logger.warn('Purchase aborted by user', {
+                    processedCountries: idx,
+                    remaining: configs.length - idx
+                });
                 break;
             }
 
-            try {
-                const result = await this.pool.buyNewNumber(country);
-                results.success++;
-                results.numbers.push({
-                    phone: result.phoneNumber,
-                    sid: result.twilioSid,
-                    cost: result.monthlyCost
+            const batchResult = await this._buyCountryBatch(
+                cfg.country,
+                cfg.count,
+                cfg.preferredProvider || null,
+                cfg.delayMs ?? this.defaultDelayMs
+            );
+
+            totalSuccess += batchResult.successCount;
+            totalFailed += batchResult.failedCount;
+            totalCost += batchResult.totalCost;
+
+            allResults.push({
+                country: cfg.country,
+                requested: cfg.count,
+                ...batchResult
+            });
+
+            // Pause between countries (except after last)
+            if (idx < configs.length - 1 && pauseBetweenMs > 0) {
+                logger.info(`Pausing ${pauseBetweenMs}ms before next country...`);
+                await this._delay(pauseBetweenMs);
+            }
+
+            // Abort on first country failure if configured
+            if (abortOnError && batchResult.failedCount > 0 && batchResult.successCount === 0) {
+                logger.error('Aborting due to complete country failure', {
+                    country: cfg.country,
+                    failed: batchResult.failedCount
                 });
-
-                logger.info(`Bought ${i + 1}/${count}`, {
-                    country,
-                    phone: result.phoneNumber?.slice(-4),
-                    cost: result.monthlyCost
-                });
-
-                if (i < count - 1 && delayMs > 0) {
-                    await this.delay(delayMs);
-                }
-
-            } catch (error) {
-                results.failed++;
-                results.errors.push({ index: i, error: error.message, code: error.code });
-
-                logger.error(`Failed to buy ${i + 1}/${count}`, {
-                    country,
-                    error: error.message,
-                    code: error.code
-                });
-
-                // Handle rate limiting with exponential backoff
-                if (error.code === 20429 || error.message?.toLowerCase().includes('rate limit')) {
-                    const backoffMs = Math.min(5000 * (2 ** results.failed), 60000);
-                    logger.warn(`Rate limited, backing off ${backoffMs}ms...`);
-                    await this.delay(backoffMs);
-                }
+                break;
             }
         }
 
-        return results;
+        const durationSec = Math.round((Date.now() - startTime) / 1000);
+        const allAttempted = totalSuccess + totalFailed;
+        const successRate = allAttempted > 0
+            ? ((totalSuccess / allAttempted) * 100).toFixed(1)
+            : '0.0';
+
+        const summary = {
+            success: totalFailed === 0,
+            totalSuccess,
+            totalFailed,
+            totalCost: parseFloat(totalCost.toFixed(2)),
+            successRate: `${successRate}%`,
+            durationSec,
+            results: allResults
+        };
+
+        logger.info('Purchase run complete', summary);
+
+        return summary;
     }
 
-    delay(ms) {
+    // ─── Internal: Country Batch ─────────────────────────────────────────
+
+    async _buyCountryBatch(country, count, preferredProvider, delayMs) {
+        const numbers = [];
+        const errors = [];
+        let totalCost = 0;
+
+        for (let i = 0; i < count; i++) {
+            if (this._isAborted()) {
+                logger.warn('Batch aborted mid-country', { country, processed: i, requested: count });
+                break;
+            }
+
+            const result = await this.buy(country, {
+                preferredProvider,
+                retries: 1
+            });
+
+            if (result.success) {
+                numbers.push(result.number);
+                totalCost += result.number.monthlyCost || 0;
+
+                logger.info(`Progress ${country}: ${i + 1}/${count}`, {
+                    phone: result.number.phoneNumber?.slice(-4),
+                    provider: result.number.provider
+                });
+            } else {
+                errors.push({
+                    index: i,
+                    error: result.error,
+                    country
+                });
+            }
+
+            // Delay between individual purchases (except last)
+            if (i < count - 1 && delayMs > 0) {
+                await this._delay(delayMs);
+            }
+        }
+
+        return {
+            successCount: numbers.length,
+            failedCount: errors.length,
+            totalCost,
+            numbers,
+            errors
+        };
+    }
+
+    // ─── Abort Control ───────────────────────────────────────────────────
+
+    abort() {
+        if (this.abortController) {
+            this.abortController.abort();
+            logger.info('NumberBuyer abort signal sent');
+        }
+    }
+
+    _isAborted() {
+        return this.abortController?.signal.aborted ?? false;
+    }
+
+    // ─── Validation ────────────────────────────────────────────────────────
+
+    _ensureReady() {
+        if (!this.isInitialized || !this.pool) {
+            throw new Error('NOT_INITIALIZED: Call init() before purchasing');
+        }
+    }
+
+    _validateCountry(country) {
+        if (!country || typeof country !== 'string' || country.length !== 2) {
+            throw new Error(`INVALID_COUNTRY: Expected 2-letter ISO code, got "${country}"`);
+        }
+    }
+
+    _validateConfig(cfg) {
+        if (!cfg || typeof cfg !== 'object') {
+            throw new Error('INVALID_CONFIG: Each config must be an object');
+        }
+        this._validateCountry(cfg.country);
+
+        const count = cfg.count;
+        if (!Number.isInteger(count) || count < 1 || count > 1000) {
+            throw new Error(`INVALID_COUNT: Expected integer 1-1000, got ${count}`);
+        }
+    }
+
+    // ─── Error Detection ─────────────────────────────────────────────────
+
+    _isRateLimitError(error) {
+        if (!error) return false;
+        const msg = error.message?.toLowerCase() || '';
+        const code = error.code;
+
+        // Twilio: 20429, 429
+        // Telnyx: 429, "rate limit", "too many requests"
+        return (
+            code === 20429 ||
+            code === 429 ||
+            code === 'ECONNRESET' ||
+            msg.includes('rate limit') ||
+            msg.includes('too many requests') ||
+            msg.includes('throttled')
+        );
+    }
+
+    _calculateBackoff(attemptIndex) {
+        // Exponential: 1s, 2s, 4s, 8s... capped at maxBackoffMs
+        const base = 1000 * (2 ** attemptIndex);
+        const jitter = Math.floor(Math.random() * 500); // 0-499ms jitter
+        return Math.min(base + jitter, this.maxBackoffMs);
+    }
+
+    // ─── Utilities ───────────────────────────────────────────────────────
+
+    _delay(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
-    async run(config = {}) {
-        const startTime = Date.now();
-        this.abortController = new AbortController();
-
-        const batches = config.batches || [
-            { country: 'US', count: 20 },
-            { country: 'UK', count: 10 },
-            { country: 'CA', count: 10 }
-        ];
-
-        const allResults = [];
-        let totalAttempts = 0;
-
-        await this.ensureConnection();
-
-        for (let idx = 0; idx < batches.length; idx++) {
-            const batch = batches[idx];
-            totalAttempts += batch.count;
-
-            const result = await this.buyBatch(
-                batch.country,
-                batch.count,
-                batch.delayMs
-            );
-
-            allResults.push({
-                country: batch.country,
-                count: batch.count,
-                ...result
-            });
-
-            // Pause between batches (except after last)
-            if (idx < batches.length - 1) {
-                const pauseMs = config.pauseBetweenBatches || 2000;
-                logger.info(`Pausing ${pauseMs}ms between batches...`);
-                await this.delay(pauseMs);
-            }
-        }
-
-        const stats = this.calculateStats(allResults, startTime);
-
-        logger.info('Batch purchase complete', {
-            totalSuccess: stats.totalSuccess,
-            totalFailed: stats.totalFailed,
-            totalCost: stats.totalCost.toFixed(2),
-            successRate: `${stats.successRate}%`,
-            durationSec: stats.durationSec
-        });
-
-        return {
-            success: stats.totalFailed === 0,
-            ...stats,
-            details: allResults
-        };
-    }
-
-    calculateStats(allResults, startTime) {
-        const totalSuccess = allResults.reduce((s, r) => s + r.success, 0);
-        const totalFailed = allResults.reduce((s, r) => s + r.failed, 0);
-        const totalAttempts = totalSuccess + totalFailed;
-        const totalCost = allResults.reduce(
-            (s, r) => s + r.numbers.reduce((ns, n) => ns + (n.cost || 0), 0),
-            0
-        );
-
-        return {
-            totalSuccess,
-            totalFailed,
-            totalCost,
-            successRate: totalAttempts > 0 ? ((totalSuccess / totalAttempts) * 100).toFixed(1) : '0.0',
-            durationSec: Math.round((Date.now() - startTime) / 1000)
-        };
-    }
-
-    abort() {
-        this.abortController.abort();
-        logger.info('BatchNumberBuyer abort signal sent');
-    }
-
-    async disconnect() {
-        if (!this.isConnected) return;
-        
-        try {
-            this.pool.stopCleanupJob?.();
-            // Mongoose connection is typically managed at app level
-            // Only disconnect if this class owns the connection
-            if (this.pool.connection) {
-                await mongoose.connection.close();
-            }
-        } catch (error) {
-            logger.error('Error during disconnect', { error: error.message });
-        } finally {
-            this.isConnected = false;
-        }
+    maskPhone(phone) {
+        if (!phone) return '****';
+        const str = phone.toString();
+        if (str.length < 4) return '****';
+        return str.slice(0, -4).replace(/./g, '*') + str.slice(-4);
     }
 }
 
-// ─── Singleton with proper cleanup ───
-let buyerInstance = null;
+// ─── Factory & Convenience Exports ─────────────────────────────────────
 
-function getBuyer() {
-    if (!buyerInstance) {
-        const twilio = new TwilioProvider();
-        const pool = new NumberPoolManager(twilio);
-        buyerInstance = new BatchNumberBuyer(pool);
-    }
-    return buyerInstance;
-}
-
-export async function purchaseNumbersBatch(config = {}) {
-    const buyer = getBuyer();
+/**
+ * Quick single purchase.
+ */
+export async function buyNumber(country, options = {}) {
+    const buyer = new NumberBuyer();
+    await buyer.init(options.providers);
     try {
-        const result = await buyer.run(config);
-        return result;
-    } catch (error) {
-        logger.error('Fatal error in purchaseNumbersBatch', { error: error.message, stack: error.stack });
-        return { success: false, error: error.message, fatal: true };
+        return await buyer.buy(country, options);
+    } finally {
+        await buyer.shutdown();
     }
 }
 
-export async function disconnectBuyer() {
-    if (!buyerInstance) return;
-    
-    await buyerInstance.disconnect();
-    buyerInstance = null;
-    logger.info('BatchNumberBuyer disconnected and instance cleared');
+/**
+ * Quick multi-country purchase.
+ */
+export async function buyNumbers(configs, globalOptions = {}) {
+    const buyer = new NumberBuyer(globalOptions);
+    await buyer.init(globalOptions?.providers);
+    try {
+        return await buyer.buyMultiple(configs, globalOptions);
+    } finally {
+        await buyer.shutdown();
+    }
 }
 
-export { BatchNumberBuyer, getBuyer };
-export default BatchNumberBuyer;
-    
+export { NumberBuyer };
+export default NumberBuyer;
+                        
