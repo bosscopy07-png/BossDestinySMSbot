@@ -428,7 +428,13 @@ class AdminCommands {
             this._clearAdminState(ctx);
             return this.handleAdmin(ctx);
         });
-
+        
+   // In your action handler registration (e.g., constructor or setup method):
+this.bot.action(/pool_country_(.+)/, (ctx) => {
+    const countryCode = ctx.match[1];
+    return this.handlePoolCountryButton(ctx, countryCode);
+});
+        
         // ─── Reset Free flow ───
         this.bot.action('resetfree_search', this.requireAdmin, (ctx) => {
             this._setAdminState(ctx, ADMIN_STATE.AWAITING_RESET_FREE_USER, { mode: 'search' });
@@ -971,25 +977,68 @@ Select provider:
 
         await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
     }
+    
+ async handlePoolProviderSelect(ctx, provider) {
+    ctx.session = ctx.session || {};
+    ctx.session.poolPurchase = { preferredProvider: provider };
+    this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_COUNTRY, { provider });
+    
+    // Common countries supported by Twilio & Telnyx
+    const countries = [
+        { code: 'US', name: '🇺🇸 United States' },
+        { code: 'CA', name: '🇨🇦 Canada' },
+        { code: 'GB', name: '🇬🇧 United Kingdom' },
+        { code: 'AU', name: '🇦🇺 Australia' },
+        { code: 'DE', name: '🇩🇪 Germany' },
+        { code: 'FR', name: '🇫🇷 France' },
+        { code: 'ES', name: '🇪🇸 Spain' },
+        { code: 'IT', name: '🇮🇹 Italy' },
+        { code: 'NL', name: '🇳🇱 Netherlands' },
+        { code: 'SE', name: '🇸🇪 Sweden' },
+        { code: 'IE', name: '🇮🇪 Ireland' },
+        { code: 'PL', name: '🇵🇱 Poland' },
+        { code: 'BE', name: '🇧🇪 Belgium' },
+        { code: 'AT', name: '🇦🇹 Austria' },
+        { code: 'PT', name: '🇵🇹 Portugal' },
+        { code: 'DK', name: '🇩🇰 Denmark' },
+        { code: 'FI', name: '🇫🇮 Finland' },
+        { code: 'NO', name: '🇳🇴 Norway' },
+        { code: 'CH', name: '🇨🇭 Switzerland' },
+        { code: 'NZ', name: '🇳🇿 New Zealand' },
+        { code: 'JP', name: '🇯🇵 Japan' },
+        { code: 'SG', name: '🇸🇬 Singapore' },
+        { code: 'HK', name: '🇭🇰 Hong Kong' },
+        { code: 'BR', name: '🇧🇷 Brazil' },
+        { code: 'MX', name: '🇲🇽 Mexico' }
+    ];
 
-    async handlePoolProviderSelect(ctx, provider) {
-        ctx.session = ctx.session || {};
-        ctx.session.poolPurchase = { preferredProvider: provider };
-        this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_COUNTRY, { provider });
-        
-        const message = `
+    const message = `
 <b>🛒 Buy Numbers — ${provider || 'Any Provider'}</b>
 
-Send the country code (2 letters):
-<code>US</code>, <code>GB</code>, <code>CA</code>, etc.
-        `;
+Tap a country code to copy it, then paste and send:
+    `;
 
-        await this.replySuccess(ctx, message, {
-            reply_markup: Markup.inlineKeyboard([
-                [Markup.button.callback('❌ Cancel', 'admin_pool')]
-            ]).reply_markup
-        });
+    // Build 3-column grid of country buttons
+    const countryButtons = countries.map(c => 
+        Markup.button.callback(`${c.name} — <code>${c.code}</code>`, `pool_country_${c.code}`)
+    );
+
+    // Arrange into rows of 3
+    const keyboardRows = [];
+    for (let i = 0; i < countryButtons.length; i += 3) {
+        keyboardRows.push(countryButtons.slice(i, i + 3));
     }
+
+    // Add cancel button at the bottom
+    keyboardRows.push([Markup.button.callback('❌ Cancel', 'admin_pool')]);
+
+    const keyboard = Markup.inlineKeyboard(keyboardRows);
+
+    await this.replySuccess(ctx, message, {
+        reply_markup: keyboard.reply_markup
+    });
+    }
+    
 
     async handlePoolCountrySelect(ctx, country) {
         ctx.session.poolPurchase = { ...ctx.session.poolPurchase, country };
