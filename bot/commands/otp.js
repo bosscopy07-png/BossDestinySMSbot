@@ -613,7 +613,11 @@ class OTPCommands {
 
         await this.sendPhotoWithCaption(ctx, IMAGES.myNumber, message, keyboard, 'HTML');
     }
-
+    
+    async handleMyNumberCommand(ctx) {
+        return this.handleViewMyNumber(ctx);
+            }
+    
     // ═══════════════════════════════════════════════════════════════════════
     //  MODE HANDLERS
     // ═══════════════════════════════════════════════════════════════════════
