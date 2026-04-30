@@ -24,7 +24,63 @@ const TX_TYPES = Object.freeze({
     NUMBER_ASSIGN: 'NUMBER_ASSIGN',
     NUMBER_RELEASE: 'NUMBER_RELEASE'
 });
-
+const SUPPORTED_COUNTRIES = [
+    { code: 'US', name: '🇺🇸 United States', flag: '🇺🇸' },
+    { code: 'CA', name: '🇨🇦 Canada', flag: '🇨🇦' },
+    { code: 'GB', name: '🇬🇧 United Kingdom', flag: '🇬🇧' },
+    { code: 'AU', name: '🇦🇺 Australia', flag: '🇦🇺' },
+    { code: 'DE', name: '🇩🇪 Germany', flag: '🇩🇪' },
+    { code: 'FR', name: '🇫🇷 France', flag: '🇫🇷' },
+    { code: 'NL', name: '🇳🇱 Netherlands', flag: '🇳🇱' },
+    { code: 'ES', name: '🇪🇸 Spain', flag: '🇪🇸' },
+    { code: 'IT', name: '🇮🇹 Italy', flag: '🇮🇹' },
+    { code: 'SE', name: '🇸🇪 Sweden', flag: '🇸🇪' },
+    { code: 'IE', name: '🇮🇪 Ireland', flag: '🇮🇪' },
+    { code: 'CH', name: '🇨🇭 Switzerland', flag: '🇨🇭' },
+    { code: 'AT', name: '🇦🇹 Austria', flag: '🇦🇹' },
+    { code: 'BE', name: '🇧🇪 Belgium', flag: '🇧🇪' },
+    { code: 'DK', name: '🇩🇰 Denmark', flag: '🇩🇰' },
+    { code: 'NO', name: '🇳🇴 Norway', flag: '🇳🇴' },
+    { code: 'FI', name: '🇫🇮 Finland', flag: '🇫🇮' },
+    { code: 'PL', name: '🇵🇱 Poland', flag: '🇵🇱' },
+    { code: 'PT', name: '🇵🇹 Portugal', flag: '🇵🇹' },
+    { code: 'CZ', name: '🇨🇿 Czech Republic', flag: '🇨🇿' },
+    { code: 'HU', name: '🇭🇺 Hungary', flag: '🇭🇺' },
+    { code: 'GR', name: '🇬🇷 Greece', flag: '🇬🇷' },
+    { code: 'RO', name: '🇷🇴 Romania', flag: '🇷🇴' },
+    { code: 'BG', name: '🇧🇬 Bulgaria', flag: '🇧🇬' },
+    { code: 'HR', name: '🇭🇷 Croatia', flag: '🇭🇷' },
+    { code: 'SI', name: '🇸🇮 Slovenia', flag: '🇸🇮' },
+    { code: 'SK', name: '🇸🇰 Slovakia', flag: '🇸🇰' },
+    { code: 'LT', name: '🇱🇹 Lithuania', flag: '🇱🇹' },
+    { code: 'LV', name: '🇱🇻 Latvia', flag: '🇱🇻' },
+    { code: 'EE', name: '🇪🇪 Estonia', flag: '🇪🇪' },
+    { code: 'LU', name: '🇱🇺 Luxembourg', flag: '🇱🇺' },
+    { code: 'CY', name: '🇨🇾 Cyprus', flag: '🇨🇾' },
+    { code: 'IS', name: '🇮🇸 Iceland', flag: '🇮🇸' },
+    { code: 'MX', name: '🇲🇽 Mexico', flag: '🇲🇽' },
+    { code: 'BR', name: '🇧🇷 Brazil', flag: '🇧🇷' },
+    { code: 'AR', name: '🇦🇷 Argentina', flag: '🇦🇷' },
+    { code: 'CL', name: '🇨🇱 Chile', flag: '🇨🇱' },
+    { code: 'CO', name: '🇨🇴 Colombia', flag: '🇨🇴' },
+    { code: 'PE', name: '🇵🇪 Peru', flag: '🇵🇪' },
+    { code: 'CR', name: '🇨🇷 Costa Rica', flag: '🇨🇷' },
+    { code: 'PA', name: '🇵🇦 Panama', flag: '🇵🇦' },
+    { code: 'DO', name: '🇩🇴 Dominican Republic', flag: '🇩🇴' },
+    { code: 'SG', name: '🇸🇬 Singapore', flag: '🇸🇬' },
+    { code: 'JP', name: '🇯🇵 Japan', flag: '🇯🇵' },
+    { code: 'HK', name: '🇭🇰 Hong Kong', flag: '🇭🇰' },
+    { code: 'MY', name: '🇲🇾 Malaysia', flag: '🇲🇾' },
+    { code: 'PH', name: '🇵🇭 Philippines', flag: '🇵🇭' },
+    { code: 'TH', name: '🇹🇭 Thailand', flag: '🇹🇭' },
+    { code: 'NZ', name: '🇳🇿 New Zealand', flag: '🇳🇿' },
+    { code: 'ZA', name: '🇿🇦 South Africa', flag: '🇿🇦' },
+    { code: 'IL', name: '🇮🇱 Israel', flag: '🇮🇱' },
+    { code: 'IN', name: '🇮🇳 India', flag: '🇮🇳' },
+    { code: 'NG', name: '🇳🇬 Nigeria', flag: '🇳🇬' },
+    { code: 'KE', name: '🇰🇪 Kenya', flag: '🇰🇪' },
+    { code: 'GH', name: '🇬🇭 Ghana', flag: '🇬🇭' }
+];
 // ─── Admin state constants for button flows ───
 const ADMIN_STATE = Object.freeze({
     NONE: 'none',
@@ -916,6 +972,9 @@ class AdminCommands {
     // ═══════════════════════════════════════════════════════════
     //  POOL MANAGEMENT
     // ═══════════════════════════════════════════════════════════
+// ============================================
+// SUPPORTED COUNTRIES (Twilio + Telnyx overlap)
+// ============================================
 
     async handlePoolMenu(ctx) {
         try {
@@ -978,17 +1037,36 @@ Select provider:
         ctx.session.poolPurchase = { preferredProvider: provider };
         this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_COUNTRY, { provider });
         
+        const providerLabel = provider === 'any' ? '🎲 Any Provider' : `🏢 ${provider.charAt(0).toUpperCase() + provider.slice(1)}`;
+        
         const message = `
-<b>🛒 Buy Numbers — ${provider || 'Any Provider'}</b>
+<b>🛒 Buy Numbers — ${providerLabel}</b>
 
-Send the country code (2 letters):
-<code>US</code>, <code>GB</code>, <code>CA</code>, etc.
+Select the country for your number purchase:
         `;
 
+        // Build country buttons (2 per row)
+        const countryButtons = [];
+        for (let i = 0; i < SUPPORTED_COUNTRIES.length; i += 2) {
+            const row = [];
+            row.push(Markup.button.callback(
+                SUPPORTED_COUNTRIES[i].name, 
+                `pool_country_${SUPPORTED_COUNTRIES[i].code}`
+            ));
+            if (SUPPORTED_COUNTRIES[i + 1]) {
+                row.push(Markup.button.callback(
+                    SUPPORTED_COUNTRIES[i + 1].name, 
+                    `pool_country_${SUPPORTED_COUNTRIES[i + 1].code}`
+                ));
+            }
+            countryButtons.push(row);
+        }
+
+        // Add cancel button at the bottom
+        countryButtons.push([Markup.button.callback('❌ Cancel', 'admin_pool')]);
+
         await this.replySuccess(ctx, message, {
-            reply_markup: Markup.inlineKeyboard([
-                [Markup.button.callback('❌ Cancel', 'admin_pool')]
-            ]).reply_markup
+            reply_markup: Markup.inlineKeyboard(countryButtons).reply_markup
         });
     }
 
@@ -996,10 +1074,13 @@ Send the country code (2 letters):
         ctx.session.poolPurchase = { ...ctx.session.poolPurchase, country };
         this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_QTY, { country });
         
+        const countryObj = SUPPORTED_COUNTRIES.find(c => c.code === country);
+        const countryDisplay = countryObj ? countryObj.name : country;
+        
         const message = `
-<b>🛒 Buy Numbers — ${country}</b>
+<b>🛒 Buy Numbers — ${countryDisplay}</b>
 
-Select quantity or send custom:
+Select quantity:
         `;
 
         const keyboard = Markup.inlineKeyboard([
@@ -1022,10 +1103,13 @@ Select quantity or send custom:
             return this.replyError(ctx, '❌ <b>Invalid purchase data.</b>\n\nPlease start over.');
         }
 
+        const countryObj = SUPPORTED_COUNTRIES.find(c => c.code === purchase.country);
+        const countryDisplay = countryObj ? countryObj.name : purchase.country;
+
         const message = `
 <b>✅ Confirm Pool Purchase</b>
 
-🌍 Country: <code>${purchase.country}</code>
+🌍 Country: <code>${countryDisplay}</code>
 📦 Quantity: <code>${purchase.quantity}</code>
 🏢 Provider: <code>${purchase.preferredProvider || 'Any'}</code>
 
@@ -1079,10 +1163,13 @@ Proceed with purchase?
                     `• <code>${n.phoneNumber}</code> (${n.provider})`
                 ).join('\n');
 
+                const countryObj = SUPPORTED_COUNTRIES.find(c => c.code === purchase.country);
+                const countryDisplay = countryObj ? countryObj.name : purchase.country;
+
                 const message = `
 <b>✅ Pool Purchase Complete!</b>
 
-🌍 Country: <code>${purchase.country}</code>
+🌍 Country: <code>${countryDisplay}</code>
 📦 Purchased: <code>${result.purchased.length}</code> numbers
 ❌ Failed: <code>${result.failed || 0}</code>
 💰 Total Cost: <code>${formatCurrency(result.totalCost || 0)}</code>
@@ -1123,7 +1210,9 @@ ${numbersList}
                 ]).reply_markup
             });
         }
-    }
+                }
+    
+
 
     async handlePoolMonitor(ctx) {
         try {
