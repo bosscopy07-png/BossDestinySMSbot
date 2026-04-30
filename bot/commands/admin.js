@@ -978,6 +978,12 @@ Select provider:
         await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
     }
     
+async handlePoolCountryButton(ctx, countryCode) {
+    // Simulate the user sending the country code
+    ctx.message = { text: countryCode };
+    return this.handlePoolCountrySelect(ctx, countryCode);
+    }
+    
  async handlePoolProviderSelect(ctx, provider) {
     ctx.session = ctx.session || {};
     ctx.session.poolPurchase = { preferredProvider: provider };
