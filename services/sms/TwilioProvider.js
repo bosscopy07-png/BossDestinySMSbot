@@ -6,17 +6,25 @@ import config from '../../config/env.js';
  * TwilioProvider — SMS sending + number lifecycle management
  * 
  * FIXED:
- * - Removed voiceEnabled: false filter that excluded valid SMS numbers
- * - getNumber now actually acquires numbers instead of returning static config
- * - hasAvailableNumbers distinguishes empty results from API errors
- * - Added proper error codes for unsupported countries
+ * - Webhook URLs now use validated BASE_URL env var
+ * - Throws startup error if BASE_URL is missing
+ * - Removed voiceEnabled: false filter
+ * - getNumber actually acquires numbers
  */
 class TwilioProvider {
     constructor() {
         this.name = 'TWILIO';
         this.tier = 'VIP';
         
-        // FIXED: Validate config before activating
+        // FIXED: Validate BASE_URL at startup
+        const baseUrl = process.env.BASE_URL || config.baseUrl;
+        if (!baseUrl) {
+            logger.error('TwilioProvider disabled — BASE_URL not configured. Set BASE_URL=https://yourdomain.com');
+            this.isActive = false;
+            return;
+        }
+        this.baseUrl = baseUrl.replace(/\/$/, ''); // Remove trailing slash
+
         const sid = config.twilio?.sid;
         const authToken = config.twilio?.authToken;
         
@@ -65,7 +73,8 @@ class TwilioProvider {
 
         logger.info('TwilioProvider initialized', { 
             hasPhoneNumber: !!this.phoneNumber,
-            isActive: this.isActive 
+            isActive: this.isActive,
+            baseUrl: this.baseUrl
         });
     }
 
@@ -163,24 +172,14 @@ class TwilioProvider {
         }
     }
 
-    /**
-     * Check if numbers are available in a country before attempting purchase.
-     * FIXED: Removed voiceEnabled: false which excluded most valid numbers.
-     * FIXED: Distinguishes API errors from empty results.
-     * @param {string} country — ISO country code
-     * @returns {Promise<boolean>}
-     */
     async hasAvailableNumbers(country = 'US') {
         if (!this.isActive) return false;
 
         try {
-            // FIXED: Removed voiceEnabled: false. Most Twilio numbers support voice.
-            // Adding voiceEnabled: false filtered out 99% of available numbers.
             const numbers = await this.client.availablePhoneNumbers(country)
                 .local.list({ 
                     limit: 1, 
                     smsEnabled: true 
-                    // voiceEnabled: false  // ← REMOVED: was causing false negatives
                 });
             
             const hasNumbers = numbers.length > 0;
@@ -191,7 +190,6 @@ class TwilioProvider {
             
             return hasNumbers;
         } catch (error) {
-            // FIXED: Log actual error code and status for debugging
             const statusCode = error.status;
             const errorCode = error.code;
             const isUnsupportedCountry = statusCode === 404 || errorCode === 20421;
@@ -204,12 +202,10 @@ class TwilioProvider {
                 isUnsupportedCountry
             });
             
-            // FIXED: Return false for unsupported countries, but re-throw real errors
             if (isUnsupportedCountry) {
                 return false;
             }
             
-            // For auth errors, rate limits, etc., return false but log clearly
             if (statusCode === 401 || statusCode === 403 || errorCode === 20429) {
                 logger.error('Twilio API auth/rate limit error', { statusCode, errorCode });
                 return false;
@@ -219,37 +215,32 @@ class TwilioProvider {
         }
     }
 
-    /**
-     * FIXED: getNumber now actually acquires a number instead of returning static config.
-     * This is the interface expected by the pool manager.
-     */
     async getNumber(country = 'US') {
         if (!this.isActive) {
             throw new Error('TWILIO_NOT_CONFIGURED');
         }
-
-        // FIXED: Actually purchase a number instead of returning config phoneNumber
         return this.buyNumber(country);
     }
 
+    /**
+     * FIXED: All webhook URLs now use validated BASE_URL
+     * Never generates undefined URLs
+     */
     async buyNumber(country = 'US') {
         if (!this.isActive) {
             throw new Error('TWILIO_NOT_CONFIGURED');
         }
 
         try {
-            // Pre-check: avoid API call if no inventory
             const hasStock = await this.hasAvailableNumbers(country);
             if (!hasStock) {
                 throw new Error(`TWILIO_NO_NUMBERS: No available numbers in ${country}`);
             }
 
-            // FIXED: Removed voiceEnabled: false from search too
             const availableNumbers = await this.client.availablePhoneNumbers(country)
                 .local.list({ 
                     limit: 5,
                     smsEnabled: true
-                    // voiceEnabled: false  // ← REMOVED
                 });
 
             if (availableNumbers.length === 0) {
@@ -257,16 +248,28 @@ class TwilioProvider {
             }
 
             const selected = availableNumbers[0];
-            const smsUrl = config.twilio?.webhookUrl || `${config.appUrl}/webhooks/twilio`;
+            
+            // FIXED: Use validated BASE_URL for all webhook URLs
+            const webhookBase = `${this.baseUrl}/webhooks/twilio`;
+            const smsUrl = webhookBase;
+            const smsFallbackUrl = `${webhookBase}/fallback`;
+            const statusCallback = `${webhookBase}/status`;
+
+            // VALIDATION: Ensure no undefined URLs
+            if (!smsUrl || !smsFallbackUrl || !statusCallback) {
+                throw new Error('TWILIO_CONFIG_ERROR: Webhook URL construction failed');
+            }
+
+            logger.debug('Twilio webhook URLs', { smsUrl, smsFallbackUrl, statusCallback });
 
             const purchasedNumber = await this.client.incomingPhoneNumbers.create({
                 phoneNumber: selected.phoneNumber,
                 friendlyName: `OTP-${country}-${Date.now()}`,
                 smsUrl,
                 smsMethod: 'POST',
-                smsFallbackUrl: `${smsUrl}/fallback`,
+                smsFallbackUrl,
                 smsFallbackMethod: 'POST',
-                statusCallback: `${smsUrl}/status`,
+                statusCallback,
                 statusCallbackMethod: 'POST'
             });
 
@@ -274,7 +277,9 @@ class TwilioProvider {
                 phone: this.maskPhone(purchasedNumber.phoneNumber),
                 sid: purchasedNumber.sid,
                 country,
-                monthlyCost: purchasedNumber.monthlyCost || 1.00
+                monthlyCost: purchasedNumber.monthlyCost || 1.00,
+                smsUrl,
+                smsFallbackUrl
             });
 
             return {
@@ -398,4 +403,3 @@ class TwilioProvider {
 }
 
 export default TwilioProvider;
-                               
