@@ -942,10 +942,52 @@ class OTPCommands {
                 `📱 Number: <code>${session.number}</code>\n` +
                 `🎯 Service: ${service}\n` +
                 `⏳ Status: Waiting for OTP...\n` +
+                `💰 Cost: ${costText}\n` +
+                `⏱ Timeout: ${Math.floor((session.timeoutAt - new Date()) / 1000)}s\n\n` +
+                `⚠️ ${mode === 'FREE' ? 'Shared number. OTP not guaranteed.' : mode === 'BUNDLE' ? 'Bundle credit used. No additional charge.' : 'Funds locked. Will be deducted on delivery.'}`;
 
+            const keyboard = KEYBOARDS.otpActions(session.sessionId);
+            
+            const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
 
+            if (sentMessage?.message_id) {
+                await this._scheduleTimeoutNotification(
+                    userId, session.sessionId, sentMessage.message_id, session.timeoutAt
+                );
+            }
 
+        } catch (error) {
+            logger.error('OTP session creation failed', { userId, mode, service, error: error.message });
+            
+            // Rollback on error
+            if (mode === 'BUNDLE') {
+                await User.updateOne({ userId }, { $inc: { bundleRemaining: 1 } }).catch(() => {});
+            } else if (mode === 'VIP' && useVipNumber) {
+                await User.updateOne({ userId }, { $inc: { vipDailyUsed: -1 } }).catch(() => {});
+            }
 
+            const errorMessages = {
+                ACTIVE_SESSION_EXISTS: '⏳ You already have an active session. Use /cancel first.',
+                INSUFFICIENT_BALANCE: '💰 Insufficient balance. Deposit first with /deposit',
+                FREE_LIMIT_REACHED: '🆓 Free limit reached for today.',
+                USER_BLACKLISTED: '🚫 Your account is suspended.',
+                VIP_EXPIRED: '👑 VIP expired. Renew your subscription.',
+                VIP_DAILY_LIMIT_REACHED: '⚠️ VIP daily limit reached.',
+                BUNDLE_EMPTY: '📦 No bundle credits left. Buy a bundle first.',
+                NO_BALANCE: '💰 Provider balance insufficient. Fund wallet or use FREE tier.',
+                ALL_PROVIDERS_FAILED: '❌ All providers failed. Try again later or different country.',
+                NO_PROVIDERS_AVAILABLE: '❌ No providers available. Check /status.',
+                NUMBER_UNAVAILABLE: '❌ No numbers available for this country/service. Try another.',
+                TIMEOUT: '⏱ Request timed out. Please try again.'
+            };
+            
+            await this.sendPhotoWithCaption(
+                ctx, IMAGES.otpFailed, 
+                errorMessages[error.message] || `❌ Error: ${error.message}`,
+                KEYBOARDS.supportOrRetry(), 'HTML'
+            );
+        }
+                    }
 
 
                 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1400,7 +1442,7 @@ class OTPCommands {
         await this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message, keyboard, 'HTML');
     }
 
-    async handleConfirmVipCancel(ctx) {
+        async handleConfirmVipCancel(ctx) {
         const userId = ctx.from.id.toString();
         const user = ctx.state.user;
         
@@ -1427,7 +1469,14 @@ class OTPCommands {
             await this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message,
                 Markup.inlineKeyboard([
                     [Markup.button.callback('📱 Request OTP', 'menu')],
-
+                    [Markup.button.callback('🔙 Main Menu', 'menu')]
+                ]), 'HTML'
+            );
+        } catch (error) {
+            logger.error('VIP cancel failed', { userId, error: error.message });
+            await ctx.answerCbQuery('❌ Failed to cancel VIP');
+        }
+        }
 
 
 
