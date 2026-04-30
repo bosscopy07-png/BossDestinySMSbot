@@ -424,7 +424,7 @@ class OTPCommands {
         }
     }
 
-    async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
+        async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
         try {
             const delayMs = new Date(timeoutAt) - new Date();
             if (delayMs <= 0) return;
@@ -436,7 +436,7 @@ class OTPCommands {
                         status: { $in: ['WAITING', 'CHECKING'] } 
                     });
                     
-                    if (!session) return;
+                    if (!session) return; // Already handled (cancelled, received, etc.)
 
                     await Session.updateOne(
                         { sessionId },
@@ -445,38 +445,42 @@ class OTPCommands {
 
                     await this._refundSession(session);
 
-                    const refundText = {
-                        FREE: 'No charges (FREE mode)',
-                        BUNDLE: 'Bundle credit restored',
-                        VIP: 'VIP daily quota restored',
-                        CHEAP: 'Funds returned to balance'
-                    }[session.mode] || 'Funds handled';
+                    // ONLY send timeout message if session wasn't already handled by polling
+                    // The polling code already sends timeout message for FREE tier
+                    if (session.mode !== 'FREE') {
+                        const refundText = {
+                            BUNDLE: 'Bundle credit restored',
+                            VIP: 'VIP daily quota restored',
+                            CHEAP: 'Funds returned to balance'
+                        }[session.mode] || 'Funds handled';
 
-                    const timeoutMessage = 
-                        `⏰ <b>OTP Request Timed Out</b>\n\n` +
-                        `📱 Number: <code>${session.number}</code>\n` +
-                        `🎯 Service: ${session.service}\n` +
-                        `⏱ Status: <b>Expired</b>\n\n` +
-                        `💰 ${refundText}\n\n` +
-                        `You can request a new OTP with /otp`;
+                        const timeoutMessage = 
+                            `⏰ <b>OTP Request Timed Out</b>\n\n` +
+                            `📱 Number: <code>${session.number}</code>\n` +
+                            `🎯 Service: ${session.service}\n` +
+                            `⏱ Status: <b>Expired</b>\n\n` +
+                            `💰 ${refundText}\n\n` +
+                            `You can request a new OTP with /otp`;
 
-                    await this.bot.telegram.sendMessage(userId, timeoutMessage, {
-                        parse_mode: 'HTML',
-                        reply_markup: Markup.inlineKeyboard([
-                            [Markup.button.callback('🔄 Request New OTP', 'menu')],
-                            [Markup.button.callback('📞 Contact Support', 'contact_support')]
-                        ]).reply_markup
-                    });
+                        await this.bot.telegram.sendMessage(userId, timeoutMessage, {
+                            parse_mode: 'HTML',
+                            reply_markup: Markup.inlineKeyboard([
+                                [Markup.button.callback('🔄 Request New OTP', 'menu')],
+                                [Markup.button.callback('📞 Contact Support', 'contact_support')]
+                            ]).reply_markup
+                        });
+                    }
 
                 } catch (notifyError) {
                     logger.error('Timeout notification failed', { userId, sessionId, error: notifyError.message });
                 }
-            }, Math.min(delayMs, 2147483647)); // Max setTimeout value
+            }, Math.min(delayMs, 2147483647));
 
         } catch (error) {
             logger.error('Failed to schedule timeout', { userId, sessionId, error: error.message });
         }
-    }
+                    }
+                
     
                     // ═══════════════════════════════════════════════════════════════════════════════
 //  OTPCommands.js — Part 2: Main Menu, My Number, Mode Handlers, Selection
