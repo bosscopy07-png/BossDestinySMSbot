@@ -574,4 +574,129 @@ class FreeProvider {
             const response = await axios.get(this.smsActivateBaseUrl, {
                 params: {
                     api_key: this.smsActivateKey,
-                    ac
+                    action: 'getPrices',
+                    country: providerCountry,
+                    service: providerService
+                },
+                timeout: 15000,
+                validateStatus: () => true
+            });
+
+            if (response.status !== 200) {
+                return { success: false, error: `HTTP ${response.status}` };
+            }
+
+            // sms-activate returns JSON for getPrices
+            const data = response.data;
+            if (typeof data === 'object' && data[providerCountry] && data[providerCountry][providerService]) {
+                const priceData = data[providerCountry][providerService];
+                return {
+                    success: true,
+                    prices: priceData,
+                    country: providerCountry,
+                    service: providerService
+                };
+            }
+
+            return { success: false, error: 'No pricing data available', raw: data };
+
+        } catch (error) {
+            logger.error('sms-activate getPrices failed', { error: error.message });
+            return { success: false, error: error.message };
+        }
+    }
+
+    async getAvailableCountries() {
+        if (!this.smsActivateKey) {
+            return { success: false, error: 'SMS_ACTIVATE_API_KEY not configured' };
+        }
+
+        try {
+            const response = await axios.get(this.smsActivateBaseUrl, {
+                params: {
+                    api_key: this.smsActivateKey,
+                    action: 'getCountries'
+                },
+                timeout: 15000,
+                validateStatus: () => true
+            });
+
+            if (response.status !== 200) {
+                return { success: false, error: `HTTP ${response.status}` };
+            }
+
+            return {
+                success: true,
+                countries: response.data
+            };
+
+        } catch (error) {
+            logger.error('sms-activate getCountries failed', { error: error.message });
+            return { success: false, error: error.message };
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  MAPPING HELPERS
+    // ═══════════════════════════════════════════════════════════
+
+    mapService(service) {
+        if (!service) return 'ot';
+        return this.serviceMap[service] || this.serviceMap['Other'] || 'ot';
+    }
+
+    mapCountry(country) {
+        if (!country) return '0';
+        return this.countryMap[country.toUpperCase()] || '0';
+    }
+
+    maskPhone(phone) {
+        if (!phone) return '****';
+        const str = phone.toString();
+        if (str.length < 4) return '****';
+        return str.slice(0, -4).replace(/./g, '*') + str.slice(-4);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  STATS
+    // ═══════════════════════════════════════════════════════════
+
+    updateStats(success, duration) {
+        this.stats.totalSent++;
+        if (success) {
+            this.stats.totalSuccess++;
+        } else {
+            this.stats.totalFailed++;
+        }
+        this.stats.avgResponseTime = (
+            (this.stats.avgResponseTime * (this.stats.totalSent - 1) + duration)
+            / this.stats.totalSent
+        );
+    }
+
+    getStats() {
+        return {
+            name: this.name,
+            tier: this.tier,
+            isActive: this.isActive,
+            hasApiKey: !!this.smsActivateKey,
+            activeActivations: this.activeActivations.size,
+            ...this.stats,
+            successRate: this.stats.totalSent > 0
+                ? Number((this.stats.totalSuccess / this.stats.totalSent * 100).toFixed(2))
+                : 100
+        };
+    }
+
+    resetStats() {
+        this.stats = {
+            totalSent: 0,
+            totalSuccess: 0,
+            totalFailed: 0,
+            avgResponseTime: 0
+        };
+        return this.getStats();
+    }
+}
+
+export default FreeProvider;
