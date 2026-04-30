@@ -200,7 +200,8 @@ class TelnyxProvider {
         const phoneNumber = numberData.phone_number;
 
         // Step 2: Purchase the number
-        // FIXED: Use correct Telnyx v2 endpoint /number_orders
+        // FIXED: Removed broken fallback that stripped data wrapper.
+        // Telnyx v2 API requires POST /number_orders with { data: { phone_numbers: [...] } }
         let purchaseResponse;
         try {
             purchaseResponse = await axios.post(
@@ -220,28 +221,9 @@ class TelnyxProvider {
             const msg = error.response?.data?.errors?.[0]?.detail || error.message;
             const code = error.response?.status;
             
-            // If /number_orders fails with 404, try without /v2 prefix
-            if (code === 404) {
-                logger.warn('Telnyx /number_orders returned 404, trying without data wrapper', {
-                    error: msg
-                });
-                try {
-                    purchaseResponse = await axios.post(
-                        `${this.baseUrl}/number_orders`,
-                        {
-                            phone_numbers: [{ phone_number: phoneNumber }],
-                            messaging_profile_id: this.messagingProfileId || undefined,
-                            connection_id: this.connectionId || undefined
-                        },
-                        { headers: this.getHeaders(), timeout: 30000 }
-                    );
-                } catch (fallbackError) {
-                    const fallbackMsg = fallbackError.response?.data?.errors?.[0]?.detail || fallbackError.message;
-                    throw new Error(`TELNYX_PURCHASE_FAILED: ${fallbackMsg}`);
-                }
-            } else {
-                throw new Error(`TELNYX_PURCHASE_FAILED: ${msg}`);
-            }
+            // FIXED: Removed broken fallback logic. The data wrapper is required by Telnyx v2.
+            // If this fails, it's a real API error (wrong key scope, no billing, etc).
+            throw new Error(`TELNYX_PURCHASE_FAILED: ${msg}`);
         }
 
         const purchased = purchaseResponse.data?.data;
@@ -360,3 +342,4 @@ class TelnyxProvider {
 }
 
 export default TelnyxProvider;
+        
