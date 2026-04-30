@@ -453,13 +453,31 @@ class OTPCommands {
                     }[session.mode] || 'Funds handled';
 
                     const timeoutMessage = 
+                        `⏰ <b>OTP Request Timed Out</b>\n\n` +
+                        `📱 Number: <code>${session.number}</code>\n` +
+                        `🎯 Service: ${session.service}\n` +
+                        `⏱ Status: <b>Expired</b>\n\n` +
+                        `💰 ${refundText}\n\n` +
+                        `You can request a new OTP with /otp`;
 
+                    await this.bot.telegram.sendMessage(userId, timeoutMessage, {
+                        parse_mode: 'HTML',
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('🔄 Request New OTP', 'menu')],
+                            [Markup.button.callback('📞 Contact Support', 'contact_support')]
+                        ]).reply_markup
+                    });
 
+                } catch (notifyError) {
+                    logger.error('Timeout notification failed', { userId, sessionId, error: notifyError.message });
+                }
+            }, Math.min(delayMs, 2147483647)); // Max setTimeout value
 
-
-
-
-
+        } catch (error) {
+            logger.error('Failed to schedule timeout', { userId, sessionId, error: error.message });
+        }
+    }
+    
                     // ═══════════════════════════════════════════════════════════════════════════════
 //  OTPCommands.js — Part 2: Main Menu, My Number, Mode Handlers, Selection
 // ═══════════════════════════════════════════════════════════════════════════════
