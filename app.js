@@ -93,14 +93,17 @@ try {
 
     let bot = null;
 
+    // ─── PORT CONFIGURATION ─────────────────────────────
+    const port = config?.server?.port || process.env.PORT || 3000;
+
     const startApp = async () => {
         await connectDatabase();
         bot = new TelegramBot();
         await bot.launch();
-        startServer(config?.server?.port || 3000);
+        startServer(port);
         const cron = new CronJobs();
         cron.start();
-        console.log('🎉 App started');
+        console.log(`🎉 App started on port ${port}`);
     };
 
     startApp();
@@ -109,5 +112,4 @@ try {
     console.error('\n💥 FATAL ERROR:', err.message);
     console.error('Stack:', err.stack);
     process.exit(1);
-           }
-    
+}
