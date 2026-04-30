@@ -429,11 +429,15 @@ class AdminCommands {
             return this.handleAdmin(ctx);
         });
         
-   // In your action handler registration (e.g., constructor or setup method):
-this.bot.action(/pool_country_(.+)/, (ctx) => {
+   // BEFORE (collides with 5Sim):
+// this.bot.action(/pool_country_(.+)/, (ctx) => { ... });
+
+// AFTER (unique prefix):
+this.bot.action(/numpool_country_(.+)/, (ctx) => {
     const countryCode = ctx.match[1];
     return this.handlePoolCountryButton(ctx, countryCode);
 });
+        
         
         // ─── Reset Free flow ───
         this.bot.action('resetfree_search', this.requireAdmin, (ctx) => {
@@ -984,12 +988,12 @@ async handlePoolCountryButton(ctx, countryCode) {
     return this.handlePoolCountrySelect(ctx, countryCode);
     }
     
- async handlePoolProviderSelect(ctx, provider) {
+ 
+async handlePoolProviderSelect(ctx, provider) {
     ctx.session = ctx.session || {};
     ctx.session.poolPurchase = { preferredProvider: provider };
     this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_COUNTRY, { provider });
     
-    // Common countries supported by Twilio & Telnyx
     const countries = [
         { code: 'US', name: '🇺🇸 United States' },
         { code: 'CA', name: '🇨🇦 Canada' },
@@ -1021,21 +1025,18 @@ async handlePoolCountryButton(ctx, countryCode) {
     const message = `
 <b>🛒 Buy Numbers — ${provider || 'Any Provider'}</b>
 
-Tap a country code to copy it, then paste and send:
+Tap a country to select it:
     `;
 
-    // Build 3-column grid of country buttons
     const countryButtons = countries.map(c => 
-        Markup.button.callback(`${c.name} — <code>${c.code}</code>`, `pool_country_${c.code}`)
+        Markup.button.callback(`${c.name}  <code>${c.code}</code>`, `numpool_country_${c.code}`)
     );
 
-    // Arrange into rows of 3
     const keyboardRows = [];
     for (let i = 0; i < countryButtons.length; i += 3) {
         keyboardRows.push(countryButtons.slice(i, i + 3));
     }
 
-    // Add cancel button at the bottom
     keyboardRows.push([Markup.button.callback('❌ Cancel', 'admin_pool')]);
 
     const keyboard = Markup.inlineKeyboard(keyboardRows);
@@ -1043,7 +1044,7 @@ Tap a country code to copy it, then paste and send:
     await this.replySuccess(ctx, message, {
         reply_markup: keyboard.reply_markup
     });
-    }
+}
     
 
     async handlePoolCountrySelect(ctx, country) {
