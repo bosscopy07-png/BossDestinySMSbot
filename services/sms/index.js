@@ -1,3 +1,7 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SMSProviderManager.js — Part 1: Imports, Setup, Validation, Provider Init
+// ═══════════════════════════════════════════════════════════════════════════════
+
 import TwilioProvider from './TwilioProvider.js';
 import TelnyxProvider from './TelnyxProvider.js';
 import CheapPanelProvider from './CheapPanelProvider.js';
@@ -7,21 +11,15 @@ import NumberBuyer from './buy-numbers.js';
 import logger from '../../utils/logger.js';
 
 /**
- * SMSProviderManager — Unified gateway for SMS number acquisition across all providers
+ * SMSProviderManager — Unified gateway for SMS number acquisition
  * 
- * ARCHITECTURE:
- *   VIP/BUNDLE  → NumberPool (Twilio + Telnyx) with preferred provider + failover
- *   CHEAP       → CheapPanelProvider (5SIM rented numbers) with balance check
- *   FREE        → FreeProvider (public/shared numbers) with health scoring + polling
+ * ARCHITECTURE (STRICT — no cross-tier failover):
+ *   VIP/BUNDLE  → NumberPool (Twilio + Telnyx) only
+ *   CHEAP       → CheapPanelProvider (5SIM) only
+ *   FREE        → FreeProvider (public/shared numbers) only
  * 
- * FIXED:
- * - BASE_URL validation at startup
- * - Smart provider failover: Telnyx → Twilio → 5SIM → Free
- * - 5SIM balance check before API calls
- * - FreeProvider integration with pollForSMS + retry logic
- * - No undefined webhook URLs
- * - Graceful degradation when providers fail
- * - Inventory handling with country fallback list
+ * Each tier stands alone. If a tier's provider fails, that tier fails.
+ * No silent fallback to other tiers.
  */
 class SMSProviderManager {
     constructor() {
@@ -30,42 +28,35 @@ class SMSProviderManager {
         this.numberBuyer = null;
         this.isInitialized = false;
 
-        // FIXED: Validate BASE_URL before anything else
         this.validateBaseUrl();
-
         this.initializeProviders();
     }
 
-    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
     //  STARTUP VALIDATION
-    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * FIXED: Validate BASE_URL at startup. Throw if missing.
-     */
     validateBaseUrl() {
         const baseUrl = process.env.BASE_URL;
         
         if (!baseUrl) {
             logger.error('FATAL: BASE_URL environment variable is not configured');
-            logger.error('Set BASE_URL=https://yourdomain.com before starting the bot');
             throw new Error('BASE_URL is not configured');
         }
 
-        // Validate URL format
         try {
             new URL(baseUrl);
         } catch (e) {
-            throw new Error(`BASE_URL is invalid: ${baseUrl}. Must be a valid URL like https://example.com`);
+            throw new Error(`BASE_URL is invalid: ${baseUrl}`);
         }
 
         this.baseUrl = baseUrl.replace(/\/$/, '');
         logger.info('BASE_URL validated', { baseUrl: this.baseUrl });
     }
 
-    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
     //  PROVIDER SETUP
-    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
 
     initializeProviders() {
         const twilio = new TwilioProvider();
@@ -78,7 +69,7 @@ class SMSProviderManager {
         this.providers.set('CHEAP_PANEL', cheapPanel);
         this.providers.set('FREE_PUBLIC', freePublic);
 
-        // NumberPool gets ALL active infrastructure providers
+        // NumberPool gets ONLY Twilio + Telnyx for VIP/BUNDLE
         const poolProviders = [];
         if (twilio.isActive) poolProviders.push(twilio);
         if (telnyx.isActive) poolProviders.push(telnyx);
@@ -96,19 +87,17 @@ class SMSProviderManager {
         });
     }
 
-    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
     //  LIFECYCLE
-    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
 
     async initialize() {
         if (this.isInitialized) return;
 
-        // Initialize number pool first (connects DB, loads available numbers)
         if (this.numberPool) {
             await this.numberPool.initialize();
         }
 
-        // Initialize number buyer (shares the pool)
         if (this.numberBuyer) {
             await this.numberBuyer.init({
                 twilio: this.providers.get('TWILIO'),
@@ -116,7 +105,6 @@ class SMSProviderManager {
             });
         }
 
-        // Initialize optional providers
         for (const [name, provider] of this.providers) {
             if (provider.initialize && typeof provider.initialize === 'function') {
                 try {
@@ -132,337 +120,329 @@ class SMSProviderManager {
         logger.info('SMS Provider Manager fully initialized');
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  SMART FAILOVER — NUMBER ACQUISITION
-    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
+    //  UTILITY HELPERS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    maskPhone(phone) {
+        if (!phone) return '****';
+        const str = phone.toString();
+        if (str.length < 4) return '****';
+        return str.slice(0, -4).replace(/./g, '*') + str.slice(-4);
+    }
+
+    escapeTelegramMessage(text) {
+        if (!text) return '';
+        return text
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#x27;')
+            .replace(/\*/g, '\\*')
+            .replace(/_/g, '\\_')
+            .replace(/\[/g, '\\[')
+            .replace(/\]/g, '\\]')
+            .replace(/\(/g, '\\(')
+            .replace(/\)/g, '\\)')
+            .replace(/`/g, '\\`');
+    }
+
+    formatTelegramStatus(status) {
+        const escaped = this.escapeTelegramMessage(status.message || status.error || 'Unknown status');
+        
+        if (status.success) {
+            return `✅ *SMS Received*\n\n📱 Number: \`${this.maskPhone(status.number || 'unknown')}\`\n💬 Message: ${escaped}\n🔢 OTP: \`${status.otp || 'N/A'}\`\n⏱️ Delivery: ${status.deliveryTime}ms`;
+        }
+        
+        if (status.status === 'TIMEOUT') {
+            return `❌ *No SMS Received*\n\n📱 Number: \`${this.maskPhone(status.number || 'unknown')}\`\n⏱️ Waited: 90 seconds\n📝 Reason: ${escaped}\n\n💡 Try retrying with a new number.`;
+        }
+        
+        if (status.status === 'POLLING') {
+            return `⏳ *Waiting for SMS...*\n\n🔍 ${escaped}`;
+        }
+        
+        return `⚠️ *Status Update*\n\n${escaped}`;
+    }
+    // ═══════════════════════════════════════════════════════════════════════════════
+//  SMSProviderManager.js — Part 2: Strict Tier Getters (No Cross-Tier Failover)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STRICT TIER GETTERS — Each tier uses ONLY its designated provider
+    // ═══════════════════════════════════════════════════════════════════════
 
     /**
-     * Get a number with intelligent provider failover.
-     * 
-     * FAILOVER ORDER:
-     *   1. VIP/BUNDLE → NumberPool (Twilio/Telnyx owned numbers)
-     *   2. CHEAP → 5SIM (with balance check)
-     *   3. FREE → FreeProvider (public numbers with health scoring)
-     * 
-     * @param {string} tier — 'VIP' | 'BUNDLE' | 'CHEAP' | 'FREE'
-     * @param {string} country — ISO country code
-     * @param {string} service — Service name (e.g., 'WhatsApp', 'Telegram')
-     * @param {string} preferredProvider — 'TWILIO' | 'TELNYX' | null
-     * @param {string} userId — Optional user identifier
+     * Get number for VIP/BUNDLE tier — uses NumberPool ONLY (Twilio/Telnyx)
+     * NO fallback to CHEAP or FREE. If pool fails, this tier fails.
      */
-    async getNumber(tier, country, service, preferredProvider = null, userId = null) {
+    async getVipNumber(country, service, userId = null, preferredProvider = null) {
         if (!this.isInitialized) await this.initialize();
 
-        // Validate inputs
         if (!country || typeof country !== 'string' || country.length !== 2) {
-            throw new Error(`INVALID_COUNTRY: Country must be 2-letter ISO code. Got: ${country}`);
+            throw new Error(`INVALID_COUNTRY: Expected 2-letter ISO code, got: ${country}`);
         }
 
-        // FIXED: VIP/BUNDLE tier — use number pool with failover
-        if ((tier === 'VIP' || tier === 'BUNDLE') && this.numberPool) {
-            try {
-                const result = await this.numberPool.acquireNumber(
-                    country,
-                    service,
-                    userId,
-                    preferredProvider
-                );
-                
-                if (result) {
-                    return {
-                        ...result,
-                        tier,
-                        acquisitionMethod: 'POOL'
-                    };
-                }
-            } catch (poolError) {
-                logger.warn('Pool acquisition failed, trying fallback providers', {
-                    error: poolError.message,
-                    country,
-                    tier
-                });
-                // Fall through to provider failover
-            }
+        if (!this.numberPool) {
+            throw new Error('POOL_NOT_AVAILABLE: Number pool not configured. Check Twilio/Telnyx credentials.');
         }
 
-        // FIXED: FREE tier — use FreeProvider with polling support
-        if (tier === 'FREE') {
-            const provider = this.providers.get('FREE_PUBLIC');
-            if (!provider?.isActive) {
-                throw new Error('FREE_PROVIDER_UNAVAILABLE: Free provider not active');
-            }
+        try {
+            const result = await this.numberPool.acquireNumber(country, service, userId, preferredProvider);
             
-            const result = await provider.getNumber(country, service);
+            if (!result) {
+                throw new Error('POOL_EMPTY: No numbers available in pool');
+            }
+
             return {
                 ...result,
-                tier,
-                acquisitionMethod: 'FREE'
+                tier: 'VIP',
+                acquisitionMethod: 'POOL',
+                provider: result.provider || preferredProvider || 'POOL'
             };
-        }
 
-        // FIXED: CHEAP tier or pool fallback — use smart provider failover
-        // Order: preferred → Telnyx → Twilio → 5SIM → Free
-        return this.acquireWithFailover(tier, country, service, preferredProvider);
+        } catch (error) {
+            logger.error('VIP/BUNDLE number acquisition failed', {
+                country, service, userId, error: error.message
+            });
+            throw error; // NO fallback — let caller handle
+        }
     }
 
     /**
-     * FIXED: Smart provider failover with retry limits.
-     * Never retries same failing provider more than 2 times.
+     * Get number for CHEAP tier — uses CheapPanelProvider (5SIM) ONLY
+     * NO fallback to FREE. If 5SIM fails, this tier fails.
      */
-    async acquireWithFailover(tier, country, service, preferredProvider = null) {
-        const attemptLog = [];
-        const maxRetriesPerProvider = 2;
-        const providerAttempts = new Map();
-
-        // Build provider order: preferred first, then Telnyx, Twilio, 5SIM, Free
-        const providerOrder = this.buildProviderOrder(preferredProvider);
-        
-        // Country fallback list
-        const countryFallbacks = this.getCountryFallbacks(country);
-
-        logger.info('Starting provider failover acquisition', {
-            tier,
-            country,
-            service,
-            preferredProvider,
-            providerOrder: providerOrder.map(p => p.name),
-            countryFallbacks
-        });
-
-        // Try each provider
-        for (const provider of providerOrder) {
-            const providerName = provider.name;
-            const attempts = providerAttempts.get(providerName) || 0;
-
-            if (attempts >= maxRetriesPerProvider) {
-                logger.debug(`Skipping ${providerName} — max retries reached`);
-                continue;
-            }
-
-            if (!provider.isActive) {
-                logger.debug(`Skipping ${providerName} — inactive`);
-                continue;
-            }
-
-            // Try primary country first, then fallbacks
-            for (const tryCountry of countryFallbacks) {
-                try {
-                    providerAttempts.set(providerName, attempts + 1);
-
-                    logger.info(`Attempting ${providerName} in ${tryCountry}`, {
-                        attempt: attempts + 1,
-                        maxRetries: maxRetriesPerProvider
-                    });
-
-                    let result;
-
-                    // Handle different provider interfaces
-                    if (providerName === 'FREE_PUBLIC') {
-                        result = await provider.getNumber(tryCountry, service);
-                    } else if (providerName === 'CHEAP_PANEL') {
-                        // 5SIM requires balance check — handled internally
-                        result = await provider.getNumber(tryCountry, service);
-                    } else {
-                        // Twilio/Telnyx
-                        result = await provider.getNumber(tryCountry);
-                    }
-
-                    if (result) {
-                        logger.info(`Success with ${providerName}`, {
-                            country: tryCountry,
-                            phone: this.maskPhone(result.phoneNumber)
-                        });
-
-                        return {
-                            ...result,
-                            tier,
-                            acquisitionMethod: providerName,
-                            countryUsed: tryCountry,
-                            failoverAttempts: attemptLog.length
-                        };
-                    }
-
-                } catch (error) {
-                    const errorMsg = error.message || '';
-                    
-                    attemptLog.push({
-                        provider: providerName,
-                        country: tryCountry,
-                        error: errorMsg,
-                        timestamp: new Date().toISOString()
-                    });
-
-                    // FIXED: Parse error type for smart skipping
-                    const isNoNumbers = errorMsg.includes('NO_NUMBERS') || 
-                                       errorMsg.includes('NOT_AVAILABLE') ||
-                                       errorMsg.includes('No available numbers');
-                    
-                    const isNoBalance = errorMsg.includes('NO_BALANCE') || 
-                                       errorMsg.includes('not enough user balance');
-                    
-                    const isRateLimit = errorMsg.includes('RATE_LIMIT') || 
-                                       errorMsg.includes('429') ||
-                                       errorMsg.includes('Too Many Requests');
-                    
-                    const isConfigError = errorMsg.includes('NOT_CONFIGURED') || 
-                                         errorMsg.includes('INVALID_COUNTRY');
-
-                    logger.warn(`${providerName} failed`, {
-                        country: tryCountry,
-                        error: errorMsg,
-                        errorType: isNoNumbers ? 'NO_NUMBERS' : 
-                                  isNoBalance ? 'NO_BALANCE' : 
-                                  isRateLimit ? 'RATE_LIMIT' : 
-                                  isConfigError ? 'CONFIG' : 'UNKNOWN'
-                    });
-
-                    // FIXED: Skip logic based on error type
-                    if (isNoBalance) {
-                        logger.error(`Skipping ${providerName} — insufficient balance`);
-                        provider.isActive = false; // Disable until funded
-                        break; // Don't try other countries for this provider
-                    }
-
-                    if (isConfigError) {
-                        logger.error(`Skipping ${providerName} — configuration error`);
-                        provider.isActive = false;
-                        break;
-                    }
-
-                    if (isRateLimit) {
-                        logger.warn(`${providerName} rate limited — will retry later`);
-                        // Continue to next country/provider
-                    }
-
-                    // If NO_NUMBERS, try next country in fallback list
-                    if (!isNoNumbers) {
-                        // For other errors, don't retry same provider
-                        break;
-                    }
-                }
-            }
-        }
-
-        // All providers exhausted
-        const errorDetails = attemptLog.map(a => `${a.provider}(${a.country}): ${a.error}`).join(' | ');
-        
-        throw new Error(
-            `ALL_PROVIDERS_FAILED: No number available after trying ${attemptLog.length} attempts. ` +
-            `Details: ${errorDetails}`
-        );
-    }
-
-    /**
-     * Build provider priority order based on preference and health
-     */
-    buildProviderOrder(preferredProvider) {
-        const order = [];
-        const added = new Set();
-
-        // Preferred provider first
-        if (preferredProvider && this.providers.has(preferredProvider)) {
-            order.push(this.providers.get(preferredProvider));
-            added.add(preferredProvider);
-        }
-
-        // Default order: Telnyx → Twilio → 5SIM → Free
-        const defaultOrder = ['TELNYX', 'TWILIO', 'CHEAP_PANEL', 'FREE_PUBLIC'];
-        
-        for (const name of defaultOrder) {
-            if (!added.has(name) && this.providers.has(name)) {
-                order.push(this.providers.get(name));
-                added.add(name);
-            }
-        }
-
-        return order.filter(p => p && p.isActive);
-    }
-
-    /**
-     * Get country fallback list for inventory handling
-     */
-    getCountryFallbacks(primaryCountry) {
-        const primary = primaryCountry.toUpperCase();
-        
-        // If primary is available, try it first
-        const fallbacks = [primary];
-
-        // Regional fallbacks
-        const regionMap = {
-            'US': ['CA', 'GB', 'AU'],
-            'GB': ['US', 'CA', 'AU'],
-            'CA': ['US', 'GB', 'AU'],
-            'AU': ['US', 'GB', 'CA'],
-            'DE': ['FR', 'NL', 'AT'],
-            'FR': ['DE', 'ES', 'IT'],
-            'NG': ['ZA', 'KE', 'GH'],
-            'IN': ['PK', 'BD', 'LK'],
-            'BR': ['MX', 'AR', 'CL'],
-            'MX': ['US', 'BR', 'CO']
-        };
-
-        const regionFallbacks = regionMap[primary] || ['US', 'GB', 'CA'];
-        
-        for (const fb of regionFallbacks) {
-            if (!fallbacks.includes(fb)) {
-                fallbacks.push(fb);
-            }
-        }
-
-        // Global fallback
-        if (!fallbacks.includes('US')) {
-            fallbacks.push('US');
-        }
-
-        return fallbacks;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  SMS CHECKING (FIXED — supports FreeProvider polling)
-    // ═══════════════════════════════════════════════════════════
-
-    /**
-     * Check SMS for a number.
-     * 
-     * For FREE tier: Uses pollForSMS with live status updates
-     * For PAID tier: Returns webhook status
-     */
-    async checkSMS(providerName, identifier, options = {}) {
+    async getCheapNumber(country, service) {
         if (!this.isInitialized) await this.initialize();
 
-        // FREE tier: Use polling engine
-        if (providerName === 'FREE_PUBLIC') {
-            const provider = this.providers.get('FREE_PUBLIC');
-            if (!provider) {
-                throw new Error('FREE_PROVIDER_NOT_FOUND');
-            }
-
-            // If identifier is a sessionId, use pollForSMS
-            if (identifier.startsWith('free_')) {
-                return provider.pollForSMS(identifier, options.onStatusUpdate);
-            }
-
-            // Otherwise use standard checkSMS
-            return provider.checkSMS(identifier);
+        if (!country || typeof country !== 'string' || country.length !== 2) {
+            throw new Error(`INVALID_COUNTRY: Expected 2-letter ISO code, got: ${country}`);
         }
 
-        // Pool/VIP numbers use webhooks
-        if (providerName === 'TWILIO' || providerName === 'TELNYX' || providerName === 'NUMBER_POOL') {
+        const provider = this.providers.get('CHEAP_PANEL');
+        
+        if (!provider) {
+            throw new Error('CHEAP_PROVIDER_NOT_FOUND: CheapPanelProvider not registered');
+        }
+
+        if (!provider.isActive) {
+            throw new Error('CHEAP_PROVIDER_INACTIVE: 5SIM provider is not active. Check API key and balance.');
+        }
+
+        try {
+            // 5SIM getNumber signature: (country, service)
+            const result = await provider.getNumber(country, service);
+            
+            if (!result) {
+                throw new Error('CHEAP_NO_NUMBERS: No numbers available from 5SIM');
+            }
+
             return {
-                success: false,
-                status: 'WAITING',
-                message: 'Check via webhook or provider API',
-                provider: providerName
+                phoneNumber: result.phoneNumber || result.number,
+                provider: 'CHEAP_PANEL',
+                providerNumberId: result.id || result.providerNumberId || result.orderId,
+                country: result.country || country,
+                service: result.service || service,
+                tier: 'CHEAP',
+                acquisitionMethod: 'CHEAP_PANEL',
+                cost: result.cost || 0
             };
+
+        } catch (error) {
+            logger.error('CHEAP number acquisition failed', {
+                country, service, error: error.message
+            });
+            throw error; // NO fallback — let caller handle
+        }
+    }
+
+    /**
+     * Get number for FREE tier — uses FreeProvider ONLY
+     * If FreeProvider fails, this tier fails.
+     */
+    async getFreeNumber(country, service) {
+        if (!this.isInitialized) await this.initialize();
+
+        if (!country || typeof country !== 'string' || country.length !== 2) {
+            throw new Error(`INVALID_COUNTRY: Expected 2-letter ISO code, got: ${country}`);
         }
 
-        // 5SIM/CheapPanel
+        const provider = this.providers.get('FREE_PUBLIC');
+        
+        if (!provider) {
+            throw new Error('FREE_PROVIDER_NOT_FOUND: FreeProvider not registered');
+        }
+
+        if (!provider.isActive) {
+            throw new Error('FREE_PROVIDER_INACTIVE: Free provider is not active');
+        }
+
+        try {
+            // FreeProvider getNumber signature: (country, service)
+            const result = await provider.getNumber(country, service);
+            
+            if (!result) {
+                throw new Error('FREE_NO_NUMBERS: No free numbers available');
+            }
+
+            return {
+                phoneNumber: result.phoneNumber || result.number,
+                provider: 'FREE_PUBLIC',
+                providerNumberId: result.sessionId || result.id || `free_${Date.now()}`,
+                country: result.country || country,
+                service: result.service || service,
+                tier: 'FREE',
+                acquisitionMethod: 'FREE_PUBLIC',
+                sessionId: result.sessionId || result.id,
+                cost: 0
+            };
+
+        } catch (error) {
+            logger.error('FREE number acquisition failed', {
+                country, service, error: error.message
+            });
+            throw error; // NO fallback
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  LEGACY getNumber — DEPRECATED, redirects to strict getters
+    //  Kept for backward compatibility but logs warning
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * LEGACY: Old getNumber with failover. 
+     * NOW STRICT: Routes to tier-specific getter, NO failover between tiers.
+     */
+    async getNumber(tier, country, service, preferredProvider = null, userId = null) {
+        logger.warn('LEGACY getNumber() called — use tier-specific getters', { tier, country });
+
+        switch (tier?.toUpperCase()) {
+            case 'VIP':
+            case 'BUNDLE':
+                return this.getVipNumber(country, service, userId, preferredProvider);
+            
+            case 'CHEAP':
+                return this.getCheapNumber(country, service);
+            
+            case 'FREE':
+                return this.getFreeNumber(country, service);
+            
+            default:
+                throw new Error(`INVALID_TIER: "${tier}". Must be VIP, BUNDLE, CHEAP, or FREE`);
+        }
+                     }
+                                                         // ═══════════════════════════════════════════════════════════════════════════════
+//  SMSProviderManager.js — Part 3: SMS Checking (Fixed Per-Provider Methods)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SMS CHECKING — Each provider uses its own correct method
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Check SMS for a CHEAP tier number (5SIM).
+     * 5SIM uses: checkSMS(orderId) or getSMS(orderId)
+     */
+    async checkCheapSMS(orderId) {
+        if (!this.isInitialized) await this.initialize();
+
+        const provider = this.providers.get('CHEAP_PANEL');
+        if (!provider) {
+            throw new Error('CHEAP_PROVIDER_NOT_FOUND');
+        }
+
+        // 5SIM may use checkSMS or getSMS depending on implementation
+        const checkMethod = provider.checkSMS || provider.getSMS || provider.getCode;
+        
+        if (typeof checkMethod !== 'function') {
+            throw new Error('CHEAP_PROVIDER_NO_CHECK_METHOD: Provider missing checkSMS/getSMS/getCode');
+        }
+
+        return checkMethod.call(provider, orderId);
+    }
+
+    /**
+     * Check SMS for a FREE tier number.
+     * FreeProvider uses: pollForSMS(sessionId, onStatusUpdate) for live polling
+     * OR checkSMS(sessionId) for one-shot check
+     */
+    async checkFreeSMS(sessionId, onStatusUpdate = null) {
+        if (!this.isInitialized) await this.initialize();
+
+        const provider = this.providers.get('FREE_PUBLIC');
+        if (!provider) {
+            throw new Error('FREE_PROVIDER_NOT_FOUND');
+        }
+
+        // If live polling requested and provider supports it
+        if (onStatusUpdate && typeof provider.pollForSMS === 'function') {
+            return provider.pollForSMS(sessionId, onStatusUpdate);
+        }
+
+        // One-shot check
+        if (typeof provider.checkSMS === 'function') {
+            return provider.checkSMS(sessionId);
+        }
+
+        // Fallback: try getSMS
+        if (typeof provider.getSMS === 'function') {
+            return provider.getSMS(sessionId);
+        }
+
+        throw new Error('FREE_PROVIDER_NO_CHECK_METHOD: FreeProvider missing checkSMS/pollForSMS/getSMS');
+    }
+
+    /**
+     * Check SMS for POOL number (VIP/BUNDLE).
+     * Pool numbers use webhooks — check database/session status.
+     */
+    async checkPoolSMS(sessionId) {
+        if (!this.isInitialized) await this.initialize();
+
+        if (!this.numberPool) {
+            throw new Error('POOL_NOT_AVAILABLE');
+        }
+
+        // Pool numbers are webhook-driven — return waiting status
+        // Actual SMS is stored in Session model by webhook handler
+        return {
+            success: false,
+            status: 'WAITING',
+            message: 'Pool numbers use webhooks. Check session status in database.',
+            provider: 'NUMBER_POOL'
+        };
+    }
+
+    /**
+     * LEGACY checkSMS — DEPRECATED. 
+     * Routes to correct tier-specific checker.
+     */
+    async checkSMS(providerName, identifier, options = {}) {
+        logger.warn('LEGACY checkSMS() called — use tier-specific checkers', { providerName });
+
+        if (providerName === 'FREE_PUBLIC' || providerName === 'FREE') {
+            return this.checkFreeSMS(identifier, options.onStatusUpdate);
+        }
+
+        if (providerName === 'CHEAP_PANEL' || providerName === 'CHEAP') {
+            return this.checkCheapSMS(identifier);
+        }
+
+        if (providerName === 'NUMBER_POOL' || providerName === 'TWILIO' || providerName === 'TELNYX') {
+            return this.checkPoolSMS(identifier);
+        }
+
+        // Direct provider lookup fallback
         const provider = this.providers.get(providerName);
         if (!provider) {
             throw new Error(`PROVIDER_NOT_FOUND: ${providerName}`);
         }
 
-        if (!provider.checkSMS) {
+        const checkMethod = provider.checkSMS || provider.getSMS || provider.getCode;
+        if (typeof checkMethod !== 'function') {
             return {
                 success: false,
                 status: 'UNSUPPORTED',
@@ -470,17 +450,69 @@ class SMSProviderManager {
             };
         }
 
-        return provider.checkSMS(identifier);
+        return checkMethod.call(provider, identifier);
     }
 
-    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
+    //  FREE TIER POLLING (For OTPCommands.startFreePolling)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Poll for SMS on a free tier session.
+     * This is what OTPCommands.startFreePolling() calls.
+     */
+    async pollFreeSMS(sessionId, onStatusUpdate = null) {
+        return this.checkFreeSMS(sessionId, onStatusUpdate);
+    }
+
+    /**
+     * Retry free tier with new number.
+     */
+    async retryFreeNumber(sessionId, country = 'US', service = 'Any') {
+        const provider = this.providers.get('FREE_PUBLIC');
+        if (!provider) {
+            throw new Error('FREE_PROVIDER_NOT_AVAILABLE');
+        }
+
+        if (typeof provider.retryWithNewNumber === 'function') {
+            return provider.retryWithNewNumber(sessionId, country, service);
+        }
+
+        // Fallback: cancel old, get new
+        if (typeof provider.cancelNumber === 'function') {
+            await provider.cancelNumber(sessionId).catch(() => {});
+        }
+
+        return this.getFreeNumber(country, service);
+    }
+
+    /**
+     * Get free provider health status.
+     */
+    getFreeProviderHealth() {
+        const provider = this.providers.get('FREE_PUBLIC');
+        if (!provider) {
+            return { available: false };
+        }
+
+        return {
+            available: true,
+            providers: typeof provider.getProviderHealth === 'function' ? provider.getProviderHealth() : [],
+            activeSessions: typeof provider.getActiveSessions === 'function' ? provider.getActiveSessions() : []
+        };
+            }
+            // ═══════════════════════════════════════════════════════════════════════════════
+//  SMSProviderManager.js — Part 4: Release, Pool, Stats, Shutdown
+// ═══════════════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
     //  NUMBER RELEASE / CANCELLATION
-    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
 
     async cancelNumber(providerName, identifier) {
         if (!this.isInitialized) await this.initialize();
 
-        // Pool numbers
+        // Pool numbers (VIP/BUNDLE)
         if (providerName === 'NUMBER_POOL' || providerName === 'TWILIO' || providerName === 'TELNYX') {
             if (!this.numberPool) {
                 return { success: false, error: 'POOL_NOT_INITIALIZED' };
@@ -489,14 +521,27 @@ class SMSProviderManager {
         }
 
         // FreeProvider sessions
-        if (providerName === 'FREE_PUBLIC') {
+        if (providerName === 'FREE_PUBLIC' || providerName === 'FREE') {
             const provider = this.providers.get('FREE_PUBLIC');
-            if (provider?.cancelNumber) {
+            if (provider?.cancelNumber && typeof provider.cancelNumber === 'function') {
                 return provider.cancelNumber(identifier);
             }
             return { success: true, status: 'RELEASED' };
         }
 
+        // CheapPanel (5SIM)
+        if (providerName === 'CHEAP_PANEL' || providerName === 'CHEAP') {
+            const provider = this.providers.get('CHEAP_PANEL');
+            if (provider?.cancelNumber && typeof provider.cancelNumber === 'function') {
+                return provider.cancelNumber(identifier);
+            }
+            if (provider?.finishNumber && typeof provider.finishNumber === 'function') {
+                return provider.finishNumber(identifier);
+            }
+            return { success: true, note: '5SIM cancellation not supported by provider' };
+        }
+
+        // Direct lookup
         const provider = this.providers.get(providerName);
         if (!provider) {
             return { success: false, error: `PROVIDER_NOT_FOUND: ${providerName}` };
@@ -512,7 +557,6 @@ class SMSProviderManager {
     async finishNumber(providerName, identifier) {
         if (!this.isInitialized) await this.initialize();
 
-        // Pool numbers
         if (providerName === 'NUMBER_POOL' || providerName === 'TWILIO' || providerName === 'TELNYX') {
             if (!this.numberPool) {
                 return { success: false, error: 'POOL_NOT_INITIALIZED' };
@@ -520,13 +564,20 @@ class SMSProviderManager {
             return this.numberPool.releaseNumber(identifier, 'SESSION_END');
         }
 
-        // FreeProvider
-        if (providerName === 'FREE_PUBLIC') {
+        if (providerName === 'FREE_PUBLIC' || providerName === 'FREE') {
             const provider = this.providers.get('FREE_PUBLIC');
-            if (provider?.finishNumber) {
+            if (provider?.finishNumber && typeof provider.finishNumber === 'function') {
                 return provider.finishNumber(identifier);
             }
             return { success: true, status: 'FINISHED' };
+        }
+
+        if (providerName === 'CHEAP_PANEL' || providerName === 'CHEAP') {
+            const provider = this.providers.get('CHEAP_PANEL');
+            if (provider?.finishNumber && typeof provider.finishNumber === 'function') {
+                return provider.finishNumber(identifier);
+            }
+            return { success: true, note: '5SIM finish not supported' };
         }
 
         const provider = this.providers.get(providerName);
@@ -537,56 +588,9 @@ class SMSProviderManager {
         return { success: true, note: 'No finish action required' };
     }
 
-    // ══════════════════════════════════════════════════════
-
-    // ═══════════════════════════════════════════════════════════
-    //  FREE TIER HELPERS
-    // ═══════════════════════════════════════════════════════════
-
-    /**
-     * Start SMS polling for a free tier session.
-     * Returns Promise that resolves when SMS received or timeout.
-     */
-    async pollFreeSMS(sessionId, onStatusUpdate = null) {
-        const provider = this.providers.get('FREE_PUBLIC');
-        if (!provider) {
-            throw new Error('FREE_PROVIDER_NOT_AVAILABLE');
-        }
-
-        return provider.pollForSMS(sessionId, onStatusUpdate);
-    }
-
-    /**
-     * Retry free tier with new number.
-     */
-    async retryFreeNumber(sessionId, country = 'US', service = 'Any') {
-        const provider = this.providers.get('FREE_PUBLIC');
-        if (!provider) {
-            throw new Error('FREE_PROVIDER_NOT_AVAILABLE');
-        }
-
-        return provider.retryWithNewNumber(sessionId, country, service);
-    }
-
-    /**
-     * Get free provider health status.
-     */
-    getFreeProviderHealth() {
-        const provider = this.providers.get('FREE_PUBLIC');
-        if (!provider) {
-            return { available: false };
-        }
-
-        return {
-            available: true,
-            providers: provider.getProviderHealth(),
-            activeSessions: provider.getActiveSessions()
-        };
-    }
-
-    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
     //  POOL MANAGEMENT
-    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
 
     async buyPoolNumbers(country = 'US', quantity = 1, preferredProvider = null) {
         if (!this.numberPool || !this.numberBuyer) {
@@ -629,9 +633,9 @@ class SMSProviderManager {
         return result;
     }
 
-    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
     //  STATS & MONITORING
-    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
 
     async getPoolStats() {
         if (!this.numberPool) {
@@ -667,64 +671,13 @@ class SMSProviderManager {
         return this.providers.get(name);
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  TELEGRAM MESSAGE SAFETY (FIXED — escape user input)
-    // ═══════════════════════════════════════════════════════════
-
-    /**
-     * FIXED: Escape Telegram message entities to prevent "Can't find end of the entity" errors.
-     * Use this before sending any user-generated content to Telegram.
-     */
-    escapeTelegramMessage(text) {
-        if (!text) return '';
-        
-        // Escape special characters that break Telegram HTML/Markdown parsing
-        return text
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#x27;')
-            .replace(/\*/g, '\\*')
-            .replace(/_/g, '\\_')
-            .replace(/\[/g, '\\[')
-            .replace(/\]/g, '\\]')
-            .replace(/\(/g, '\\(')
-            .replace(/\)/g, '\\)')
-            .replace(/`/g, '\\`');
+    getProviderInstance(name) {
+        return this.providers.get(name);
     }
 
-    /**
-     * Format status message for Telegram with proper escaping.
-     */
-    formatTelegramStatus(status) {
-        const escaped = this.escapeTelegramMessage(status.message || status.error || 'Unknown status');
-        
-        if (status.success) {
-            return `✅ *SMS Received*\n\n📱 Number: \`${this.maskPhone(status.number || 'unknown')}\`\n💬 Message: ${escaped}\n🔢 OTP: \`${status.otp || 'N/A'}\`\n⏱️ Delivery: ${status.deliveryTime}ms`;
-        }
-        
-        if (status.status === 'TIMEOUT') {
-            return `❌ *No SMS Received*\n\n📱 Number: \`${this.maskPhone(status.number || 'unknown')}\`\n⏱️ Waited: 90 seconds\n📝 Reason: ${escaped}\n\n💡 Try retrying with a new number.`;
-        }
-        
-        if (status.status === 'POLLING') {
-            return `⏳ *Waiting for SMS...*\n\n🔍 ${escaped}`;
-        }
-        
-        return `⚠️ *Status Update*\n\n${escaped}`;
-    }
-
-    maskPhone(phone) {
-        if (!phone) return '****';
-        const str = phone.toString();
-        if (str.length < 4) return '****';
-        return str.slice(0, -4).replace(/./g, '*') + str.slice(-4);
-    }
-
-    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
     //  SHUTDOWN
-    // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
 
     async shutdown() {
         if (this.numberBuyer) {
@@ -759,3 +712,4 @@ class SMSProviderManager {
 }
 
 export default SMSProviderManager;
+                
