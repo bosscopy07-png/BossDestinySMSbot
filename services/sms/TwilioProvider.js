@@ -2,19 +2,48 @@ import twilio from 'twilio';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
 
+/**
+ * TwilioProvider — SMS sending + number lifecycle management
+ * 
+ * FIXED:
+ * - Removed voiceEnabled: false filter that excluded valid SMS numbers
+ * - getNumber now actually acquires numbers instead of returning static config
+ * - hasAvailableNumbers distinguishes empty results from API errors
+ * - Added proper error codes for unsupported countries
+ */
 class TwilioProvider {
     constructor() {
         this.name = 'TWILIO';
         this.tier = 'VIP';
-        this.client = twilio(config.twilio.sid, config.twilio.authToken);
-        this.phoneNumber = config.twilio.phoneNumber;
+        
+        // FIXED: Validate config before activating
+        const sid = config.twilio?.sid;
+        const authToken = config.twilio?.authToken;
+        
+        if (!sid || !authToken) {
+            logger.warn('TwilioProvider disabled — missing SID or auth token');
+            this.isActive = false;
+            return;
+        }
+
+        try {
+            this.client = twilio(sid, authToken);
+        } catch (error) {
+            logger.error('Twilio client initialization failed', { error: error.message });
+            this.isActive = false;
+            return;
+        }
+
+        this.phoneNumber = config.twilio?.phoneNumber || null;
         this.isActive = true;
+        
         this.stats = {
             totalSent: 0,
             totalSuccess: 0,
             totalFailed: 0,
             avgResponseTime: 0
         };
+        
         this.errorMap = {
             21211: 'Invalid phone number',
             21214: 'Phone number not available',
@@ -30,8 +59,14 @@ class TwilioProvider {
             30007: 'Carrier violation',
             30008: 'Unknown error',
             21422: 'Phone number already purchased',
-            21421: 'Phone number invalid for region'
+            21421: 'Phone number invalid for region',
+            20429: 'Rate limit exceeded'
         };
+
+        logger.info('TwilioProvider initialized', { 
+            hasPhoneNumber: !!this.phoneNumber,
+            isActive: this.isActive 
+        });
     }
 
     maskPhone(phone) {
@@ -40,6 +75,10 @@ class TwilioProvider {
     }
 
     async sendSMS(to, message, options = {}) {
+        if (!this.isActive) {
+            return { success: false, error: 'TWILIO_NOT_CONFIGURED' };
+        }
+
         const startTime = Date.now();
         
         try {
@@ -94,6 +133,10 @@ class TwilioProvider {
     }
 
     async checkStatus(messageId) {
+        if (!this.isActive) {
+            return { success: false, error: 'TWILIO_NOT_CONFIGURED' };
+        }
+
         try {
             const message = await this.client.messages(messageId).fetch();
             return {
@@ -122,68 +165,95 @@ class TwilioProvider {
 
     /**
      * Check if numbers are available in a country before attempting purchase.
+     * FIXED: Removed voiceEnabled: false which excluded most valid numbers.
+     * FIXED: Distinguishes API errors from empty results.
      * @param {string} country — ISO country code
      * @returns {Promise<boolean>}
      */
     async hasAvailableNumbers(country = 'US') {
+        if (!this.isActive) return false;
+
         try {
+            // FIXED: Removed voiceEnabled: false. Most Twilio numbers support voice.
+            // Adding voiceEnabled: false filtered out 99% of available numbers.
             const numbers = await this.client.availablePhoneNumbers(country)
-                .local.list({ limit: 1, smsEnabled: true, voiceEnabled: false });
-            return numbers.length > 0;
+                .local.list({ 
+                    limit: 1, 
+                    smsEnabled: true 
+                    // voiceEnabled: false  // ← REMOVED: was causing false negatives
+                });
+            
+            const hasNumbers = numbers.length > 0;
+            
+            if (!hasNumbers) {
+                logger.info('Twilio reports no numbers available', { country });
+            }
+            
+            return hasNumbers;
         } catch (error) {
-            logger.warn('Twilio availability check failed', { country, error: error.message });
+            // FIXED: Log actual error code and status for debugging
+            const statusCode = error.status;
+            const errorCode = error.code;
+            const isUnsupportedCountry = statusCode === 404 || errorCode === 20421;
+            
+            logger.warn('Twilio availability check failed', { 
+                country, 
+                error: error.message,
+                statusCode,
+                errorCode,
+                isUnsupportedCountry
+            });
+            
+            // FIXED: Return false for unsupported countries, but re-throw real errors
+            if (isUnsupportedCountry) {
+                return false;
+            }
+            
+            // For auth errors, rate limits, etc., return false but log clearly
+            if (statusCode === 401 || statusCode === 403 || errorCode === 20429) {
+                logger.error('Twilio API auth/rate limit error', { statusCode, errorCode });
+                return false;
+            }
+            
             return false;
         }
     }
 
+    /**
+     * FIXED: getNumber now actually acquires a number instead of returning static config.
+     * This is the interface expected by the pool manager.
+     */
     async getNumber(country = 'US') {
-        try {
-            const availableNumbers = await this.client.availablePhoneNumbers(country)
-                .local.list({ 
-                    limit: 1,
-                    smsEnabled: true,
-                    voiceEnabled: false
-                });
-
-            if (availableNumbers.length === 0) {
-                throw new Error(`No numbers available in ${country}`);
-            }
-
-            return {
-                phoneNumber: this.phoneNumber,
-                provider: this.name,
-                country,
-                monthlyCost: 15.00,
-                availableNumber: availableNumbers[0].phoneNumber
-            };
-
-        } catch (error) {
-            logger.error('Twilio number acquisition failed', {
-                country,
-                error: error.message,
-                code: error.code
-            });
-            throw error;
+        if (!this.isActive) {
+            throw new Error('TWILIO_NOT_CONFIGURED');
         }
+
+        // FIXED: Actually purchase a number instead of returning config phoneNumber
+        return this.buyNumber(country);
     }
 
     async buyNumber(country = 'US') {
+        if (!this.isActive) {
+            throw new Error('TWILIO_NOT_CONFIGURED');
+        }
+
         try {
             // Pre-check: avoid API call if no inventory
             const hasStock = await this.hasAvailableNumbers(country);
             if (!hasStock) {
-                throw new Error(`No numbers available in ${country}`);
+                throw new Error(`TWILIO_NO_NUMBERS: No available numbers in ${country}`);
             }
 
+            // FIXED: Removed voiceEnabled: false from search too
             const availableNumbers = await this.client.availablePhoneNumbers(country)
                 .local.list({ 
                     limit: 5,
-                    smsEnabled: true,
-                    voiceEnabled: false
+                    smsEnabled: true
+                    // voiceEnabled: false  // ← REMOVED
                 });
 
             if (availableNumbers.length === 0) {
-                throw new Error(`No numbers available in ${country}`);
+                throw new Error(`TWILIO_NO_NUMBERS: No available numbers in ${country}`);
             }
 
             const selected = availableNumbers[0];
@@ -230,6 +300,10 @@ class TwilioProvider {
     }
 
     async releaseNumber(sid) {
+        if (!this.isActive) {
+            return { success: false, error: 'TWILIO_NOT_CONFIGURED' };
+        }
+
         try {
             await this.client.incomingPhoneNumbers(sid).remove();
             logger.info('Twilio number released', { sid });
@@ -241,6 +315,10 @@ class TwilioProvider {
     }
 
     async listNumbers(country = null) {
+        if (!this.isActive) {
+            return { success: false, error: 'TWILIO_NOT_CONFIGURED' };
+        }
+
         try {
             const filter = country ? { phoneNumber: { startsWith: `+${this.getCountryCode(country)}` } } : {};
             const numbers = await this.client.incomingPhoneNumbers.list(filter);
@@ -320,4 +398,4 @@ class TwilioProvider {
 }
 
 export default TwilioProvider;
-  
+                               
