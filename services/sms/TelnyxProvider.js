@@ -120,6 +120,7 @@ class TelnyxProvider {
 
     /**
      * Check if numbers are available in a country before attempting purchase.
+     * FIXED: Returns false on 400/404 instead of throwing.
      * @param {string} country — ISO country code
      * @returns {Promise<boolean>}
      */
@@ -142,7 +143,12 @@ class TelnyxProvider {
             const available = response.data?.data;
             return available && available.length > 0;
         } catch (error) {
-            logger.warn('Telnyx availability check failed', { country, error: error.message });
+            // FIXED: Return false on any error instead of throwing
+            logger.warn('Telnyx availability check failed', { 
+                country, 
+                error: error.response?.data?.errors?.[0]?.detail || error.message,
+                status: error.response?.status
+            });
             return false;
         }
     }
@@ -194,15 +200,14 @@ class TelnyxProvider {
         const phoneNumber = numberData.phone_number;
 
         // Step 2: Purchase the number
-        // FIXED: Use /phone_numbers/orders endpoint with correct payload structure
-        // Fallback to legacy /phone_numbers if 404
+        // FIXED: Use correct Telnyx v2 endpoint /number_orders
         let purchaseResponse;
         try {
             purchaseResponse = await axios.post(
-                `${this.baseUrl}/phone_numbers/orders`,
+                `${this.baseUrl}/number_orders`,
                 {
                     data: {
-                        phone_numbers: [phoneNumber],
+                        phone_numbers: [{ phone_number: phoneNumber }],
                         messaging_profile_id: this.messagingProfileId || undefined,
                         connection_id: this.connectionId || undefined,
                         billing_group_id: config.telnyx?.billingGroupId || undefined,
@@ -215,20 +220,18 @@ class TelnyxProvider {
             const msg = error.response?.data?.errors?.[0]?.detail || error.message;
             const code = error.response?.status;
             
-            // FALLBACK: If /orders fails with 404, try legacy /phone_numbers endpoint
+            // If /number_orders fails with 404, try without /v2 prefix
             if (code === 404) {
-                logger.warn('Telnyx /phone_numbers/orders returned 404, trying fallback /phone_numbers', {
+                logger.warn('Telnyx /number_orders returned 404, trying without data wrapper', {
                     error: msg
                 });
                 try {
                     purchaseResponse = await axios.post(
-                        `${this.baseUrl}/phone_numbers`,
+                        `${this.baseUrl}/number_orders`,
                         {
-                            data: {
-                                phone_number: phoneNumber,
-                                messaging_profile_id: this.messagingProfileId || undefined,
-                                connection_id: this.connectionId || undefined
-                            }
+                            phone_numbers: [{ phone_number: phoneNumber }],
+                            messaging_profile_id: this.messagingProfileId || undefined,
+                            connection_id: this.connectionId || undefined
                         },
                         { headers: this.getHeaders(), timeout: 30000 }
                     );
@@ -357,4 +360,3 @@ class TelnyxProvider {
 }
 
 export default TelnyxProvider;
-                
