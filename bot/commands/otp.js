@@ -521,29 +521,15 @@ class OTPCommands {
     //  MAIN MENU & MY NUMBER
     // ═══════════════════════════════════════════════════════════════════════
 
-    async handleOTPCommand(ctx) {
+        async handleOTPCommand(ctx) {
         const user = ctx.state.user;
-        const stats = this._getUserStats(user);
-        const hasBundle = stats.bundleRemaining > 0;
-        const isVip = stats.isVip;
+        const isVip = this._isVipActive(user);
+        const hasBundle = (user.bundleRemaining || 0) > 0;
 
-        let message = 
-            `📱 <b>SwiftSMS OTP Bot</b>\n\n` +
-            `👤 <b>Your Stats:</b>\n` +
-            `💰 Balance: <code>${formatCurrency(stats.balance)}</code>\n` +
-            `🆓 Free Today: <code>${stats.freeRemaining}</code> left\n`;
+        let message = '📱 <b>Request OTP</b>\n\nSelect your preferred mode:';
         
-        if (isVip) {
-            message += `👑 VIP: <code>${stats.vipRemaining}</code> left (${stats.vipDays} days)\n`;
-        }
-        if (hasBundle) {
-            message += `📦 Bundle: <code>${stats.bundleRemaining}</code> OTPs\n`;
-        }
-        
-        message += `\nSelect your preferred mode:`;
-
         const buttons = [
-            [Markup.button.callback('🆓 FREE OTP', 'mode_free'), Markup.button.callback('💰 CHEAP OTP', 'mode_cheap')]
+            [Markup.button.callback('🆓 FREE', 'mode_free'), Markup.button.callback('💰 CHEAP', 'mode_cheap')]
         ];
 
         if (hasBundle || isVip) {
@@ -559,23 +545,15 @@ class OTPCommands {
         }
 
         if (isVip && user.vipPhoneNumber) {
-            buttons.push([Markup.button.callback('📱 My VIP Number', 'view_my_number')]);
+            buttons.push([Markup.button.callback('📱 View My Number', 'view_my_number')]);
         }
 
-        buttons.push(
-            [Markup.button.callback('⚡ Quick Buy', 'quick_buy'), Markup.button.callback('📊 My Stats', 'stats')],
-            [Markup.button.callback('📜 History', 'history'), Markup.button.callback('👥 Referral', 'referral')],
-            [Markup.button.callback('⚙️ Settings', 'settings'), Markup.button.callback('❓ FAQ', 'faq')]
-        );
+        buttons.push([Markup.button.callback('🔙 Back to OTP Hub', 'otp_hub')]);
 
         const keyboard = Markup.inlineKeyboard(buttons);
         await this.sendPhotoWithCaption(ctx, IMAGES.otpMenu, message, keyboard, 'HTML');
-    }
-
-    async handleMyNumberCommand(ctx) {
-        return this.handleViewMyNumber(ctx);
-    }
-
+}
+             
     async handleViewMyNumber(ctx) {
         const user = ctx.state.user;
         
