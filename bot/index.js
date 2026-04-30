@@ -211,7 +211,7 @@ class TelegramBot {
 
         // ─── Initialize command modules ───
         const userCommands = new UserCommands(this.bot, this.walletService);
-        const otpCommands = new OTPCommands(this.bot, this.walletService);
+        const otpCommands = new OTPCommands(this.bot, this.walletService, this.smsProviderManager);
         
         // FIXED: Pass smsProviderManager to AdminCommands (4th argument)
         const adminCommands = new AdminCommands(
