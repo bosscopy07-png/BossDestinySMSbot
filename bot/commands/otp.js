@@ -377,15 +377,38 @@ class OTPCommands {
         return `⚠️ ${this.escapeTelegramText(status.message || status.error || '...')}`;
     }
 
-    async sendPollUpdate(ctx, status) {
+        async sendPollUpdate(ctx, status) {
+        // Don't send new message every poll — update existing or skip if no change
         const message = this.formatPollStatus(status);
+        
         try {
-            await ctx.reply(message, { parse_mode: 'Markdown' });
+            // If we have a poll message ID stored, try to edit it
+            if (ctx.session?.pollMessageId) {
+                try {
+                    await ctx.telegram.editMessageText(
+                        ctx.chat.id,
+                        ctx.session.pollMessageId,
+                        undefined,
+                        message,
+                        { parse_mode: 'Markdown' }
+                    );
+                    return; // Successfully edited, don't send new
+                } catch (editError) {
+                    // Message too old or can't edit, fall through to send new
+                }
+            }
+            
+            // Send new message and store ID for future edits
+            const sent = await ctx.reply(message, { parse_mode: 'Markdown' });
+            if (sent?.message_id) {
+                ctx.session = ctx.session || {};
+                ctx.session.pollMessageId = sent.message_id;
+            }
         } catch (error) {
-            logger.debug('Poll update send failed', { error: error.message });
+            logger.debug('Poll update failed', { error: error.message });
         }
-    }
-
+        }
+    
     maskPhone(phone) {
         if (!phone) return '****';
         const str = phone.toString();
