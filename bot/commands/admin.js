@@ -1,3 +1,4 @@
+
 import { Markup } from 'telegraf';
 import { User, Session, Transaction, AdminLog, Settings, Number as NumberModel } from '../../models/index.js';
 import { generateId, formatCurrency } from '../../utils/helpers.js';
@@ -988,8 +989,7 @@ async handlePoolCountryButton(ctx, countryCode) {
     return this.handlePoolCountrySelect(ctx, countryCode);
     }
     
- 
-async handlePoolProviderSelect(ctx, provider) {
+ async handlePoolProviderSelect(ctx, provider) {
     ctx.session = ctx.session || {};
     ctx.session.poolPurchase = { preferredProvider: provider };
     this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_COUNTRY, { provider });
@@ -1019,32 +1019,40 @@ async handlePoolProviderSelect(ctx, provider) {
         { code: 'SG', name: '🇸🇬 Singapore' },
         { code: 'HK', name: '🇭🇰 Hong Kong' },
         { code: 'BR', name: '🇧🇷 Brazil' },
-        { code: 'MX', name: '🇲🇽 Mexico' }
+        { code: 'MX', name: '🇲🇽 Mexico' },
+        { code: 'ZA', name: '🇿🇦 South Africa' },
+        { code: 'IN', name: '🇮🇳 India' },
+        { code: 'AE', name: '🇦🇪 UAE' },
+        { code: 'IL', name: '🇮🇱 Israel' },
+        { code: 'TR', name: '🇹🇷 Turkey' },
+        { code: 'AR', name: '🇦🇷 Argentina' },
+        { code: 'CL', name: '🇨🇱 Chile' },
+        { code: 'CO', name: '🇨🇴 Colombia' },
+        { code: 'PE', name: '🇵🇪 Peru' }
     ];
 
-    const message = `
-<b>🛒 Buy Numbers — ${provider || 'Any Provider'}</b>
+    // Build copyable country list
+    const countryList = countries.map(c => 
+        `${c.name}  <code>${c.code}</code>`
+    ).join('\n');
 
-Tap a country to select it:
+    const message = `
+<b>🛒 Buy Numbers — ${(provider || 'Any Provider').toUpperCase()}</b>
+
+Send the country code (2 letters):
+
+${countryList}
     `;
 
-    const countryButtons = countries.map(c => 
-        Markup.button.callback(`${c.name}  <code>${c.code}</code>`, `numpool_country_${c.code}`)
-    );
-
-    const keyboardRows = [];
-    for (let i = 0; i < countryButtons.length; i += 3) {
-        keyboardRows.push(countryButtons.slice(i, i + 3));
-    }
-
-    keyboardRows.push([Markup.button.callback('❌ Cancel', 'admin_pool')]);
-
-    const keyboard = Markup.inlineKeyboard(keyboardRows);
+    const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('❌ Cancel', 'admin_pool')]
+    ]);
 
     await this.replySuccess(ctx, message, {
-        reply_markup: keyboard.reply_markup
+        reply_markup: keyboard.reply_markup,
+        parse_mode: 'HTML'
     });
-}
+ }
     
 
     async handlePoolCountrySelect(ctx, country) {
