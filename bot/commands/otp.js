@@ -285,6 +285,14 @@ class OTPCommands {
         this.bot.action('buy_vip', this.handleBuyVIP);
         this.bot.action('confirm_bundle', this.handleConfirmBundle);
         this.bot.action('confirm_vip', this.handleConfirmVIP);
+                // Mode selection
+        this.bot.action('mode_free', this.handleFreeMode);
+        this.bot.action('mode_cheap', this.handleCheapMode);
+        this.bot.action('mode_vip', this.handleVIPMode);
+        this.bot.action('mode_bundle', this.handleBundleMode);
+        
+        // OTP Hub
+        this.bot.action('otp_hub', this.handleOTPHub);
         
         // OTP actions
         this.bot.action(/reveal_(.+)/, this.handleRevealOTP);
@@ -791,10 +799,89 @@ class OTPCommands {
         await this.showServiceSelection(ctx, 'VIP', IMAGES.vipOther);
     }
 
+        // ═══════════════════════════════════════════════════════════════════════
+    //  OTP HUB — Central OTP services screen (called from your existing /menu)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleOTPHub(ctx) {
+        const user = ctx.state.user;
+        const stats = this._getUserStats(user);
+        const isVip = stats.isVip;
+        const hasBundle = stats.bundleRemaining > 0;
+
+        let message = 
+            `📱 <b>OTP Services</b>\n\n` +
+            `👤 <b>Quick Stats:</b>\n` +
+            `💰 Balance: <code>${formatCurrency(stats.balance)}</code>\n` +
+            `🆓 Free Today: <code>${stats.freeRemaining}</code> left\n`;
+        
+        if (isVip) {
+            message += `👑 VIP: <code>${stats.vipRemaining}</code> left (${stats.vipDays} days)\n`;
+        }
+        if (hasBundle) {
+            message += `📦 Bundle: <code>${stats.bundleRemaining}</code> OTPs\n`;
+        }
+        
+        message += `\nChoose an option:`;
+
+        // Primary OTP actions
+        const buttons = [
+            [Markup.button.callback('🆓 FREE OTP', 'mode_free'), Markup.button.callback('💰 CHEAP OTP', 'mode_cheap')]
+        ];
+
+        // VIP/BUNDLE or Buy options
+        if (hasBundle || isVip) {
+            buttons.push([
+                Markup.button.callback('📦 Bundle', 'mode_bundle'),
+                Markup.button.callback('👑 VIP', 'mode_vip')
+            ]);
+        } else {
+            buttons.push([
+                Markup.button.callback('📦 Buy Bundle', 'buy_bundle'),
+                Markup.button.callback('👑 Upgrade VIP', 'buy_vip')
+            ]);
+        }
+
+        // VIP number quick access
+        if (isVip && user.vipPhoneNumber) {
+            buttons.push([Markup.button.callback('📱 My VIP Number', 'view_my_number')]);
+        }
+
+        // Feature buttons row 1
+        buttons.push([
+            Markup.button.callback('⚡ Quick Buy', 'quick_buy'),
+            Markup.button.callback('📊 My Stats', 'stats')
+        ]);
+
+        // Feature buttons row 2
+        buttons.push([
+            Markup.button.callback('📜 History', 'history'),
+            Markup.button.callback('👥 Referral', 'referral')
+        ]);
+
+        // Feature buttons row 3
+        buttons.push([
+            Markup.button.callback('⚙️ Settings', 'settings'),
+            Markup.button.callback('❓ FAQ', 'faq')
+        ]);
+
+        // Bottom row
+        buttons.push([
+            Markup.button.callback('🔌 Status', 'provider_status'),
+            Markup.button.callback('📞 Support', 'contact_support')
+        ]);
+
+        // Back to YOUR existing menu
+        buttons.push([Markup.button.callback('🔙 Back to Main Menu', 'menu')]);
+
+        const keyboard = Markup.inlineKeyboard(buttons);
+        await this.sendPhotoWithCaption(ctx, IMAGES.otpMenu, message, keyboard, 'HTML');
+                }
+
     // ═══════════════════════════════════════════════════════════════════════
     //  SERVICE & COUNTRY SELECTION
     // ═══════════════════════════════════════════════════════════════════════
-
+    
     async showServiceSelection(ctx, mode, imageUrl) {
         const message = `📱 <b>${mode} Mode</b>\n\nChoose the service you need OTP for:`;
         const buttons = [];
