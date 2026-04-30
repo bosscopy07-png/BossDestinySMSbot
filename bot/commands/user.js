@@ -355,7 +355,7 @@ class UserCommands {
             [Markup.button.callback('📜 History', 'history'), Markup.button.callback('📊 Stats', 'stats')],
             [Markup.button.callback('🎁 Referral', 'referral'), Markup.button.callback('⚙️ Settings', 'settings')],
             [Markup.button.callback('💰 Balance', 'balance'), Markup.button.callback('🎧 Support', 'support')],
-            [Markup.button.callback('❓ Help', 'help')]
+            [Markup.button.callback('❓ Help', 'help'), Markup.button.callback('📱 OTP Services', 'otp_hub')]
         ]);
 
         try {
