@@ -6,8 +6,9 @@ import config from '../../config/env.js';
  * CheapPanelProvider — 5SIM API Integration
  * 
  * FIXED:
- * - Correct API endpoint for product availability: /guest/prices (not /guest/products)
- * - Added product caching to avoid repeated API calls
+ * - Correct API endpoint: /guest/prices (not /guest/products which requires path params)
+ * - Use targeted /guest/prices?country=X&product=Y for availability checks
+ * - Added product caching with structure validation
  * - Enhanced error logging for HTTP 400 responses
  * - Pre-flight availability check before purchase attempts
  * - Map "not enough user balance" to NO_BALANCE
@@ -26,10 +27,10 @@ class CheapPanelProvider {
             checkStatus: '/user/check',
             finish: '/user/finish',
             cancel: '/user/cancel',
-            getPrices: '/guest/prices',              // FIXED: was /guest/products — 5SIM v1 uses /guest/prices
+            getPrices: '/guest/prices',              // FIXED: /guest/prices returns all prices; /guest/products requires /{country}/{operator}
             getBalance: '/user/profile',
             getCountries: '/guest/countries',
-            getProducts: '/guest/prices'               // FIXED: correct endpoint for service availability
+            getProducts: '/guest/prices'               // FIXED: same endpoint for price catalog
         };
 
         this.stats = {
@@ -65,7 +66,7 @@ class CheapPanelProvider {
         };
 
         // FIXED: Correct 5SIM v1 country codes
-        // Verified against 5SIM API documentation
+        // Verified against 5SIM API documentation [^1^]
         this.countryMap = {
             'US': 'usa',
             'UK': 'england',           // ← FIXED: was 'united kingdom'
@@ -222,12 +223,13 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  PRODUCT CACHE (ADDED)
+    //  PRODUCT CACHE (FIXED)
     // ═══════════════════════════════════════════════════════════
 
     /**
      * Fetch and cache available products from 5SIM.
-     * Returns map of { country: { service: { operators: {...}, price: ... } } }
+     * Uses /guest/prices endpoint which returns { country: { service: { operator: { cost, count, rate } } } }
+     * FIXED: Validates response structure before caching.
      */
     async getProducts() {
         const now = Date.now();
@@ -241,25 +243,42 @@ class CheapPanelProvider {
 
             // FIXED: Do not cache 404 or error responses
             if (response.status >= 400) {
-                logger.error('5SIM products endpoint returned error', { 
+                logger.error('5SIM prices endpoint returned error', { 
                     status: response.status, 
                     data: response.data 
                 });
                 return null;
             }
 
-            // FIXED: Validate data is an object before caching
-            if (!data || typeof data !== 'object' || Array.isArray(data)) {
-                logger.error('5SIM products returned invalid data structure', { data });
+            // FIXED: Validate data is a non-empty object before caching
+            if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).length === 0) {
+                logger.error('5SIM prices returned invalid data structure', { 
+                    data,
+                    type: typeof data,
+                    isArray: Array.isArray(data),
+                    keys: data ? Object.keys(data) : null
+                });
+                return null;
+            }
+
+            // Validate at least one country entry has expected structure
+            const firstCountry = Object.values(data)[0];
+            if (!firstCountry || typeof firstCountry !== 'object') {
+                logger.error('5SIM prices data missing country structure', { firstCountry });
                 return null;
             }
 
             this.productsCache = data;
             this.productsCacheTime = now;
 
+            logger.info('5SIM products cache refreshed', { 
+                countries: Object.keys(data).length,
+                sampleCountry: Object.keys(data)[0]
+            });
+
             return data;
         } catch (error) {
-            logger.error('Failed to fetch 5SIM products', { error: error.message });
+            logger.error('Failed to fetch 5SIM prices', { error: error.message });
             return null;
         }
     }
@@ -270,7 +289,7 @@ class CheapPanelProvider {
 
     /**
      * Check if a service/country combination is available before purchasing.
-     * FIXED: Uses /guest/prices endpoint instead of non-existent /guest/products
+     * FIXED: Uses /guest/prices endpoint with optional query params for efficiency.
      * @param {string} country — ISO country code
      * @param {string} service — Service name
      * @returns {Promise<{available: boolean, error?: string, operators?: Array, data?: Object}>}
@@ -280,38 +299,78 @@ class CheapPanelProvider {
             const providerCountry = this.mapCountry(country);
             const providerService = this.mapService(service);
 
-            const products = await this.getProducts();
-            if (!products) {
-                return { available: false, error: 'Failed to fetch product catalog' };
+            // FIXED: Use targeted /guest/prices?country=X&product=Y for single checks
+            // This is more efficient than fetching the entire catalog
+            const targetedEndpoint = `${this.endpoints.getProducts}?country=${providerCountry}&product=${providerService}`;
+            
+            let response;
+            try {
+                response = await this.request('get', targetedEndpoint, null, 10000);
+            } catch (err) {
+                // Fallback to full catalog if targeted query fails
+                logger.warn('Targeted price query failed, falling back to full catalog', { 
+                    country: providerCountry, 
+                    service: providerService,
+                    error: err.message 
+                });
+                const products = await this.getProducts();
+                if (!products) {
+                    return { available: false, error: 'Failed to fetch product catalog' };
+                }
+                return this._checkAvailabilityFromProducts(products, providerCountry, providerService);
             }
 
-            // 5SIM prices structure: { country: { service: { operators: {...} } } }
-            const countryData = products[providerCountry];
-            if (!countryData) {
-                return { available: false, error: `Country ${providerCountry} not available` };
+            if (response.status >= 400) {
+                // If 400, likely invalid country/service combo — fall back to full catalog
+                const products = await this.getProducts();
+                if (!products) {
+                    return { available: false, error: `Failed to fetch product catalog. HTTP ${response.status}` };
+                }
+                return this._checkAvailabilityFromProducts(products, providerCountry, providerService);
             }
 
-            const serviceData = countryData[providerService];
-            if (!serviceData) {
-                return { available: false, error: `Service ${providerService} not available in ${providerCountry}` };
+            const data = response.data;
+            if (!data || typeof data !== 'object' || Object.keys(data).length === 0) {
+                return { available: false, error: `No data returned for ${providerCountry}/${providerService}` };
             }
 
-            // Check if any operator has stock
-            const operators = serviceData.operators || serviceData;
-            const hasStock = Object.values(operators).some(op => {
-                // Operator data can be { count: number, price: number } or just a number
-                const count = typeof op === 'object' ? op.count : op;
-                return count > 0;
-            });
+            return this._checkAvailabilityFromProducts(data, providerCountry, providerService);
 
-            return { 
-                available: hasStock, 
-                operators: Object.keys(operators),
-                data: serviceData 
-            };
         } catch (error) {
             return { available: false, error: error.message };
         }
+    }
+
+    /**
+     * Helper to check availability from products data structure
+     */
+    _checkAvailabilityFromProducts(products, providerCountry, providerService) {
+        const countryData = products[providerCountry];
+        if (!countryData) {
+            return { available: false, error: `Country ${providerCountry} not available` };
+        }
+
+        const serviceData = countryData[providerService];
+        if (!serviceData) {
+            return { available: false, error: `Service ${providerService} not available in ${providerCountry}` };
+        }
+
+        // 5SIM prices structure: { operator: { cost, count, rate } }
+        const operators = serviceData;
+        const operatorNames = Object.keys(operators);
+        
+        const hasStock = operatorNames.some(opName => {
+            const op = operators[opName];
+            // Operator data is { cost: number, count: number, rate: number }
+            const count = typeof op === 'object' ? (op.count ?? 0) : (typeof op === 'number' ? op : 0);
+            return count > 0;
+        });
+
+        return { 
+            available: hasStock, 
+            operators: operatorNames,
+            data: serviceData 
+        };
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -410,407 +469,3 @@ class CheapPanelProvider {
 
             if (this.isFakeNumber(phoneStr)) {
                 logger.error('5SIM returned fake number', { phone: phoneStr, activationId });
-                await this.cancelNumber(activationId).catch(() => {});
-                throw new Error(`FAKE_NUMBER_REJECTED: ${phoneStr}`);
-            }
-
-            if (phoneStr.length < 7 || phoneStr.length > 15) {
-                logger.error('5SIM returned invalid phone length', { phone: phoneStr, length: phoneStr.length });
-                await this.cancelNumber(activationId).catch(() => {});
-                throw new Error(`INVALID_PHONE_LENGTH: ${phoneStr} (${phoneStr.length} digits)`);
-            }
-
-            if (!/^\d+$/.test(activationId)) {
-                throw new Error(`INVALID_ACTIVATION_ID: ${activationId}`);
-            }
-
-            const duration = Date.now() - startTime;
-            this.updateStats(true, duration, parseFloat(data.price) || 0);
-
-            logger.info('Number acquired from 5SIM', {
-                activationId,
-                phone: this.maskPhone(phoneStr),
-                country: providerCountry,
-                service: providerService,
-                operator,
-                price: data.price,
-                duration
-            });
-
-            return {
-                phoneNumber: phoneStr,
-                provider: this.name,
-                providerNumberId: activationId,
-                country,
-                service,
-                cost: parseFloat(data.price) || 0.02,
-                operator: operator,
-                expiresAt: new Date(Date.now() + 20 * 60 * 1000),
-                isVirtual: true
-            };
-
-        } catch (error) {
-            const duration = Date.now() - startTime;
-            this.updateStats(false, duration, 0);
-
-            logger.error('5SIM number acquisition failed', {
-                country,
-                service,
-                error: error.message
-            });
-
-            throw this.handleError(error);
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  SMS CHECKING
-    // ═══════════════════════════════════════════════════════════
-
-    async checkSMS(activationId) {
-        try {
-            if (!this.isActive) {
-                return { success: false, error: 'PROVIDER_NOT_CONFIGURED' };
-            }
-
-            if (!activationId || !/^\d+$/.test(activationId.toString())) {
-                return { success: false, error: 'INVALID_ACTIVATION_ID' };
-            }
-
-            const endpoint = `${this.endpoints.checkStatus}/${activationId}`;
-            const response = await this.request('get', endpoint, null, 15000);
-            const data = response.data;
-
-            if (response.status >= 400) {
-                return {
-                    success: false,
-                    error: data?.error || `HTTP ${response.status}`,
-                    status: 'ERROR'
-                };
-            }
-
-            logger.debug('SMS status check', {
-                activationId,
-                status: data?.status,
-                hasCode: !!data?.code,
-                hasText: !!data?.text
-            });
-
-            const status = (data?.status || '').toUpperCase();
-
-            if (status === 'RECEIVED' || status === 'FINISHED') {
-                const otp = this.extractOTP(data.code, data.text);
-                
-                if (otp) {
-                    return {
-                        success: true,
-                        otp,
-                        status: 'RECEIVED',
-                        fullText: data.text || null,
-                        receivedAt: new Date()
-                    };
-                }
-
-                return {
-                    success: false,
-                    status: 'CHECKING',
-                    rawText: data.text,
-                    message: 'SMS received but OTP extraction failed'
-                };
-            }
-
-            if (status === 'CANCELED' || status === 'CANCELLED') {
-                return { success: false, status: 'CANCELLED', message: 'Number was cancelled' };
-            }
-
-            if (status === 'EXPIRED') {
-                return { success: false, status: 'TIMEOUT', message: 'Activation expired' };
-            }
-
-            return { success: false, status: 'WAITING', message: `Status: ${data.status}` };
-
-        } catch (error) {
-            logger.error('5SMS check failed', { activationId, error: error.message });
-            return { success: false, error: error.message, status: 'ERROR' };
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  NUMBER MANAGEMENT
-    // ═══════════════════════════════════════════════════════════
-
-    async cancelNumber(activationId) {
-        try {
-            if (!this.isActive) {
-                return { success: false, error: 'PROVIDER_NOT_CONFIGURED' };
-            }
-
-            if (!activationId) {
-                return { success: false, error: 'MISSING_ACTIVATION_ID' };
-            }
-
-            const endpoint = `${this.endpoints.cancel}/${activationId}`;
-            await this.request('get', endpoint);
-
-            logger.info('Number cancelled successfully', { activationId, provider: this.name });
-
-            return { success: true, status: 'CANCELLED' };
-
-        } catch (error) {
-            if (error.response?.status === 404 || error.message?.includes('not found')) {
-                logger.info('Number already released or not found', { activationId });
-                return { success: true, status: 'ALREADY_RELEASED' };
-            }
-            logger.warn('Cancel request failed', { activationId, error: error.message });
-            return { success: false, error: error.message, status: 'ERROR' };
-        }
-    }
-
-    async finishNumber(activationId) {
-        try {
-            if (!activationId) {
-                return { success: false, error: 'MISSING_ACTIVATION_ID' };
-            }
-            
-            const endpoint = `${this.endpoints.finish}/${activationId}`;
-            await this.request('get', endpoint);
-
-            logger.info('Activation marked as finished', { activationId });
-            return { success: true, status: 'FINISHED' };
-
-        } catch (error) {
-            logger.warn('Finish request failed', { activationId, error: error.message });
-            return { success: false, error: error.message };
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  PRICING & INFO (FIXED)
-    // ═══════════════════════════════════════════════════════════
-
-    async getPrices(country = 'US', service = 'Any') {
-        try {
-            const providerCountry = this.mapCountry(country);
-            const providerService = this.mapService(service);
-            
-            // FIXED: Use getProducts() which now uses correct /guest/prices endpoint
-            const products = await this.getProducts();
-            if (!products) {
-                return { success: false, error: 'Failed to fetch products' };
-            }
-
-            const countryData = products[providerCountry];
-            if (!countryData) {
-                return { success: false, error: `Country ${providerCountry} not found` };
-            }
-
-            const serviceData = countryData[providerService];
-            if (!serviceData) {
-                return { success: false, error: `Service ${providerService} not found in ${providerCountry}` };
-            }
-
-            return {
-                success: true,
-                prices: serviceData
-            };
-        } catch (error) {
-            logger.error('Failed to get prices', { country, service, error: error.message });
-            return { success: false, error: error.message };
-        }
-    }
-
-    async getAvailableCountries() {
-        try {
-            const response = await this.request('get', this.endpoints.getCountries);
-            return {
-                success: true,
-                countries: response.data
-            };
-        } catch (error) {
-            logger.error('Failed to get countries', { error: error.message });
-            return { success: false, error: error.message };
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  REQUEST HELPER
-    // ═══════════════════════════════════════════════════════════
-
-    async request(method, endpoint, data = null, timeout = 10000) {
-        const url = `${this.baseUrl}${endpoint}`;
-        const config = {
-            method,
-            url,
-            headers: this.getHeaders(),
-            timeout,
-            validateStatus: () => true
-        };
-        
-        if (data) config.data = data;
-        
-        const response = await axios(config);
-        
-        // LOG 400+ responses for debugging
-        if (response.status >= 400) {
-            logger.error('5SIM API error response', {
-                url,
-                status: response.status,
-                statusText: response.statusText,
-                data: response.data,
-                headers: response.headers
-            });
-        }
-        
-        return response;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  MAPPING HELPERS
-    // ═══════════════════════════════════════════════════════════
-
-    mapService(service) {
-        if (!service || service === 'Any') return 'other';
-        return this.serviceMap[service] || 'other';
-    }
-
-    mapCountry(country) {
-        if (!country) throw new Error('BAD_COUNTRY: Country required');
-        const mapped = this.countryMap[country.toUpperCase()];
-        if (!mapped) throw new Error(`BAD_COUNTRY: ${country} not supported`);
-        return mapped;
-    }
-
-    mapOperator(country, preferred) {
-        if (preferred && preferred !== 'any') {
-            const operators = this.operatorMap[country] || this.operatorMap['default'];
-            if (operators.includes(preferred)) return preferred;
-        }
-        return 'any';
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  VALIDATION HELPERS
-    // ═══════════════════════════════════════════════════════════
-
-    isFakeNumber(phone) {
-        if (!phone) return true;
-        const clean = phone.toString().replace(/\D/g, '');
-        return this.fakeNumbers.has(clean) || this.fakeNumbers.has(phone);
-    }
-
-    extractOTP(code, text) {
-        if (code && /^\d{4,8}$/.test(code.toString().trim())) {
-            return code.toString().trim();
-        }
-
-        if (!text) return null;
-
-        const patterns = [
-            /\b\d{4,8}\b/,
-            /code[:\s]+(\d{4,8})/i,
-            /otp[:\s]+(\d{4,8})/i,
-            /verification[:\s]+(\d{4,8})/i,
-            /(\d{4,8})[:\s]*is your/i,
-            /(\d{4,8})[:\s]*is the/i,
-            /验证码[:\s]*(\d{4,8})/i,
-            /код[:\s]+(\d{4,8})/i,
-            /code[:\s]*(\d{4,8})/i,
-            /(\d{4,8})[:\s]*код/i,
-            /pin[:\s]+(\d{4,8})/i,
-            /password[:\s]+(\d{4,8})/i
-        ];
-
-        for (const pattern of patterns) {
-            const match = text.match(pattern);
-            if (match) {
-                const otp = match[1] || match[0];
-                if (/^\d{4,8}$/.test(otp)) return otp;
-            }
-        }
-
-        const digits = text.match(/\b\d{4,8}\b/g);
-        if (digits?.length > 0) return digits[digits.length - 1];
-
-        return null;
-    }
-
-    getHeaders() {
-        return {
-            'Authorization': `Bearer ${this.apiKey}`,
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
-        };
-    }
-
-    maskPhone(phone) {
-        if (!phone) return '****';
-        const str = phone.toString();
-        if (str.length < 4) return '****';
-        return str.slice(0, -4).replace(/./g, '*') + str.slice(-4);
-    }
-
-    handleError(error) {
-        const message = error.message || '';
-
-        for (const [key, value] of Object.entries(this.errorMap)) {
-            if (message.includes(key)) {
-                return new Error(`${value.message} (${key})`);
-            }
-        }
-
-        return new Error(`PROVIDER_ERROR: ${message}`);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  STATS
-    // ═══════════════════════════════════════════════════════════
-
-    updateStats(success, duration, cost = 0) {
-        this.stats.totalSent++;
-        this.stats.totalCost += cost;
-        if (success) this.stats.totalSuccess++;
-        else this.stats.totalFailed++;
-        this.stats.avgResponseTime = (
-            (this.stats.avgResponseTime * (this.stats.totalSent - 1) + duration)
-            / this.stats.totalSent
-        );
-    }
-
-    getStats() {
-        const { totalSent, totalSuccess, totalFailed, avgResponseTime, totalCost } = this.stats;
-        
-        return {
-            name: this.name,
-            tier: this.tier,
-            isActive: this.isActive,
-            baseUrl: this.baseUrl,
-            totalSent,
-            totalSuccess,
-            totalFailed,
-            successRate: totalSent > 0
-                ? Number((totalSuccess / totalSent * 100).toFixed(2))
-                : 100,
-            failureRate: totalSent > 0
-                ? Number((totalFailed / totalSent * 100).toFixed(2))
-                : 0,
-            avgResponseTime: Math.round(avgResponseTime),
-            totalCost: Number(totalCost.toFixed(4)),
-            avgCost: totalSent > 0
-                ? Number((totalCost / totalSent).toFixed(4))
-                : 0
-        };
-    }
-
-    resetStats() {
-        this.stats = {
-            totalSent: 0,
-            totalSuccess: 0,
-            totalFailed: 0,
-            avgResponseTime: 0,
-            totalCost: 0
-        };
-        return this.getStats();
-    }
-}
-
-export default CheapPanelProvider;
