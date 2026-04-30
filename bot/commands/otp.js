@@ -88,7 +88,7 @@ class OTPCommands {
             'handleCancelVipSubscription', 'handleConfirmVipCancel',
             'handleHistory', 'handleReferral', 'handleStats', 'handleQuickBuy',
             'handleProviderStatus', 'handleSettings', 'handleToggleNotifications',
-            'handleFaq', 'handleTerms'
+            'handleFaq', 'handleTerms', 'handleOTPHub' 
         ];
         
         for (const name of handlerNames) {
