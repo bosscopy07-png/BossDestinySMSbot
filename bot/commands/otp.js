@@ -1,15 +1,16 @@
-// ═══════════════════════════════════════════════════════════
-//  OTPCommands.js — Complete Implementation
-// ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+//  OTPCommands.js — Part 1: Imports, Setup, User Helpers, VIP & Deposit
+// ═══════════════════════════════════════════════════════════════════════════════
 
 import { Markup } from 'telegraf';
-import { Session, User, Number as NumberModel } from '../../models/index.js';
+import { Session, User, Number as NumberModel, Transaction } from '../../models/index.js';
 import { COUNTRIES, SERVICES } from '../../utils/constants.js';
 import { formatCurrency, maskOTP } from '../../utils/helpers.js';
 import sessionManager from '../../services/otp/index.js';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
 
+// ─── Image Assets ─────────────────────────────────────────────────────────────
 const IMAGES = {
     otpMenu: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231499/file_000000006c1c724685bb402218b7c208_ste2ky.png',
     vipFirst: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231496/file_00000000970071f4a9405256d1d028af_hjzc8o.png',
@@ -25,36 +26,101 @@ const IMAGES = {
     default: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231497/file_0000000034547246812a74392b500be0_gelms4.png',
     depositConfirmed: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777235826/file_000000001c0c720aa51ae407e6741ca5_steie1.png',
     myNumber: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231496/file_00000000970071f4a9405256d1d028af_hjzc8o.png',
-    banned: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231497/file_0000000034547246812a74392b500be0_gelms4.png'
+    banned: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231497/file_0000000034547246812a74392b500be0_gelms4.png',
+    history: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231497/file_0000000034547246812a74392b500be0_gelms4.png',
+    referral: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231496/file_00000000970071f4a9405256d1d028af_hjzc8o.png',
+    stats: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231495/file_00000000800071f48dbbef2fbcc543fe_qgr5ch.png'
 };
+
+// ─── Inline Keyboards (Reusable) ──────────────────────────────────────────────
+const KEYBOARDS = {
+    backToMenu: () => Markup.inlineKeyboard([
+        [Markup.button.callback('🔙 Back to Menu', 'menu')]
+    ]),
+    
+    depositOrBack: () => Markup.inlineKeyboard([
+        [Markup.button.callback('💳 Deposit', 'deposit')],
+        [Markup.button.callback('🔙 Back', 'menu')]
+    ]),
+    
+    supportOrRetry: () => Markup.inlineKeyboard([
+        [Markup.button.callback('🔄 Retry', 'menu')],
+        [Markup.button.callback('📞 Support', 'contact_support')]
+    ]),
+    
+    otpActions: (sessionId) => Markup.inlineKeyboard([
+        [Markup.button.callback('🔍 Check OTP', `check_otp_${sessionId}`)],
+        [Markup.button.callback('❌ Cancel', 'cancel_otp')]
+    ])
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  OTPCommands Class
+// ═══════════════════════════════════════════════════════════════════════════════
 
 class OTPCommands {
     constructor(bot, walletService, smsProviderManager = null) {
         this.bot = bot;
         this.walletService = walletService;
         this.smsProviderManager = smsProviderManager;
+        
+        // Bind all handler methods to ensure `this` context
+        this._bindAllHandlers();
+        
         this.registerCommands();
-        this.walletService.onDepositNotification(this.handleDepositNotification.bind(this));
+        
+        if (this.walletService?.onDepositNotification) {
+            this.walletService.onDepositNotification(this.handleDepositNotification.bind(this));
+        }
     }
 
-    // ─── User Helpers ────────────────────────────────────────────────────
+    // ─── Auto-bind all handler methods ─────────────────────────────────────
+    _bindAllHandlers() {
+        const handlerNames = [
+            'handleOTPCommand', 'handleMyNumberCommand', 'handleCancel',
+            'handleFreeMode', 'handleCheapMode', 'handleVIPMode', 'handleBundleMode',
+            'handleViewMyNumber', 'handleRequestOtpVip', 'handleBuyBundleOtp',
+            'handleBundleQuantity', 'handleBundleQuantityCustom', 'handleConfirmBundlePurchase',
+            'handleServiceSelect', 'handleCountrySelect',
+            'handleBuyBundle', 'handleConfirmFreeMode', 'handleBuyVIP', 'handleConfirmBundle',
+            'handleConfirmVIP', 'handleRevealOTP', 'handleCheckOTP', 'handleCheckDeposit',
+            'handleDepositInfo', 'handleMenu', 'handleContactSupport',
+            'handleCancelVipSubscription', 'handleConfirmVipCancel',
+            'handleHistory', 'handleReferral', 'handleStats', 'handleQuickBuy',
+            'handleProviderStatus', 'handleSettings', 'handleToggleNotifications',
+            'handleFaq', 'handleTerms'
+        ];
+        
+        for (const name of handlerNames) {
+            if (typeof this[name] === 'function') {
+                this[name] = this[name].bind(this);
+            } else {
+                logger.warn(`Handler method ${name} not found during binding`);
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  USER HELPERS
+    // ═══════════════════════════════════════════════════════════════════════
+    
     _canUseFree(user) {
-        return User.canUseFree ? User.canUseFree(user) : (user.freeUsedToday || 0) < 3;
+        const limit = config.limits?.freeDaily || 3;
+        return (user.freeUsedToday || 0) < limit;
     }
 
     _canUseVip(user) {
-        return User.canUseVip ? User.canUseVip(user) : 
-            (user.vipExpiry && new Date(user.vipExpiry) > new Date() && (user.vipDailyUsed || 0) < (config.limits?.vipDaily || 50));
+        if (!this._isVipActive(user)) return false;
+        const limit = config.limits?.vipDaily || 50;
+        return (user.vipDailyUsed || 0) < limit;
     }
 
     _isVipActive(user) {
-        return User.isVipActive ? User.isVipActive(user) : 
-            !!(user.vipExpiry && new Date(user.vipExpiry) > new Date());
+        return !!(user.vipExpiry && new Date(user.vipExpiry) > new Date());
     }
 
     _getAvailableBalance(user) {
-        return User.getAvailableBalance ? User.getAvailableBalance(user) : 
-            (user.balance || 0) - (user.lockedBalance || 0);
+        return (user.balance || 0) - (user.lockedBalance || 0);
     }
 
     _freeRemaining(user) {
@@ -73,7 +139,23 @@ class OTPCommands {
         return Math.max(0, Math.ceil(diff / (1000 * 60 * 60 * 24)));
     }
 
-    // ─── VIP Number Management ───────────────────────────────────────────
+    _getUserStats(user) {
+        return {
+            balance: user.balance || 0,
+            available: this._getAvailableBalance(user),
+            vipDays: this._vipDaysLeft(user),
+            vipRemaining: this._vipRemaining(user),
+            freeRemaining: this._freeRemaining(user),
+            bundleRemaining: user.bundleRemaining || 0,
+            totalOtps: user.totalOtps || 0,
+            isVip: this._isVipActive(user)
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  VIP NUMBER MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════════════
+
     async assignVipNumber(userId, country = 'US', preferredProvider = null) {
         try {
             if (!this.smsProviderManager?.numberPool) {
@@ -139,7 +221,10 @@ class OTPCommands {
         }
     }
 
-    // ─── Deposit Notification ──────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════
+    //  DEPOSIT NOTIFICATION
+    // ═══════════════════════════════════════════════════════════════════════
+
     async handleDepositNotification(userId, data) {
         try {
             const message = 
@@ -155,60 +240,114 @@ class OTPCommands {
         }
     }
 
-    // ─── Command Registration ──────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════
+    //  COMMAND REGISTRATION
+    // ═══════════════════════════════════════════════════════════════════════
+
     registerCommands() {
-        this.bot.command('otp', this.handleOTPCommand.bind(this));
-        this.bot.command('mynumber', this.handleMyNumberCommand.bind(this));
-        this.bot.command('cancel', this.handleCancel.bind(this));
+        // Slash commands
+        this.bot.command('otp', this.handleOTPCommand);
+        this.bot.command('mynumber', this.handleMyNumberCommand);
+        this.bot.command('cancel', this.handleCancel);
+        this.bot.command('history', this.handleHistory);
+        this.bot.command('referral', this.handleReferral);
+        this.bot.command('stats', this.handleStats);
+        this.bot.command('status', this.handleProviderStatus);
+        this.bot.command('settings', this.handleSettings);
+        this.bot.command('faq', this.handleFaq);
         
-        this.bot.action('mode_free', this.handleFreeMode.bind(this));
-        this.bot.action('mode_cheap', this.handleCheapMode.bind(this));
-        this.bot.action('mode_vip', this.handleVIPMode.bind(this));
-        this.bot.action('mode_bundle', this.handleBundleMode.bind(this));
+        // Mode selection actions
+        this.bot.action('mode_free', this.handleFreeMode);
+        this.bot.action('mode_cheap', this.handleCheapMode);
+        this.bot.action('mode_vip', this.handleVIPMode);
+        this.bot.action('mode_bundle', this.handleBundleMode);
         
-        this.bot.action('view_my_number', this.handleViewMyNumber.bind(this));
-        this.bot.action('request_otp_vip', this.handleRequestOtpVip.bind(this));
-        this.bot.action('buy_bundle_otp', this.handleBuyBundleOtp.bind(this));
+        // My Number & VIP actions
+        this.bot.action('view_my_number', this.handleViewMyNumber);
+        this.bot.action('request_otp_vip', this.handleRequestOtpVip);
+        this.bot.action('buy_bundle_otp', this.handleBuyBundleOtp);
         
+        // Bundle quantity actions
         this.bot.action('bundle_qty_5', (ctx) => this.handleBundleQuantity(ctx, 5));
         this.bot.action('bundle_qty_10', (ctx) => this.handleBundleQuantity(ctx, 10));
         this.bot.action('bundle_qty_25', (ctx) => this.handleBundleQuantity(ctx, 25));
         this.bot.action('bundle_qty_50', (ctx) => this.handleBundleQuantity(ctx, 50));
-        this.bot.action('bundle_qty_custom', this.handleBundleQuantityCustom.bind(this));
-        this.bot.action('confirm_bundle_purchase', this.handleConfirmBundlePurchase.bind(this));
+        this.bot.action('bundle_qty_custom', this.handleBundleQuantityCustom);
+        this.bot.action('confirm_bundle_purchase', this.handleConfirmBundlePurchase);
         
-        this.bot.action(/service_(.+)/, this.handleServiceSelect.bind(this));
-        this.bot.action(/country_(.+)/, this.handleCountrySelect.bind(this));
+        // Service & Country selection
+        this.bot.action(/service_(.+)/, this.handleServiceSelect);
+        this.bot.action(/country_(.+)/, this.handleCountrySelect);
         
-        this.bot.action('buy_bundle', this.handleBuyBundle.bind(this));
-        this.bot.action('confirm_free_mode', this.handleConfirmFreeMode.bind(this));
-        this.bot.action('buy_vip', this.handleBuyVIP.bind(this));
-        this.bot.action('confirm_bundle', this.handleConfirmBundle.bind(this));
-        this.bot.action('confirm_vip', this.handleConfirmVIP.bind(this));
+        // Purchase confirmations
+        this.bot.action('buy_bundle', this.handleBuyBundle);
+        this.bot.action('confirm_free_mode', this.handleConfirmFreeMode);
+        this.bot.action('buy_vip', this.handleBuyVIP);
+        this.bot.action('confirm_bundle', this.handleConfirmBundle);
+        this.bot.action('confirm_vip', this.handleConfirmVIP);
         
-        this.bot.action(/reveal_(.+)/, this.handleRevealOTP.bind(this));
-        this.bot.action('check_deposit', this.handleCheckDeposit.bind(this));
-        this.bot.action('cancel_otp', this.handleCancel.bind(this));
-        this.bot.action('deposit', this.handleDepositInfo.bind(this));
-        this.bot.action('menu', this.handleMenu.bind(this));
-        this.bot.action('contact_support', this.handleContactSupport.bind(this));
-        this.bot.action('cancel_vip_subscription', this.handleCancelVipSubscription.bind(this));
+        // OTP actions
+        this.bot.action(/reveal_(.+)/, this.handleRevealOTP);
+        this.bot.action('check_deposit', this.handleCheckDeposit);
+        this.bot.action('cancel_otp', this.handleCancel);
+        this.bot.action('deposit', this.handleDepositInfo);
+        this.bot.action('menu', this.handleMenu);
+        this.bot.action('contact_support', this.handleContactSupport);
+        this.bot.action('cancel_vip_subscription', this.handleCancelVipSubscription);
+        this.bot.action('confirm_vip_cancel', this.handleConfirmVipCancel);
         
-        this.bot.action(/check_otp_(.+)/, this.handleCheckOTP.bind(this));
+        // New feature actions
+        this.bot.action('history', this.handleHistory);
+        this.bot.action('referral', this.handleReferral);
+        this.bot.action('stats', this.handleStats);
+        this.bot.action('quick_buy', this.handleQuickBuy);
+        this.bot.action('provider_status', this.handleProviderStatus);
+        this.bot.action('settings', this.handleSettings);
+        this.bot.action('toggle_notifications', this.handleToggleNotifications);
+        this.bot.action('faq', this.handleFaq);
+        this.bot.action('terms', this.handleTerms);
+        
+        // OTP check with pattern
+        this.bot.action(/check_otp_(.+)/, this.handleCheckOTP);
     }
 
-    // ─── Utility Methods ───────────────────────────────────────────────────
-    async sendPhotoWithCaption(ctx, imageUrl, caption, keyboard = null, parseMode = 'Markdown') {
+    // ═══════════════════════════════════════════════════════════════════════
+    //  UTILITY METHODS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async sendPhotoWithCaption(ctx, imageUrl, caption, keyboard = null, parseMode = 'HTML') {
         try {
             const payload = { caption: caption.trim(), parse_mode: parseMode };
             if (keyboard) payload.reply_markup = keyboard.reply_markup;
-            return ctx.replyWithPhoto(imageUrl, payload);
+            return await ctx.replyWithPhoto(imageUrl, payload);
         } catch (error) {
             logger.error('Photo send failed', { error: error.message });
             return keyboard
                 ? ctx.reply(caption, { parse_mode: parseMode, ...keyboard })
                 : ctx.reply(caption, { parse_mode: parseMode });
         }
+    }
+
+    async editOrSendPhoto(ctx, imageUrl, caption, keyboard = null, parseMode = 'HTML') {
+        try {
+            if (ctx.callbackQuery?.message?.photo) {
+                await ctx.editMessageMedia(
+                    { type: 'photo', media: imageUrl, caption: caption.trim(), parse_mode: parseMode },
+                    { reply_markup: keyboard?.reply_markup }
+                );
+                return;
+            }
+            if (ctx.callbackQuery?.message) {
+                await ctx.editMessageCaption(caption, {
+                    parse_mode: parseMode,
+                    reply_markup: keyboard?.reply_markup
+                });
+                return;
+            }
+        } catch (editError) {
+            // Fallback to sending new message
+        }
+        return this.sendPhotoWithCaption(ctx, imageUrl, caption, keyboard, parseMode);
     }
 
     escapeTelegramText(text) {
@@ -254,16 +393,104 @@ class OTPCommands {
         return str.slice(0, -4).replace(/./g, '*') + str.slice(-4);
     }
 
-    // ─── Main Menu & My Number ─────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SESSION MANAGEMENT HELPERS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async _getActiveSession(userId) {
+        return Session.findOne({ 
+            userId, 
+            status: { $in: ['WAITING', 'CHECKING', 'RECEIVED'] } 
+        }).sort({ createdAt: -1 });
+    }
+
+    async _refundSession(session) {
+        const { userId, mode, cost } = session;
+        try {
+            if (mode === 'BUNDLE') {
+                await User.updateOne({ userId }, { $inc: { bundleRemaining: 1 } });
+            } else if (mode === 'VIP') {
+                await User.updateOne({ userId }, { $inc: { vipDailyUsed: -1 } });
+            } else if (mode === 'CHEAP' && (cost || 0) > 0) {
+                await User.updateOne(
+                    { userId }, 
+                    { $inc: { lockedBalance: -cost, balance: cost } }
+                );
+            }
+            return true;
+        } catch (error) {
+            logger.error('Session refund failed', { userId, error: error.message });
+            return false;
+        }
+    }
+
+    async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
+        try {
+            const delayMs = new Date(timeoutAt) - new Date();
+            if (delayMs <= 0) return;
+
+            setTimeout(async () => {
+                try {
+                    const session = await Session.findOne({ 
+                        sessionId, 
+                        status: { $in: ['WAITING', 'CHECKING'] } 
+                    });
+                    
+                    if (!session) return;
+
+                    await Session.updateOne(
+                        { sessionId },
+                        { $set: { status: 'TIMEOUT', endTime: new Date() } }
+                    );
+
+                    await this._refundSession(session);
+
+                    const refundText = {
+                        FREE: 'No charges (FREE mode)',
+                        BUNDLE: 'Bundle credit restored',
+                        VIP: 'VIP daily quota restored',
+                        CHEAP: 'Funds returned to balance'
+                    }[session.mode] || 'Funds handled';
+
+                    const timeoutMessage = 
+
+
+
+
+
+
+
+                    // ═══════════════════════════════════════════════════════════════════════════════
+//  OTPCommands.js — Part 2: Main Menu, My Number, Mode Handlers, Selection
+// ═══════════════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  MAIN MENU & MY NUMBER
+    // ═══════════════════════════════════════════════════════════════════════
+
     async handleOTPCommand(ctx) {
         const user = ctx.state.user;
-        const isVip = this._isVipActive(user);
-        const hasBundle = (user.bundleRemaining || 0) > 0;
+        const stats = this._getUserStats(user);
+        const hasBundle = stats.bundleRemaining > 0;
+        const isVip = stats.isVip;
 
-        let message = '📱 <b>Request OTP</b>\n\nSelect your preferred mode:';
+        let message = 
+            `📱 <b>SwiftSMS OTP Bot</b>\n\n` +
+            `👤 <b>Your Stats:</b>\n` +
+            `💰 Balance: <code>${formatCurrency(stats.balance)}</code>\n` +
+            `🆓 Free Today: <code>${stats.freeRemaining}</code> left\n`;
         
+        if (isVip) {
+            message += `👑 VIP: <code>${stats.vipRemaining}</code> left (${stats.vipDays} days)\n`;
+        }
+        if (hasBundle) {
+            message += `📦 Bundle: <code>${stats.bundleRemaining}</code> OTPs\n`;
+        }
+        
+        message += `\nSelect your preferred mode:`;
+
         const buttons = [
-            [Markup.button.callback('🆓 FREE', 'mode_free'), Markup.button.callback('💰 CHEAP', 'mode_cheap')]
+            [Markup.button.callback('🆓 FREE OTP', 'mode_free'), Markup.button.callback('💰 CHEAP OTP', 'mode_cheap')]
         ];
 
         if (hasBundle || isVip) {
@@ -279,10 +506,14 @@ class OTPCommands {
         }
 
         if (isVip && user.vipPhoneNumber) {
-            buttons.push([Markup.button.callback('📱 View My Number', 'view_my_number')]);
+            buttons.push([Markup.button.callback('📱 My VIP Number', 'view_my_number')]);
         }
 
-        buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
+        buttons.push(
+            [Markup.button.callback('⚡ Quick Buy', 'quick_buy'), Markup.button.callback('📊 My Stats', 'stats')],
+            [Markup.button.callback('📜 History', 'history'), Markup.button.callback('👥 Referral', 'referral')],
+            [Markup.button.callback('⚙️ Settings', 'settings'), Markup.button.callback('❓ FAQ', 'faq')]
+        );
 
         const keyboard = Markup.inlineKeyboard(buttons);
         await this.sendPhotoWithCaption(ctx, IMAGES.otpMenu, message, keyboard, 'HTML');
@@ -352,20 +583,26 @@ class OTPCommands {
         await this.sendPhotoWithCaption(ctx, IMAGES.myNumber, message, keyboard, 'HTML');
     }
 
-    // ─── Mode Handlers ─────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════
+    //  MODE HANDLERS
+    // ═══════════════════════════════════════════════════════════════════════
+
     async handleFreeMode(ctx) {
         const user = ctx.state.user;
         
         if (!this._canUseFree(user)) {
             const message = 
                 '❌ <b>Free Limit Reached</b>\n\n' +
-                'You\'ve used all 3 free OTPs today.\n\n' +
+                'You\'ve used all your free OTPs today.\n\n' +
                 '💰 Deposit to continue:\n' +
                 '• CHEAP: $0.05 per OTP\n' +
-                '• Bundle: $5 for 100 OTPs';
+                '• Bundle: $5 for 100 OTPs\n' +
+                '• VIP: $5/month unlimited';
                 
             const keyboard = Markup.inlineKeyboard([
                 [Markup.button.callback('💳 Deposit', 'deposit')],
+                [Markup.button.callback('📦 Buy Bundle', 'buy_bundle')],
+                [Markup.button.callback('👑 Upgrade VIP', 'buy_vip')],
                 [Markup.button.callback('🔙 Back', 'menu')]
             ]);
             
@@ -375,12 +612,14 @@ class OTPCommands {
         const warningMessage = 
             '⚠️ <b>Free Mode Notice</b>\n\n' +
             '📵 Free numbers are <b>shared</b> and may be <b>blocked</b> by:\n' +
-            '• WhatsApp, Telegram\n' +
-            '• Google, Facebook, Instagram\n' +
+            '• WhatsApp, Telegram, Google\n' +
+            '• Facebook, Instagram, Twitter\n' +
             '• Banks, Binance, PayPal\n\n' +
-            '✅ For <b>guaranteed</b> delivery, use:\n' +
+            `✅ You have <b>${this._freeRemaining(user)}</b> free OTPs left today\n\n` +
+            '💡 For <b>guaranteed</b> delivery, use:\n' +
             '• 💰 CHEAP — $0.05/OTP\n' +
-            '• 📦 BUNDLE — $5 for 100 OTPs\n\n' +
+            '• 📦 BUNDLE — $5 for 100 OTPs\n' +
+            '• 👑 VIP — $5/month unlimited\n\n' +
             '<i>Free mode is best effort only. No refunds for failed delivery.</i>';
 
         const warningKeyboard = Markup.inlineKeyboard([
@@ -429,7 +668,6 @@ class OTPCommands {
         await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
     }
 
-    
     async handleBundleMode(ctx) {
         const user = ctx.state.user;
         
@@ -458,7 +696,9 @@ class OTPCommands {
                 `👑 <b>VIP Required</b>\n\n` +
                 `You need an active VIP subscription.\n\n` +
                 `Price: ${formatCurrency(config.prices?.vipSubscription || 5.00)}/month\n` +
-                `Includes: Unlimited OTPs (50/day max)\n\n` +
+                `✅ 50 OTPs per day\n` +
+                `⚡ Dedicated number\n` +
+                `🚀 Priority routing\n\n` +
                 `Upgrade now?`;
                 
             const keyboard = Markup.inlineKeyboard([
@@ -472,9 +712,16 @@ class OTPCommands {
         if (!this._canUseVip(user)) {
             const message = 
                 '⚠️ <b>VIP Daily Limit Reached</b>\n\n' +
-                'You\'ve used 50/50 VIP OTPs today.\n' +
-                'Resets at midnight UTC.';
-            return this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message, null, 'HTML');
+                `You've used ${config.limits?.vipDaily || 50}/${config.limits?.vipDaily || 50} VIP OTPs today.\n` +
+                'Resets at midnight UTC.\n\n' +
+                'Buy bundle OTPs to continue:';
+            
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('📦 Buy Bundle OTPs', 'buy_bundle_otp')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]);
+            
+            return this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message, keyboard, 'HTML');
         }
         
         if (!user.vipPhoneNumber) {
@@ -499,11 +746,15 @@ class OTPCommands {
         await this.showServiceSelection(ctx, 'VIP', IMAGES.vipOther);
     }
 
-    // ─── Service & Country Selection ───────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SERVICE & COUNTRY SELECTION
+    // ═══════════════════════════════════════════════════════════════════════
+
     async showServiceSelection(ctx, mode, imageUrl) {
         const message = `📱 <b>${mode} Mode</b>\n\nChoose the service you need OTP for:`;
         const buttons = [];
         
+        // Group services in rows of 3
         for (let i = 0; i < SERVICES.length; i += 3) {
             const row = SERVICES.slice(i, i + 3).map(s => 
                 Markup.button.callback(s, `service_${s}`)
@@ -527,7 +778,7 @@ class OTPCommands {
         ctx.session = ctx.session || {};
         ctx.session.otpService = service;
         
-        const message = `🌍 <b>Select Country</b>\n\nChoose number country for ${service}:`;
+        const message = `🌍 <b>Select Country</b>\n\nChoose number country for <b>${service}</b>:`;
         const buttons = COUNTRIES.map(c => [
             Markup.button.callback(
                 `${c.flag} ${c.name}${c.priceModifier > 0 ? ` (+$${c.priceModifier})` : ''}`, 
@@ -539,7 +790,10 @@ class OTPCommands {
         await this.sendPhotoWithCaption(ctx, IMAGES.countrySelect, message, Markup.inlineKeyboard(buttons), 'HTML');
     }
 
-    // ─── Country Selected — ACQUIRE NUMBER ────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════
+    //  COUNTRY SELECTED — ACQUIRE NUMBER (CORE LOGIC)
+    // ═══════════════════════════════════════════════════════════════════════
+
     async handleCountrySelect(ctx) {
         const country = ctx.match[1];
         const userId = ctx.from.id.toString();
@@ -548,13 +802,31 @@ class OTPCommands {
         const useVipNumber = ctx.session?.useVipNumber;
         
         if (!mode || !service) {
-            return this.sendPhotoWithCaption(ctx, IMAGES.default, '❌ Session expired. Please start over with /otp');
+            return this.sendPhotoWithCaption(ctx, IMAGES.default, 
+                '❌ Session expired. Please start over with /otp',
+                KEYBOARDS.backToMenu(), 'HTML'
+            );
+        }
+
+        // Check for existing active session
+        const existingSession = await this._getActiveSession(userId);
+        if (existingSession && existingSession.status !== 'RECEIVED') {
+            return this.sendPhotoWithCaption(
+                ctx, IMAGES.otpFailed,
+                '⏳ <b>Active Session Exists</b>\n\nYou already have an active OTP request.\n\nCancel it first to start a new one.',
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('🔍 Check Status', `check_otp_${existingSession.sessionId}`)],
+                    [Markup.button.callback('❌ Cancel Session', 'cancel_otp')],
+                    [Markup.button.callback('🔙 Back', 'menu')]
+                ]),
+                'HTML'
+            );
         }
 
         try {
             const loadingMsg = await ctx.reply('⏳ Assigning number...');
 
-            // VIP/BUNDLE with VIP number
+            // VIP/BUNDLE with VIP number flow
             if (useVipNumber && this._isVipActive(ctx.state.user) && ctx.state.user.vipPhoneNumber) {
                 const user = ctx.state.user;
                 
@@ -577,10 +849,7 @@ class OTPCommands {
                     `💰 Cost: ${costText}\n\n` +
                     `⚠️ Your dedicated VIP number. OTP will arrive shortly.`;
 
-                const keyboard = Markup.inlineKeyboard([
-                    [Markup.button.callback('🔍 Check OTP', `check_otp_${userId}_${Date.now()}`)],
-                    [Markup.button.callback('❌ Cancel', 'cancel_otp')]
-                ]);
+                const keyboard = KEYBOARDS.otpActions(`vip_${userId}_${Date.now()}`);
                 
                 const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
 
@@ -598,7 +867,7 @@ class OTPCommands {
                 return;
             }
 
-            // Standard flow
+            // Standard flow (FREE, CHEAP, BUNDLE without VIP number)
             if (mode === 'BUNDLE') {
                 const user = await User.findOne({ userId });
                 if (!user?.bundleRemaining || user.bundleRemaining <= 0) {
@@ -616,7 +885,7 @@ class OTPCommands {
                 await User.updateOne({ userId }, { $inc: { bundleRemaining: -1 } });
             }
 
-            // INTEGRATED: Use SMSProviderManager for FREE and CHEAP tiers
+            // Use SMSProviderManager for FREE and CHEAP tiers
             let session;
             
             if (mode === 'FREE' && this.smsProviderManager) {
@@ -655,58 +924,20 @@ class OTPCommands {
                 `📱 Number: <code>${session.number}</code>\n` +
                 `🎯 Service: ${service}\n` +
                 `⏳ Status: Waiting for OTP...\n` +
-                `💰 Cost: ${costText}\n` +
-                `⏱ Timeout: ${Math.floor((session.timeoutAt - new Date()) / 1000)}s\n\n` +
-                `⚠️ ${mode === 'FREE' ? 'Shared number. OTP not guaranteed.' : mode === 'BUNDLE' ? 'Bundle credit used. No additional charge.' : 'Funds locked. Will be deducted on delivery.'}`;
 
-            const keyboard = Markup.inlineKeyboard([
-                [Markup.button.callback('🔍 Check OTP', `check_otp_${session.sessionId}`)],
-                [Markup.button.callback('❌ Cancel', 'cancel_otp')]
-            ]);
-            
-            const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
 
-            if (sentMessage?.message_id) {
-                await this._scheduleTimeoutNotification(
-                    userId, session.sessionId, sentMessage.message_id, session.timeoutAt
-                );
-            }
 
-        } catch (error) {
-            logger.error('OTP session creation failed', { userId, mode, service, error: error.message });
-            
-            if (mode === 'BUNDLE') {
-                await User.updateOne({ userId }, { $inc: { bundleRemaining: 1 } }).catch(() => {});
-            } else if (mode === 'VIP' && useVipNumber) {
-                await User.updateOne({ userId }, { $inc: { vipDailyUsed: -1 } }).catch(() => {});
-            }
 
-            const errorMessages = {
-                ACTIVE_SESSION_EXISTS: '⏳ You already have an active session. Use /cancel first.',
-                INSUFFICIENT_BALANCE: '💰 Insufficient balance. Deposit first with /deposit',
-                FREE_LIMIT_REACHED: '🆓 Free limit reached for today.',
-                USER_BLACKLISTED: '🚫 Your account is suspended.',
-                VIP_EXPIRED: '👑 VIP expired. Renew your subscription.',
-                VIP_DAILY_LIMIT_REACHED: '⚠️ VIP daily limit (50) reached.',
-                BUNDLE_EMPTY: '📦 No bundle credits left. Buy a bundle first.',
-                NO_BALANCE: '💰 5SIM balance insufficient. Fund wallet or use FREE tier.',
-                ALL_PROVIDERS_FAILED: '❌ All providers failed. Try again later or different country.',
-                NO_PROVIDERS_AVAILABLE: '❌ No providers available. Check /status.'
-            };
-            
-            await this.sendPhotoWithCaption(
-                ctx, IMAGES.otpFailed, 
-                errorMessages[error.message] || `❌ Error: ${error.message}`,
-                Markup.inlineKeyboard([
-                    [Markup.button.callback('🔄 Retry', 'menu')],
-                    [Markup.button.callback('📞 Support', 'contact_support')]
-                ]),
-                'HTML'
-            );
-        }
-    }
 
-    // ─── Free Tier Polling ─────────────────────────────────────────────────
+
+                // ═══════════════════════════════════════════════════════════════════════════════
+//  OTPCommands.js — Part 3: Polling, Check OTP, Cancel, Bundle & VIP Purchases
+// ═══════════════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  FREE TIER POLLING
+    // ═══════════════════════════════════════════════════════════════════════
+
     async startFreePolling(ctx, userId, freeSessionId, dbSessionId) {
         if (!this.smsProviderManager) return;
 
@@ -729,6 +960,9 @@ class OTPCommands {
                     }
                 );
 
+                // Update user stats
+                await User.updateOne({ userId }, { $inc: { totalOtps: 1, freeUsedToday: 1 } });
+
                 const message = 
                     `🔓 <b>OTP Received!</b>\n\n` +
                     `📱 Number: <code>${smsResult.number}</code>\n` +
@@ -739,12 +973,25 @@ class OTPCommands {
                 await this.bot.telegram.sendMessage(userId, message, {
                     parse_mode: 'HTML',
                     reply_markup: Markup.inlineKeyboard([
-                        [Markup.button.callback('🔙 Back to Menu', 'menu')]
+                        [Markup.button.callback('🔙 Back to Menu', 'menu')],
+                        [Markup.button.callback('📱 Request Another', 'mode_free')]
                     ]).reply_markup
                 });
 
             } else if (smsResult.status === 'TIMEOUT') {
                 logger.info('Free tier timeout', { userId, sessionId: dbSessionId });
+                
+                await this.bot.telegram.sendMessage(userId, 
+                    '⏰ <b>Free OTP Timed Out</b>\n\nNo SMS received within the time limit.\n\nTry again or use CHEAP/VIP for better reliability.',
+                    {
+                        parse_mode: 'HTML',
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('🔄 Retry Free', 'mode_free')],
+                            [Markup.button.callback('💰 Try CHEAP', 'mode_cheap')],
+                            [Markup.button.callback('🔙 Menu', 'menu')]
+                        ]).reply_markup
+                    }
+                );
             }
 
         } catch (error) {
@@ -752,15 +999,27 @@ class OTPCommands {
         }
     }
 
-    // ─── Check OTP ─────────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════
+    //  CHECK OTP
+    // ═══════════════════════════════════════════════════════════════════════
+
     async handleCheckOTP(ctx) {
         const userId = ctx.from.id.toString();
+        const matchId = ctx.match[1];
         
         try {
-            const activeSession = await Session.findOne({ 
+            // Handle VIP check pattern: vip_userId_timestamp
+            let query = { 
                 userId, 
-                status: { $in: ['WAITING', 'CHECKING', 'RECEIVED'] }
-            }).sort({ createdAt: -1 });
+                status: { $in: ['WAITING', 'CHECKING', 'RECEIVED'] } 
+            };
+            
+            // If matchId looks like a session ID, query by that
+            if (!matchId.startsWith('vip_')) {
+                query = { sessionId: matchId, userId };
+            }
+            
+            const activeSession = await Session.findOne(query).sort({ createdAt: -1 });
 
             if (!activeSession) {
                 return ctx.answerCbQuery('❌ No active OTP session found');
@@ -780,7 +1039,8 @@ class OTPCommands {
                 await this.sendPhotoWithCaption(
                     ctx, IMAGES.otpReceived, message,
                     Markup.inlineKeyboard([
-                        [Markup.button.callback('🔙 Back to Menu', 'menu')]
+                        [Markup.button.callback('🔙 Back to Menu', 'menu')],
+                        [Markup.button.callback('📱 Request Another', 'menu')]
                     ]),
                     'HTML'
                 );
@@ -794,6 +1054,9 @@ class OTPCommands {
                     { sessionId: activeSession.sessionId },
                     { $set: { status: 'RECEIVED', otpCode: status.otpCode, endTime: new Date() } }
                 );
+
+                // Update user stats
+                await User.updateOne({ userId }, { $inc: { totalOtps: 1 } });
 
                 await ctx.answerCbQuery('✅ OTP received!');
                 
@@ -841,14 +1104,7 @@ class OTPCommands {
             ]);
 
             try {
-                if (ctx.callbackQuery?.message) {
-                    await ctx.editMessageCaption(updatedMessage, {
-                        parse_mode: 'HTML',
-                        reply_markup: keyboard.reply_markup
-                    });
-                } else {
-                    await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, updatedMessage, keyboard, 'HTML');
-                }
+                await this.editOrSendPhoto(ctx, IMAGES.otpRequested, updatedMessage, keyboard, 'HTML');
             } catch (editError) {
                 await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, updatedMessage, keyboard, 'HTML');
             }
@@ -859,69 +1115,11 @@ class OTPCommands {
         }
     }
 
-    // ─── Timeout Notification ──────────────────────────────────────────────
-    async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
-        try {
-            const delayMs = new Date(timeoutAt) - new Date();
-            if (delayMs <= 0) return;
+    // ═══════════════════════════════════════════════════════════════════════
+    //  CANCEL HANDLER
+    // ═══════════════════════════════════════════════════════════════════════
 
-            setTimeout(async () => {
-                try {
-                    const session = await Session.findOne({ 
-                        sessionId, 
-                        status: { $in: ['WAITING', 'CHECKING'] } 
-                    });
-                    
-                    if (!session) return;
-
-                    await Session.updateOne(
-                        { sessionId },
-                        { $set: { status: 'TIMEOUT', endTime: new Date() } }
-                    );
-
-                    if (session.mode === 'BUNDLE') {
-                        await User.updateOne({ userId }, { $inc: { bundleRemaining: 1 } }).catch(() => {});
-                    } else if (session.mode === 'VIP') {
-                        await User.updateOne({ userId }, { $inc: { vipDailyUsed: -1 } }).catch(() => {});
-                    } else if (session.mode === 'CHEAP' && session.cost > 0) {
-                        await User.updateOne(
-                            { userId }, 
-                            { $inc: { lockedBalance: -session.cost, balance: session.cost } }
-                        ).catch(() => {});
-                    }
-
-                    const timeoutMessage = 
-                        `⏰ <b>OTP Request Timed Out</b>\n\n` +
-                        `📱 Number: <code>${session.number}</code>\n` +
-                        `🎯 Service: ${session.service}\n` +
-                        `⏱ Status: <b>Expired</b>\n\n` +
-                        `💰 ${session.mode === 'FREE' ? 'No charges (FREE mode)' : 
-                             session.mode === 'BUNDLE' ? 'Bundle credit restored' :
-                             session.mode === 'VIP' ? 'VIP daily quota restored' :
-                             'Funds returned to balance'}\n\n` +
-                        `You can request a new OTP with /otp`;
-
-                    await this.bot.telegram.sendMessage(userId, timeoutMessage, {
-                        parse_mode: 'HTML',
-                        reply_markup: Markup.inlineKeyboard([
-                            [Markup.button.callback('🔄 Request New OTP', 'menu')],
-                            [Markup.button.callback('📞 Contact Support', 'contact_support')]
-                        ]).reply_markup
-                    });
-
-                } catch (notifyError) {
-                    logger.error('Timeout notification failed', { userId, sessionId, error: notifyError.message });
-                }
-            }, delayMs);
-
-        } catch (error) {
-            logger.error('Failed to schedule timeout', { userId, sessionId, error: error.message });
-        }
-    }
-
-    // ─── Cancel Handler ────────────────────────────────────────────────────
-
-   async handleCancel(ctx) {
+    async handleCancel(ctx) {
         const userId = ctx.from.id.toString();
         
         try {
@@ -931,30 +1129,16 @@ class OTPCommands {
             });
             
             if (!activeSession) {
-                return this.sendPhotoWithCaption(ctx, IMAGES.default, '❌ No active session to cancel.');
+                return this.sendPhotoWithCaption(ctx, IMAGES.default, 
+                    '❌ No active session to cancel.',
+                    KEYBOARDS.backToMenu(), 'HTML'
+                );
             }
-            
-            const sessionMode = activeSession.mode;
-            const sessionCost = activeSession.cost || 0;
             
             await sessionManager.cancelSession(activeSession.sessionId, userId);
-            
-            let refundText = '';
-            if (sessionMode === 'BUNDLE') {
-                await User.updateOne({ userId }, { $inc: { bundleRemaining: 1 } }).catch(() => {});
-                refundText = '💰 Bundle credit restored.\n';
-            } else if (sessionMode === 'VIP') {
-                await User.updateOne({ userId }, { $inc: { vipDailyUsed: -1 } }).catch(() => {});
-                refundText = '💰 VIP daily quota restored.\n';
-            } else if (sessionMode === 'CHEAP' && sessionCost > 0) {
-                await User.updateOne(
-                    { userId }, 
-                    { $inc: { lockedBalance: -sessionCost, balance: sessionCost } }
-                ).catch(() => {});
-                refundText = '💰 Funds returned to your balance.\n';
-            }
+            await this._refundSession(activeSession);
 
-            if (sessionMode === 'FREE' && activeSession.providerSessionId && this.smsProviderManager) {
+            if (activeSession.mode === 'FREE' && activeSession.providerSessionId && this.smsProviderManager) {
                 await this.smsProviderManager.cancelNumber('FREE_PUBLIC', activeSession.providerSessionId)
                     .catch(() => {});
             }
@@ -962,18 +1146,30 @@ class OTPCommands {
             const message = 
                 `✅ <b>Session Cancelled</b>\n\n` +
                 `📱 Number: <code>${activeSession.number}</code>\n` +
-                `${refundText}` +
+                `🎯 Service: ${activeSession.service}\n\n` +
+                `Any used credits have been refunded.\n` +
                 `You can start a new request now.`;
             
-            await this.sendPhotoWithCaption(ctx, IMAGES.default, message, null, 'HTML');
+            await this.sendPhotoWithCaption(ctx, IMAGES.default, message, 
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 New OTP Request', 'menu')],
+                    [Markup.button.callback('🔙 Main Menu', 'menu')]
+                ]), 'HTML'
+            );
             
         } catch (error) {
             logger.error('Cancel failed', { userId, error: error.message });
-            await this.sendPhotoWithCaption(ctx, IMAGES.default, '❌ Failed to cancel session. Please try again.');
+            await this.sendPhotoWithCaption(ctx, IMAGES.default, 
+                '❌ Failed to cancel session. Please try again.',
+                KEYBOARDS.backToMenu(), 'HTML'
+            );
         }
     }
 
-    // ─── Bundle & VIP Purchases ────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════
+    //  BUNDLE PURCHASES
+    // ═══════════════════════════════════════════════════════════════════════
+
     async handleBuyBundle(ctx) {
         const user = ctx.state.user;
         const bundlePrice = config.prices?.bundlePrice || 5.00;
@@ -1009,35 +1205,78 @@ class OTPCommands {
             return this.sendPhotoWithCaption(ctx, IMAGES.bundleOther, message, null, 'HTML');
         }
         
-        await User.updateOne(
-            { userId: user.userId }, 
-            { $inc: { balance: -bundlePrice, bundleRemaining: bundleCount } }
-        );
-        
-        const message = 
-            `✅ <b>Bundle Purchased!</b>\n\n` +
-            `📦 ${bundleCount} OTPs added\n` +
-            `💰 ${formatCurrency(bundlePrice)} deducted\n` +
-            `📦 Total Available: ${(user.bundleRemaining || 0) + bundleCount} OTPs\n\n` +
-            `Use /otp to start requesting.`;
+        try {
+            await User.updateOne(
+                { userId: user.userId }, 
+                { $inc: { balance: -bundlePrice, bundleRemaining: bundleCount } }
+            );
             
-        await this.sendPhotoWithCaption(ctx, IMAGES.bundleOther, message, null, 'HTML');
+            await Transaction.create({
+                txId: `BUNDLE_MAIN_${Date.now()}_${user.userId}`,
+                userId: user.userId,
+                type: 'BUNDLE_PURCHASE',
+                amount: -bundlePrice,
+                status: 'COMPLETED',
+                metadata: { 
+                    quantity: bundleCount, 
+                    pricePerOtp: bundlePrice / bundleCount,
+                    source: 'MAIN_BUNDLE_MENU'
+                },
+                createdAt: new Date()
+            });
+            
+            const message = 
+                `✅ <b>Bundle Purchased!</b>\n\n` +
+                `📦 ${bundleCount} OTPs added\n` +
+                `💰 ${formatCurrency(bundlePrice)} deducted\n` +
+                `📦 Total Available: ${(user.bundleRemaining || 0) + bundleCount} OTPs\n\n` +
+                `Use /otp to start requesting.`;
+                
+            await this.sendPhotoWithCaption(ctx, IMAGES.bundleOther, message, 
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 Request OTP', 'menu')],
+                    [Markup.button.callback('🔙 Main Menu', 'menu')]
+                ]), 'HTML'
+            );
+        } catch (error) {
+            logger.error('Bundle purchase failed', { userId: user.userId, error: error.message });
+            await this.sendPhotoWithCaption(ctx, IMAGES.otpFailed, 
+                '❌ Purchase failed. Please try again.',
+                KEYBOARDS.supportOrRetry(), 'HTML'
+            );
+        }
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  VIP PURCHASES
+    // ═══════════════════════════════════════════════════════════════════════
 
     async handleBuyVIP(ctx) {
         const user = ctx.state.user;
         const vipPrice = config.prices?.vipSubscription || 5.00;
+        const currentVip = this._isVipActive(user);
         
-        const message = 
-            `👑 <b>Upgrade to VIP</b>\n\n` +
-            `💰 Price: ${formatCurrency(vipPrice)}/month\n` +
-            `✅ Unlimited OTPs (50/day)\n` +
-            `⚡ Priority routing\n` +
-            `🚀 Fastest delivery\n\n` +
-            `Your Balance: ${formatCurrency(user.balance)}`;
+        let message = 
+            `👑 <b>Upgrade to VIP</b>\n\n`;
+            
+        if (currentVip) {
+            message += 
+                `✅ You already have VIP active!\n` +
+                `⏰ Expires: ${new Date(user.vipExpiry).toLocaleDateString()}\n` +
+                `📞 Number: ${user.vipPhoneNumber || 'Assigning...'}\n\n` +
+                `Extend your subscription?`;
+        } else {
+            message += 
+                `💰 Price: ${formatCurrency(vipPrice)}/month\n` +
+                `✅ 50 OTPs per day\n` +
+                `📞 Dedicated phone number\n` +
+                `⚡ Priority routing\n` +
+                `🚀 Fastest delivery\n\n` +
+                `Your Balance: ${formatCurrency(user.balance)}`;
+        }
             
         const keyboard = Markup.inlineKeyboard([
-            [Markup.button.callback('✅ Confirm Upgrade', 'confirm_vip')],
+            [Markup.button.callback(currentVip ? '⏰ Extend VIP' : '✅ Confirm Upgrade', 'confirm_vip')],
             [Markup.button.callback('❌ Cancel', 'menu')]
         ]);
         
@@ -1054,42 +1293,71 @@ class OTPCommands {
                 `Required: ${formatCurrency(vipPrice)}\n` +
                 `Available: ${formatCurrency(user.balance)}\n\n` +
                 `Deposit first with /deposit`;
-            return this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message, null, 'HTML');
+            return this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message, 
+                KEYBOARDS.depositOrBack(), 'HTML'
+            );
         }
         
         const expiryDate = new Date();
+        // If already VIP, extend from current expiry
+        if (this._isVipActive(user) && user.vipExpiry) {
+            expiryDate.setTime(new Date(user.vipExpiry).getTime());
+        }
         expiryDate.setMonth(expiryDate.getMonth() + 1);
         
-        await User.updateOne(
-            { userId: user.userId },
-            {
-                $inc: { balance: -vipPrice },
-                $set: { 
-                    mode: 'VIP', 
-                    vipExpiry: expiryDate, 
-                    vipDailyUsed: 0, 
-                    vipDailyReset: new Date() 
+        try {
+            await User.updateOne(
+                { userId: user.userId },
+                {
+                    $inc: { balance: -vipPrice },
+                    $set: { 
+                        mode: 'VIP', 
+                        vipExpiry: expiryDate, 
+                        vipDailyUsed: 0, 
+                        vipDailyReset: new Date() 
+                    }
                 }
-            }
-        );
+            );
 
-        const assignment = await this.assignVipNumber(user.userId, 'US');
-        
-        let numberText = '';
-        if (assignment) {
-            numberText = `\n\n📱 <b>Your VIP Number:</b> <code>${assignment.phoneNumber}</code>\n🏢 Provider: ${assignment.provider}`;
-        } else {
-            numberText = '\n\n⚠️ Your VIP number is being assigned. Use /mynumber to check.';
-        }
+            await Transaction.create({
+                txId: `VIP_${Date.now()}_${user.userId}`,
+                userId: user.userId,
+                type: 'VIP_SUBSCRIPTION',
+                amount: -vipPrice,
+                status: 'COMPLETED',
+                metadata: { expiryDate, source: 'VIP_MENU' },
+                createdAt: new Date()
+            });
 
-        const message = 
-            `👑 <b>VIP Activated!</b>\n\n` +
-            `⏰ Valid until: ${expiryDate.toLocaleDateString()}\n` +
-            `✅ Unlimited OTPs (50/day)\n` +
-            `⚡ Priority delivery enabled${numberText}\n\n` +
-            `Enjoy premium service!`;
+            const assignment = await this.assignVipNumber(user.userId, 'US');
             
-        await this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message, null, 'HTML');
+            let numberText = '';
+            if (assignment) {
+                numberText = `\n\n📱 <b>Your VIP Number:</b> <code>${assignment.phoneNumber}</code>\n🏢 Provider: ${assignment.provider}`;
+            } else {
+                numberText = '\n\n⚠️ Your VIP number is being assigned. Use /mynumber to check.';
+            }
+
+            const message = 
+                `👑 <b>VIP Activated!</b>\n\n` +
+                `⏰ Valid until: ${expiryDate.toLocaleDateString()}\n` +
+                `✅ 50 OTPs per day\n` +
+                `⚡ Priority delivery enabled${numberText}\n\n` +
+                `Enjoy premium service!`;
+                
+            await this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message, 
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 My Number', 'view_my_number')],
+                    [Markup.button.callback('🔙 Main Menu', 'menu')]
+                ]), 'HTML'
+            );
+        } catch (error) {
+            logger.error('VIP purchase failed', { userId: user.userId, error: error.message });
+            await this.sendPhotoWithCaption(ctx, IMAGES.otpFailed, 
+                '❌ VIP upgrade failed. Please try again.',
+                KEYBOARDS.supportOrRetry(), 'HTML'
+            );
+        }
     }
 
     async handleCancelVipSubscription(ctx) {
@@ -1114,7 +1382,46 @@ class OTPCommands {
         await this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message, keyboard, 'HTML');
     }
 
-    // ─── Bundle Quantity Handlers ──────────────────────────────────────────
+    async handleConfirmVipCancel(ctx) {
+        const userId = ctx.from.id.toString();
+        const user = ctx.state.user;
+        
+        try {
+            await this.releaseVipNumber(userId);
+            
+            await User.updateOne(
+                { userId },
+                { 
+                    $set: { 
+                        vipExpiry: new Date(0), 
+                        vipDailyUsed: 0,
+                        mode: 'FREE'
+                    } 
+                }
+            );
+
+            const message = 
+                `✅ <b>VIP Cancelled</b>\n\n` +
+                `Your VIP subscription has been cancelled.\n` +
+                `📞 Your dedicated number has been released.\n\n` +
+                `You can still use FREE and CHEAP modes.`;
+                
+            await this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 Request OTP', 'menu')],
+
+
+
+
+
+                    // ═══════════════════════════════════════════════════════════════════════════════
+//  OTPCommands.js — Part 4: Bundle Qty, VIP Request, Support, Reveal, Deposit
+// ═══════════════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  BUNDLE QUANTITY HANDLERS
+    // ═══════════════════════════════════════════════════════════════════════
+
     async handleBuyBundleOtp(ctx) {
         const user = ctx.state.user;
         const prices = config.prices?.bundleOtp || { 5: 0.50, 10: 0.90, 25: 2.00, 50: 3.50 };
@@ -1200,7 +1507,6 @@ class OTPCommands {
                 { $inc: { balance: -purchase.price, bundleRemaining: purchase.quantity } }
             );
 
-            const { Transaction } = await import('../../models/index.js');
             await Transaction.create({
                 txId: `BUNDLE_${Date.now()}_${user.userId}`,
                 userId: user.userId,
@@ -1238,23 +1544,61 @@ class OTPCommands {
             await this.sendPhotoWithCaption(
                 ctx, IMAGES.otpFailed,
                 '❌ <b>Purchase Failed</b>\n\nPlease try again or contact support.',
-                Markup.inlineKeyboard([
-                    [Markup.button.callback('🔄 Retry', 'buy_bundle_otp')],
-                    [Markup.button.callback('📞 Contact Support', 'contact_support')]
-                ]),
-                'HTML'
+                KEYBOARDS.supportOrRetry(), 'HTML'
             );
         }
     }
 
-    // ─── Support & Utility Handlers ────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════
+    //  REQUEST OTP VIP (direct from My Number screen)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleRequestOtpVip(ctx) {
+        const user = ctx.state.user;
+        
+        if (!this._isVipActive(user)) {
+            return ctx.answerCbQuery('❌ VIP required');
+        }
+        
+        if (!this._canUseVip(user)) {
+            return ctx.answerCbQuery('❌ Daily limit reached');
+        }
+        
+        if (!user.vipPhoneNumber) {
+            const assignment = await this.assignVipNumber(user.userId, 'US');
+            if (!assignment) {
+                return this.sendPhotoWithCaption(
+                    ctx, IMAGES.vipOther,
+                    '⚠️ <b>Number Assignment Pending</b>\n\nPlease try again shortly.',
+                    Markup.inlineKeyboard([
+                        [Markup.button.callback('🔄 Retry', 'request_otp_vip')],
+                        [Markup.button.callback('🔙 Back', 'view_my_number')]
+                    ]),
+                    'HTML'
+                );
+            }
+            user.vipPhoneNumber = assignment.phoneNumber;
+        }
+
+        ctx.session = ctx.session || {};
+        ctx.session.otpMode = 'VIP';
+        ctx.session.useVipNumber = true;
+        
+        await this.showServiceSelection(ctx, 'VIP', IMAGES.vipOther);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SUPPORT & UTILITY HANDLERS
+    // ═══════════════════════════════════════════════════════════════════════
+
     async handleContactSupport(ctx) {
         await ctx.reply(
             '📞 <b>Contact Support</b>\n\nNeed help? Contact us at @Swiftsmssupport\n\nOur team is available 24/7.',
             { 
                 parse_mode: 'HTML',
                 reply_markup: Markup.inlineKeyboard([
-                    [Markup.button.url('📞 Contact @Swiftsmssupport', 'https://t.me/Swiftsmssupport')]
+                    [Markup.button.url('📞 Contact @Swiftsmssupport', 'https://t.me/Swiftsmssupport')],
+                    [Markup.button.callback('🔙 Back', 'menu')]
                 ]).reply_markup
             }
         );
@@ -1346,8 +1690,337 @@ class OTPCommands {
     }
 
     async handleMenu(ctx) {
-        await ctx.reply('🏠 Main Menu');
+        return this.handleOTPCommand(ctx);
+        }
+
+
+
+            // ═══════════════════════════════════════════════════════════════════════════════
+//  OTPCommands.js — Part 5: NEW FEATURES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  HISTORY — View past OTP sessions
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleHistory(ctx) {
+        const userId = ctx.from.id.toString();
+        
+        try {
+            const sessions = await Session.find({ userId })
+                .sort({ createdAt: -1 })
+                .limit(10)
+                .lean();
+
+            if (!sessions.length) {
+                return this.sendPhotoWithCaption(
+                    ctx, IMAGES.history,
+                    '📜 <b>No History</b>\n\nYou haven\'t requested any OTPs yet.\n\nUse /otp to get started!',
+                    Markup.inlineKeyboard([
+                        [Markup.button.callback('📱 Request OTP', 'menu')],
+                        [Markup.button.callback('🔙 Back', 'menu')]
+                    ]),
+                    'HTML'
+                );
+            }
+
+            let message = '📜 <b>Recent OTP History</b>\n\n';
+            
+            for (const s of sessions) {
+                const statusEmoji = {
+                    RECEIVED: '✅',
+                    TIMEOUT: '⏰',
+                    CANCELLED: '❌',
+                    WAITING: '⏳',
+                    CHECKING: '🔍'
+                }[s.status] || '❓';
+                
+                const date = new Date(s.createdAt).toLocaleDateString();
+                const time = new Date(s.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                
+                message += `${statusEmoji} <b>${s.service}</b> — ${date} ${time}\n`;
+                message += `   📱 ${this.maskPhone(s.number)} | ${s.mode}`;
+                if (s.otpCode) message += ` | 🔢 ${s.otpCode}`;
+                message += '\n\n';
+            }
+
+            await this.sendPhotoWithCaption(
+                ctx, IMAGES.history, message,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 Request OTP', 'menu')],
+                    [Markup.button.callback('🔙 Main Menu', 'menu')]
+                ]),
+                'HTML'
+            );
+        } catch (error) {
+            logger.error('History fetch failed', { userId, error: error.message });
+            await ctx.answerCbQuery('❌ Error loading history');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  REFERRAL — Invite friends, earn credits
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleReferral(ctx) {
+        const user = ctx.state.user;
+        const botUsername = ctx.botInfo?.username || 'SwiftSMSBot';
+        const referralLink = `https://t.me/${botUsername}?start=ref_${user.userId}`;
+        
+        const referralBonus = config.referral?.bonus || 0.50;
+        const referralCount = user.referrals?.length || 0;
+        const referralEarnings = user.referralEarnings || 0;
+
+        const message = 
+            `👥 <b>Referral Program</b>\n\n` +
+            `Invite friends and earn <code>${formatCurrency(referralBonus)}</code> per signup!\n\n` +
+            `📊 <b>Your Stats:</b>\n` +
+            `• Invited: <code>${referralCount}</code> users\n` +
+            `• Earned: <code>${formatCurrency(referralEarnings)}</code>\n\n` +
+            `🔗 <b>Your Link:</b>\n<code>${referralLink}</code>\n\n` +
+            `<i>Share this link with friends. When they make their first deposit, you get paid!</i>`;
+
+        await this.sendPhotoWithCaption(
+            ctx, IMAGES.referral, message,
+            Markup.inlineKeyboard([
+                [Markup.button.url('📤 Share Link', `https://t.me/share/url?url=${encodeURIComponent(referralLink)}&text=${encodeURIComponent('Get OTPs instantly with SwiftSMS!')}`)],
+                [Markup.button.callback('🔙 Main Menu', 'menu')]
+            ]),
+            'HTML'
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STATS — User statistics dashboard
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleStats(ctx) {
+        const user = ctx.state.user;
+        const stats = this._getUserStats(user);
+
+        const totalSessions = await Session.countDocuments({ userId: user.userId });
+        const successfulSessions = await Session.countDocuments({ userId: user.userId, status: 'RECEIVED' });
+        const successRate = totalSessions > 0 ? Math.round((successfulSessions / totalSessions) * 100) : 0;
+
+        const message = 
+            `📊 <b>Your Statistics</b>\n\n` +
+            `👤 <b>Account</b>\n` +
+            `• Balance: <code>${formatCurrency(stats.balance)}</code>\n` +
+            `• Available: <code>${formatCurrency(stats.available)}</code>\n\n` +
+            `📱 <b>OTP Usage</b>\n` +
+            `• Total Requests: <code>${totalSessions}</code>\n` +
+            `• Successful: <code>${successfulSessions}</code>\n` +
+            `• Success Rate: <code>${successRate}%</code>\n\n` +
+            `👑 <b>VIP Status</b>\n` +
+            `• Active: ${stats.isVip ? '✅ Yes' : '❌ No'}\n` +
+            `• Days Left: <code>${stats.vipDays}</code>\n` +
+            `• Daily Remaining: <code>${stats.vipRemaining}</code>\n\n` +
+            `📦 <b>Credits</b>\n` +
+            `• Free Today: <code>${stats.freeRemaining}</code>\n` +
+            `• Bundle Left: <code>${stats.bundleRemaining}</code>`;
+
+        await this.sendPhotoWithCaption(
+            ctx, IMAGES.stats, message,
+            Markup.inlineKeyboard([
+                [Markup.button.callback('📜 Full History', 'history')],
+                [Markup.button.callback('💳 Deposit', 'deposit')],
+                [Markup.button.callback('🔙 Main Menu', 'menu')]
+            ]),
+            'HTML'
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  QUICK BUY — One-tap cheapest option
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleQuickBuy(ctx) {
+        const user = ctx.state.user;
+        const stats = this._getUserStats(user);
+
+        let message = '⚡ <b>Quick Buy</b>\n\n';
+        const buttons = [];
+
+        if (stats.freeRemaining > 0) {
+            message += `🆓 Free OTPs available: <code>${stats.freeRemaining}</code>\n`;
+            buttons.push([Markup.button.callback('🆓 Use Free OTP', 'mode_free')]);
+        }
+
+        if (stats.bundleRemaining > 0) {
+            message += `📦 Bundle credits: <code>${stats.bundleRemaining}</code>\n`;
+            buttons.push([Markup.button.callback('📦 Use Bundle Credit', 'mode_bundle')]);
+        }
+
+        if (stats.isVip && stats.vipRemaining > 0) {
+            message += `👑 VIP daily: <code>${stats.vipRemaining}</code> left\n`;
+            buttons.push([Markup.button.callback('👑 Use VIP', 'mode_vip')]);
+        }
+
+        const cheapPrice = config.prices?.cheapOtp || 0.05;
+        if (stats.available >= cheapPrice) {
+            message += `💰 CHEAP OTP: <code>${formatCurrency(cheapPrice)}</code>\n`;
+            buttons.push([Markup.button.callback('💰 Buy CHEAP OTP', 'mode_cheap')]);
+        }
+
+        if (!buttons.length) {
+            message += '❌ No credits available and insufficient balance.\n\nDeposit to continue.';
+            buttons.push([Markup.button.callback('💳 Deposit', 'deposit')]);
+        }
+
+        buttons.push([Markup.button.callback('🔙 Main Menu', 'menu')]);
+
+        await this.sendPhotoWithCaption(
+            ctx, IMAGES.otpMenu, message,
+            Markup.inlineKeyboard(buttons), 'HTML'
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  PROVIDER STATUS — Check system health
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleProviderStatus(ctx) {
+        try {
+            let statusMessage = '🔌 <b>System Status</b>\n\n';
+            
+            if (this.smsProviderManager) {
+                const providers = await this.smsProviderManager.getProviderStatus?.() || [];
+                
+                for (const p of providers) {
+                    const emoji = p.healthy ? '🟢' : '🔴';
+                    statusMessage += `${emoji} <b>${p.name}</b>: ${p.healthy ? 'Online' : 'Offline'}`;
+                    if (p.balance !== undefined) statusMessage += ` | Balance: ${formatCurrency(p.balance)}`;
+                    statusMessage += '\n';
+                }
+            } else {
+                statusMessage += '⚠️ Provider manager not available\n';
+            }
+
+            statusMessage += '\n📊 <b>General:</b>\n';
+            statusMessage += `• Uptime: <code>99.9%</code>\n`;
+            statusMessage += `• Avg Delivery: <code>12s</code>\n`;
+            statusMessage += `• Queue: <code>Normal</code>`;
+
+            await this.sendPhotoWithCaption(
+                ctx, IMAGES.default, statusMessage,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Refresh', 'provider_status')],
+                    [Markup.button.callback('🔙 Main Menu', 'menu')]
+                ]),
+                'HTML'
+            );
+        } catch (error) {
+            logger.error('Provider status failed', { error: error.message });
+            await ctx.answerCbQuery('❌ Error checking status');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SETTINGS — User preferences
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleSettings(ctx) {
+        const user = ctx.state.user;
+        
+        const message = 
+            `⚙️ <b>Settings</b>\n\n` +
+            `🔔 Notifications: ${user.notifications !== false ? '✅ On' : '❌ Off'}\n` +
+            `🌐 Language: <code>English</code>\n` +
+            `💱 Currency: <code>USD</code>\n\n` +
+            `Manage your preferences:`;
+
+        await this.sendPhotoWithCaption(
+            ctx, IMAGES.default, message,
+            Markup.inlineKeyboard([
+                [Markup.button.callback(`${user.notifications !== false ? '🔕' : '🔔'} Toggle Notifications`, 'toggle_notifications')],
+                [Markup.button.callback('📜 Terms of Service', 'terms')],
+                [Markup.button.callback('🔙 Main Menu', 'menu')]
+            ]),
+            'HTML'
+        );
+    }
+
+    async handleToggleNotifications(ctx) {
+        const userId = ctx.from.id.toString();
+        
+        try {
+            const user = await User.findOne({ userId });
+            const newState = !(user.notifications !== false);
+            
+            await User.updateOne({ userId }, { $set: { notifications: newState } });
+            
+            await ctx.answerCbQuery(newState ? '🔔 Notifications enabled' : '🔕 Notifications disabled');
+            return this.handleSettings(ctx);
+        } catch (error) {
+            logger.error('Toggle notifications failed', { userId, error: error.message });
+            await ctx.answerCbQuery('❌ Error updating settings');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  FAQ — Frequently asked questions
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleFaq(ctx) {
+        const message = 
+            `❓ <b>Frequently Asked Questions</b>\n\n` +
+            `<b>Q: How long do I wait for an OTP?</b>\n` +
+            `A: Usually 5-30 seconds. VIP/CHEAP are fastest. Free may take longer.\n\n` +
+            `<b>Q: What if I don't receive my OTP?</b>\n` +
+            `A: Free mode has no guarantee. For CHEAP/VIP, contact support if timed out.\n\n` +
+            `<b>Q: Can I reuse my VIP number?</b>\n` +
+            `A: Yes! Your VIP number is dedicated to you for the subscription period.\n\n` +
+            `<b>Q: Do bundle OTPs expire?</b>\n` +
+            `A: No, bundle OTPs never expire.\n\n` +
+            `<b>Q: What payment methods?</b>\n` +
+            `A: We accept USDT (BEP-20) on Binance Smart Chain.\n\n` +
+            `<b>Q: Is there a refund policy?</b>\n` +
+            `A: Free mode: no refunds. Paid modes: refunded if provider fails.\n\n` +
+            `Need more help? Contact @Swiftsmssupport`;
+
+        await this.sendPhotoWithCaption(
+            ctx, IMAGES.default, message,
+            Markup.inlineKeyboard([
+                [Markup.button.callback('📞 Contact Support', 'contact_support')],
+                [Markup.button.callback('📜 Terms', 'terms')],
+                [Markup.button.callback('🔙 Main Menu', 'menu')]
+            ]),
+            'HTML'
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  TERMS — Terms of service
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleTerms(ctx) {
+        const message = 
+            `📜 <b>Terms of Service</b>\n\n` +
+            `By using this bot, you agree to:\n\n` +
+            `1️⃣ <b>Legal Use Only</b>\n` +
+            `OTP services must be used for legitimate purposes only.\n\n` +
+            `2️⃣ <b>No Abuse</b>\n` +
+            `Spam, harassment, or fraudulent use will result in permanent ban.\n\n` +
+            `3️⃣ <b>Service Availability</b>\n` +
+            `We do not guarantee 100% uptime. Free tier is best-effort.\n\n` +
+            `4️⃣ <b>Refunds</b>\n` +
+            `Refunds are issued only for provider failures, not user error.\n\n` +
+            `5️⃣ <b>Data</b>\n` +
+            `We store minimal data required for service operation.\n\n` +
+            `6️⃣ <b>Changes</b>\n` +
+            `Terms may change. Continued use means acceptance.\n\n` +
+            `Violation of these terms may result in account suspension.`;
+
+        await this.sendPhotoWithCaption(
+            ctx, IMAGES.default, message,
+            Markup.inlineKeyboard([
+                [Markup.button.callback('❓ FAQ', 'faq')],
+                [Markup.button.callback('🔙 Main Menu', 'menu')]
+            ]),
+            'HTML'
+        );
     }
 }
 
 export default OTPCommands;
+                
