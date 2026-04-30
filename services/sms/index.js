@@ -538,3 +538,224 @@ class SMSProviderManager {
     }
 
     // ══════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════
+    //  FREE TIER HELPERS
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Start SMS polling for a free tier session.
+     * Returns Promise that resolves when SMS received or timeout.
+     */
+    async pollFreeSMS(sessionId, onStatusUpdate = null) {
+        const provider = this.providers.get('FREE_PUBLIC');
+        if (!provider) {
+            throw new Error('FREE_PROVIDER_NOT_AVAILABLE');
+        }
+
+        return provider.pollForSMS(sessionId, onStatusUpdate);
+    }
+
+    /**
+     * Retry free tier with new number.
+     */
+    async retryFreeNumber(sessionId, country = 'US', service = 'Any') {
+        const provider = this.providers.get('FREE_PUBLIC');
+        if (!provider) {
+            throw new Error('FREE_PROVIDER_NOT_AVAILABLE');
+        }
+
+        return provider.retryWithNewNumber(sessionId, country, service);
+    }
+
+    /**
+     * Get free provider health status.
+     */
+    getFreeProviderHealth() {
+        const provider = this.providers.get('FREE_PUBLIC');
+        if (!provider) {
+            return { available: false };
+        }
+
+        return {
+            available: true,
+            providers: provider.getProviderHealth(),
+            activeSessions: provider.getActiveSessions()
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  POOL MANAGEMENT
+    // ═══════════════════════════════════════════════════════════
+
+    async buyPoolNumbers(country = 'US', quantity = 1, preferredProvider = null) {
+        if (!this.numberPool || !this.numberBuyer) {
+            throw new Error('POOL_NOT_AVAILABLE: Number pool not configured');
+        }
+
+        if (!this.isInitialized) await this.initialize();
+
+        const result = await this.numberBuyer.buyMultiple(
+            [{ country, count: quantity, preferredProvider }],
+            { abortOnError: false }
+        );
+
+        if (result.totalSuccess > 0) {
+            await this.numberPool.initialize();
+        }
+
+        return {
+            success: result.totalFailed === 0,
+            purchased: result.results[0]?.numbers || [],
+            failed: result.totalFailed,
+            totalCost: result.totalCost,
+            errors: result.results[0]?.errors || []
+        };
+    }
+
+    async buyPoolNumbersBulk(configs) {
+        if (!this.numberPool || !this.numberBuyer) {
+            throw new Error('POOL_NOT_AVAILABLE: Number pool not configured');
+        }
+
+        if (!this.isInitialized) await this.initialize();
+
+        const result = await this.numberBuyer.buyMultiple(configs, { abortOnError: false });
+
+        if (result.totalSuccess > 0) {
+            await this.numberPool.initialize();
+        }
+
+        return result;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  STATS & MONITORING
+    // ═══════════════════════════════════════════════════════════
+
+    async getPoolStats() {
+        if (!this.numberPool) {
+            return { available: false, reason: 'POOL_NOT_CONFIGURED' };
+        }
+
+        return {
+            available: true,
+            pools: this.numberPool.getPoolStats(),
+            detailed: this.numberPool.getDetailedStats?.() || null
+        };
+    }
+
+    getAllStats() {
+        const stats = {};
+        for (const [name, provider] of this.providers) {
+            stats[name] = provider.getStats ? provider.getStats() : { isActive: provider.isActive };
+        }
+        if (this.numberPool) {
+            stats['POOL'] = this.numberPool.getPoolStats();
+            stats['POOL_DETAILED'] = this.numberPool.getDetailedStats?.();
+        }
+        return stats;
+    }
+
+    getActiveProviders() {
+        return Array.from(this.providers.entries())
+            .filter(([_, provider]) => provider.isActive)
+            .map(([name, _]) => name);
+    }
+
+    getProvider(name) {
+        return this.providers.get(name);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  TELEGRAM MESSAGE SAFETY (FIXED — escape user input)
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * FIXED: Escape Telegram message entities to prevent "Can't find end of the entity" errors.
+     * Use this before sending any user-generated content to Telegram.
+     */
+    escapeTelegramMessage(text) {
+        if (!text) return '';
+        
+        // Escape special characters that break Telegram HTML/Markdown parsing
+        return text
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#x27;')
+            .replace(/\*/g, '\\*')
+            .replace(/_/g, '\\_')
+            .replace(/\[/g, '\\[')
+            .replace(/\]/g, '\\]')
+            .replace(/\(/g, '\\(')
+            .replace(/\)/g, '\\)')
+            .replace(/`/g, '\\`');
+    }
+
+    /**
+     * Format status message for Telegram with proper escaping.
+     */
+    formatTelegramStatus(status) {
+        const escaped = this.escapeTelegramMessage(status.message || status.error || 'Unknown status');
+        
+        if (status.success) {
+            return `✅ *SMS Received*\n\n📱 Number: \`${this.maskPhone(status.number || 'unknown')}\`\n💬 Message: ${escaped}\n🔢 OTP: \`${status.otp || 'N/A'}\`\n⏱️ Delivery: ${status.deliveryTime}ms`;
+        }
+        
+        if (status.status === 'TIMEOUT') {
+            return `❌ *No SMS Received*\n\n📱 Number: \`${this.maskPhone(status.number || 'unknown')}\`\n⏱️ Waited: 90 seconds\n📝 Reason: ${escaped}\n\n💡 Try retrying with a new number.`;
+        }
+        
+        if (status.status === 'POLLING') {
+            return `⏳ *Waiting for SMS...*\n\n🔍 ${escaped}`;
+        }
+        
+        return `⚠️ *Status Update*\n\n${escaped}`;
+    }
+
+    maskPhone(phone) {
+        if (!phone) return '****';
+        const str = phone.toString();
+        if (str.length < 4) return '****';
+        return str.slice(0, -4).replace(/./g, '*') + str.slice(-4);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  SHUTDOWN
+    // ═══════════════════════════════════════════════════════════
+
+    async shutdown() {
+        if (this.numberBuyer) {
+            try {
+                await this.numberBuyer.shutdown();
+            } catch (e) {
+                logger.warn('NumberBuyer shutdown failed', { error: e.message });
+            }
+        }
+
+        if (this.numberPool) {
+            try {
+                await this.numberPool.uninitialize();
+            } catch (e) {
+                logger.warn('Pool uninitialize failed', { error: e.message });
+            }
+        }
+
+        for (const [name, provider] of this.providers) {
+            if (provider.stopCleanupJob && typeof provider.stopCleanupJob === 'function') {
+                try {
+                    provider.stopCleanupJob();
+                } catch (e) {
+                    logger.warn(`Provider ${name} cleanup failed`, { error: e.message });
+                }
+            }
+        }
+
+        this.isInitialized = false;
+        logger.info('SMS Provider Manager shut down');
+    }
+}
+
+export default SMSProviderManager;
