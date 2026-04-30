@@ -1041,23 +1041,38 @@ Tap a country code to copy it, then paste and send:
     
 
     async handlePoolCountrySelect(ctx, country) {
-        ctx.session.poolPurchase = { ...ctx.session.poolPurchase, country };
-        this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_QTY, { country });
-        
-        const message = `
-<b>🛒 Buy Numbers — ${country}</b>
+    ctx.session.poolPurchase = { ...ctx.session.poolPurchase, country };
+    this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_QTY, { country });
+    
+    const message = `
+<b>🛒 Buy Numbers — 🇺🇳 ${country}</b>
 
-Select quantity or send custom:
-        `;
+How many numbers do you want?
+    `;
 
-        const keyboard = Markup.inlineKeyboard([
-            [Markup.button.callback('1', 'pool_qty_1'), Markup.button.callback('5', 'pool_qty_5'), Markup.button.callback('10', 'pool_qty_10')],
-            [Markup.button.callback('20', 'pool_qty_20'), Markup.button.callback('50', 'pool_qty_50')],
-            [Markup.button.callback('❌ Cancel', 'admin_pool')]
-        ]);
+    const keyboard = Markup.inlineKeyboard([
+        [
+            Markup.button.callback('1️⃣  1', 'pool_qty_1'),
+            Markup.button.callback('5️⃣  5', 'pool_qty_5'),
+            Markup.button.callback('🔟  10', 'pool_qty_10')
+        ],
+        [
+            Markup.button.callback('2️⃣0️⃣  20', 'pool_qty_20'),
+            Markup.button.callback('5️⃣0️⃣  50', 'pool_qty_50'),
+            Markup.button.callback('1️⃣0️⃣0️⃣  100', 'pool_qty_100')
+        ],
+        [
+            Markup.button.callback('✏️ Custom Amount', 'pool_qty_custom')
+        ],
+        [
+            Markup.button.callback('🔙 Back', 'pool_buy_numbers'),
+            Markup.button.callback('❌ Cancel', 'admin_pool')
+        ]
+    ]);
 
-        await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+    await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
     }
+    
 
     async handlePoolQuantitySelect(ctx, qty) {
         ctx.session.poolPurchase = { ...ctx.session.poolPurchase, quantity: qty };
