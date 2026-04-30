@@ -839,6 +839,10 @@ class OTPCommands {
     //  COUNTRY SELECTED — ACQUIRE NUMBER (CORE LOGIC)
     // ═══════════════════════════════════════════════════════════════════════
 
+                        // ═══════════════════════════════════════════════════════════════════════
+    //  COUNTRY SELECTED — ACQUIRE NUMBER (STRICT TIER MODE — NO FALLBACK)
+    // ═══════════════════════════════════════════════════════════════════════
+
     async handleCountrySelect(ctx) {
         const country = ctx.match[1];
         const userId = ctx.from.id.toString();
@@ -871,7 +875,9 @@ class OTPCommands {
         try {
             const loadingMsg = await ctx.reply('⏳ Assigning number...');
 
-            // VIP/BUNDLE with VIP number flow
+            // ═════════════════════════════════════════════════════════════════
+            //  VIP/BUNDLE with VIP number — uses NumberPool ONLY
+            // ═════════════════════════════════════════════════════════════════
             if (useVipNumber && this._isVipActive(ctx.state.user) && ctx.state.user.vipPhoneNumber) {
                 const user = ctx.state.user;
                 
@@ -912,7 +918,9 @@ class OTPCommands {
                 return;
             }
 
-            // Standard flow (FREE, CHEAP, BUNDLE without VIP number)
+            // ═════════════════════════════════════════════════════════════════
+            //  BUNDLE without VIP number — uses NumberPool ONLY
+            // ═════════════════════════════════════════════════════════════════
             if (mode === 'BUNDLE') {
                 const user = await User.findOne({ userId });
                 if (!user?.bundleRemaining || user.bundleRemaining <= 0) {
@@ -928,68 +936,187 @@ class OTPCommands {
                     );
                 }
                 await User.updateOne({ userId }, { $inc: { bundleRemaining: -1 } });
+
+                if (!this.smsProviderManager) {
+                    await ctx.deleteMessage(loadingMsg.message_id);
+                    throw new Error('SMS_PROVIDER_NOT_AVAILABLE');
+                }
+
+                // STRICT: BUNDLE uses NumberPool only (Twilio/Telnyx)
+                const bundleResult = await this.smsProviderManager.getVipNumber(country, service, userId);
+
+                await ctx.deleteMessage(loadingMsg.message_id);
+
+                const session = await sessionManager.createSessionWithNumber(
+                    userId, mode, service, country,
+                    bundleResult.phoneNumber, bundleResult.provider,
+                    bundleResult.providerNumberId || bundleResult.numberId
+                );
+
+                const message = 
+                    `📱 <b>OTP Request Started</b>\n\n` +
+                    `🌍 Mode: BUNDLE\n` +
+                    `📱 Number: <code>${session.number}</code>\n` +
+                    `🎯 Service: ${service}\n` +
+                    `⏳ Status: Waiting for OTP...\n` +
+                    `💰 Cost: BUNDLE (1 credit used)\n` +
+                    `⏱ Timeout: ${Math.floor((session.timeoutAt - new Date()) / 1000)}s\n\n` +
+                    `⚠️ Bundle credit used. No additional charge.`;
+
+                const keyboard = KEYBOARDS.otpActions(session.sessionId);
+                const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
+
+                if (sentMessage?.message_id) {
+                    await this._scheduleTimeoutNotification(
+                        userId, session.sessionId, sentMessage.message_id, session.timeoutAt
+                    );
+                }
+
+                return;
             }
 
-            // Use SMSProviderManager for FREE and CHEAP tiers
-            let session;
-            
-            if (mode === 'FREE' && this.smsProviderManager) {
-                const freeResult = await this.smsProviderManager.getNumber('FREE', country, service);
-                
-                session = await sessionManager.createSessionWithNumber(
+            // ═════════════════════════════════════════════════════════════════
+            //  FREE tier — uses FreeProvider ONLY (NO fallback to CHEAP)
+            // ═════════════════════════════════════════════════════════════════
+            if (mode === 'FREE') {
+                if (!this.smsProviderManager) {
+                    await ctx.deleteMessage(loadingMsg.message_id);
+                    throw new Error('SMS_PROVIDER_NOT_AVAILABLE');
+                }
+
+                const freeResult = await this.smsProviderManager.getFreeNumber(country, service);
+
+                await ctx.deleteMessage(loadingMsg.message_id);
+
+                const session = await sessionManager.createSessionWithNumber(
                     userId, mode, service, country,
                     freeResult.phoneNumber, 'FREE_PUBLIC',
                     freeResult.sessionId
                 );
-                
+
+                const message = 
+                    `📱 <b>OTP Request Started</b>\n\n` +
+                    `🌍 Mode: FREE\n` +
+                    `📱 Number: <code>${session.number}</code>\n` +
+                    `🎯 Service: ${service}\n` +
+                    `⏳ Status: Waiting for OTP...\n` +
+                    `💰 Cost: FREE\n` +
+                    `⏱ Timeout: ${Math.floor((session.timeoutAt - new Date()) / 1000)}s\n\n` +
+                    `⚠️ Shared number. OTP not guaranteed.`;
+
+                const keyboard = KEYBOARDS.otpActions(session.sessionId);
+                const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
+
+                // Start polling for SMS
                 this.startFreePolling(ctx, userId, freeResult.sessionId, session.sessionId);
-                
-            } else if (mode === 'CHEAP' && this.smsProviderManager) {
-                const cheapResult = await this.smsProviderManager.getNumber('CHEAP', country, service);
-                
-                session = await sessionManager.createSessionWithNumber(
+
+                if (sentMessage?.message_id) {
+                    await this._scheduleTimeoutNotification(
+                        userId, session.sessionId, sentMessage.message_id, session.timeoutAt
+                    );
+                }
+
+                return;
+            }
+
+            // ═════════════════════════════════════════════════════════════════
+            //  CHEAP tier — uses CheapPanelProvider (5SIM) ONLY (NO fallback to FREE)
+            // ═════════════════════════════════════════════════════════════════
+            if (mode === 'CHEAP') {
+                if (!this.smsProviderManager) {
+                    await ctx.deleteMessage(loadingMsg.message_id);
+                    throw new Error('SMS_PROVIDER_NOT_AVAILABLE');
+                }
+
+                const cheapResult = await this.smsProviderManager.getCheapNumber(country, service);
+
+                await ctx.deleteMessage(loadingMsg.message_id);
+
+                const session = await sessionManager.createSessionWithNumber(
                     userId, mode, service, country,
                     cheapResult.phoneNumber, cheapResult.provider,
                     cheapResult.providerNumberId
                 );
-                
-            } else {
-                session = await sessionManager.createSession(userId, mode, service, country);
+
+                const message = 
+                    `📱 <b>OTP Request Started</b>\n\n` +
+                    `🌍 Mode: CHEAP\n` +
+                    `📱 Number: <code>${session.number}</code>\n` +
+                    `🎯 Service: ${service}\n` +
+                    `⏳ Status: Waiting for OTP...\n` +
+                    `💰 Cost: ${formatCurrency(session.cost)}\n` +
+                    `⏱ Timeout: ${Math.floor((session.timeoutAt - new Date()) / 1000)}s\n\n` +
+                    `⚠️ Funds locked. Will be deducted on delivery.`;
+
+                const keyboard = KEYBOARDS.otpActions(session.sessionId);
+                const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
+
+                if (sentMessage?.message_id) {
+                    await this._scheduleTimeoutNotification(
+                        userId, session.sessionId, sentMessage.message_id, session.timeoutAt
+                    );
+                }
+
+                return;
             }
 
-            await ctx.deleteMessage(loadingMsg.message_id);
+            // ═════════════════════════════════════════════════════════════════
+            //  VIP tier (without dedicated number) — uses NumberPool ONLY
+            // ═════════════════════════════════════════════════════════════════
+            if (mode === 'VIP') {
+                if (!this.smsProviderManager) {
+                    await ctx.deleteMessage(loadingMsg.message_id);
+                    throw new Error('SMS_PROVIDER_NOT_AVAILABLE');
+                }
 
-            const costText = mode === 'FREE' ? 'FREE' : 
-                            mode === 'BUNDLE' ? 'BUNDLE (1 credit used)' : 
-                            formatCurrency(session.cost);
+                const user = ctx.state.user;
+                await User.updateOne({ userId }, { $inc: { vipDailyUsed: 1 } });
 
-            const message = 
-                `📱 <b>OTP Request Started</b>\n\n` +
-                `🌍 Mode: ${mode}\n` +
-                `📱 Number: <code>${session.number}</code>\n` +
-                `🎯 Service: ${service}\n` +
-                `⏳ Status: Waiting for OTP...\n` +
-                `💰 Cost: ${costText}\n` +
-                `⏱ Timeout: ${Math.floor((session.timeoutAt - new Date()) / 1000)}s\n\n` +
-                `⚠️ ${mode === 'FREE' ? 'Shared number. OTP not guaranteed.' : mode === 'BUNDLE' ? 'Bundle credit used. No additional charge.' : 'Funds locked. Will be deducted on delivery.'}`;
+                const vipResult = await this.smsProviderManager.getVipNumber(country, service, userId);
 
-            const keyboard = KEYBOARDS.otpActions(session.sessionId);
-            
-            const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
+                await ctx.deleteMessage(loadingMsg.message_id);
 
-            if (sentMessage?.message_id) {
-                await this._scheduleTimeoutNotification(
-                    userId, session.sessionId, sentMessage.message_id, session.timeoutAt
+                const session = await sessionManager.createSessionWithNumber(
+                    userId, mode, service, country,
+                    vipResult.phoneNumber, vipResult.provider,
+                    vipResult.providerNumberId || vipResult.numberId
                 );
+
+                const message = 
+                    `📱 <b>OTP Request Started</b>\n\n` +
+                    `🌍 Mode: VIP\n` +
+                    `📱 Number: <code>${session.number}</code>\n` +
+                    `🎯 Service: ${service}\n` +
+                    `⏳ Status: Waiting for OTP...\n` +
+                    `💰 Cost: VIP (daily quota)\n` +
+                    `⏱ Timeout: ${Math.floor((session.timeoutAt - new Date()) / 1000)}s\n\n` +
+                    `⚠️ Priority delivery enabled.`;
+
+                const keyboard = KEYBOARDS.otpActions(session.sessionId);
+                const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
+
+                if (sentMessage?.message_id) {
+                    await this._scheduleTimeoutNotification(
+                        userId, session.sessionId, sentMessage.message_id, session.timeoutAt
+                    );
+                }
+
+                return;
             }
+
+            // Unknown mode
+            await ctx.deleteMessage(loadingMsg.message_id);
+            throw new Error(`UNKNOWN_MODE: ${mode}`);
 
         } catch (error) {
             logger.error('OTP session creation failed', { userId, mode, service, error: error.message });
-            
+
             // Rollback on error
             if (mode === 'BUNDLE') {
                 await User.updateOne({ userId }, { $inc: { bundleRemaining: 1 } }).catch(() => {});
             } else if (mode === 'VIP' && useVipNumber) {
+                await User.updateOne({ userId }, { $inc: { vipDailyUsed: -1 } }).catch(() => {});
+            } else if (mode === 'VIP') {
                 await User.updateOne({ userId }, { $inc: { vipDailyUsed: -1 } }).catch(() => {});
             }
 
@@ -999,22 +1126,35 @@ class OTPCommands {
                 FREE_LIMIT_REACHED: '🆓 Free limit reached for today.',
                 USER_BLACKLISTED: '🚫 Your account is suspended.',
                 VIP_EXPIRED: '👑 VIP expired. Renew your subscription.',
-                VIP_DAILY_LIMIT_REACHED: '⚠️ VIP daily limit reached.',
+                VIP_DAILY_LIMIT_REACHED: '⚠️ VIP daily limit (50) reached.',
                 BUNDLE_EMPTY: '📦 No bundle credits left. Buy a bundle first.',
-                NO_BALANCE: '💰 Provider balance insufficient. Fund wallet or use FREE tier.',
-                ALL_PROVIDERS_FAILED: '❌ All providers failed. Try again later or different country.',
+                CHEAP_PROVIDER_INACTIVE: '💰 CHEAP provider is not available. Please try FREE or upgrade to VIP.',
+                CHEAP_NO_NUMBERS: '💰 No CHEAP numbers available for this country. Try another country or FREE mode.',
+                CHEAP_PROVIDER_NOT_FOUND: '💰 CHEAP service not configured. Contact support.',
+                FREE_PROVIDER_INACTIVE: '🆓 Free provider is not available. Please try CHEAP or VIP.',
+                FREE_NO_NUMBERS: '🆓 No free numbers available. Try again later.',
+                FREE_PROVIDER_NOT_FOUND: '🆓 Free service not configured. Contact support.',
+                POOL_NOT_AVAILABLE: '👑 VIP pool not configured. Contact support.',
+                POOL_EMPTY: '👑 No VIP numbers available. Contact support to restock.',
+                SMS_PROVIDER_NOT_AVAILABLE: '🔌 SMS service temporarily unavailable. Try again later.',
+                INVALID_COUNTRY: '🌍 Invalid country selected. Please try again.',
+                ALL_PROVIDERS_FAILED: '❌ Service temporarily unavailable. Try again later or different country.',
                 NO_PROVIDERS_AVAILABLE: '❌ No providers available. Check /status.',
                 NUMBER_UNAVAILABLE: '❌ No numbers available for this country/service. Try another.',
                 TIMEOUT: '⏱ Request timed out. Please try again.'
             };
-            
+
+            const errorKey = Object.keys(errorMessages).find(key => error.message?.includes(key));
+            const displayMessage = errorMessages[errorKey] || `❌ Error: ${error.message}`;
+
             await this.sendPhotoWithCaption(
                 ctx, IMAGES.otpFailed, 
-                errorMessages[error.message] || `❌ Error: ${error.message}`,
+                displayMessage,
                 KEYBOARDS.supportOrRetry(), 'HTML'
             );
         }
-                    }
+    }
+    
 
 
                 // ═══════════════════════════════════════════════════════════════════════════════
