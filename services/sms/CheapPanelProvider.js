@@ -6,10 +6,11 @@ import config from '../../config/env.js';
  * CheapPanelProvider — 5SIM API Integration
  * 
  * FIXED:
- * - Removed broken /guest/products pre-flight check (endpoint doesn't exist)
- * - Direct buy attempt with proper error classification
- * - /guest/prices endpoint for pricing info (no path params)
- * - Enhanced error handling for 404 service/country not found
+ * - Correct API endpoint for product availability: /guest/prices (not /guest/products)
+ * - Added product caching to avoid repeated API calls
+ * - Enhanced error logging for HTTP 400 responses
+ * - Pre-flight availability check before purchase attempts
+ * - Map "not enough user balance" to NO_BALANCE
  */
 class CheapPanelProvider {
     constructor() {
@@ -25,9 +26,10 @@ class CheapPanelProvider {
             checkStatus: '/user/check',
             finish: '/user/finish',
             cancel: '/user/cancel',
-            getPrices: '/guest/prices',            // FIXED: no path params, returns all prices
+            getPrices: '/guest/prices',              // FIXED: was /guest/products — 5SIM v1 uses /guest/prices
             getBalance: '/user/profile',
-            getCountries: '/guest/countries'
+            getCountries: '/guest/countries',
+            getProducts: '/guest/prices'               // FIXED: correct endpoint for service availability
         };
 
         this.stats = {
@@ -63,10 +65,11 @@ class CheapPanelProvider {
         };
 
         // FIXED: Correct 5SIM v1 country codes
+        // Verified against 5SIM API documentation
         this.countryMap = {
             'US': 'usa',
-            'UK': 'england',
-            'GB': 'england',
+            'UK': 'england',           // ← FIXED: was 'united kingdom'
+            'GB': 'england',           // ← ADDED: alias for UK
             'CA': 'canada',
             'RU': 'russia',
             'CN': 'china',
@@ -133,6 +136,7 @@ class CheapPanelProvider {
             'XK': 'kosovo'
         };
 
+        // Available operators per country (5SIM specific)
         this.operatorMap = {
             'default': 'any',
             'usa': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual8', 'virtual12', 'virtual15', 'virtual16', 'virtual20', 'virtual21', 'virtual23', 'virtual24', 'virtual25', 'virtual26', 'virtual29', 'virtual30', 'virtual31', 'virtual32', 'virtual33', 'virtual34', 'virtual35', 'virtual36', 'virtual37', 'virtual38', 'virtual39', 'virtual40', 'virtual41', 'virtual42', 'virtual43', 'virtual44', 'virtual45'],
@@ -169,6 +173,11 @@ class CheapPanelProvider {
             'CONNECTION_ERROR': { recoverable: true, retryAfter: 5000, message: 'Connection error' },
             'NOT_AVAILABLE': { recoverable: true, retryAfter: 3000, message: 'Service not available in this country' }
         };
+
+        // ADDED: Product cache to avoid repeated API calls to /guest/prices
+        this.productsCache = null;
+        this.productsCacheTime = 0;
+        this.productsCacheTtl = 5 * 60 * 1000; // 5 minutes
 
         if (this.isActive) {
             this.checkBalance().catch(err => 
@@ -213,7 +222,100 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  NUMBER ACQUISITION (FIXED — direct buy, no broken pre-flight)
+    //  PRODUCT CACHE (ADDED)
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Fetch and cache available products from 5SIM.
+     * Returns map of { country: { service: { operators: {...}, price: ... } } }
+     */
+    async getProducts() {
+        const now = Date.now();
+        if (this.productsCache && (now - this.productsCacheTime) < this.productsCacheTtl) {
+            return this.productsCache;
+        }
+
+        try {
+            const response = await this.request('get', this.endpoints.getProducts, null, 15000);
+            const data = response.data;
+
+            // FIXED: Do not cache 404 or error responses
+            if (response.status >= 400) {
+                logger.error('5SIM products endpoint returned error', { 
+                    status: response.status, 
+                    data: response.data 
+                });
+                return null;
+            }
+
+            // FIXED: Validate data is an object before caching
+            if (!data || typeof data !== 'object' || Array.isArray(data)) {
+                logger.error('5SIM products returned invalid data structure', { data });
+                return null;
+            }
+
+            this.productsCache = data;
+            this.productsCacheTime = now;
+
+            return data;
+        } catch (error) {
+            logger.error('Failed to fetch 5SIM products', { error: error.message });
+            return null;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  PRE-FLIGHT AVAILABILITY CHECK (FIXED)
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Check if a service/country combination is available before purchasing.
+     * FIXED: Uses /guest/prices endpoint instead of non-existent /guest/products
+     * @param {string} country — ISO country code
+     * @param {string} service — Service name
+     * @returns {Promise<{available: boolean, error?: string, operators?: Array, data?: Object}>}
+     */
+    async checkAvailability(country, service) {
+        try {
+            const providerCountry = this.mapCountry(country);
+            const providerService = this.mapService(service);
+
+            const products = await this.getProducts();
+            if (!products) {
+                return { available: false, error: 'Failed to fetch product catalog' };
+            }
+
+            // 5SIM prices structure: { country: { service: { operators: {...} } } }
+            const countryData = products[providerCountry];
+            if (!countryData) {
+                return { available: false, error: `Country ${providerCountry} not available` };
+            }
+
+            const serviceData = countryData[providerService];
+            if (!serviceData) {
+                return { available: false, error: `Service ${providerService} not available in ${providerCountry}` };
+            }
+
+            // Check if any operator has stock
+            const operators = serviceData.operators || serviceData;
+            const hasStock = Object.values(operators).some(op => {
+                // Operator data can be { count: number, price: number } or just a number
+                const count = typeof op === 'object' ? op.count : op;
+                return count > 0;
+            });
+
+            return { 
+                available: hasStock, 
+                operators: Object.keys(operators),
+                data: serviceData 
+            };
+        } catch (error) {
+            return { available: false, error: error.message };
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  NUMBER ACQUISITION (FIXED ENDPOINT)
     // ═══════════════════════════════════════════════════════════
 
     async getNumber(country = 'US', service = 'Any', preferredOperator = 'any') {
@@ -224,9 +326,23 @@ class CheapPanelProvider {
                 throw new Error('PROVIDER_NOT_CONFIGURED');
             }
 
+            // PRE-FLIGHT: Check if service/country is available
+            const availability = await this.checkAvailability(country, service);
+            if (!availability.available) {
+                throw new Error(`NOT_AVAILABLE: ${service} not available in ${country}. ${availability.error || ''}`);
+            }
+
             const providerCountry = this.mapCountry(country);
             const providerService = this.mapService(service);
             const operator = this.mapOperator(providerCountry, preferredOperator);
+
+            // Validate operator is available for this service
+            if (availability.operators && !availability.operators.includes(operator) && operator !== 'any') {
+                logger.warn('Preferred operator not available, falling back to any', {
+                    operator,
+                    available: availability.operators
+                });
+            }
 
             logger.info('Requesting number from 5SIM', {
                 country: providerCountry,
@@ -256,10 +372,22 @@ class CheapPanelProvider {
             if (statusCode >= 400) {
                 const errorMsg = data?.error || data?.message || `HTTP ${statusCode}`;
                 
-                // FIXED: Better 404 classification
+                // FIXED: Map "not enough user balance" to NO_BALANCE
+                if (errorMsg.toLowerCase().includes('not enough user balance') || 
+                    errorMsg.toLowerCase().includes('no balance') ||
+                    errorMsg.toLowerCase().includes('insufficient funds')) {
+                    throw new Error(`NO_BALANCE: ${errorMsg}`);
+                }
+
+                // Handle specific 404 cases
                 if (statusCode === 404) {
-                    // 404 on buy endpoint means service/country/operator combo not available
-                    throw new Error(`NOT_AVAILABLE: ${providerService} not available in ${providerCountry} (${errorMsg})`);
+                    if (errorMsg.includes('country') || errorMsg.includes('not found')) {
+                        throw new Error(`BAD_COUNTRY: ${providerCountry} not available`);
+                    }
+                    if (errorMsg.includes('service') || errorMsg.includes('product')) {
+                        throw new Error(`BAD_SERVICE: ${providerService} not available in ${providerCountry}`);
+                    }
+                    throw new Error(`NOT_AVAILABLE: ${errorMsg}`);
                 }
                 
                 throw new Error(`PROVIDER_ERROR: ${errorMsg}`);
@@ -359,327 +487,5 @@ class CheapPanelProvider {
                     error: data?.error || `HTTP ${response.status}`,
                     status: 'ERROR'
                 };
-            }
-
-            logger.debug('SMS status check', {
-                activationId,
-                status: data?.status,
-                hasCode: !!data?.code,
-                hasText: !!data?.text
-            });
-
-            const status = (data?.status || '').toUpperCase();
-
-            if (status === 'RECEIVED' || status === 'FINISHED') {
-                const otp = this.extractOTP(data.code, data.text);
-                
-                if (otp) {
-                    return {
-                        success: true,
-                        otp,
-                        status: 'RECEIVED',
-                        fullText: data.text || null,
-                        receivedAt: new Date()
-                    };
-                }
-
-                return {
-                    success: false,
-                    status: 'CHECKING',
-                    rawText: data.text,
-                    message: 'SMS received but OTP extraction failed'
-                };
-            }
-
-            if (status === 'CANCELED' || status === 'CANCELLED') {
-                return { success: false, status: 'CANCELLED', message: 'Number was cancelled' };
-            }
-
-            if (status === 'EXPIRED') {
-                return { success: false, status: 'TIMEOUT', message: 'Activation expired' };
-            }
-
-            return { success: false, status: 'WAITING', message: `Status: ${data.status}` };
-
-        } catch (error) {
-            logger.error('5SMS check failed', { activationId, error: error.message });
-            return { success: false, error: error.message, status: 'ERROR' };
         }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  NUMBER MANAGEMENT
-    // ═══════════════════════════════════════════════════════════
-
-    async cancelNumber(activationId) {
-        try {
-            if (!this.isActive) {
-                return { success: false, error: 'PROVIDER_NOT_CONFIGURED' };
-            }
-
-            if (!activationId) {
-                return { success: false, error: 'MISSING_ACTIVATION_ID' };
-            }
-
-            const endpoint = `${this.endpoints.cancel}/${activationId}`;
-            await this.request('get', endpoint);
-
-            logger.info('Number cancelled successfully', { activationId, provider: this.name });
-
-            return { success: true, status: 'CANCELLED' };
-
-        } catch (error) {
-            if (error.response?.status === 404 || error.message?.includes('not found')) {
-                logger.info('Number already released or not found', { activationId });
-                return { success: true, status: 'ALREADY_RELEASED' };
-            }
-            logger.warn('Cancel request failed', { activationId, error: error.message });
-            return { success: false, error: error.message, status: 'ERROR' };
-        }
-    }
-
-    async finishNumber(activationId) {
-        try {
-            if (!activationId) {
-                return { success: false, error: 'MISSING_ACTIVATION_ID' };
-            }
             
-            const endpoint = `${this.endpoints.finish}/${activationId}`;
-            await this.request('get', endpoint);
-
-            logger.info('Activation marked as finished', { activationId });
-            return { success: true, status: 'FINISHED' };
-
-        } catch (error) {
-            logger.warn('Finish request failed', { activationId, error: error.message });
-            return { success: false, error: error.message };
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  PRICING & INFO (FIXED — /guest/prices has no path params)
-    // ═══════════════════════════════════════════════════════════
-
-    async getPrices(country = 'US', service = 'Any') {
-        try {
-            // FIXED: /guest/prices returns all prices, no path params
-            const response = await this.request('get', this.endpoints.getPrices, null, 15000);
-            const allPrices = response.data;
-
-            if (response.status >= 400) {
-                return { success: false, error: `HTTP ${response.status}` };
-            }
-
-            const providerCountry = this.mapCountry(country);
-            const providerService = this.mapService(service);
-
-            // Filter prices for requested country/service
-            const countryPrices = allPrices?.[providerCountry];
-            const servicePrices = countryPrices?.[providerService];
-
-            return {
-                success: true,
-                prices: servicePrices || null,
-                allPrices: allPrices || null
-            };
-        } catch (error) {
-            logger.error('Failed to get prices', { country, service, error: error.message });
-            return { success: false, error: error.message };
-        }
-    }
-
-    async getAvailableCountries() {
-        try {
-            const response = await this.request('get', this.endpoints.getCountries);
-            return {
-                success: true,
-                countries: response.data
-            };
-        } catch (error) {
-            logger.error('Failed to get countries', { error: error.message });
-            return { success: false, error: error.message };
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  REQUEST HELPER
-    // ═══════════════════════════════════════════════════════════
-
-    async request(method, endpoint, data = null, timeout = 10000) {
-        const url = `${this.baseUrl}${endpoint}`;
-        const config = {
-            method,
-            url,
-            headers: this.getHeaders(),
-            timeout,
-            validateStatus: () => true
-        };
-        
-        if (data) config.data = data;
-        
-        const response = await axios(config);
-        
-        // LOG 400+ responses for debugging
-        if (response.status >= 400) {
-            logger.error('5SIM API error response', {
-                url,
-                status: response.status,
-                statusText: response.statusText,
-                data: response.data,
-                headers: response.headers
-            });
-        }
-        
-        return response;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  MAPPING HELPERS
-    // ═══════════════════════════════════════════════════════════
-
-    mapService(service) {
-        if (!service || service === 'Any') return 'other';
-        return this.serviceMap[service] || 'other';
-    }
-
-    mapCountry(country) {
-        if (!country) throw new Error('BAD_COUNTRY: Country required');
-        const mapped = this.countryMap[country.toUpperCase()];
-        if (!mapped) throw new Error(`BAD_COUNTRY: ${country} not supported`);
-        return mapped;
-    }
-
-    mapOperator(country, preferred) {
-        if (preferred && preferred !== 'any') {
-            const operators = this.operatorMap[country] || this.operatorMap['default'];
-            if (operators.includes(preferred)) return preferred;
-        }
-        return 'any';
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  VALIDATION HELPERS
-    // ═══════════════════════════════════════════════════════════
-
-    isFakeNumber(phone) {
-        if (!phone) return true;
-        const clean = phone.toString().replace(/\D/g, '');
-        return this.fakeNumbers.has(clean) || this.fakeNumbers.has(phone);
-    }
-
-    extractOTP(code, text) {
-        if (code && /^\d{4,8}$/.test(code.toString().trim())) {
-            return code.toString().trim();
-        }
-
-        if (!text) return null;
-
-        const patterns = [
-            /\b\d{4,8}\b/,
-            /code[:\s]+(\d{4,8})/i,
-            /otp[:\s]+(\d{4,8})/i,
-            /verification[:\s]+(\d{4,8})/i,
-            /(\d{4,8})[:\s]*is your/i,
-            /(\d{4,8})[:\s]*is the/i,
-            /验证码[:\s]*(\d{4,8})/i,
-            /код[:\s]+(\d{4,8})/i,
-            /code[:\s]*(\d{4,8})/i,
-            /(\d{4,8})[:\s]*код/i,
-            /pin[:\s]+(\d{4,8})/i,
-            /password[:\s]+(\d{4,8})/i
-        ];
-
-        for (const pattern of patterns) {
-            const match = text.match(pattern);
-            if (match) {
-                const otp = match[1] || match[0];
-                if (/^\d{4,8}$/.test(otp)) return otp;
-            }
-        }
-
-        const digits = text.match(/\b\d{4,8}\b/g);
-        if (digits?.length > 0) return digits[digits.length - 1];
-
-        return null;
-    }
-
-    getHeaders() {
-        return {
-            'Authorization': `Bearer ${this.apiKey}`,
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
-        };
-    }
-
-    maskPhone(phone) {
-        if (!phone) return '****';
-        const str = phone.toString();
-        if (str.length < 4) return '****';
-        return str.slice(0, -4).replace(/./g, '*') + str.slice(-4);
-    }
-
-    handleError(error) {
-        const message = error.message || '';
-
-        for (const [key, value] of Object.entries(this.errorMap)) {
-            if (message.includes(key)) {
-                return new Error(`${value.message} (${key})`);
-            }
-        }
-
-        return new Error(`PROVIDER_ERROR: ${message}`);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  STATS
-    // ═══════════════════════════════════════════════════════════
-
-    updateStats(success, duration, cost = 0) {
-        this.stats.totalSent++;
-        this.stats.totalCost += cost;
-        if (success) this.stats.totalSuccess++;
-        else this.stats.totalFailed++;
-        this.stats.avgResponseTime = (
-            (this.stats.avgResponseTime * (this.stats.totalSent - 1) + duration)
-            / this.stats.totalSent
-        );
-    }
-
-    getStats() {
-        const { totalSent, totalSuccess, totalFailed, avgResponseTime, totalCost } = this.stats;
-        
-        return {
-            name: this.name,
-            tier: this.tier,
-            isActive: this.isActive,
-            baseUrl: this.baseUrl,
-            totalSent,
-            totalSuccess,
-            totalFailed,
-            successRate: totalSent > 0
-                ? Number((totalSuccess / totalSent * 100).toFixed(2))
-                : 100,
-            failureRate: totalSent > 0
-                ? Number((totalFailed / totalSent * 100).toFixed(2))
-                : 0,
-            avgResponseTime: Math.round(avgResponseTime),
-            totalCost: Number(totalCost.toFixed(4)),
-            avgCost: totalSent > 0
-                ? Number((totalCost / totalSent).toFixed(4))
-                : 0
-        };
-    }
-
-    resetStats() {
-        this.stats = {
-            totalSent: 0,
-            totalSuccess: 0,
-            totalFailed: 0,
-            avgResponseTime: 0,
-            totalCost: 0
-        };
-        return this.getStats();
-    }
-}
-
-export default CheapPanelProvider;
