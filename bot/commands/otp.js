@@ -883,11 +883,45 @@ class OTPCommands {
                         await User.updateOne({ userId }, { $inc: { bundleRemaining: 1 } }).catch(() => {});
                     } else if (session.mode === 'VIP') {
                         await User.updateOne({ userId }, { $inc: { vipDailyUsed: -1 } }).catch(() => {});
-                    } else if (session.
+                    } else if (session.mode === 'CHEAP' && session.cost > 0) {
+                        await User.updateOne(
+                            { userId }, 
+                            { $inc: { lockedBalance: -session.cost, balance: session.cost } }
+                        ).catch(() => {});
+                    }
 
+                    const timeoutMessage = 
+                        `⏰ <b>OTP Request Timed Out</b>\n\n` +
+                        `📱 Number: <code>${session.number}</code>\n` +
+                        `🎯 Service: ${session.service}\n` +
+                        `⏱ Status: <b>Expired</b>\n\n` +
+                        `💰 ${session.mode === 'FREE' ? 'No charges (FREE mode)' : 
+                             session.mode === 'BUNDLE' ? 'Bundle credit restored' :
+                             session.mode === 'VIP' ? 'VIP daily quota restored' :
+                             'Funds returned to balance'}\n\n` +
+                        `You can request a new OTP with /otp`;
 
+                    await this.bot.telegram.sendMessage(userId, timeoutMessage, {
+                        parse_mode: 'HTML',
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('🔄 Request New OTP', 'menu')],
+                            [Markup.button.callback('📞 Contact Support', 'contact_support')]
+                        ]).reply_markup
+                    });
 
-                               async handleCancel(ctx) {
+                } catch (notifyError) {
+                    logger.error('Timeout notification failed', { userId, sessionId, error: notifyError.message });
+                }
+            }, delayMs);
+
+        } catch (error) {
+            logger.error('Failed to schedule timeout', { userId, sessionId, error: error.message });
+        }
+    }
+
+    // ─── Cancel Handler ────────────────────────────────────────────────────
+
+   async handleCancel(ctx) {
         const userId = ctx.from.id.toString();
         
         try {
