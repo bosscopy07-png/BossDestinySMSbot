@@ -5,13 +5,11 @@ import config from '../../config/env.js';
 /**
  * TelnyxProvider — SMS sending + number lifecycle management
  * 
- * Required env/config:
- *   TELNYX_API_KEY (must start with "KEY", 40+ chars)
- *   TELNYX_MESSAGING_PROFILE_ID (optional, for SMS)
- *   TELNYX_CONNECTION_ID (optional, for number purchase)
- * 
- * Number management requires:
- *   TELNYX_API_KEY with scope: phone_numbers, messaging
+ * FIXED:
+ * - Country validated before ANY API call
+ * - Payload logged before every request
+ * - BASE_URL validated for webhook configuration
+ * - Empty payload protection on number_orders
  */
 class TelnyxProvider {
     constructor() {
@@ -19,6 +17,15 @@ class TelnyxProvider {
         this.tier = 'VIP';
         this.isActive = false;
         this.baseUrl = 'https://api.telnyx.com/v2';
+
+        // FIXED: Validate BASE_URL for webhook configuration
+        const baseUrl = process.env.BASE_URL || config.baseUrl;
+        if (!baseUrl) {
+            logger.warn('TelnyxProvider — BASE_URL not set. Webhooks will not be configured for purchased numbers.');
+            this.webhookUrl = null;
+        } else {
+            this.webhookUrl = `${baseUrl.replace(/\/$/, '')}/webhooks/telnyx`;
+        }
 
         const rawKey = config.telnyx?.apiKey;
         const apiKey = rawKey ? rawKey.trim() : null;
@@ -28,7 +35,6 @@ class TelnyxProvider {
             return;
         }
 
-        // VALIDATE: Telnyx keys start with "KEY" and are 40+ chars
         if (!apiKey.startsWith('KEY') || apiKey.length < 20) {
             logger.error('TelnyxProvider disabled — API key malformed', {
                 startsWith: apiKey.slice(0, 3),
@@ -53,7 +59,8 @@ class TelnyxProvider {
 
         logger.info('TelnyxProvider initialized', { 
             hasMessagingProfile: !!this.messagingProfileId,
-            hasConnectionId: !!this.connectionId
+            hasConnectionId: !!this.connectionId,
+            hasWebhookUrl: !!this.webhookUrl
         });
     }
 
@@ -84,6 +91,9 @@ class TelnyxProvider {
             if (this.messagingProfileId) {
                 payload.messaging_profile_id = this.messagingProfileId;
             }
+
+            // FIXED: Log payload before API call
+            logger.debug('Telnyx SMS payload', { payload: { ...payload, text: payload.text?.slice(0, 20) + '...' } });
 
             const response = await axios.post(
                 `${this.baseUrl}/messages`,
@@ -118,12 +128,6 @@ class TelnyxProvider {
 
     // ─── Number Availability Check ───────────────────────────────────────
 
-    /**
-     * Check if numbers are available in a country before attempting purchase.
-     * FIXED: Returns false on 400/404 instead of throwing.
-     * @param {string} country — ISO country code
-     * @returns {Promise<boolean>}
-     */
     async hasAvailableNumbers(country = 'US') {
         if (!this.isActive) return false;
 
@@ -143,7 +147,6 @@ class TelnyxProvider {
             const available = response.data?.data;
             return available && available.length > 0;
         } catch (error) {
-            // FIXED: Return false on any error instead of throwing
             logger.warn('Telnyx availability check failed', { 
                 country, 
                 error: error.response?.data?.errors?.[0]?.detail || error.message,
@@ -156,16 +159,20 @@ class TelnyxProvider {
     // ─── Number Lifecycle (Pool Manager Interface) ───────────────────────
 
     /**
-     * Search for available numbers in a country and purchase one.
-     * @param {string} country — ISO country code (e.g. 'US', 'GB')
-     * @returns {Promise<{phoneNumber: string, sid: string, monthlyCost: number}>}
+     * FIXED: Country validated before ANY API call.
+     * Payload logged before number_orders POST.
+     * Never sends empty phone_numbers array.
      */
     async buyNumber(country = 'US') {
         if (!this.isActive) {
             throw new Error('TELNYX_NOT_CONFIGURED');
         }
 
-        // Pre-check: avoid API call if no inventory
+        // FIXED: Validate country parameter
+        if (!country || typeof country !== 'string' || country.length !== 2) {
+            throw new Error(`TELNYX_INVALID_COUNTRY: Country must be a 2-letter ISO code. Got: ${country}`);
+        }
+
         const hasStock = await this.hasAvailableNumbers(country);
         if (!hasStock) {
             throw new Error(`TELNYX_NO_NUMBERS: No available numbers in ${country}`);
@@ -199,30 +206,65 @@ class TelnyxProvider {
         const numberData = available[0];
         const phoneNumber = numberData.phone_number;
 
-        // Step 2: Purchase the number
-        // FIXED: Removed broken fallback that stripped data wrapper.
-        // Telnyx v2 API requires POST /number_orders with { data: { phone_numbers: [...] } }
+        // FIXED: Validate phone number before building payload
+        if (!phoneNumber || typeof phoneNumber !== 'string') {
+            throw new Error(`TELNYX_INVALID_NUMBER: Search returned invalid phone number: ${phoneNumber}`);
+        }
+
+        // Step 2: Build and validate purchase payload
+        const purchasePayload = {
+            data: {
+                phone_numbers: [{ phone_number: phoneNumber }],
+                customer_reference: `otp-pool-${Date.now()}`
+            }
+        };
+
+        // Add optional fields only if they exist
+        if (this.messagingProfileId) {
+            purchasePayload.data.messaging_profile_id = this.messagingProfileId;
+        }
+        if (this.connectionId) {
+            purchasePayload.data.connection_id = this.connectionId;
+        }
+        if (config.telnyx?.billingGroupId) {
+            purchasePayload.data.billing_group_id = config.telnyx.billingGroupId;
+        }
+
+        // FIXED: Validate payload has phone_numbers array with at least one entry
+        if (!purchasePayload.data.phone_numbers || purchasePayload.data.phone_numbers.length === 0) {
+            throw new Error('TELNYX_EMPTY_PAYLOAD: phone_numbers array is empty');
+        }
+
+        // FIXED: Log payload before API call
+        logger.info('Telnyx number purchase payload', {
+            country,
+            phoneNumber: this.maskPhone(phoneNumber),
+            payloadKeys: Object.keys(purchasePayload.data),
+            hasMessagingProfile: !!purchasePayload.data.messaging_profile_id,
+            hasConnectionId: !!purchasePayload.data.connection_id
+        });
+
+        // Step 3: Purchase the number
         let purchaseResponse;
         try {
             purchaseResponse = await axios.post(
                 `${this.baseUrl}/number_orders`,
-                {
-                    data: {
-                        phone_numbers: [{ phone_number: phoneNumber }],
-                        messaging_profile_id: this.messagingProfileId || undefined,
-                        connection_id: this.connectionId || undefined,
-                        billing_group_id: config.telnyx?.billingGroupId || undefined,
-                        customer_reference: `otp-pool-${Date.now()}`
-                    }
-                },
+                purchasePayload,
                 { headers: this.getHeaders(), timeout: 30000 }
             );
         } catch (error) {
             const msg = error.response?.data?.errors?.[0]?.detail || error.message;
             const code = error.response?.status;
             
-            // FIXED: Removed broken fallback logic. The data wrapper is required by Telnyx v2.
-            // If this fails, it's a real API error (wrong key scope, no billing, etc).
+            // FIXED: Enhanced error logging for 400 responses
+            if (code === 400) {
+                logger.error('Telnyx 400 error on number purchase', {
+                    message: msg,
+                    payload: purchasePayload,
+                    response: error.response?.data
+                });
+            }
+            
             throw new Error(`TELNYX_PURCHASE_FAILED: ${msg}`);
         }
 
@@ -231,7 +273,6 @@ class TelnyxProvider {
             throw new Error('TELNYX_PURCHASE_EMPTY: No data returned after purchase');
         }
 
-        // Handle both single object and array responses
         const purchaseRecord = Array.isArray(purchased) ? purchased[0] : purchased;
         const sid = purchaseRecord.id || purchaseRecord.phone_number_id;
 
@@ -248,10 +289,6 @@ class TelnyxProvider {
         };
     }
 
-    /**
-     * Release a purchased number back to Telnyx.
-     * @param {string} sid — Telnyx phone number ID
-     */
     async releaseNumber(sid) {
         if (!this.isActive) {
             throw new Error('TELNYX_NOT_CONFIGURED');
@@ -273,10 +310,6 @@ class TelnyxProvider {
         }
     }
 
-    /**
-     * Get details for a specific number.
-     * @param {string} sid — Telnyx phone number ID
-     */
     async getNumberDetails(sid) {
         if (!this.isActive) {
             throw new Error('TELNYX_NOT_CONFIGURED');
@@ -342,4 +375,3 @@ class TelnyxProvider {
 }
 
 export default TelnyxProvider;
-        
