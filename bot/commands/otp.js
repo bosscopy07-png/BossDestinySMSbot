@@ -1020,19 +1020,45 @@ class OTPCommands {
                 // ═══════════════════════════════════════════════════════════════════════════════
 //  OTPCommands.js — Part 3: Polling, Check OTP, Cancel, Bundle & VIP Purchases
 // ═══════════════════════════════════════════════════════════════════════════════
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  FREE TIER POLLING
-    // ═══════════════════════════════════════════════════════════════════════
-
     async startFreePolling(ctx, userId, freeSessionId, dbSessionId) {
         if (!this.smsProviderManager) return;
+
+        let pollMessageId = null;
 
         try {
             const smsResult = await this.smsProviderManager.pollFreeSMS(
                 freeSessionId,
-                (status) => this.sendPollUpdate(ctx, status)
+                async (status) => {
+                    const message = this.formatPollStatus(status);
+                    
+                    try {
+                        if (pollMessageId) {
+                            await ctx.telegram.editMessageText(
+                                ctx.chat.id,
+                                pollMessageId,
+                                undefined,
+                                message,
+                                { parse_mode: 'Markdown' }
+                            );
+                            return;
+                        }
+                        
+                        const sent = await ctx.reply(message, { parse_mode: 'Markdown' });
+                        if (sent?.message_id) pollMessageId = sent.message_id;
+                    } catch (err) {
+                        // Edit failed or message too old — silently ignore
+                    }
+                }
             );
+
+            // Delete the poll message before sending final result
+            if (pollMessageId) {
+                try {
+                    await ctx.telegram.deleteMessage(ctx.chat.id, pollMessageId);
+                } catch (err) {
+                    // Message already gone or too old — ignore
+                }
+            }
 
             if (smsResult.success) {
                 await Session.updateOne(
@@ -1047,14 +1073,14 @@ class OTPCommands {
                     }
                 );
 
-                // Update user stats
                 await User.updateOne({ userId }, { $inc: { totalOtps: 1, freeUsedToday: 1 } });
 
                 const message = 
                     `🔓 <b>OTP Received!</b>\n\n` +
                     `📱 Number: <code>${smsResult.number}</code>\n` +
+                    `🎯 Service: ${smsResult.service || 'N/A'}\n` +
                     `🔢 OTP: <code>${smsResult.otp}</code>\n` +
-                    `⏱ Delivery: ${smsResult.deliveryTime}ms\n\n` +
+                    `⏱ Delivery: ${smsResult.deliveryTime || '~'}ms\n\n` +
                     `⚠️ Do not share this code with anyone.`;
 
                 await this.bot.telegram.sendMessage(userId, message, {
@@ -1065,26 +1091,39 @@ class OTPCommands {
                     ]).reply_markup
                 });
 
+                return;
+
             } else if (smsResult.status === 'TIMEOUT') {
                 logger.info('Free tier timeout', { userId, sessionId: dbSessionId });
-                
-                await this.bot.telegram.sendMessage(userId, 
-                    '⏰ <b>Free OTP Timed Out</b>\n\nNo SMS received within the time limit.\n\nTry again or use CHEAP/VIP for better reliability.',
-                    {
-                        parse_mode: 'HTML',
-                        reply_markup: Markup.inlineKeyboard([
-                            [Markup.button.callback('🔄 Retry Free', 'mode_free')],
-                            [Markup.button.callback('💰 Try CHEAP', 'mode_cheap')],
-                            [Markup.button.callback('🔙 Menu', 'menu')]
-                        ]).reply_markup
-                    }
-                );
+
+                const message = 
+                    `⏰ <b>Free OTP Timed Out</b>\n\n` +
+                    `No SMS received within the time limit.\n\n` +
+                    `💡 Try again or use paid options for better reliability:`;
+
+                await this.bot.telegram.sendMessage(userId, message, {
+                    parse_mode: 'HTML',
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🔄 Retry Free', 'mode_free')],
+                        [Markup.button.callback('💰 Try CHEAP', 'mode_cheap')],
+                        [Markup.button.callback('👑 Try VIP', 'buy_vip')],
+                        [Markup.button.callback('🔙 Menu', 'menu')]
+                    ]).reply_markup
+                });
             }
 
         } catch (error) {
             logger.error('Free polling failed', { userId, error: error.message });
+            
+            // Cleanup poll message on error
+            if (pollMessageId) {
+                try {
+                    await ctx.telegram.deleteMessage(ctx.chat.id, pollMessageId);
+                } catch (err) {}
+            }
         }
-    }
+                                }
+                
 
     // ═══════════════════════════════════════════════════════════════════════
     //  CHECK OTP
