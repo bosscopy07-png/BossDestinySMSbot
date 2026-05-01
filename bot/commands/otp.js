@@ -899,8 +899,12 @@ class OTPCommands {
     //  SERVICE & COUNTRY SELECTION
     // ═══════════════════════════════════════════════════════════════════════
     
-    async showServiceSelection(ctx, mode, imageUrl) {
-        const message = `📱 <b>${mode} Mode</b>\n\nChoose the service you need OTP for:`;
+        /**
+     * Show service selection (unchanged)
+     */
+    async showServiceSelection(ctx, mode, imageUrl, displayPrice = null) {
+        const priceText = displayPrice ? `\n💰 Starting from ${formatCurrency(displayPrice)}` : '';
+        const message = `📱 <b>${mode} Mode</b>${priceText}\n\nChoose the service you need OTP for:`;
         const buttons = [];
         
         // Group services in rows of 3
@@ -915,6 +919,10 @@ class OTPCommands {
         await this.sendPhotoWithCaption(ctx, imageUrl, message, Markup.inlineKeyboard(buttons), 'HTML');
     }
 
+    /**
+     * FIXED: Service selection now fetches dynamic countries from 5SIM for CHEAP mode
+     * For other modes, uses static COUNTRIES list
+     */
     async handleServiceSelect(ctx) {
         const service = ctx.match[1];
         
@@ -927,6 +935,18 @@ class OTPCommands {
         ctx.session = ctx.session || {};
         ctx.session.otpService = service;
         
+        const mode = ctx.session?.otpMode;
+        
+        // ═════════════════════════════════════════════════════════════════
+        //  CHEAP mode: Fetch available countries from 5SIM dynamically
+        // ═════════════════════════════════════════════════════════════════
+        if (mode === 'CHEAP') {
+            return this._showCheapCountrySelection(ctx, service);
+        }
+        
+        // ═════════════════════════════════════════════════════════════════
+        //  Other modes: Use static COUNTRIES list
+        // ═════════════════════════════════════════════════════════════════
         const message = `🌍 <b>Select Country</b>\n\nChoose number country for <b>${service}</b>:`;
         const buttons = COUNTRIES.map(c => [
             Markup.button.callback(
@@ -939,6 +959,142 @@ class OTPCommands {
         await this.sendPhotoWithCaption(ctx, IMAGES.countrySelect, message, Markup.inlineKeyboard(buttons), 'HTML');
     }
 
+    /**
+     * NEW: Show country selection for CHEAP mode using 5SIM's available countries
+     * Fetches real-time stock from 5SIM API
+     */
+    async _showCheapCountrySelection(ctx, service) {
+        const userId = ctx.from.id.toString();
+        let loadingMsg = null;
+        
+        try {
+            loadingMsg = await ctx.reply('🌍 Fetching available countries...');
+            
+            if (!this.smsProviderManager) {
+                throw new Error('SMS_PROVIDER_NOT_AVAILABLE');
+            }
+
+            // Fetch available countries from 5SIM for this service
+            const countriesResult = await this.smsProviderManager.getCheapCountries(service);
+            
+            if (!countriesResult || countriesResult.length === 0) {
+                try {
+                    if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
+                } catch (delErr) {}
+                
+                return this.sendPhotoWithCaption(
+                    ctx, IMAGES.otpFailed,
+                    `❌ <b>No Countries Available</b>\n\nNo countries have stock for <b>${service}</b> right now.\n\nTry another service or check back later.`,
+                    Markup.inlineKeyboard([
+                        [Markup.button.callback('🔄 Try Another Service', 'menu')],
+                        [Markup.button.callback('🔙 Back', 'menu')]
+                    ]),
+                    'HTML'
+                );
+            }
+
+            // Fetch prices for top countries to show accurate pricing
+            const countriesWithPrices = [];
+            for (const country of countriesResult.slice(0, 20)) { // Limit to 20 to avoid rate limits
+                try {
+                    const priceInfo = await this.smsProviderManager.getCheapPrice(country.code, service);
+                    countriesWithPrices.push({
+                        ...country,
+                        simPrice: priceInfo.simPrice,
+                        displayPrice: priceInfo.displayPrice,
+                        stock: priceInfo.stock
+                    });
+                } catch (priceErr) {
+                    // If price fetch fails, still show country with unknown price
+                    countriesWithPrices.push({
+                        ...country,
+                        simPrice: null,
+                        displayPrice: null,
+                        stock: country.stock || 0
+                    });
+                }
+            }
+
+            // Sort by price (cheapest first)
+            countriesWithPrices.sort((a, b) => (a.displayPrice || Infinity) - (b.displayPrice || Infinity));
+
+            try {
+                if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
+            } catch (delErr) {
+                logger.debug('Failed to delete loading message', { error: delErr.message });
+            }
+
+            const message = `🌍 <b>Select Country for ${service}</b>\n\nPrices include service fee. Cheapest shown first:`;
+            const buttons = [];
+            
+            // Group in rows of 2
+            for (let i = 0; i < countriesWithPrices.length; i += 2) {
+                const row = countriesWithPrices.slice(i, i + 2).map(c => {
+                    const priceText = c.displayPrice 
+                        ? ` $${c.displayPrice.toFixed(2)}`
+                        : (c.simPrice ? ` ~$${(c.simPrice + 0.20).toFixed(2)}` : '');
+                    const stockText = c.stock > 5 ? '' : ` (${c.stock} left)`;
+                    
+                    return Markup.button.callback(
+                        `${this._getFlag(c.code)} ${c.name}${priceText}${stockText}`,
+                        `country_${c.code}`
+                    );
+                });
+                buttons.push(row);
+            }
+
+            buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
+            
+            await this.sendPhotoWithCaption(
+                ctx, IMAGES.countrySelect, message, 
+                Markup.inlineKeyboard(buttons), 'HTML'
+            );
+
+        } catch (error) {
+            try {
+                if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
+            } catch (delErr) {}
+
+            logger.error('Failed to fetch CHEAP countries', { userId, service, error: error.message });
+            
+            // Fallback to static list with warning
+            const message = `🌍 <b>Select Country</b>\n\n⚠️ Live prices unavailable. Showing default list for <b>${service}</b>:`;
+            const buttons = COUNTRIES.map(c => [
+                Markup.button.callback(
+                    `${c.flag} ${c.name}${c.priceModifier > 0 ? ` (+$${c.priceModifier})` : ''}`, 
+                    `country_${c.code}`
+                )
+            ]);
+            
+            buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
+            await this.sendPhotoWithCaption(ctx, IMAGES.countrySelect, message, Markup.inlineKeyboard(buttons), 'HTML');
+        }
+    }
+
+    /**
+     * Helper: Get flag emoji from country code
+     */
+    
+    _getFlag(code) {
+        const flags = {
+            'US': '🇺🇸', 'UK': '🇬🇧', 'CA': '🇨🇦', 'RU': '🇷🇺', 'CN': '🇨🇳',
+            'IN': '🇮🇳', 'NG': '🇳🇬', 'DE': '🇩🇪', 'FR': '🇫🇷', 'BR': '🇧🇷',
+            'MX': '🇲🇽', 'ID': '🇮🇩', 'PH': '🇵🇭', 'VN': '🇻🇳', 'TH': '🇹🇭',
+            'TR': '🇹🇷', 'PL': '🇵🇱', 'UA': '🇺🇦', 'KZ': '🇰🇿', 'RO': '🇷🇴',
+            'ES': '🇪🇸', 'IT': '🇮🇹', 'NL': '🇳🇱', 'SE': '🇸🇪', 'NO': '🇳🇴',
+            'FI': '🇫🇮', 'DK': '🇩🇰', 'AU': '🇦🇺', 'JP': '🇯🇵', 'KR': '🇰🇷',
+            'SG': '🇸🇬', 'MY': '🇲🇾', 'ZA': '🇿🇦', 'EG': '🇪🇬', 'SA': '🇸🇦',
+            'AE': '🇦🇪', 'IL': '🇮🇱', 'BE': '🇧🇪', 'AT': '🇦🇹', 'CH': '🇨🇭',
+            'PT': '🇵🇹', 'GR': '🇬🇷', 'CZ': '🇨🇿', 'HU': '🇭🇺', 'SK': '🇸🇰',
+            'BG': '🇧🇬', 'HR': '🇭🇷', 'SI': '🇸🇮', 'LT': '🇱🇹', 'LV': '🇱🇻',
+            'EE': '🇪🇪', 'MD': '🇲🇩', 'GE': '🇬🇪', 'AM': '🇦🇲', 'AZ': '🇦🇿',
+            'BY': '🇧🇾', 'KG': '🇰🇬', 'TJ': '🇹🇯', 'TM': '🇹🇲', 'UZ': '🇺🇿',
+            'AL': '🇦🇱', 'BA': '🇧🇦', 'MK': '🇲🇰', 'ME': '🇲🇪', 'RS': '🇷🇸',
+            'XK': '🇽🇰'
+        };
+        return flags[code] || '🌍';
+    }
+    
     // ═══════════════════════════════════════════════════════════════════════
     //  COUNTRY SELECTED — ACQUIRE NUMBER (CORE LOGIC)
     // ═══════════════════════════════════════════════════════════════════════
