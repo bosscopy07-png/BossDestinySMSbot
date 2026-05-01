@@ -188,49 +188,127 @@ class SessionManager {
         return this.checkSessionStatus(session.sessionId);
     }
 
-    /**
+        /**
      * Cancel an active session
-     * FIXED: Now properly cancels on 5SIM using activation ID (not phone number)
+     * FIXED:
+     * - Only releases funds if lockTx is still PENDING
+     * - Prevents double-refund by checking tx status first
+     * - Returns detailed cancel result
+     * - Cleans up memory timers properly
      */
     async cancelSession(sessionId, userId) {
         const session = await Session.findOne({ sessionId, userId });
-        if (!session) throw new Error('SESSION_NOT_FOUND');
+        if (!session) {
+            throw new Error('SESSION_NOT_FOUND');
+        }
+        
         if (!['WAITING', 'CHECKING'].includes(session.status)) {
             throw new Error('SESSION_NOT_CANCELLABLE');
         }
 
-        // FIXED: Release provider number using correct ID
-        // For CHEAP: uses providerNumberId (activation ID like "1001025384")
-        // For others: falls back to session.number if providerNumberId is null
-        await this._releaseProviderNumber(session, 'USER_CANCELLED');
+        let releasedAmount = 0;
+        let providerReleased = false;
 
-        // Restore user credits
-        await this._restoreCredits(session);
-
-        // Release locked funds
-        if (session.lockTxId) {
-            await this.walletService.releaseFunds(
-                session.lockTxId,
-                userId,
-                'USER_CANCELLED'
-            );
+        try {
+            // Step 1: Release provider number FIRST
+            await this._releaseProviderNumber(session, 'USER_CANCELLED');
+            providerReleased = true;
+        } catch (providerError) {
+            logger.warn('Provider release failed during cancel', {
+                sessionId,
+                error: providerError.message
+            });
+            // Continue — provider release is best-effort
         }
 
-        // Update session status
-        await Session.markCancelled(sessionId);
+        // Step 2: Restore credits (bundle/vip/free counts)
+        try {
+            await this._restoreCredits(session);
+        } catch (creditError) {
+            logger.error('Credit restoration failed during cancel', {
+                sessionId,
+                error: creditError.message
+            });
+            // Continue — don't block refund if credits fail
+        }
 
-        // Cleanup
+        // Step 3: Release locked funds — ONLY if still PENDING
+        if (session.lockTxId) {
+            try {
+                // Check if transaction is still PENDING before releasing
+                const lockTx = await Transaction.findOne({ 
+                    txId: session.lockTxId,
+                    userId 
+                });
+
+                if (!lockTx) {
+                    logger.warn('Lock transaction not found during cancel', {
+                        sessionId,
+                        lockTxId: session.lockTxId
+                    });
+                } else if (lockTx.status !== 'PENDING') {
+                    logger.warn('Lock transaction already processed, skipping release', {
+                        sessionId,
+                        lockTxId: session.lockTxId,
+                        lockTxStatus: lockTx.status,
+                        lockTxType: lockTx.type
+                    });
+                } else {
+                    // FIXED: Only release if actually PENDING
+                    const releaseResult = await this.walletService.releaseFunds(
+                        session.lockTxId,
+                        userId,
+                        'USER_CANCELLED'
+                    );
+                    
+                    if (releaseResult.success) {
+                        releasedAmount = releaseResult.releasedAmount || session.cost || 0;
+                    }
+                }
+            } catch (releaseError) {
+                logger.error('Fund release failed during cancel', {
+                    sessionId,
+                    lockTxId: session.lockTxId,
+                    error: releaseError.message
+                });
+                // Continue — session is still cancelled, but funds may be stuck
+                // Admin should manually review
+            }
+        }
+
+        // Step 4: Mark session as cancelled
+        try {
+            await Session.markCancelled(sessionId);
+        } catch (dbError) {
+            logger.error('Failed to mark session cancelled', {
+                sessionId,
+                error: dbError.message
+            });
+            throw new Error('SESSION_CANCEL_DB_FAILED');
+        }
+
+        // Step 5: Cleanup memory
         this._cleanupSession(sessionId);
 
-        logger.info('Session cancelled by user', { sessionId, userId, mode: session.mode });
+        logger.info('Session cancelled by user', { 
+            sessionId, 
+            userId, 
+            mode: session.mode,
+            releasedAmount,
+            providerReleased,
+            lockTxId: session.lockTxId
+        });
 
         return {
             success: true,
             sessionId,
+            mode: session.mode,
+            releasedAmount,
             restoredCredits: !!CreditRestoreConfig[session.mode],
-            refundedAmount: session.mode === 'CHEAP' ? session.cost : 0
+            providerReleased
         };
     }
+    
 
     /**
      * Deliver OTP to session (called by webhook or polling)
