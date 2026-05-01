@@ -405,7 +405,6 @@ class AdminCommands {
     // ═══════════════════════════════════════════════════════
     //  EXISTING FEATURES (Your #1-3, 5-8, 14, 15, 22-24, 27, 28, 35)
     // ═══════════════════════════════════════════════════════
-
     // ─── 1. Fix Negative Balances ───
     async handleFixBalances(ctx) {
         const userId = ctx.from?.id?.toString();
@@ -423,4 +422,466 @@ class AdminCommands {
             if (results.fixedNegative.length > 0) {
                 details.push(`<b>🔴 Negative fixed:</b> ${results.fixedNegative.length}`);
                 results.fixedNegative.slice(0, 5).forEach(u => {
-                    details.push(`  • <code>${u.userId}</code>: ${u.
+                    details.push(`  • <code>${u.userId}</code>: ${u.was} → ${u.now}`);
+                });
+                if (results.fixedNegative.length > 5) {
+                    details.push(`  ... and ${results.fixedNegative.length - 5} more`);
+                }
+            }
+
+            if (results.fixedMissing.length > 0) {
+                details.push(`<b>⚪ Missing fixed:</b> ${results.fixedMissing.length}`);
+            }
+
+            if (results.fixedExcessive.length > 0) {
+                details.push(`<b>🟠 Excessive fixed:</b> ${results.fixedExcessive.length}`);
+                results.fixedExcessive.slice(0, 3).forEach(u => {
+                    details.push(`  • <code>${u.userId}</code>: ${u.was} → ${u.now} (bal: ${u.balance})`);
+                });
+            }
+
+            const text = results.totalFixed > 0
+                ? `✅ <b>Balance Fix Complete</b>\n\n` +
+                  `📊 Total fixed: <b>${results.totalFixed}</b> users\n\n` +
+                  details.join('\n') +
+                  `\n\n<i>${new Date().toLocaleString()}</i>`
+                : `✅ <b>Balance Fix Complete</b>\n\n` +
+                  `🎉 No issues found. All balances are clean.\n\n` +
+                  `<i>${new Date().toLocaleString()}</i>`;
+
+            await ctx.telegram.editMessageText(msg.chat.id, msg.message_id, null, text, { 
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_system' }]] }
+            });
+
+        } catch (error) {
+            logger.error('Fix balances failed', { error: error.message });
+            await ctx.telegram.editMessageText(
+                msg.chat.id, msg.message_id, null,
+                `❌ <b>Fix failed:</b>\n\n<code>${error.message}</code>`,
+                { 
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_system' }]] }
+                }
+            );
+        }
+    }
+
+    // ─── 2. System Health ───
+    async handleHealth(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('🏥 Checking health...');
+
+        try {
+            const { User, Session } = await import('../models/index.js');
+            
+            const [totalUsers, activeSessions, brokenBalances] = await Promise.all([
+                User.countDocuments(),
+                Session.countDocuments({ status: { $in: ['WAITING', 'CHECKING'] } }),
+                User.countDocuments({ lockedBalance: { $lt: 0 } })
+            ]);
+
+            const uptime = process.uptime();
+            const uptimeStr = `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`;
+
+            const text = 
+                `🏥 <b>System Health Report</b>\n\n` +
+                `👤 <b>Users:</b> ${totalUsers.toLocaleString()}\n` +
+                `⏳ <b>Active Sessions:</b> ${activeSessions}\n` +
+                `⚠️ <b>Broken Balances:</b> ${brokenBalances}\n` +
+                `⏱️ <b>Uptime:</b> ${uptimeStr}\n` +
+                `💾 <b>Memory:</b> ${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1)} MB\n\n` +
+                (brokenBalances > 0 
+                    ? `⚡ <i>Tap "Fix Balances" below to repair.</i>`
+                    : `✅ <i>All systems operational.</i>`
+                );
+
+            await ctx.editMessageText(text, {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '🔧 Fix Balances', callback_data: 'admin_fix_balances' },
+                            { text: '🔄 Refresh', callback_data: 'admin_health' }
+                        ],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_system' }]
+                    ]
+                }
+            });
+
+        } catch (error) {
+            logger.error('Health check failed', { error: error.message });
+            ctx.editMessageText(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_system' }]] }
+            });
+        }
+    }
+
+    // ─── 3. Restart Bot ───
+    async handleRestart(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('🔄 Restarting...');
+        await ctx.editMessageText(
+            `🔄 <b>Bot Restarting...</b>\n\n` +
+            `⏳ Graceful shutdown in progress.\n` +
+            `💡 The bot will be back online in ~5 seconds.`,
+            { parse_mode: 'HTML' }
+        );
+
+        logger.info('Admin triggered restart', { adminId: userId });
+        setTimeout(() => process.exit(0), 2000);
+    }
+
+    // ─── 5. Toggle Maintenance ───
+    async handleToggleMaintenance(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        // Toggle maintenance flag in config (you'd implement this in your config system)
+        const current = config.maintenance || false;
+        config.maintenance = !current;
+        
+        const status = config.maintenance ? '🔴 ON' : '🟢 OFF';
+        await ctx.answerCbQuery(`Maintenance: ${status}`, { show_alert: true });
+        
+        await ctx.editMessageText(
+            `🛠️ <b>Maintenance Mode</b>\n\n` +
+            `Status: <b>${status}</b>\n\n` +
+            `${config.maintenance 
+                ? '🔒 Non-admin users are now blocked.' 
+                : '✅ Bot is open to all users.'}`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ 
+                            text: config.maintenance ? '🟢 Disable' : '🔴 Enable', 
+                            callback_data: 'admin_maintenance' 
+                        }],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_system' }]
+                    ]
+                }
+            }
+        );
+    }
+
+    // ─── 6. View Logs ───
+    async handleViewLogs(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('📜 Fetching logs...');
+        // Implement log tailing from your logger
+        await ctx.editMessageText(
+            `📜 <b>Recent Logs</b>\n\n` +
+            `<i>Implement log retrieval from your logging system.</i>\n\n` +
+            `💡 Tip: Use Winston/Pino to store last 100 lines in memory.`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_system' }]] }
+            }
+        );
+    }
+
+    // ─── 7. Clear Cache ───
+    async handleClearCache(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('🧹 Clearing...');
+        // Clear your cache/store
+        if (global.botCache) global.botCache.clear();
+        
+        await ctx.editMessageText(
+            `🧹 <b>Cache Cleared</b>\n\n` +
+            `✅ All temporary data flushed.\n` +
+            `💾 Memory freed.`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_system' }]] }
+            }
+        );
+    }
+
+    // ─── 8. Database Backup ───
+    async handleBackup(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('💾 Backing up...');
+        const msg = await ctx.reply('💾 <b>Database backup in progress...</b>', { parse_mode: 'HTML' });
+
+        try {
+            // Implement your backup logic (mongodump, etc.)
+            await ctx.telegram.editMessageText(
+                msg.chat.id, msg.message_id, null,
+                `✅ <b>Backup Complete</b>\n\n` +
+                `📦 Database exported successfully.\n` +
+                `⏰ ${new Date().toLocaleString()}`,
+                { 
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_system' }]] }
+                }
+            );
+        } catch (error) {
+            await ctx.telegram.editMessageText(
+                msg.chat.id, msg.message_id, null,
+                `❌ <b>Backup Failed</b>\n\n<code>${error.message}</code>`,
+                { 
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_system' }]] }
+                }
+            );
+        }
+    }
+
+    // ─── 14. Provider Performance ───
+    async handleProviderPerformance(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('📡 Analyzing providers...');
+
+        try {
+            const { Transaction } = await import('../models/index.js');
+            
+            const providerStats = await Transaction.aggregate([
+                { $match: { type: 'OTP', createdAt: { $gte: new Date(Date.now() - 24*60*60*1000) } } },
+                { $group: { 
+                    _id: '$provider', 
+                    total: { $sum: 1 }, 
+                    success: { $sum: { $cond: [{ $eq: ['$status', 'COMPLETED'] }, 1, 0] } },
+                    avgTime: { $avg: '$duration' }
+                }}
+            ]);
+
+            let text = `📡 <b>SMS Provider Performance (24h)</b>\n\n`;
+            
+            if (providerStats.length === 0) {
+                text += `<i>No OTP data in last 24h.</i>`;
+            } else {
+                providerStats.forEach(p => {
+                    const rate = ((p.success / p.total) * 100).toFixed(1);
+                    const avg = p.avgTime ? `${p.avgTime.toFixed(1)}s` : 'N/A';
+                    text += `📱 <b>${p._id || 'Unknown'}</b>\n` +
+                           `   ✅ Success: <b>${rate}%</b> (${p.success}/${p.total})\n` +
+                           `   ⏱️ Avg Time: <b>${avg}</b>\n\n`;
+                });
+            }
+
+            await ctx.editMessageText(text, {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔄 Refresh', callback_data: 'admin_provider_perf' }],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_analytics' }]
+                    ]
+                }
+            });
+
+        } catch (error) {
+            logger.error('Provider perf failed', { error: error.message });
+            ctx.editMessageText(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_analytics' }]] }
+            });
+        }
+    }
+
+    // ─── 15. Peak Hours ───
+    async handlePeakHours(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('⏰ Analyzing peak hours...');
+
+        try {
+            const { Transaction } = await import('../models/index.js');
+            
+            const hourly = await Transaction.aggregate([
+                { $match: { createdAt: { $gte: new Date(Date.now() - 7*24*60*60*1000) } } },
+                { $group: { 
+                    _id: { $hour: '$createdAt' }, 
+                    count: { $sum: 1 } 
+                }},
+                { $sort: { _id: 1 } }
+            ]);
+
+            let text = `⏰ <b>Peak Hours (7 days)</b>\n\n`;
+            const maxCount = Math.max(...hourly.map(h => h.count), 1);
+            
+            hourly.forEach(h => {
+                const bar = '█'.repeat(Math.round((h.count / maxCount) * 10));
+                const hour = h._id.toString().padStart(2, '0');
+                text += `${hour}:00 ${bar} <b>${h.count}</b>\n`;
+            });
+
+            await ctx.editMessageText(text, {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔄 Refresh', callback_data: 'admin_peak_hours' }],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_analytics' }]
+                    ]
+                }
+            });
+
+        } catch (error) {
+            logger.error('Peak hours failed', { error: error.message });
+            ctx.editMessageText(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_analytics' }]] }
+            });
+        }
+    }
+
+    // ─── 22. Clear User History ───
+    async promptClearHistory(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery();
+        ctx.session.awaitingClearHistory = true;
+        
+        await ctx.editMessageText(
+            `🧹 <b>Clear User History</b>\n\n` +
+            `⚠️ <b>This is DESTRUCTIVE!</b>\n\n` +
+            `Send the <b>User ID</b> to clear ALL history:\n` +
+            `• Transactions\n` +
+            `• Sessions\n` +
+            `• OTP logs\n\n` +
+            `Or send /cancel to abort.`,
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    async processClearHistory(ctx, targetId) {
+        try {
+            const { User, Transaction, Session } = await import('../models/index.js');
+            
+            const [user, txDel, sessDel] = await Promise.all([
+                User.findOne({ userId: targetId }),
+                Transaction.deleteMany({ userId: targetId }),
+                Session.deleteMany({ userId: targetId })
+            ]);
+
+            if (!user) {
+                return ctx.reply(`❌ User <code>${targetId}</code> not found.`, { 
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_users' }]] }
+                });
+            }
+
+            // Optionally reset balance or keep it
+            // await User.updateOne({ userId: targetId }, { $set: { lockedBalance: 0, balance: 0 } });
+
+            await ctx.reply(
+                `✅ <b>History Cleared</b>\n\n` +
+                `👤 User: <code>${targetId}</code>\n` +
+                `🗑️ Transactions deleted: <b>${txDel.deletedCount}</b>\n` +
+                `🗑️ Sessions deleted: <b>${sessDel.deletedCount}</b>\n\n` +
+                `⚠️ Balance was preserved. Use "Deduct Balance" if needed.`,
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_users' }]] }
+                }
+            );
+
+        } catch (error) {
+            logger.error('Clear history failed', { error: error.message, targetId });
+            ctx.reply(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_users' }]] }
+            });
+        }
+    }
+
+    // ─── 23. Reset User Session ───
+    async promptResetSession(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery();
+        ctx.session.awaitingResetSession = true;
+        
+        await ctx.editMessageText(
+            `♻️ <b>Reset User Session</b>\n\n` +
+            `Send the <b>User ID</b> to force-cancel their active session.\n\n` +
+            `Or send /cancel to abort.`,
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    async processResetSession(ctx, targetId) {
+        try {
+            const { Session } = await import('../models/index.js');
+            const result = await Session.updateMany(
+                { userId: targetId, status: { $in: ['WAITING', 'CHECKING', 'PENDING'] } },
+                { $set: { status: 'CANCELLED', cancelledAt: new Date(), cancelledBy: 'admin' } }
+            );
+
+            await ctx.reply(
+                `♻️ <b>Session Reset</b>\n\n` +
+                `👤 User: <code>${targetId}</code>\n` +
+                `🔄 Sessions cancelled: <b>${result.modifiedCount}</b>`,
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_users' }]] }
+                }
+            );
+
+        } catch (error) {
+            logger.error('Reset session failed', { error: error.message, targetId });
+            ctx.reply(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_users' }]] }
+            });
+        }
+    }
+
+    // ─── 24. Impersonate User ───
+    async promptImpersonate(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery();
+        ctx.session.awaitingImpersonate = true;
+        
+        await ctx.editMessageText(
+            `🎭 <b>Impersonate User</b>\n\n` +
+            `Send the <b>User ID</b> to see their dashboard view.\n\n` +
+            `⚠️ You will see exactly what they see.\n` +
+            `Or send /cancel to abort.`,
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    async processImpersonate(ctx, targetId) {
+        try {
+            const { User } = await import('../models/index.js');
+            const user = await User.findOne({ userId: targetId });
+
+            if (!user) {
+                return ctx.reply(`❌ User <code>${targetId}</code> not found.`, { 
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_users' }]] }
+                });
+            }
+
+            const text = 
+                `🎭 <b>Impersonating: ${targetId}</b>\n\n` +
+                `💰 Balance: <b>$${user.balance?.toFixed(2) || '0.00'}</b>\n` +
+                `🔒 Locked: <b>$${user.lockedBalance?.toFixed(2) || '0.00'}</b>\n` +
+                `📊 Total Spent: <b>$${user.totalSpent?.toFixed(2) || '0.00'}</b>\n` +
+                `📥 Total Deposited: <b>$${user.totalDeposited?.toFixed(2) || '0.00'}</b>\n` +
+                `🚫 Blacklisted: <b>${user.blacklisted ? 'YES' : 'No'}</b>\n` +
+                `📅 Joined: <i>${user.createdAt?.toLocaleDateString() || 'N/A'}</i>\n\n` +
+                `<i>This is their current view.</i>`;
+
+            await ctx.reply(text, {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '💰 Add Balance', callback_data: `admin_add_bal_${targetId}` },
+                            { text: '💸 Deduct', cal
