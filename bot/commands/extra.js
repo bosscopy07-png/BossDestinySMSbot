@@ -5,11 +5,7 @@
 import { fixNegativeLockedBalances } from '../../scripts/index.js';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
-// WRONG (current):
-const { User, Session } = await import('../models/index.js');
 
-// CORRECT:
-const { User, Session } = await import('../../models/index.js');
 
 // ─── SAFE EDIT HELPER ───
 // Prevents "no text in the message to edit" crashes
@@ -568,7 +564,7 @@ async showDevopsMenu(ctx) {
         await ctx.answerCbQuery('🏥 Checking health...');
 
         try {
-            const { User, Session } = await import('../models/index.js');
+            const { User, Session } = await import('../../models/index.js');
             
             const [totalUsers, activeSessions, brokenBalances] = await Promise.all([
                 User.countDocuments(),
@@ -736,7 +732,7 @@ async showDevopsMenu(ctx) {
         await ctx.answerCbQuery('📡 Analyzing providers...');
 
         try {
-            const { Transaction } = await import('../models/index.js');
+            const { Transaction } = await import('../../models/index.js');
             
             const providerStats = await Transaction.aggregate([
                 { $match: { type: 'OTP', createdAt: { $gte: new Date(Date.now() - 24*60*60*1000) } } },
@@ -788,7 +784,7 @@ async showDevopsMenu(ctx) {
         await ctx.answerCbQuery('⏰ Analyzing peak hours...');
 
         try {
-            const { Transaction } = await import('../models/index.js');
+            const { Transaction } = await import('../../models/index.js');
             
             const hourly = await Transaction.aggregate([
                 { $match: { createdAt: { $gte: new Date(Date.now() - 7*24*60*60*1000) } } },
@@ -848,7 +844,7 @@ async showDevopsMenu(ctx) {
 
     async processClearHistory(ctx, targetId) {
         try {
-            const { User, Transaction, Session } = await import('../models/index.js');
+            const { User, Transaction, Session } = await import('../../models/index.js');
             
             const [user, txDel, sessDel] = await Promise.all([
                 User.findOne({ userId: targetId }),
@@ -901,7 +897,7 @@ async showDevopsMenu(ctx) {
 
     async processResetSession(ctx, targetId) {
         try {
-            const { Session } = await import('../models/index.js');
+            const { Session } = await import('../../models/index.js');
             const result = await Session.updateMany(
                 { userId: targetId, status: { $in: ['WAITING', 'CHECKING', 'PENDING'] } },
                 { $set: { status: 'CANCELLED', cancelledAt: new Date(), cancelledBy: 'admin' } }
@@ -945,7 +941,7 @@ async showDevopsMenu(ctx) {
     
     async processImpersonate(ctx, targetId) {
         try {
-            const { User } = await import('../models/index.js');
+            const { User } = await import('../../models/index.js');
             const user = await User.findOne({ userId: targetId });
 
             if (!user) {
@@ -1005,7 +1001,7 @@ async showDevopsMenu(ctx) {
 
     async processRefund(ctx, targetId, amount, reason) {
         try {
-            const { User, Transaction } = await import('../models/index.js');
+            const { User, Transaction } = await import('../../models/index.js');
             
             const user = await User.findOneAndUpdate(
                 { userId: targetId },
@@ -1066,7 +1062,7 @@ async showDevopsMenu(ctx) {
 
     async processAdjustTransaction(ctx, txId, newAmount) {
         try {
-            const { Transaction } = await import('../models/index.js');
+            const { Transaction } = await import('../../models/index.js');
             const tx = await Transaction.findByIdAndUpdate(
                 txId,
                 { $set: { amount: newAmount, adjustedBy: ctx.from.id.toString(), adjustedAt: new Date() } },
@@ -1188,7 +1184,7 @@ async showDevopsMenu(ctx) {
         await ctx.answerCbQuery('📍 Analyzing fingerprints...');
 
         try {
-            const { User } = await import('../models/index.js');
+            const { User } = await import('../../models/index.js');
             
             const suspicious = await User.aggregate([
                 { $match: { lastIP: { $exists: true } } },
@@ -1287,7 +1283,7 @@ async showDevopsMenu(ctx) {
         await ctx.answerCbQuery('📉 Analyzing churn...');
 
         try {
-            const { User, Transaction } = await import('../models/index.js');
+            const { User, Transaction } = await import('../../models/index.js');
             const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
             
             const churnRisk = await User.find({
@@ -1351,7 +1347,7 @@ async showDevopsMenu(ctx) {
 
     async processUserNotes(ctx, targetId, note) {
         try {
-            const { User } = await import('../models/index.js');
+            const { User } = await import('../../models/index.js');
             
             const user = await User.findOneAndUpdate(
                 { userId: targetId },
@@ -1410,7 +1406,7 @@ async showDevopsMenu(ctx) {
 
     async processBalanceFreeze(ctx, targetId, action, reason) {
         try {
-            const { User } = await import('../models/index.js');
+            const { User } = await import('../../models/index.js');
             
             const isFrozen = action === 'freeze';
             const user = await User.findOneAndUpdate(
@@ -1545,7 +1541,7 @@ async showDevopsMenu(ctx) {
         await ctx.answerCbQuery('📊 Loading stats...');
 
         try {
-            const { Transaction } = await import('../models/index.js');
+            const { Transaction } = await import('../../models/index.js');
             const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
             const [revenue, deposits, pendingLocks] = await Promise.all([
