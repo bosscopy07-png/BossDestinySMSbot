@@ -1,7 +1,3 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-//  SMSProviderManager.js — Part 1: Imports, Setup, Validation, Provider Init
-// ═══════════════════════════════════════════════════════════════════════════════
-
 import TwilioProvider from './TwilioProvider.js';
 import TelnyxProvider from './TelnyxProvider.js';
 import CheapPanelProvider from './CheapPanelProvider.js';
@@ -14,9 +10,9 @@ import logger from '../../utils/logger.js';
  * SMSProviderManager — Unified gateway for SMS number acquisition
  * 
  * ARCHITECTURE (STRICT — no cross-tier failover):
- *   VIP/BUNDLE  → NumberPool (Twilio + Telnyx) only
- *   CHEAP       → CheapPanelProvider (5SIM) only
- *   FREE        → FreeProvider (public/shared numbers) only
+ * VIP/BUNDLE → NumberPool (Twilio + Telnyx) only
+ * CHEAP → CheapPanelProvider (5SIM) only
+ * FREE → FreeProvider (public/shared numbers) only
  * 
  * Each tier stands alone. If a tier's provider fails, that tier fails.
  * No silent fallback to other tiers.
@@ -165,9 +161,6 @@ class SMSProviderManager {
         
         return `⚠️ *Status Update*\n\n${escaped}`;
     }
-    // ═══════════════════════════════════════════════════════════════════════════════
-//  SMSProviderManager.js — Part 2: Strict Tier Getters (No Cross-Tier Failover)
-// ═══════════════════════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════════════════
     //  STRICT TIER GETTERS — Each tier uses ONLY its designated provider
@@ -232,7 +225,6 @@ class SMSProviderManager {
         }
 
         try {
-            // 5SIM getNumber signature: (country, service)
             const result = await provider.getNumber(country, service);
             
             if (!result) {
@@ -240,14 +232,15 @@ class SMSProviderManager {
             }
 
             return {
-                phoneNumber: result.phoneNumber || result.number,
+                phoneNumber: result.phoneNumber,
                 provider: 'CHEAP_PANEL',
-                providerNumberId: result.id || result.providerNumberId || result.orderId,
+                providerNumberId: result.providerNumberId,
                 country: result.country || country,
                 service: result.service || service,
                 tier: 'CHEAP',
                 acquisitionMethod: 'CHEAP_PANEL',
-                cost: result.cost || 0
+                cost: result.cost || 0,
+                displayCost: result.displayCost || result.cost || 0
             };
 
         } catch (error) {
@@ -256,6 +249,99 @@ class SMSProviderManager {
             });
             throw error; // NO fallback — let caller handle
         }
+    }
+
+    /**
+     * Get dynamic price for CHEAP tier (NEW)
+     * Returns { simPrice, displayPrice, profit } for display to user
+     */
+    async getCheapPrice(country, service) {
+        const provider = this.providers.get('CHEAP_PANEL');
+        
+        if (!provider || !provider.isActive) {
+            throw new Error('CHEAP_PROVIDER_INACTIVE');
+        }
+
+        const result = await provider.getPrice(country, service);
+        
+        if (!result.success) {
+            throw new Error(result.error || 'PRICE_CHECK_FAILED');
+        }
+
+        return {
+            simPrice: result.simPrice,
+            displayPrice: result.displayPrice,
+            profit: result.profit,
+            operator: result.operator,
+            stock: result.stock,
+            available: result.available
+        };
+    }
+
+    /**
+     * Get available countries for CHEAP tier (NEW)
+     * Returns list of countries with stock for the service
+     */
+    async getCheapCountries(service = 'Any') {
+        const provider = this.providers.get('CHEAP_PANEL');
+        
+        if (!provider || !provider.isActive) {
+            throw new Error('CHEAP_PROVIDER_INACTIVE');
+        }
+
+        const result = await provider.getAvailableCountries(service);
+        
+        if (!result.success) {
+            throw new Error(result.error || 'COUNTRY_CHECK_FAILED');
+        }
+
+        return result.countries;
+    }
+
+    /**
+     * Cancel CHEAP number with activation ID (FIXED)
+     */
+    async cancelCheapNumber(activationId) {
+        const provider = this.providers.get('CHEAP_PANEL');
+        
+        if (!provider || !provider.isActive) {
+            return { success: false, error: 'CHEAP_PROVIDER_INACTIVE' };
+        }
+
+        if (!activationId) {
+            return { success: false, error: 'MISSING_ACTIVATION_ID' };
+        }
+
+        // FIXED: Validate activation ID is numeric, not phone number
+        const cleanId = activationId.toString().trim();
+        if (!/^\d+$/.test(cleanId)) {
+            logger.error('cancelCheapNumber called with non-numeric ID', { activationId: cleanId });
+            return { success: false, error: 'INVALID_ACTIVATION_ID: Must be numeric 5SIM activation ID' };
+        }
+
+        return provider.cancelNumber(cleanId);
+    }
+
+    /**
+     * Finish CHEAP number with activation ID
+     */
+    async finishCheapNumber(activationId) {
+        const provider = this.providers.get('CHEAP_PANEL');
+        
+        if (!provider || !provider.isActive) {
+            return { success: false, error: 'CHEAP_PROVIDER_INACTIVE' };
+        }
+
+        if (!activationId) {
+            return { success: false, error: 'MISSING_ACTIVATION_ID' };
+        }
+
+        const cleanId = activationId.toString().trim();
+        if (!/^\d+$/.test(cleanId)) {
+            return { success: false, error: 'INVALID_ACTIVATION_ID' };
+        }
+
+        return provider.finishNumber(cleanId);
     }
 
     /**
@@ -280,7 +366,6 @@ class SMSProviderManager {
         }
 
         try {
-            // FreeProvider getNumber signature: (country, service)
             const result = await provider.getNumber(country, service);
             
             if (!result) {
@@ -333,10 +418,7 @@ class SMSProviderManager {
             default:
                 throw new Error(`INVALID_TIER: "${tier}". Must be VIP, BUNDLE, CHEAP, or FREE`);
         }
-                     }
-                                                         // ═══════════════════════════════════════════════════════════════════════════════
-//  SMSProviderManager.js — Part 3: SMS Checking (Fixed Per-Provider Methods)
-// ═══════════════════════════════════════════════════════════════════════════════
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  SMS CHECKING — Each provider uses its own correct method
@@ -344,7 +426,7 @@ class SMSProviderManager {
 
     /**
      * Check SMS for a CHEAP tier number (5SIM).
-     * 5SIM uses: checkSMS(orderId) or getSMS(orderId)
+     * 5SIM uses: checkSMS(activationId)
      */
     async checkCheapSMS(orderId) {
         if (!this.isInitialized) await this.initialize();
@@ -354,14 +436,12 @@ class SMSProviderManager {
             throw new Error('CHEAP_PROVIDER_NOT_FOUND');
         }
 
-        // 5SIM may use checkSMS or getSMS depending on implementation
-        const checkMethod = provider.checkSMS || provider.getSMS || provider.getCode;
-        
-        if (typeof checkMethod !== 'function') {
-            throw new Error('CHEAP_PROVIDER_NO_CHECK_METHOD: Provider missing checkSMS/getSMS/getCode');
+        // FIXED: 5SIM uses checkSMS with activation ID
+        if (typeof provider.checkSMS === 'function') {
+            return provider.checkSMS(orderId);
         }
 
-        return checkMethod.call(provider, orderId);
+        throw new Error('CHEAP_PROVIDER_NO_CHECK_METHOD: Provider missing checkSMS');
     }
 
     /**
@@ -491,225 +571,4 @@ class SMSProviderManager {
      */
     getFreeProviderHealth() {
         const provider = this.providers.get('FREE_PUBLIC');
-        if (!provider) {
-            return { available: false };
-        }
-
-        return {
-            available: true,
-            providers: typeof provider.getProviderHealth === 'function' ? provider.getProviderHealth() : [],
-            activeSessions: typeof provider.getActiveSessions === 'function' ? provider.getActiveSessions() : []
-        };
-            }
-            // ═══════════════════════════════════════════════════════════════════════════════
-//  SMSProviderManager.js — Part 4: Release, Pool, Stats, Shutdown
-// ═══════════════════════════════════════════════════════════════════════════════
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  NUMBER RELEASE / CANCELLATION
-    // ═══════════════════════════════════════════════════════════════════════
-
-    async cancelNumber(providerName, identifier) {
-        if (!this.isInitialized) await this.initialize();
-
-        // Pool numbers (VIP/BUNDLE)
-        if (providerName === 'NUMBER_POOL' || providerName === 'TWILIO' || providerName === 'TELNYX') {
-            if (!this.numberPool) {
-                return { success: false, error: 'POOL_NOT_INITIALIZED' };
-            }
-            return this.numberPool.releaseNumber(identifier, 'USER_CANCELLED');
-        }
-
-        // FreeProvider sessions
-        if (providerName === 'FREE_PUBLIC' || providerName === 'FREE') {
-            const provider = this.providers.get('FREE_PUBLIC');
-            if (provider?.cancelNumber && typeof provider.cancelNumber === 'function') {
-                return provider.cancelNumber(identifier);
-            }
-            return { success: true, status: 'RELEASED' };
-        }
-
-        // CheapPanel (5SIM)
-        if (providerName === 'CHEAP_PANEL' || providerName === 'CHEAP') {
-            const provider = this.providers.get('CHEAP_PANEL');
-            if (provider?.cancelNumber && typeof provider.cancelNumber === 'function') {
-                return provider.cancelNumber(identifier);
-            }
-            if (provider?.finishNumber && typeof provider.finishNumber === 'function') {
-                return provider.finishNumber(identifier);
-            }
-            return { success: true, note: '5SIM cancellation not supported by provider' };
-        }
-
-        // Direct lookup
-        const provider = this.providers.get(providerName);
-        if (!provider) {
-            return { success: false, error: `PROVIDER_NOT_FOUND: ${providerName}` };
-        }
-
-        if (provider.cancelNumber && typeof provider.cancelNumber === 'function') {
-            return provider.cancelNumber(identifier);
-        }
-
-        return { success: true, note: 'Nothing to cancel for this provider' };
-    }
-
-    async finishNumber(providerName, identifier) {
-        if (!this.isInitialized) await this.initialize();
-
-        if (providerName === 'NUMBER_POOL' || providerName === 'TWILIO' || providerName === 'TELNYX') {
-            if (!this.numberPool) {
-                return { success: false, error: 'POOL_NOT_INITIALIZED' };
-            }
-            return this.numberPool.releaseNumber(identifier, 'SESSION_END');
-        }
-
-        if (providerName === 'FREE_PUBLIC' || providerName === 'FREE') {
-            const provider = this.providers.get('FREE_PUBLIC');
-            if (provider?.finishNumber && typeof provider.finishNumber === 'function') {
-                return provider.finishNumber(identifier);
-            }
-            return { success: true, status: 'FINISHED' };
-        }
-
-        if (providerName === 'CHEAP_PANEL' || providerName === 'CHEAP') {
-            const provider = this.providers.get('CHEAP_PANEL');
-            if (provider?.finishNumber && typeof provider.finishNumber === 'function') {
-                return provider.finishNumber(identifier);
-            }
-            return { success: true, note: '5SIM finish not supported' };
-        }
-
-        const provider = this.providers.get(providerName);
-        if (provider?.finishNumber && typeof provider.finishNumber === 'function') {
-            return provider.finishNumber(identifier);
-        }
-
-        return { success: true, note: 'No finish action required' };
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  POOL MANAGEMENT
-    // ═══════════════════════════════════════════════════════════════════════
-
-    async buyPoolNumbers(country = 'US', quantity = 1, preferredProvider = null) {
-        if (!this.numberPool || !this.numberBuyer) {
-            throw new Error('POOL_NOT_AVAILABLE: Number pool not configured');
-        }
-
-        if (!this.isInitialized) await this.initialize();
-
-        const result = await this.numberBuyer.buyMultiple(
-            [{ country, count: quantity, preferredProvider }],
-            { abortOnError: false }
-        );
-
-        if (result.totalSuccess > 0) {
-            await this.numberPool.initialize();
-        }
-
-        return {
-            success: result.totalFailed === 0,
-            purchased: result.results[0]?.numbers || [],
-            failed: result.totalFailed,
-            totalCost: result.totalCost,
-            errors: result.results[0]?.errors || []
-        };
-    }
-
-    async buyPoolNumbersBulk(configs) {
-        if (!this.numberPool || !this.numberBuyer) {
-            throw new Error('POOL_NOT_AVAILABLE: Number pool not configured');
-        }
-
-        if (!this.isInitialized) await this.initialize();
-
-        const result = await this.numberBuyer.buyMultiple(configs, { abortOnError: false });
-
-        if (result.totalSuccess > 0) {
-            await this.numberPool.initialize();
-        }
-
-        return result;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  STATS & MONITORING
-    // ═══════════════════════════════════════════════════════════════════════
-
-    async getPoolStats() {
-        if (!this.numberPool) {
-            return { available: false, reason: 'POOL_NOT_CONFIGURED' };
-        }
-
-        return {
-            available: true,
-            pools: this.numberPool.getPoolStats(),
-            detailed: this.numberPool.getDetailedStats?.() || null
-        };
-    }
-
-    getAllStats() {
-        const stats = {};
-        for (const [name, provider] of this.providers) {
-            stats[name] = provider.getStats ? provider.getStats() : { isActive: provider.isActive };
-        }
-        if (this.numberPool) {
-            stats['POOL'] = this.numberPool.getPoolStats();
-            stats['POOL_DETAILED'] = this.numberPool.getDetailedStats?.();
-        }
-        return stats;
-    }
-
-    getActiveProviders() {
-        return Array.from(this.providers.entries())
-            .filter(([_, provider]) => provider.isActive)
-            .map(([name, _]) => name);
-    }
-
-    getProvider(name) {
-        return this.providers.get(name);
-    }
-
-    getProviderInstance(name) {
-        return this.providers.get(name);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  SHUTDOWN
-    // ═══════════════════════════════════════════════════════════════════════
-
-    async shutdown() {
-        if (this.numberBuyer) {
-            try {
-                await this.numberBuyer.shutdown();
-            } catch (e) {
-                logger.warn('NumberBuyer shutdown failed', { error: e.message });
-            }
-        }
-
-        if (this.numberPool) {
-            try {
-                await this.numberPool.uninitialize();
-            } catch (e) {
-                logger.warn('Pool uninitialize failed', { error: e.message });
-            }
-        }
-
-        for (const [name, provider] of this.providers) {
-            if (provider.stopCleanupJob && typeof provider.stopCleanupJob === 'function') {
-                try {
-                    provider.stopCleanupJob();
-                } catch (e) {
-                    logger.warn(`Provider ${name} cleanup failed`, { error: e.message });
-                }
-            }
-        }
-
-        this.isInitialized = false;
-        logger.info('SMS Provider Manager shut down');
-    }
-}
-
-export default SMSProviderManager;
-                
+        if (!prov
