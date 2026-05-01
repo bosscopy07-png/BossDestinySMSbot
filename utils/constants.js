@@ -18,7 +18,10 @@ export const USER_MODES = {
 
 export const TRANSACTION_TYPES = {
     DEPOSIT: 'DEPOSIT',
-    CHEAP_OTP: 'CHEAP_OTP',
+    LOCK: 'LOCK',                    // ← ADD
+    CAPTURE: 'CAPTURE',              // ← ADD (optional)
+    OTP_PURCHASE: 'OTP_PURCHASE',    // ← ADD (replaces CHEAP_OTP)
+    CHEAP_OTP: 'CHEAP_OTP',          // Keep for backward compat
     BUNDLE_PURCHASE: 'BUNDLE_PURCHASE',
     VIP_SUBSCRIPTION: 'VIP_SUBSCRIPTION',
     REFERRAL_REWARD: 'REFERRAL_REWARD',
