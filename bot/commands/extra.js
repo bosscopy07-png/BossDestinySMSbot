@@ -1716,11 +1716,492 @@ listed</b>\n\n` +
 
     async processBroadcast(ctx, messageText) {
         try {
-            const { User } = await i
+            const { User } = await import('../../models/index.js');
+            const users = await User.find({ blacklisted: { $ne: true } }).select('userId');
+            
+            let sent = 0;
+            let failed = 0;
+            
+            for (const user of users) {
+                try {
+                    await ctx.telegram.sendMessage(user.userId, 
+                        `📢 <b>Announcement</b>\n\n${messageText}`,
+                        { parse_mode: 'HTML' }
+                    );
+                    sent++;
+                } catch (e) {
+                    failed++;
+                }
+            }
 
+            await ctx.replyWithPhoto(ADMIN_IMAGE_URL, {
+                caption: 
+                    `📢 <b>Broadcast Complete</b>\n\n` +
+                    `✅ Sent: <b>${sent}</b>\n` +
+                    `❌ Failed: <b>${failed}</b>\n` +
+                    `📊 Total: <b>${users.length}</b>`,
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_users' }]] }
+            });
 
+        } catch (error) {
+            logger.error('Broadcast failed', { error: error.message });
+            ctx.replyWithPhoto(ADMIN_IMAGE_URL, { 
+                caption: `❌ Error: ${error.message}`, 
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_users' }]] }
+            });
+        }
+    }
 
+    // ═══════════════════════════════════════════════════════
+    //  FINANCIAL FEATURES
+    // ═══════════════════════════════════════════════════════
 
+    // ─── 26. Manual Refund ───
+    async promptRefund(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery();
+        ctx.session.awaitingRefund = true;
+        
+        await safeEditWithImage(ctx,
+            `↩️ <b>Manual Refund</b>\n\n` +
+            `Send: <code>USER_ID AMOUNT REASON</code>\n` +
+            `Example: <code>123456789 10.50 Service outage</code>\n\n` +
+            `Or send /cancel to abort.`,
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    async processRefund(ctx, targetId, amount, reason) {
+        try {
+            const { User, Transaction } = await import('../../models/index.js');
+            
+            const user = await User.findOneAndUpdate(
+                { userId: targetId },
+                { $inc: { balance: amount } },
+                { new: true }
+            );
+
+            if (!user) {
+                return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { 
+                    caption: `❌ User <code>${targetId}</code> not found.`, 
+                    parse_mode: 'HTML' 
+                });
+            }
+
+            await Transaction.create({
+                userId: targetId,
+                type: 'REFUND',
+                amount: amount,
+                status: 'COMPLETED',
+                reason: reason,
+                createdAt: new Date()
+            });
+
+            await ctx.replyWithPhoto(ADMIN_IMAGE_URL, {
+                caption: 
+                    `↩️ <b>Refund Processed</b>\n\n` +
+                    `👤 User: <code>${targetId}</code>\n` +
+                    `💰 Amount: <b>$${amount.toFixed(2)}</b>\n` +
+                    `📝 Reason: <i>${reason}</i>\n` +
+                    `💳 New Balance: <b>$${user.balance.toFixed(2)}</b>`,
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+
+        } catch (error) {
+            logger.error('Refund failed', { error: error.message });
+            ctx.replyWithPhoto(ADMIN_IMAGE_URL, { 
+                caption: `❌ Error: ${error.message}`, 
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+        }
+    }
+
+    // ─── 27. Adjust Transaction ───
+    async promptAdjustTransaction(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery();
+        ctx.session.awaitingAdjustTx = true;
+        
+        await safeEditWithImage(ctx,
+            `✏️ <b>Adjust Transaction</b>\n\n` +
+            `Send: <code>TX_ID NEW_AMOUNT</code>\n` +
+            `Example: <code>507f1f77bcf86cd799439011 25.00</code>\n\n` +
+            `⚠️ This modifies historical data!\n` +
+            `Or send /cancel to abort.`,
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    async processAdjustTransaction(ctx, txId, newAmount) {
+        try {
+            const { Transaction } = await import('../../models/index.js');
+            const tx = await Transaction.findByIdAndUpdate(
+                txId,
+                { $set: { amount: newAmount, adjustedBy: ctx.from.id.toString(), adjustedAt: new Date() } },
+                { new: true }
+            );
+
+            if (!tx) {
+                return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { 
+                    caption: `❌ Transaction <code>${txId}</code> not found.`, 
+                    parse_mode: 'HTML' 
+                });
+            }
+
+            await ctx.replyWithPhoto(ADMIN_IMAGE_URL, {
+                caption: 
+                    `✏️ <b>Transaction Adjusted</b>\n\n` +
+                    `🆔 ID: <code>${txId}</code>\n` +
+                    `💰 New Amount: <b>$${newAmount.toFixed(2)}</b>\n` +
+                    `📊 Type: <b>${tx.type}</b>\n` +
+                    `👤 User: <code>${tx.userId}</code>`,
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+
+        } catch (error) {
+            logger.error('Adjust tx failed', { error: error.message });
+            ctx.replyWithPhoto(ADMIN_IMAGE_URL, { 
+                caption: `❌ Error: ${error.message}`, 
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+        }
+    }
+
+    // ─── 28. Set Min/Max Deposit Limits ───
+    async handleSetLimits(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery();
+        ctx.session.awaitingSetLimits = true;
+        
+        await safeEditWithImage(ctx,
+            `📊 <b>Set Deposit Limits</b>\n\n` +
+            `Send: <code>MIN MAX</code>\n` +
+            `Example: <code>10 1000</code>\n\n` +
+            `Current: Min <b>$${config.minDeposit || 'N/A'}</b>, Max <b>$${config.maxDeposit || 'N/A'}</b>\n` +
+            `Or send /cancel to abort.`,
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    async processSetLimits(ctx, min, max) {
+        try {
+            config.minDeposit = min;
+            config.maxDeposit = max;
+            
+            await ctx.replyWithPhoto(ADMIN_IMAGE_URL, {
+                caption: 
+                    `📊 <b>Limits Updated</b>\n\n` +
+                    `🔽 Minimum: <b>$${min.toFixed(2)}</b>\n` +
+                    `🔼 Maximum: <b>$${max.toFixed(2)}</b>\n\n` +
+                    `✅ New limits are now active.`,
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+
+        } catch (error) {
+            logger.error('Set limits failed', { error: error.message });
+            ctx.replyWithPhoto(ADMIN_IMAGE_URL, { 
+                caption: `❌ Error: ${error.message}`, 
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+        }
+    }
+
+    // ─── 29. Set OTP Price ───
+    async handleSetPrice(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery();
+        ctx.session.awaitingSetPrice = true;
+        
+        await safeEditWithImage(ctx,
+            `🏷️ <b>Set OTP Price</b>\n\n` +
+            `Send: <code>NEW_PRICE</code>\n` +
+            `Example: <code>2.50</code>\n\n` +
+            `Current: <b>$${config.otpPrice || 'N/A'}</b>\n` +
+            `Or send /cancel to abort.`,
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    async processSetPrice(ctx, newPrice) {
+        try {
+            config.otpPrice = newPrice;
+            
+            await ctx.replyWithPhoto(ADMIN_IMAGE_URL, {
+                caption: 
+                    `🏷️ <b>Price Updated</b>\n\n` +
+                    `💰 New OTP Price: <b>$${newPrice.toFixed(2)}</b>\n\n` +
+                    `✅ Price is now active for all users.`,
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+
+        } catch (error) {
+            logger.error('Set price failed', { error: error.message });
+            ctx.replyWithPhoto(ADMIN_IMAGE_URL, { 
+                caption: `❌ Error: ${error.message}`, 
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+        }
+    }
+
+    // ─── 30. Revenue Export ───
+    async handleExportRevenue(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('📥 Generating export...');
+
+        try {
+            const { Transaction } = await import('../../models/index.js');
+            const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+            
+            const transactions = await Transaction.find({
+                createdAt: { $gte: since }
+            }).sort({ createdAt: -1 }).limit(1000);
+
+            let csv = 'Date,Type,User,Amount,Status,Provider\n';
+            transactions.forEach(tx => {
+                csv += `${tx.createdAt?.toISOString()},${tx.type},${tx.userId},${tx.amount},${tx.status},${tx.provider || 'N/A'}\n`;
+            });
+
+            await ctx.replyWithDocument({
+                source: Buffer.from(csv),
+                filename: `revenue_export_${new Date().toISOString().split('T')[0]}.csv`
+            }, {
+                caption: `📥 <b>Revenue Export</b>\n\nPeriod: Last 30 days\nRecords: <b>${transactions.length}</b>`,
+                parse_mode: 'HTML'
+            });
+
+        } catch (error) {
+            logger.error('Export failed', { error: error.message });
+            ctx.replyWithPhoto(ADMIN_IMAGE_URL, { 
+                caption: `❌ Error: ${error.message}`, 
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+        }
+    }
+
+    // ─── 31. Pending Deposits ───
+    async handlePendingDeposits(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('⏳ Loading pending deposits...');
+
+        try {
+            const { Transaction } = await import('../../models/index.js');
+            
+            const pending = await Transaction.find({
+                type: 'DEPOSIT',
+                status: 'PENDING'
+            }).sort({ createdAt: -1 }).limit(20);
+
+            let text = `⏳ <b>Pending Deposits</b>\n\n`;
+            
+            if (pending.length === 0) {
+                text += `<i>No pending deposits. All caught up!</i>`;
+            } else {
+                text += `<b>${pending.length} pending:</b>\n\n`;
+                pending.forEach((tx, i) => {
+                    const age = Math.floor((Date.now() - tx.createdAt) / 60000);
+                    text += `${i + 1}. <code>${tx.userId}</code>\n` +
+                           `   💰 Amount: <b>$${tx.amount?.toFixed(2) || '0.00'}</b>\n` +
+                           `   ⏰ Age: <b>${age} min</b>\n` +
+                           `   🆔 TX: <code>${tx._id?.toString().slice(-6) || 'N/A'}</code>\n\n`;
+                });
+            }
+
+            await safeEditWithImage(ctx, text, {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔄 Refresh', callback_data: 'admin_pending_deps' }],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_finance' }]
+                    ]
+                }
+            });
+
+        } catch (error) {
+            logger.error('Pending deposits failed', { error: error.message });
+            await safeEditWithImage(ctx, `❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+        }
+    }
+
+    // ─── 32. Force-Confirm Deposit ───
+    async promptForceConfirm(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery();
+        ctx.session.awaitingForceConfirm = true;
+        
+        await safeEditWithImage(ctx,
+            `✅ <b>Force-Confirm Deposit</b>\n\n` +
+            `Send: <code>TX_ID</code> or <code>USER_ID</code>\n` +
+            `Example: <code>507f1f77bcf86cd799439011</code>\n\n` +
+            `⚠️ This marks a pending deposit as completed manually.\n` +
+            `Or send /cancel to abort.`,
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    async processForceConfirm(ctx, txId) {
+        try {
+            const { Transaction, User } = await import('../../models/index.js');
+            
+            const tx = await Transaction.findByIdAndUpdate(
+                txId,
+                { $set: { status: 'COMPLETED', confirmedBy: ctx.from.id.toString(), confirmedAt: new Date() } },
+                { new: true }
+            );
+
+            if (!tx) {
+                return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { 
+                    caption: `❌ Transaction <code>${txId}</code> not found.`, 
+                    parse_mode: 'HTML' 
+                });
+            }
+
+            await User.updateOne(
+                { userId: tx.userId },
+                { $inc: { balance: tx.amount, totalDeposited: tx.amount } }
+            );
+
+            await ctx.replyWithPhoto(ADMIN_IMAGE_URL, {
+                caption: 
+                    `✅ <b>Deposit Confirmed</b>\n\n` +
+                    `🆔 TX: <code>${txId}</code>\n` +
+                    `👤 User: <code>${tx.userId}</code>\n` +
+                    `💰 Amount: <b>$${tx.amount?.toFixed(2) || '0.00'}</b>\n` +
+                    `⏰ Confirmed: <i>${new Date().toLocaleString()}</i>`,
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+
+        } catch (error) {
+            logger.error('Force confirm failed', { error: error.message });
+            ctx.replyWithPhoto(ADMIN_IMAGE_URL, { 
+                caption: `❌ Error: ${error.message}`, 
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  SMS/OTP FEATURES
+    // ═══════════════════════════════════════════════════════
+
+    // ─── 33. Switch SMS Provider ───
+    async handleSwitchProvider(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('🔄 Loading providers...');
+
+        try {
+            if (!this.smsProviderManager) {
+                throw new Error('SMS Provider Manager not initialized');
+            }
+
+            const providers = await this.smsProviderManager.getAvailableProviders();
+            
+            let text = `🔄 <b>Switch SMS Provider</b>\n\n`;
+            text += `Current: <b>${this.smsProviderManager.getCurrentProvider() || 'None'}</b>\n\n`;
+            text += `Available providers:\n`;
+
+            const buttons = providers.map(p => ([{
+                text: `${p.active ? '✅ ' : ''}${p.name}`,
+                callback_data: `admin_switch_to_${p.id}`
+            }]));
+
+            buttons.push([{ text: '◀️ Back', callback_data: 'admin_back_sms' }]);
+
+            await safeEditWithImage(ctx, text, {
+                reply_markup: { inline_keyboard: buttons }
+            });
+
+        } catch (error) {
+            logger.error('Switch provider failed', { error: error.message });
+            await safeEditWithImage(ctx, `❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_sms' }]] }
+            });
+        }
+    }
+
+    // ─── 34. Provider Balance Check ───
+    async handleProviderBalance(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('💳 Checking balances...');
+
+        try {
+            if (!this.smsProviderManager) {
+                throw new Error('SMS Provider Manager not initialized');
+            }
+
+            const balances = await this.smsProviderManager.checkBalances();
+            
+            let text = `💳 <b>SMS Provider Balances</b>\n\n`;
+            
+            if (!balances || balances.length === 0) {
+                text += `<i>No providers configured or all offline.</i>`;
+            } else {
+                balances.forEach(b => {
+                    const status = b.available ? '🟢' : '🔴';
+                    text += `${status} <b>${b.provider}</b>: ${b.balance} ${b.currency || 'credits'}\n` +
+                           `   📊 Success Rate: <b>${(b.successRate * 100).toFixed(1)}%</b>\n\n`;
+                });
+            }
+
+            await safeEditWithImage(ctx, text, {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔄 Refresh', callback_data: 'admin_provider_balance' }],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_sms' }]
+                    ]
+                }
+            });
+
+        } catch (error) {
+            logger.error('Provider balance failed', { error: error.message });
+            await safeEditWithImage(ctx, `❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_sms' }]] }
+            });
+        }
+    }
+
+    // ─── 35. Retry Failed OTP ───
+    async handleRetryFailedOTP(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('🔄 Retrying failed OTPs...');
+
+        try {
+            const { Transaction } = await import('../../models/index.js');
+            
+            const f
                 // ═══════════════════════════════════════════════════════
     //  FRAUD & SECURITY FEATURES
     // ═══════════════════════════════════════════════════════
