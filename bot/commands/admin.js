@@ -842,14 +842,14 @@ this.bot.action(/numpool_country_(.+)/, (ctx) => {
     // ═══════════════════════════════════════════════════════════
 
     async handleAdmin(ctx) {
-        try {
-            if (!this._checkCooldown(ctx.from.id, 'admin', 3000)) {
-                return ctx.answerCbQuery?.('Please wait...').catch(() => {});
-            }
+    try {
+        if (!this._checkCooldown(ctx.from.id, 'admin', 3000)) {
+            return ctx.answerCbQuery?.('Please wait...').catch(() => {});
+        }
 
-            const stats = await this.getSystemStats();
+        const stats = await this.getSystemStats();
 
-            const message = `
+        const message = `
 <b>🔐 Admin Dashboard</b>
 
 <b>📊 Revenue</b>
@@ -877,53 +877,60 @@ this.bot.action(/numpool_country_(.+)/, (ctx) => {
 • Master Balance: <code>${formatCurrency(stats.masterBalance)}</code>
 • Uptime: <code>${stats.uptime}</code>
 • Maintenance: <code>${config.maintenance ? '🔴 ON' : '🟢 OFF'}</code>
-            `;
+        `;
 
-            const keyboard = Markup.inlineKeyboard([
-                [
-                    Markup.button.callback('👥 Users', 'admin_users'),
-                    Markup.button.callback('💰 Profits', 'admin_profits')
-                ],
-                [
-                    Markup.button.callback('⚙️ System', 'admin_system'),
-                    Markup.button.callback('📋 Logs', 'admin_logs')
-                ],
-                [
-                    Markup.button.callback('📢 Broadcast', 'admin_broadcast'),
-                    Markup.button.callback('🔧 Settings', 'admin_settings')
-                ],
-                [
-                    Markup.button.callback('🔍 Search', 'admin_search'),
-                    Markup.button.callback('🏆 Top Users', 'admin_topusers')
-                ],
-                [
-                    Markup.button.callback('📊 Daily Report', 'admin_dailyreport'),
-                    Markup.button.callback('🔄 Reset Free', 'admin_resetfree')
-                ],
-                [
-                    Markup.button.callback('👑 Give VIP', 'admin_givevip'),
-                    Markup.button.callback('❌ Cancel VIP', 'admin_cancelvip')
-                ],
-                [
-                    Markup.button.callback('📦 Pool', 'admin_pool'),
-                    Markup.button.callback('💰 Bundle Prices', 'admin_bundleprices')
-                ],
-                [
-                    Markup.button.callback('📱 Numbers', 'admin_numberinventory'),
-                    Markup.button.callback('📊 Analytics', 'admin_analytics')
-                ],
-                [
-                    Markup.button.callback('⚡ Bulk Actions', 'admin_bulkactions')
-                ]
-            ]);
+        const keyboard = Markup.inlineKeyboard([
+            [
+                Markup.button.callback('👥 Users', 'admin_users'),
+                Markup.button.callback('💰 Profits', 'admin_profits')
+            ],
+            [
+                Markup.button.callback('⚙️ System', 'admin_system'),
+                Markup.button.callback('📋 Logs', 'admin_logs')
+            ],
+            [
+                Markup.button.callback('📢 Broadcast', 'admin_broadcast'),
+                Markup.button.callback('🔧 Settings', 'admin_settings')
+            ],
+            [
+                Markup.button.callback('🔍 Search', 'admin_search'),
+                Markup.button.callback('🏆 Top Users', 'admin_topusers')
+            ],
+            [
+                Markup.button.callback('📊 Daily Report', 'admin_dailyreport'),
+                Markup.button.callback('🔄 Reset Free', 'admin_resetfree')
+            ],
+            [
+                Markup.button.callback('👑 Give VIP', 'admin_givevip'),
+                Markup.button.callback('❌ Cancel VIP', 'admin_cancelvip')
+            ],
+            [
+                Markup.button.callback('📦 Pool', 'admin_pool'),
+                Markup.button.callback('💰 Bundle Prices', 'admin_bundleprices')
+            ],
+            [
+                Markup.button.callback('📱 Numbers', 'admin_numberinventory'),
+                Markup.button.callback('📊 Analytics', 'admin_analytics')
+            ],
+            [
+                Markup.button.callback('⚡ Bulk Actions', 'admin_bulkactions')
+            ],
+            // ═══════════════════════════════════════════════════
+            //  NEW: Advanced Admin Tools Button
+            // ═══════════════════════════════════════════════════
+            [
+                Markup.button.callback('🛠️ Advanced Tools', 'open_admin_dashboard')
+            ]
+        ]);
 
-            await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
-        } catch (error) {
-            logger.error('Admin dashboard error', { error: error.message, stack: error.stack });
-            await this.replyError(ctx, '❌ <b>Failed to load admin dashboard.</b>\n\nPlease check the logs for details.');
-        }
+        await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+    } catch (error) {
+        logger.error('Admin dashboard error', { error: error.message, stack: error.stack });
+        await this.replyError(ctx, '❌ <b>Failed to load admin dashboard.</b>\n\nPlease check the logs for details.');
     }
-
+    }
+    
+                    
     // ═══════════════════════════════════════════════════════════
     //  POOL MANAGEMENT
     // ═══════════════════════════════════════════════════════════
