@@ -713,11 +713,34 @@ class WalletService {
         }
     }
 
+        /**
+     * Release locked funds back to user (cancel/refund)
+     * FIXED:
+     * - Uses aggregation with $max to prevent negative lockedBalance
+     * - Validates tx is PENDING before releasing
+     * - Calculates actual release amount (never more than lockedBalance)
+     * - Returns detailed result for logging
+     */
     async releaseFunds(txId, userId, reason) {
         try {
+            // Validate transaction exists and is PENDING
             const tx = await Transaction.findOne({ txId, userId });
-            if (!tx || tx.status !== 'PENDING') {
-                throw new Error(`INVALID_TRANSACTION: Transaction not found or status is ${tx?.status || 'missing'}`);
+            if (!tx) {
+                throw new Error('TRANSACTION_NOT_FOUND');
+            }
+            if (tx.status !== 'PENDING') {
+                logger.warn('Release skipped: transaction not pending', {
+                    txId,
+                    userId,
+                    currentStatus: tx.status,
+                    reason
+                });
+                return { 
+                    success: false, 
+                    error: 'TRANSACTION_NOT_PENDING',
+                    currentStatus: tx.status,
+                    alreadyReleased: tx.status === 'CANCELLED'
+                };
             }
 
             const amount = Math.abs(tx.amount);
@@ -725,49 +748,97 @@ class WalletService {
                 throw new Error('INVALID_AMOUNT');
             }
 
+            // Get user for validation
             const user = await User.findOne({ userId });
             if (!user) {
                 throw new Error('USER_NOT_FOUND');
             }
 
-            if ((user.lockedBalance || 0) < amount) {
-                logger.warn('Locked balance less than release amount', {
+            // FIXED: Calculate actual release amount — never more than lockedBalance
+            const currentLocked = user.lockedBalance || 0;
+            const releaseAmount = Math.min(amount, currentLocked);
+            
+            if (releaseAmount < amount) {
+                logger.warn('Partial release: insufficient locked balance', {
                     userId,
-                    lockedBalance: user.lockedBalance,
-                    releaseAmount: amount
+                    txId,
+                    requestedRelease: amount,
+                    actualRelease: releaseAmount,
+                    currentLockedBalance: currentLocked,
+                    reason
                 });
             }
 
-            // FIXED: Keep type as LOCK (for audit trail), only change status to CANCELLED
+            // Update transaction to CANCELLED
             await Transaction.updateOne(
                 { txId },
                 {
                     $set: {
                         status: 'CANCELLED',
                         'metadata.releasedAt': new Date(),
-                        'metadata.releaseReason': reason
+                        'metadata.releaseReason': reason,
+                        'metadata.requestedAmount': amount,
+                        'metadata.actualReleasedAmount': releaseAmount,
+                        'metadata.previousLockedBalance': currentLocked
                     }
                 }
             );
 
+            // FIXED: Use aggregation pipeline to prevent negative lockedBalance
+            // $max ensures lockedBalance never goes below 0
             const updateResult = await User.updateOne(
                 { userId },
-                { $inc: { lockedBalance: -amount } }
+                [
+                    {
+                        $set: {
+                            lockedBalance: {
+                                $max: [
+                                    0,
+                                    { $subtract: ['$lockedBalance', releaseAmount] }
+                                ]
+                            }
+                        }
+                    }
+                ]
             );
 
             if (updateResult.matchedCount === 0) {
+                // Rollback transaction status
+                await Transaction.updateOne(
+                    { txId },
+                    { $set: { status: 'PENDING' } }
+                );
                 throw new Error('USER_UPDATE_FAILED');
             }
 
-            logger.info('Funds released', { userId, amount, reason, txId });
+            logger.info('Funds released', { 
+                userId, 
+                txId,
+                requestedAmount: amount,
+                releasedAmount: releaseAmount,
+                previousLockedBalance: currentLocked,
+                newLockedBalance: Math.max(0, currentLocked - releaseAmount),
+                reason
+            });
 
-            return true;
+            return { 
+                success: true, 
+                releasedAmount: releaseAmount,
+                requestedAmount: amount,
+                wasPartial: releaseAmount < amount
+            };
 
         } catch (error) {
-            logger.error('Failed to release funds', { txId, userId, error: error.message });
+            logger.error('Failed to release funds', { 
+                txId, 
+                userId, 
+                reason,
+                error: error.message 
+            });
             throw error;
         }
-    }
+                }
+    
     
 
             
