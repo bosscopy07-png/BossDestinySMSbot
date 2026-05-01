@@ -571,4 +571,210 @@ class SMSProviderManager {
      */
     getFreeProviderHealth() {
         const provider = this.providers.get('FREE_PUBLIC');
-        if (!prov
+        if (!provider) {
+            return { available: false };
+        }
+
+        return {
+            available: true,
+            providers: typeof provider.getProviderHealth === 'function' ? provider.getProviderHealth() : [],
+            activeSessions: typeof provider.getActiveSessions === 'function' ? provider.getActiveSessions() : []
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  NUMBER RELEASE / CANCELLATION
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async cancelNumber(providerName, identifier) {
+        if (!this.isInitialized) await this.initialize();
+
+        // Pool numbers (VIP/BUNDLE)
+        if (providerName === 'NUMBER_POOL' || providerName === 'TWILIO' || providerName === 'TELNYX') {
+            if (!this.numberPool) {
+                return { success: false, error: 'POOL_NOT_INITIALIZED' };
+            }
+            return this.numberPool.releaseNumber(identifier, 'USER_CANCELLED');
+        }
+
+        // FreeProvider sessions
+        if (providerName === 'FREE_PUBLIC' || providerName === 'FREE') {
+            const provider = this.providers.get('FREE_PUBLIC');
+            if (provider?.cancelNumber && typeof provider.cancelNumber === 'function') {
+                return provider.cancelNumber(identifier);
+            }
+            return { success: true, status: 'RELEASED' };
+        }
+
+        // CheapPanel (5SIM) — FIXED: route to dedicated method
+        if (providerName === 'CHEAP_PANEL' || providerName === 'CHEAP') {
+            return this.cancelCheapNumber(identifier);
+        }
+
+        // Direct lookup
+        const provider = this.providers.get(providerName);
+        if (!provider) {
+            return { success: false, error: `PROVIDER_NOT_FOUND: ${providerName}` };
+        }
+
+        if (provider.cancelNumber && typeof provider.cancelNumber === 'function') {
+            return provider.cancelNumber(identifier);
+        }
+
+        return { success: true, note: 'Nothing to cancel for this provider' };
+    }
+
+    async finishNumber(providerName, identifier) {
+        if (!this.isInitialized) await this.initialize();
+
+        if (providerName === 'NUMBER_POOL' || providerName === 'TWILIO' || providerName === 'TELNYX') {
+            if (!this.numberPool) {
+                return { success: false, error: 'POOL_NOT_INITIALIZED' };
+            }
+            return this.numberPool.releaseNumber(identifier, 'SESSION_END');
+        }
+
+        if (providerName === 'FREE_PUBLIC' || providerName === 'FREE') {
+            const provider = this.providers.get('FREE_PUBLIC');
+            if (provider?.finishNumber && typeof provider.finishNumber === 'function') {
+                return provider.finishNumber(identifier);
+            }
+            return { success: true, status: 'FINISHED' };
+        }
+
+        if (providerName === 'CHEAP_PANEL' || providerName === 'CHEAP') {
+            return this.finishCheapNumber(identifier);
+        }
+
+        const provider = this.providers.get(providerName);
+        if (provider?.finishNumber && typeof provider.finishNumber === 'function') {
+            return provider.finishNumber(identifier);
+        }
+
+        return { success: true, note: 'No finish action required' };
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  POOL MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async buyPoolNumbers(country = 'US', quantity = 1, preferredProvider = null) {
+        if (!this.numberPool || !this.numberBuyer) {
+            throw new Error('POOL_NOT_AVAILABLE: Number pool not configured');
+        }
+
+        if (!this.isInitialized) await this.initialize();
+
+        const result = await this.numberBuyer.buyMultiple(
+            [{ country, count: quantity, preferredProvider }],
+            { abortOnError: false }
+        );
+
+        if (result.totalSuccess > 0) {
+            await this.numberPool.initialize();
+        }
+
+        return {
+            success: result.totalFailed === 0,
+            purchased: result.results[0]?.numbers || [],
+            failed: result.totalFailed,
+            totalCost: result.totalCost,
+            errors: result.results[0]?.errors || []
+        };
+    }
+
+    async buyPoolNumbersBulk(configs) {
+        if (!this.numberPool || !this.numberBuyer) {
+            throw new Error('POOL_NOT_AVAILABLE: Number pool not configured');
+        }
+
+        if (!this.isInitialized) await this.initialize();
+
+        const result = await this.numberBuyer.buyMultiple(configs, { abortOnError: false });
+
+        if (result.totalSuccess > 0) {
+            await this.numberPool.initialize();
+        }
+
+        return result;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STATS & MONITORING
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async getPoolStats() {
+        if (!this.numberPool) {
+            return { available: false, reason: 'POOL_NOT_CONFIGURED' };
+        }
+
+        return {
+            available: true,
+            pools: this.numberPool.getPoolStats(),
+            detailed: this.numberPool.getDetailedStats?.() || null
+        };
+    }
+
+    getAllStats() {
+        const stats = {};
+        for (const [name, provider] of this.providers) {
+            stats[name] = provider.getStats ? provider.getStats() : { isActive: provider.isActive };
+        }
+        if (this.numberPool) {
+            stats['POOL'] = this.numberPool.getPoolStats();
+            stats['POOL_DETAILED'] = this.numberPool.getDetailedStats?.();
+        }
+        return stats;
+    }
+
+    getActiveProviders() {
+        return Array.from(this.providers.entries())
+            .filter(([_, provider]) => provider.isActive)
+            .map(([name, _]) => name);
+    }
+
+    getProvider(name) {
+        return this.providers.get(name);
+    }
+
+    getProviderInstance(name) {
+        return this.providers.get(name);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SHUTDOWN
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async shutdown() {
+        if (this.numberBuyer) {
+            try {
+                await this.numberBuyer.shutdown();
+            } catch (e) {
+                logger.warn('NumberBuyer shutdown failed', { error: e.message });
+            }
+        }
+
+        if (this.numberPool) {
+            try {
+                await this.numberPool.uninitialize();
+            } catch (e) {
+                logger.warn('Pool uninitialize failed', { error: e.message });
+            }
+        }
+
+        for (const [name, provider] of this.providers) {
+            if (provider.stopCleanupJob && typeof provider.stopCleanupJob === 'function') {
+                try {
+                    provider.stopCleanupJob();
+                } catch (e) {
+                    logger.warn(`Provider ${name} cleanup failed`, { error: e.message });
+                }
+            }
+        }
+
+        this.isInitialized = false;
+        logger.info('SMS Provider Manager shut down');
+    }
+}
+
+export default SMSProviderManager;
