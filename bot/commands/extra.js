@@ -873,6 +873,7 @@ class Admin {
         );
     }
 
+    
     async processImpersonate(ctx, targetId) {
         try {
             const { User } = await import('../models/index.js');
@@ -901,7 +902,176 @@ class Admin {
                     inline_keyboard: [
                         [
                             { text: '💰 Add Balance', callback_data: `admin_add_bal_${targetId}` },
-         // ═══════════════════════════════════════════════════════
+                            { text: '💸 Deduct', callback_data: `admin_ded_bal_${targetId}` }
+                        ],
+                        [{ text: '◀️ Back to Users', callback_data: 'admin_back_users' }]
+                    ]
+                }
+            });
+
+        } catch (error) {
+            logger.error('Impersonate failed', { error: error.message, targetId });
+            ctx.reply(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_users' }]] }
+            });
+        }
+    }
+
+    // ─── 27. Manual Refund ───
+    async promptRefund(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery();
+        ctx.session.awaitingRefund = true;
+        
+        await safeEditMessage(ctx,
+            `↩️ <b>Manual Refund</b>\n\n` +
+            `Send: <code>USER_ID AMOUNT REASON</code>\n` +
+            `Example: <code>123456789 10.50 Service outage</code>\n\n` +
+            `Or send /cancel to abort.`,
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    async processRefund(ctx, targetId, amount, reason) {
+        try {
+            const { User, Transaction } = await import('../models/index.js');
+            
+            const user = await User.findOneAndUpdate(
+                { userId: targetId },
+                { $inc: { balance: amount } },
+                { new: true }
+            );
+
+            if (!user) {
+                return ctx.reply(`❌ User <code>${targetId}</code> not found.`, { parse_mode: 'HTML' });
+            }
+
+            await Transaction.create({
+                userId: targetId,
+                type: 'REFUND',
+                amount: amount,
+                status: 'COMPLETED',
+                reason: reason,
+                createdAt: new Date()
+            });
+
+            await ctx.reply(
+                `↩️ <b>Refund Processed</b>\n\n` +
+                `👤 User: <code>${targetId}</code>\n` +
+                `💰 Amount: <b>$${amount.toFixed(2)}</b>\n` +
+                `📝 Reason: <i>${reason}</i>\n` +
+                `💳 New Balance: <b>$${user.balance.toFixed(2)}</b>`,
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+                }
+            );
+
+        } catch (error) {
+            logger.error('Refund failed', { error: error.message });
+            ctx.reply(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+        }
+    }
+
+    // ─── 28. Adjust Transaction ───
+    async promptAdjustTransaction(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery();
+        ctx.session.awaitingAdjustTx = true;
+        
+        await safeEditMessage(ctx,
+            `✏️ <b>Adjust Transaction</b>\n\n` +
+            `Send: <code>TX_ID NEW_AMOUNT</code>\n` +
+            `Example: <code>507f1f77bcf86cd799439011 25.00</code>\n\n` +
+            `⚠️ This modifies historical data!\n` +
+            `Or send /cancel to abort.`,
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    async processAdjustTransaction(ctx, txId, newAmount) {
+        try {
+            const { Transaction } = await import('../models/index.js');
+            const tx = await Transaction.findByIdAndUpdate(
+                txId,
+                { $set: { amount: newAmount, adjustedBy: ctx.from.id.toString(), adjustedAt: new Date() } },
+                { new: true }
+            );
+
+            if (!tx) {
+                return ctx.reply(`❌ Transaction <code>${txId}</code> not found.`, { parse_mode: 'HTML' });
+            }
+
+            await ctx.reply(
+                `✏️ <b>Transaction Adjusted</b>\n\n` +
+                `🆔 ID: <code>${txId}</code>\n` +
+                `💰 New Amount: <b>$${newAmount.toFixed(2)}</b>\n` +
+                `📊 Type: <b>${tx.type}</b>\n` +
+                `👤 User: <code>${tx.userId}</code>`,
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+                }
+            );
+
+        } catch (error) {
+            logger.error('Adjust tx failed', { error: error.message });
+            ctx.reply(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+        }
+    }
+
+    // ─── 35. Provider Balance Check ───
+    async handleProviderBalance(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('💳 Checking balances...');
+
+        try {
+            if (!this.smsProviderManager) {
+                throw new Error('SMS Provider Manager not initialized');
+            }
+
+            const balances = await this.smsProviderManager.checkBalances();
+            
+            let text = `💳 <b>SMS Provider Balances</b>\n\n`;
+            
+            if (!balances || balances.length === 0) {
+                text += `<i>No providers configured or all offline.</i>`;
+            } else {
+                balances.forEach(b => {
+                    const status = b.available ? '🟢' : '🔴';
+                    text += `${status} <b>${b.provider}</b>: ${b.balance} ${b.currency || 'credits'}\n` +
+                           `   📊 Success Rate: <b>${(b.successRate * 100).toFixed(1)}%</b>\n\n`;
+                });
+            }
+
+            await safeEditMessage(ctx, text, {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔄 Refresh', callback_data: 'admin_provider_balance' }],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_sms' }]
+                    ]
+                }
+            });
+
+        } catch (error) {
+            logger.error('Provider balance failed', { error: error.message });
+            safeEditMessage(ctx, `❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_sms' }]] }
+            });
+        }
+    }
+     // ═══════════════════════════════════════════════════════
     //  NEW FEATURES (38, 39, 45, 51, 56, 60)
     // ═══════════════════════════════════════════════════════
 
@@ -1356,6 +1526,7 @@ class Admin {
     //  PLACEHOLDERS
     // ═══════════════════════════════════════════════════════
 
+    
     async handleStats7d(ctx) { return this.comingSoon(ctx, '7-day Stats'); }
     async handleStats30d(ctx) { return this.comingSoon(ctx, '30-day Stats'); }
     async handleTopUsers(ctx) { return this.comingSoon(ctx, 'Top Users'); }
@@ -1367,4 +1538,50 @@ class Admin {
     async handleSwitchProvider(ctx) { return this.comingSoon(ctx, 'Switch Provider'); }
     async handleRetryFailedOTP(ctx) { return this.comingSoon(ctx, 'Retry Failed OTP'); }
     async handlePriceByCountry(ctx) { return this.comingSoon(ctx, 'Price by Country'); }
-    async handleVelocityCheck(ctx) { return this.comingS
+    async handleVelocityCheck(ctx) { return this.comingSoon(ctx, 'Velocity Check'); }
+    async handleGeoFencing(ctx) { return this.comingSoon(ctx, 'Geo-Fencing'); }
+    async handleSmartRefund(ctx) { return this.comingSoon(ctx, 'Smart Refund'); }
+    async handleStaleSessionCleaner(ctx) { return this.comingSoon(ctx, 'Stale Session Cleaner'); }
+    async handleCohortRetention(ctx) { return this.comingSoon(ctx, 'Cohort Retention'); }
+    async handleLTV(ctx) { return this.comingSoon(ctx, 'LTV Analysis'); }
+    async handleRevenueByCountry(ctx) { return this.comingSoon(ctx, 'Revenue by Country'); }
+    async handleHourlyHeatmap(ctx) { return this.comingSoon(ctx, 'Hourly Heatmap'); }
+    async handleConversionFunnel(ctx) { return this.comingSoon(ctx, 'Conversion Funnel'); }
+    async handleBulkOperations(ctx) { return this.comingSoon(ctx, 'Bulk Operations'); }
+    async handleReferralTree(ctx) { return this.comingSoon(ctx, 'Referral Tree'); }
+    async promptShadowBan(ctx) { return this.comingSoon(ctx, 'Shadow Ban'); }
+    async promptAccountMerge(ctx) { return this.comingSoon(ctx, 'Account Merge'); }
+    async handleDynamicPricing(ctx) { return this.comingSoon(ctx, 'Dynamic Pricing'); }
+    async handlePromoCodes(ctx) { return this.comingSoon(ctx, 'Promo Codes'); }
+    async handleCommissionSplit(ctx) { return this.comingSoon(ctx, 'Commission Split'); }
+    async handleInvoiceGenerator(ctx) { return this.comingSoon(ctx, 'Invoice Generator'); }
+    async handleTaxExport(ctx) { return this.comingSoon(ctx, 'Tax Export'); }
+    async handleAuditTrail(ctx) { return this.comingSoon(ctx, 'Audit Trail'); }
+    async handleWebhookTest(ctx) { return this.comingSoon(ctx, 'Webhook Test'); }
+    async handleHotReload(ctx) { return this.comingSoon(ctx, 'Hot Reload'); }
+    async handleABTesting(ctx) { return this.comingSoon(ctx, 'A/B Testing'); }
+    async handleKeyRotation(ctx) { return this.comingSoon(ctx, 'Key Rotation'); }
+    async handleWorkerStatus(ctx) { return this.comingSoon(ctx, 'Worker Status'); }
+    async handleSearchUser(ctx) { return this.comingSoon(ctx, 'Search User'); }
+    async promptBlacklist(ctx) { return this.comingSoon(ctx, 'Blacklist User'); }
+    async promptWhitelist(ctx) { return this.comingSoon(ctx, 'Whitelist User'); }
+    async promptMessageUser(ctx) { return this.comingSoon(ctx, 'Message User'); }
+    async promptBroadcast(ctx) { return this.comingSoon(ctx, 'Broadcast'); }
+
+    async comingSoon(ctx, feature) {
+        await ctx.answerCbQuery(`${feature}: Coming soon!`, { show_alert: true });
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  HELPER: Reply with error
+    // ═══════════════════════════════════════════════════════
+
+    replyError(ctx, text) {
+        return ctx.reply(text, { 
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: [[{ text: '◀️ Dashboard', callback_data: 'admin_dashboard' }]] }
+        });
+    }
+}
+
+export default Admin;
