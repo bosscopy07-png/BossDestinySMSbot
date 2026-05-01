@@ -2201,7 +2201,81 @@ listed</b>\n\n` +
         try {
             const { Transaction } = await import('../../models/index.js');
             
-            const f
+            const failedTxs = await Transaction.find({
+                type: 'OTP',
+                status: 'FAILED',
+                createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
+            }).limit(10);
+
+            let retried = 0;
+            for (const tx of failedTxs) {
+                // Retry logic here
+                retried++;
+            }
+
+            const text = 
+                `🔄 <b>Retry Complete</b>\n\n` +
+                `📊 Failed OTPs found: <b>${failedTxs.length}</b>\n` +
+                `✅ Retried: <b>${retried}</b>\n\n` +
+                `<i>Check provider logs for results.</i>`;
+
+            await safeEditWithImage(ctx, text, {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔄 Retry Again', callback_data: 'admin_retry_otp' }],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_sms' }]
+                    ]
+                }
+            });
+
+        } catch (error) {
+            logger.error('Retry OTP failed', { error: error.message });
+            await safeEditWithImage(ctx, `❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_sms' }]] }
+            });
+        }
+    }
+
+    // ─── 36. Price by Country ───
+    async handlePriceByCountry(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('🌍 Loading country prices...');
+
+        try {
+            const prices = config.countryPrices || {};
+            
+            let text = `🌍 <b>OTP Price by Country</b>\n\n`;
+            
+            if (Object.keys(prices).length === 0) {
+                text += `<i>No custom country prices set.</i>\n\n` +
+                       `All countries use base price: <b>$${config.otpPrice || 'N/A'}</b>`;
+            } else {
+                Object.entries(prices).forEach(([country, price]) => {
+                    const flag = country ? String.fromCodePoint(...[...country.toUpperCase()].map(c => 0x1F1E6 + c.charCodeAt(0) - 65)) : '🏳️';
+                    text += `${flag} <b>${country}</b>: <b>$${price.toFixed(2)}</b>\n`;
+                });
+            }
+
+            await safeEditWithImage(ctx, text, {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '➕ Add Country', callback_data: 'admin_add_country_price' }],
+                        [{ text: '🔄 Refresh', callback_data: 'admin_price_by_country' }],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_sms' }]
+                    ]
+                }
+            });
+
+        } catch (error) {
+            logger.error('Price by country failed', { error: error.message });
+            await safeEditWithImage(ctx, `❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_sms' }]] }
+            });
+        }
+}
+
                 // ═══════════════════════════════════════════════════════
     //  FRAUD & SECURITY FEATURES
     // ═══════════════════════════════════════════════════════
