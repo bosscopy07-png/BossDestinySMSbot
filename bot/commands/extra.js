@@ -126,6 +126,16 @@ class Admin {
         this.bot.action('admin_heatmap', (ctx) => this.handleHourlyHeatmap(ctx));
         this.bot.action('admin_funnel', (ctx) => this.handleConversionFunnel(ctx));
 
+        // ─── Sub-menu navigation handlers (WERE MISSING!) ───
+this.bot.action('admin_system_menu', (ctx) => this.showSystemMenu(ctx));
+this.bot.action('admin_analytics_menu', (ctx) => this.showAnalyticsMenu(ctx));
+this.bot.action('admin_users_menu', (ctx) => this.showUsersMenu(ctx));
+this.bot.action('admin_finance_menu', (ctx) => this.showFinanceMenu(ctx));
+this.bot.action('admin_sms_menu', (ctx) => this.showSMSMenu(ctx));
+this.bot.action('admin_fraud_menu', (ctx) => this.showFraudMenu(ctx));
+this.bot.action('admin_automation_menu', (ctx) => this.showAutomationMenu(ctx));
+this.bot.action('admin_devops_menu', (ctx) => this.showDevopsMenu(ctx));
+        
         // ─── NEW: Advanced User Management ───
         this.bot.action('admin_bulk_ops', (ctx) => this.handleBulkOperations(ctx));
         this.bot.action('admin_user_notes', (ctx) => this.promptUserNotes(ctx));
@@ -164,37 +174,42 @@ class Admin {
     // ═══════════════════════════════════════════════════════
 
     async showDashboard(ctx, edit = true) {
-        const userId = ctx.from?.id?.toString();
-        if (!this.isAdmin(userId)) {
-            return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
-        }
+    const userId = ctx.from?.id?.toString();
+    if (!this.isAdmin(userId)) {
+        return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+    }
 
-        const text = 
-            `🏛️ <b>Admin Dashboard</b>\n\n` +
-            `Welcome, <b>${ctx.from.first_name || 'Admin'}</b>!\n` +
-            `Select a category below:`;
+    try {
+        await ctx.answerCbQuery('🏛️ Dashboard').catch(() => {});
+    } catch (e) {}
 
-        const keyboard = {
-            inline_keyboard: [
-                [
-                    { text: '🔧 System', callback_data: 'admin_system_menu' },
-                    { text: '📊 Analytics', callback_data: 'admin_analytics_menu' }
-                ],
-                [
-                    { text: '👤 Users', callback_data: 'admin_users_menu' },
-                    { text: '💰 Finance', callback_data: 'admin_finance_menu' }
-                ],
-                [
-                    { text: '📱 SMS/OTP', callback_data: 'admin_sms_menu' },
-                    { text: '🛡️ Fraud & Security', callback_data: 'admin_fraud_menu' }
-                ],
-                [
-                    { text: '🤖 Automation', callback_data: 'admin_automation_menu' },
-                    { text: '⚙️ DevOps', callback_data: 'admin_devops_menu' }
-                ]
+    const text = 
+        `🏛️ <b>Admin Dashboard</b>\n\n` +
+        `Welcome, <b>${ctx.from.first_name || 'Admin'}</b>!\n` +
+        `Select a category below:`;
+
+    const keyboard = {
+        inline_keyboard: [
+            [
+                { text: '🔧 System', callback_data: 'admin_system_menu' },
+                { text: '📊 Analytics', callback_data: 'admin_analytics_menu' }
+            ],
+            [
+                { text: '👤 Users', callback_data: 'admin_users_menu' },
+                { text: '💰 Finance', callback_data: 'admin_finance_menu' }
+            ],
+            [
+                { text: '📱 SMS/OTP', callback_data: 'admin_sms_menu' },
+                { text: '🛡️ Fraud & Security', callback_data: 'admin_fraud_menu' }
+            ],
+            [
+                { text: '🤖 Automation', callback_data: 'admin_automation_menu' },
+                { text: '⚙️ DevOps', callback_data: 'admin_devops_menu' }
             ]
-        };
+        ]
+    };
 
+    try {
         if (edit && ctx.callbackQuery) {
             await safeEditMessage(ctx, text, { 
                 parse_mode: 'HTML', 
@@ -206,11 +221,21 @@ class Admin {
                 reply_markup: keyboard 
             });
         }
-        ctx.answerCbQuery().catch(() => {});
+    } catch (err) {
+        logger.error('showDashboard error', { error: err.message });
+        try {
+            await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard });
+        } catch (e) {}
     }
+    }
+    
+    
+    
 
     // ─── System Sub-Menu ───
-    async showSystemMenu(ctx) {
+async showSystemMenu(ctx) {
+    try {
+        await ctx.answerCbQuery('🔧 System').catch(() => {});
         const text = `🔧 <b>System & Maintenance</b>\n\nManage bot health and operations:`;
         const keyboard = {
             inline_keyboard: [
@@ -234,11 +259,16 @@ class Admin {
             ]
         };
         await safeEditMessage(ctx, text, { parse_mode: 'HTML', reply_markup: keyboard });
-        ctx.answerCbQuery().catch(() => {});
+    } catch (err) {
+        logger.error('showSystemMenu error', { error: err.message });
+        ctx.answerCbQuery('❌ Error').catch(() => {});
     }
+}
 
-    // ─── Analytics Sub-Menu ───
-    async showAnalyticsMenu(ctx) {
+// ─── Analytics Sub-Menu ───
+async showAnalyticsMenu(ctx) {
+    try {
+        await ctx.answerCbQuery('📊 Analytics').catch(() => {});
         const text = `📊 <b>Analytics & Stats</b>\n\nView performance metrics:`;
         const keyboard = {
             inline_keyboard: [
@@ -266,11 +296,16 @@ class Admin {
             ]
         };
         await safeEditMessage(ctx, text, { parse_mode: 'HTML', reply_markup: keyboard });
-        ctx.answerCbQuery().catch(() => {});
+    } catch (err) {
+        logger.error('showAnalyticsMenu error', { error: err.message });
+        ctx.answerCbQuery('❌ Error').catch(() => {});
     }
+}
 
-    // ─── Users Sub-Menu ───
-    async showUsersMenu(ctx) {
+// ─── Users Sub-Menu ───
+async showUsersMenu(ctx) {
+    try {
+        await ctx.answerCbQuery('👤 Users').catch(() => {});
         const text = `👤 <b>User Management</b>\n\nManage individual users:`;
         const keyboard = {
             inline_keyboard: [
@@ -306,11 +341,16 @@ class Admin {
             ]
         };
         await safeEditMessage(ctx, text, { parse_mode: 'HTML', reply_markup: keyboard });
-        ctx.answerCbQuery().catch(() => {});
+    } catch (err) {
+        logger.error('showUsersMenu error', { error: err.message });
+        ctx.answerCbQuery('❌ Error').catch(() => {});
     }
+}
 
-    // ─── Finance Sub-Menu ───
-    async showFinanceMenu(ctx) {
+// ─── Finance Sub-Menu ───
+async showFinanceMenu(ctx) {
+    try {
+        await ctx.answerCbQuery('💰 Finance').catch(() => {});
         const text = `💰 <b>Financial Control</b>\n\nManage money operations:`;
         const keyboard = {
             inline_keyboard: [
@@ -338,11 +378,16 @@ class Admin {
             ]
         };
         await safeEditMessage(ctx, text, { parse_mode: 'HTML', reply_markup: keyboard });
-        ctx.answerCbQuery().catch(() => {});
+    } catch (err) {
+        logger.error('showFinanceMenu error', { error: err.message });
+        ctx.answerCbQuery('❌ Error').catch(() => {});
     }
+}
 
-    // ─── SMS/OTP Sub-Menu ───
-    async showSMSMenu(ctx) {
+// ─── SMS/OTP Sub-Menu ───
+async showSMSMenu(ctx) {
+    try {
+        await ctx.answerCbQuery('📱 SMS').catch(() => {});
         const text = `📱 <b>SMS/OTP Management</b>\n\nControl SMS operations:`;
         const keyboard = {
             inline_keyboard: [
@@ -358,11 +403,16 @@ class Admin {
             ]
         };
         await safeEditMessage(ctx, text, { parse_mode: 'HTML', reply_markup: keyboard });
-        ctx.answerCbQuery().catch(() => {});
+    } catch (err) {
+        logger.error('showSMSMenu error', { error: err.message });
+        ctx.answerCbQuery('❌ Error').catch(() => {});
     }
+}
 
-    // ─── Fraud & Security Sub-Menu ───
-    async showFraudMenu(ctx) {
+// ─── Fraud & Security Sub-Menu ───
+async showFraudMenu(ctx) {
+    try {
+        await ctx.answerCbQuery('🛡️ Fraud').catch(() => {});
         const text = `🛡️ <b>Fraud Detection & Security</b>\n\nProtect against abuse:`;
         const keyboard = {
             inline_keyboard: [
@@ -378,11 +428,16 @@ class Admin {
             ]
         };
         await safeEditMessage(ctx, text, { parse_mode: 'HTML', reply_markup: keyboard });
-        ctx.answerCbQuery().catch(() => {});
+    } catch (err) {
+        logger.error('showFraudMenu error', { error: err.message });
+        ctx.answerCbQuery('❌ Error').catch(() => {});
     }
+}
 
-    // ─── Automation Sub-Menu ───
-    async showAutomationMenu(ctx) {
+// ─── Automation Sub-Menu ───
+async showAutomationMenu(ctx) {
+    try {
+        await ctx.answerCbQuery('🤖 Automation').catch(() => {});
         const text = `🤖 <b>Automation</b>\n\nSet up auto-pilot features:`;
         const keyboard = {
             inline_keyboard: [
@@ -402,11 +457,16 @@ class Admin {
             ]
         };
         await safeEditMessage(ctx, text, { parse_mode: 'HTML', reply_markup: keyboard });
-        ctx.answerCbQuery().catch(() => {});
+    } catch (err) {
+        logger.error('showAutomationMenu error', { error: err.message });
+        ctx.answerCbQuery('❌ Error').catch(() => {});
     }
+}
 
-    // ─── DevOps Sub-Menu ───
-    async showDevopsMenu(ctx) {
+// ─── DevOps Sub-Menu ───
+async showDevopsMenu(ctx) {
+    try {
+        await ctx.answerCbQuery('⚙️ DevOps').catch(() => {});
         const text = `⚙️ <b>DevOps & Integrations</b>\n\nSystem operations:`;
         const keyboard = {
             inline_keyboard: [
@@ -418,12 +478,16 @@ class Admin {
                     { text: '🧪 A/B Testing', callback_data: 'admin_ab_test' },
                     { text: '🔑 Key Rotation', callback_data: 'admin_key_rotate' }
                 ],
-                                [{ text: '◀️ Back', callback_data: 'admin_back' }]
+                [{ text: '◀️ Back', callback_data: 'admin_back' }]
             ]
         };
         await safeEditMessage(ctx, text, { parse_mode: 'HTML', reply_markup: keyboard });
-        ctx.answerCbQuery().catch(() => {});
+    } catch (err) {
+        logger.error('showDevopsMenu error', { error: err.message });
+        ctx.answerCbQuery('❌ Error').catch(() => {});
     }
+}
+    
 
     // ═══════════════════════════════════════════════════════
     //  EXISTING FEATURES (Your #1-3, 5-8, 14, 15, 22-24, 27, 28, 35)
