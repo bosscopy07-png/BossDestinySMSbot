@@ -1344,8 +1344,18 @@ class OTPCommands {
                 TIMEOUT: '⏱ Request timed out. Please try again.'
             };
 
+            
+            
             const errorKey = Object.keys(errorMessages).find(key => error.message?.includes(key));
-            const displayMessage = errorMessages[errorKey] || `
+            const displayMessage = errorMessages[errorKey] || `❌ Error: ${error.message}`;
+
+            await this.sendPhotoWithCaption(
+                ctx, IMAGES.otpFailed, 
+                displayMessage,
+                KEYBOARDS.supportOrRetry(), 'HTML'
+            );
+        }
+    }
     
     // ═══════════════════════════════════════════════════════════════════════════════
 //  OTPCommands.js — Part 3: Polling, Check OTP, Cancel, Bundle & VIP Purchases
