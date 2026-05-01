@@ -596,11 +596,10 @@ class WalletService {
      * Lock funds from user balance for a pending purchase
      * Funds are reserved but NOT deducted from balance yet
      */
-    async lockFunds(userId, amount, purpose) {
+        async lockFunds(userId, amount, purpose) {
         const txId = generateId();
 
         try {
-            // Validate amount
             amount = parseFloat(amount);
             if (isNaN(amount) || amount <= 0) {
                 throw new Error('INVALID_AMOUNT: Amount must be positive');
@@ -616,7 +615,7 @@ class WalletService {
                 throw new Error('INSUFFICIENT_FUNDS');
             }
 
-            // Create lock transaction
+            // FIXED: Use 'LOCK' enum value (added to schema)
             await Transaction.create({
                 txId,
                 userId,
@@ -632,14 +631,12 @@ class WalletService {
                 }
             });
 
-            // Increment lockedBalance (balance stays the same)
             const updateResult = await User.updateOne(
                 { userId },
                 { $inc: { lockedBalance: amount } }
             );
 
             if (updateResult.matchedCount === 0) {
-                // Rollback: delete transaction
                 await Transaction.deleteOne({ txId });
                 throw new Error('USER_UPDATE_FAILED');
             }
@@ -654,11 +651,6 @@ class WalletService {
         }
     }
 
-    /**
-     * FIXED: Capture locked funds — DEDUCTS from actual balance
-     * Previously: Only removed from lockedBalance, never touched balance
-     * Now: Deducts from balance, removes from lockedBalance, increments totalSpent
-     */
     async captureFunds(txId, userId) {
         try {
             const tx = await Transaction.findOne({ txId, userId });
@@ -671,50 +663,47 @@ class WalletService {
                 throw new Error('INVALID_AMOUNT');
             }
 
-            // Get user for validation
             const user = await User.findOne({ userId });
             if (!user) {
                 throw new Error('USER_NOT_FOUND');
             }
 
-            // Validate sufficient locked balance
             if ((user.lockedBalance || 0) < amount) {
                 throw new Error('INSUFFICIENT_LOCKED_BALANCE');
             }
 
-            // Update transaction to COMPLETED
+            // FIXED: Update transaction to COMPLETED with type CAPTURE
             await Transaction.updateOne(
                 { txId },
                 {
                     $set: {
                         status: 'COMPLETED',
+                        type: 'CAPTURE',  // ← Track that this was a capture
                         'metadata.capturedAt': new Date()
                     }
                 }
             );
 
-            // FIXED: Atomically deduct from balance, remove from locked, track totalSpent
             const updateResult = await User.updateOne(
                 { userId },
                 {
                     $inc: {
-                        balance: -amount,        // ← FIXED: Actually deduct from real balance
-                        lockedBalance: -amount,   // ← Remove from locked
-                        totalSpent: amount        // ← Track for stats
+                        balance: -amount,
+                        lockedBalance: -amount,
+                        totalSpent: amount
                     }
                 }
             );
 
             if (updateResult.matchedCount === 0) {
-                // Attempt rollback
                 await Transaction.updateOne(
                     { txId },
-                    { $set: { status: 'PENDING' } }
+                    { $set: { status: 'PENDING', type: 'LOCK' } }
                 );
                 throw new Error('USER_UPDATE_FAILED');
             }
 
-            logger.info('Funds captured', { userId, amount, txId, newBalance: user.balance - amount });
+            logger.info('Funds captured', { userId, amount, txId });
 
             return true;
 
@@ -724,12 +713,6 @@ class WalletService {
         }
     }
 
-    /**
-     * FIXED: Release locked funds back to user (cancel/refund)
-     * Previously: Returned false silently on invalid tx
-     * Now: Throws error so caller knows refund failed
-     * Preserves original transaction type, only changes status to CANCELLED
-     */
     async releaseFunds(txId, userId, reason) {
         try {
             const tx = await Transaction.findOne({ txId, userId });
@@ -742,23 +725,20 @@ class WalletService {
                 throw new Error('INVALID_AMOUNT');
             }
 
-            // Get user for validation
             const user = await User.findOne({ userId });
             if (!user) {
                 throw new Error('USER_NOT_FOUND');
             }
 
-            // Validate sufficient locked balance
             if ((user.lockedBalance || 0) < amount) {
                 logger.warn('Locked balance less than release amount', {
                     userId,
                     lockedBalance: user.lockedBalance,
                     releaseAmount: amount
                 });
-                // Continue anyway — don't block refund
             }
 
-            // FIXED: Preserve original transaction type, only change status
+            // FIXED: Keep type as LOCK (for audit trail), only change status to CANCELLED
             await Transaction.updateOne(
                 { txId },
                 {
@@ -770,7 +750,6 @@ class WalletService {
                 }
             );
 
-            // Remove from lockedBalance (balance stays the same — was never deducted)
             const updateResult = await User.updateOne(
                 { userId },
                 { $inc: { lockedBalance: -amount } }
@@ -789,6 +768,10 @@ class WalletService {
             throw error;
         }
     }
+    
+
+            
+    
 
     // ═══════════════════════════════════════════════════════════
     //  ADMIN BALANCE OPERATIONS
