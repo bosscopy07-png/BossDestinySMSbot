@@ -2,10 +2,13 @@
 //  bot/commands/extra.js — Advanced Admin Dashboard
 // ═══════════════════════════════════════════════════════════
 
+        // ═══════════════════════════════════════════════════════════
+//  bot/commands/extra.js — Advanced Admin Dashboard
+// ═══════════════════════════════════════════════════════════
+
 import { fixNegativeLockedBalances } from '../../scripts/index.js';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
-
 
 // ─── SAFE EDIT HELPER ───
 // Prevents "no text in the message to edit" crashes
@@ -62,8 +65,18 @@ class Admin {
      * Register all admin callback actions
      */
     registerActions() {
-        // Main dashboard entry point — replaces /admin slash command
+        // Main dashboard entry point
         this.bot.action('admin_dashboard', (ctx) => this.showDashboard(ctx));
+        
+        // ─── Sub-menu navigation handlers ───
+        this.bot.action('admin_system_menu', (ctx) => this.showSystemMenu(ctx));
+        this.bot.action('admin_analytics_menu', (ctx) => this.showAnalyticsMenu(ctx));
+        this.bot.action('admin_users_menu', (ctx) => this.showUsersMenu(ctx));
+        this.bot.action('admin_finance_menu', (ctx) => this.showFinanceMenu(ctx));
+        this.bot.action('admin_sms_menu', (ctx) => this.showSMSMenu(ctx));
+        this.bot.action('admin_fraud_menu', (ctx) => this.showFraudMenu(ctx));
+        this.bot.action('admin_automation_menu', (ctx) => this.showAutomationMenu(ctx));
+        this.bot.action('admin_devops_menu', (ctx) => this.showDevopsMenu(ctx));
         
         // ─── System & Maintenance ───
         this.bot.action('admin_fix_balances', (ctx) => this.handleFixBalances(ctx));
@@ -108,18 +121,18 @@ class Admin {
         this.bot.action('admin_retry_otp', (ctx) => this.handleRetryFailedOTP(ctx));
         this.bot.action('admin_price_by_country', (ctx) => this.handlePriceByCountry(ctx));
 
-        // ─── NEW: Fraud & Security ───
+        // ─── Fraud & Security ───
         this.bot.action('admin_fraud_auto', (ctx) => this.handleAutoBlacklistToggle(ctx));
         this.bot.action('admin_fraud_ip', (ctx) => this.handleIPFingerprinting(ctx));
         this.bot.action('admin_fraud_velocity', (ctx) => this.handleVelocityCheck(ctx));
         this.bot.action('admin_fraud_geo', (ctx) => this.handleGeoFencing(ctx));
 
-        // ─── NEW: Automation ───
+        // ─── Automation ───
         this.bot.action('admin_smart_refund', (ctx) => this.handleSmartRefund(ctx));
         this.bot.action('admin_provider_failover', (ctx) => this.handleProviderFailover(ctx));
         this.bot.action('admin_stale_cleaner', (ctx) => this.handleStaleSessionCleaner(ctx));
 
-        // ─── NEW: Advanced Analytics ───
+        // ─── Advanced Analytics ───
         this.bot.action('admin_cohort', (ctx) => this.handleCohortRetention(ctx));
         this.bot.action('admin_ltv', (ctx) => this.handleLTV(ctx));
         this.bot.action('admin_churn', (ctx) => this.handleChurnPrediction(ctx));
@@ -127,17 +140,7 @@ class Admin {
         this.bot.action('admin_heatmap', (ctx) => this.handleHourlyHeatmap(ctx));
         this.bot.action('admin_funnel', (ctx) => this.handleConversionFunnel(ctx));
 
-        // ─── Sub-menu navigation handlers (WERE MISSING!) ───
-this.bot.action('admin_system_menu', (ctx) => this.showSystemMenu(ctx));
-this.bot.action('admin_analytics_menu', (ctx) => this.showAnalyticsMenu(ctx));
-this.bot.action('admin_users_menu', (ctx) => this.showUsersMenu(ctx));
-this.bot.action('admin_finance_menu', (ctx) => this.showFinanceMenu(ctx));
-this.bot.action('admin_sms_menu', (ctx) => this.showSMSMenu(ctx));
-this.bot.action('admin_fraud_menu', (ctx) => this.showFraudMenu(ctx));
-this.bot.action('admin_automation_menu', (ctx) => this.showAutomationMenu(ctx));
-this.bot.action('admin_devops_menu', (ctx) => this.showDevopsMenu(ctx));
-        
-        // ─── NEW: Advanced User Management ───
+        // ─── Advanced User Management ───
         this.bot.action('admin_bulk_ops', (ctx) => this.handleBulkOperations(ctx));
         this.bot.action('admin_user_notes', (ctx) => this.promptUserNotes(ctx));
         this.bot.action('admin_referral_tree', (ctx) => this.handleReferralTree(ctx));
@@ -145,7 +148,7 @@ this.bot.action('admin_devops_menu', (ctx) => this.showDevopsMenu(ctx));
         this.bot.action('admin_account_merge', (ctx) => this.promptAccountMerge(ctx));
         this.bot.action('admin_balance_freeze', (ctx) => this.promptBalanceFreeze(ctx));
 
-        // ─── NEW: Business ───
+        // ─── Business ───
         this.bot.action('admin_dynamic_price', (ctx) => this.handleDynamicPricing(ctx));
         this.bot.action('admin_promo', (ctx) => this.handlePromoCodes(ctx));
         this.bot.action('admin_commission', (ctx) => this.handleCommissionSplit(ctx));
@@ -153,7 +156,7 @@ this.bot.action('admin_devops_menu', (ctx) => this.showDevopsMenu(ctx));
         this.bot.action('admin_tax_export', (ctx) => this.handleTaxExport(ctx));
         this.bot.action('admin_audit', (ctx) => this.handleAuditTrail(ctx));
 
-        // ─── NEW: DevOps ───
+        // ─── DevOps ───
         this.bot.action('admin_webhook_test', (ctx) => this.handleWebhookTest(ctx));
         this.bot.action('admin_hot_reload', (ctx) => this.handleHotReload(ctx));
         this.bot.action('admin_ab_test', (ctx) => this.handleABTesting(ctx));
@@ -168,8 +171,9 @@ this.bot.action('admin_devops_menu', (ctx) => this.showDevopsMenu(ctx));
         this.bot.action('admin_back_sms', (ctx) => this.showSMSMenu(ctx));
         this.bot.action('admin_back_fraud', (ctx) => this.showFraudMenu(ctx));
         this.bot.action('admin_back_automation', (ctx) => this.showAutomationMenu(ctx));
-    }
-
+        this.bot.action('admin_back_devops', (ctx) => this.showDevopsMenu(ctx));
+            }
+    
     // ═══════════════════════════════════════════════════════
     //  DASHBOARD MENUS
     // ═══════════════════════════════════════════════════════
