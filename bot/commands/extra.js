@@ -10,7 +10,7 @@ import config from '../config/env.js';
  * Admin command handlers — Button-Based Dashboard
  * All actions check adminId before executing
  */
-class AdminCommands {
+class Admin {
     constructor(bot, walletService = null, referralService = null, smsProviderManager = null) {
         this.bot = bot;
         this.walletService = walletService;
@@ -1344,4 +1344,246 @@ class AdminCommands {
             );
 
             if (!user) {
-                return ctx.reply(`❌ User <code>${targetId}</code> not found.
+                return ctx.reply(`❌ User <code>${targetId}</code> not found.`, { parse_mode: 'HTML' });
+            }
+
+            const status = isFrozen ? '🔒 FROZEN' : '🔓 UNFROZEN';
+            
+            await ctx.reply(
+                `${status} <b>Balance Updated</b>\n\n` +
+                `👤 User: <code>${targetId}</code>\n` +
+                `💰 Balance: <b>$${user.balance?.toFixed(2) || '0.00'}</b>\n` +
+                `📊 Status: <b>${status}</b>\n` +
+                `${isFrozen ? `📝 Reason: <i>${reason}</i>\n` : ''}` +
+                `${isFrozen ? `⏰ Frozen at: <i>${new Date().toLocaleString()}</i>\n` : ''}`,
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_users' }]] }
+                }
+            );
+
+        } catch (error) {
+            logger.error('Balance freeze failed', { error: error.message });
+            ctx.reply(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_users' }]] }
+            });
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  TEXT INPUT HANDLERS (Session-based prompts)
+    // ═══════════════════════════════════════════════════════
+
+    /**
+     * Process text inputs for admin awaiting states
+     * Call this from your main text handler or integrate into TelegramBot.js
+     */
+    async handleTextInput(ctx) {
+        if (!ctx.session) return false;
+        
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return false;
+
+        // ─── Clear History ───
+        if (ctx.session.awaitingClearHistory) {
+            delete ctx.session.awaitingClearHistory;
+            const targetId = ctx.message.text.trim();
+            if (targetId === '/cancel') return ctx.reply('❌ Cancelled.');
+            return this.processClearHistory(ctx, targetId);
+        }
+
+        // ─── Reset Session ───
+        if (ctx.session.awaitingResetSession) {
+            delete ctx.session.awaitingResetSession;
+            const targetId = ctx.message.text.trim();
+            if (targetId === '/cancel') return ctx.reply('❌ Cancelled.');
+            return this.processResetSession(ctx, targetId);
+        }
+
+        // ─── Impersonate ───
+        if (ctx.session.awaitingImpersonate) {
+            delete ctx.session.awaitingImpersonate;
+            const targetId = ctx.message.text.trim();
+            if (targetId === '/cancel') return ctx.reply('❌ Cancelled.');
+            return this.processImpersonate(ctx, targetId);
+        }
+
+        // ─── Refund ───
+        if (ctx.session.awaitingRefund) {
+            delete ctx.session.awaitingRefund;
+            const text = ctx.message.text.trim();
+            if (text === '/cancel') return ctx.reply('❌ Cancelled.');
+            const parts = text.split(' ');
+            const targetId = parts[0];
+            const amount = parseFloat(parts[1]);
+            const reason = parts.slice(2).join(' ') || 'Manual refund';
+            if (isNaN(amount)) return ctx.reply('❌ Invalid amount.');
+            return this.processRefund(ctx, targetId, amount, reason);
+        }
+
+        // ─── Adjust Transaction ───
+        if (ctx.session.awaitingAdjustTx) {
+            delete ctx.session.awaitingAdjustTx;
+            const text = ctx.message.text.trim();
+            if (text === '/cancel') return ctx.reply('❌ Cancelled.');
+            const parts = text.split(' ');
+            const txId = parts[0];
+            const amount = parseFloat(parts[1]);
+            if (isNaN(amount)) return ctx.reply('❌ Invalid amount.');
+            return this.processAdjustTransaction(ctx, txId, amount);
+        }
+
+        // ─── User Notes ───
+        if (ctx.session.awaitingUserNotes) {
+            delete ctx.session.awaitingUserNotes;
+            const text = ctx.message.text.trim();
+            if (text === '/cancel') return ctx.reply('❌ Cancelled.');
+            const [targetId, ...noteParts] = text.split('|');
+            const note = noteParts.join('|').trim();
+            if (!note) return ctx.reply('❌ Note cannot be empty.');
+            return this.processUserNotes(ctx, targetId.trim(), note);
+        }
+
+        // ─── Balance Freeze ───
+        if (ctx.session.awaitingBalanceFreeze) {
+            delete ctx.session.awaitingBalanceFreeze;
+            const text = ctx.message.text.trim();
+            if (text === '/cancel') return ctx.reply('❌ Cancelled.');
+            const parts = text.split(' ');
+            const targetId = parts[0];
+            const action = parts[1];
+            const reason = parts.slice(2).join(' ');
+            if (!['freeze', 'unfreeze'].includes(action)) {
+                return ctx.reply('❌ Action must be "freeze" or "unfreeze".');
+            }
+            return this.processBalanceFreeze(ctx, targetId, action, reason);
+        }
+
+        return false; // Not handled
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  STATS (24h) — Moved to button
+    // ═══════════════════════════════════════════════════════
+
+    async handleStats(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('📊 Loading stats...');
+
+        try {
+            const { Transaction } = await import('../models/index.js');
+            const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+            const [revenue, deposits, pendingLocks] = await Promise.all([
+                Transaction.calculateRevenue(since),
+                Transaction.aggregate([
+                    { $match: { type: 'DEPOSIT', status: 'COMPLETED', createdAt: { $gte: since } } },
+                    { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }
+                ]),
+                Transaction.countDocuments({ type: 'LOCK', status: 'PENDING' })
+            ]);
+
+            const depositTotal = deposits[0]?.total || 0;
+            const depositCount = deposits[0]?.count || 0;
+            const net = depositTotal - (revenue.total || 0);
+
+            const text = 
+                `📊 <b>24h Statistics</b>\n\n` +
+                `💰 Revenue: <b>$${revenue.total?.toFixed(2) || '0.00'}</b> (${revenue.count || 0} tx)\n` +
+                `💳 Deposits: <b>$${depositTotal.toFixed(2)}</b> (${depositCount} tx)\n` +
+                `🔒 Pending Locks: <b>${pendingLocks}</b>\n` +
+                `📈 Net: <b>$${net.toFixed(2)}</b>\n\n` +
+                `⏰ Updated: <i>${new Date().toLocaleString()}</i>`;
+
+            await ctx.editMessageText(text, {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '📈 7d', callback_data: 'admin_stats_7d' },
+                            { text: '📉 30d', callback_data: 'admin_stats_30d' }
+                        ],
+                        [{ text: '🔄 Refresh', callback_data: 'admin_stats' }],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_analytics' }]
+                    ]
+                }
+            });
+
+        } catch (error) {
+            logger.error('Stats failed', { error: error.message });
+            ctx.editMessageText(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_analytics' }]] }
+            });
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  PLACEHOLDERS for unimplemented features
+    //  (So buttons don't crash — shows "Coming Soon")
+    // ═══════════════════════════════════════════════════════
+
+    async handleStats7d(ctx) { return this.comingSoon(ctx, '7-day Stats'); }
+    async handleStats30d(ctx) { return this.comingSoon(ctx, '30-day Stats'); }
+    async handleTopUsers(ctx) { return this.comingSoon(ctx, 'Top Users'); }
+    async handleOTPSuccessRate(ctx) { return this.comingSoon(ctx, 'OTP Success Rate'); }
+    async handleSetLimits(ctx) { return this.comingSoon(ctx, 'Set Limits'); }
+    async handleSetPrice(ctx) { return this.comingSoon(ctx, 'Set Price'); }
+    async handleExportRevenue(ctx) { return this.comingSoon(ctx, 'Export Revenue'); }
+    async handlePendingDeposits(ctx) { return this.comingSoon(ctx, 'Pending Deposits'); }
+    async handleSwitchProvider(ctx) { return this.comingSoon(ctx, 'Switch Provider'); }
+    async handleRetryFailedOTP(ctx) { return this.comingSoon(ctx, 'Retry Failed OTP'); }
+    async handlePriceByCountry(ctx) { return this.comingSoon(ctx, 'Price by Country'); }
+    async handleVelocityCheck(ctx) { return this.comingSoon(ctx, 'Velocity Check'); }
+    async handleGeoFencing(ctx) { return this.comingSoon(ctx, 'Geo-Fencing'); }
+    async handleSmartRefund(ctx) { return this.comingSoon(ctx, 'Smart Refund'); }
+    async handleStaleSessionCleaner(ctx) { return this.comingSoon(ctx, 'Stale Session Cleaner'); }
+    async handleCohortRetention(ctx) { return this.comingSoon(ctx, 'Cohort Retention'); }
+    async handleLTV(ctx) { return this.comingSoon(ctx, 'LTV Analysis'); }
+    async handleRevenueByCountry(ctx) { return this.comingSoon(ctx, 'Revenue by Country'); }
+    async handleHourlyHeatmap(ctx) { return this.comingSoon(ctx, 'Hourly Heatmap'); }
+    async handleConversionFunnel(ctx) { return this.comingSoon(ctx, 'Conversion Funnel'); }
+    async handleBulkOperations(ctx) { return this.comingSoon(ctx, 'Bulk Operations'); }
+    async handleReferralTree(ctx) { return this.comingSoon(ctx, 'Referral Tree'); }
+    async promptShadowBan(ctx) { return this.comingSoon(ctx, 'Shadow Ban'); }
+    async promptAccountMerge(ctx) { return this.comingSoon(ctx, 'Account Merge'); }
+    async handleDynamicPricing(ctx) { return this.comingSoon(ctx, 'Dynamic Pricing'); }
+    async handlePromoCodes(ctx) { return this.comingSoon(ctx, 'Promo Codes'); }
+    async handleCommissionSplit(ctx) { return this.comingSoon(ctx, 'Commission Split'); }
+    async handleInvoiceGenerator(ctx) { return this.comingSoon(ctx, 'Invoice Generator'); }
+    async handleTaxExport(ctx) { return this.comingSoon(ctx, 'Tax Export'); }
+    async handleAuditTrail(ctx) { return this.comingSoon(ctx, 'Audit Trail'); }
+    async handleWebhookTest(ctx) { return this.comingSoon(ctx, 'Webhook Test'); }
+    async handleHotReload(ctx) { return this.comingSoon(ctx, 'Hot Reload'); }
+    async handleABTesting(ctx) { return this.comingSoon(ctx, 'A/B Testing'); }
+    async handleKeyRotation(ctx) { return this.comingSoon(ctx, 'Key Rotation'); }
+    async handleWorkerStatus(ctx) { return this.comingSoon(ctx, 'Worker Status'); }
+    async handleSearchUser(ctx) { return this.comingSoon(ctx, 'Search User'); }
+    async promptBlacklist(ctx) { return this.comingSoon(ctx, 'Blacklist User'); }
+    async promptWhitelist(ctx) { return this.comingSoon(ctx, 'Whitelist User'); }
+    async promptMessageUser(ctx) { return this.comingSoon(ctx, 'Message User'); }
+    async promptBroadcast(ctx) { return this.comingSoon(ctx, 'Broadcast'); }
+
+    async comingSoon(ctx, feature) {
+        await ctx.answerCbQuery(`${feature}: Coming soon!`, { show_alert: true });
+        // Optionally edit message to show coming soon page
+        // await ctx.editMessageText(`🚧 <b>${feature}</b>\n\n<i>Coming in next update...</i>`, {
+        //     parse_mode: 'HTML',
+        //     reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back' }]] }
+        // });
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  HELPER: Reply with error
+    // ═══════════════════════════════════════════════════════
+
+    replyError(ctx, text) {
+        return ctx.reply(text, { 
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: [[{ text: '◀️ Dashboard', callback_data: 'admin_dashboard' }]] }
+        });
+    }
+}
+
+export default Admin;
