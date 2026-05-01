@@ -884,4 +884,464 @@ class AdminCommands {
                     inline_keyboard: [
                         [
                             { text: '💰 Add Balance', callback_data: `admin_add_bal_${targetId}` },
-                            { text: '💸 Deduct', cal
+                            { text: '💸 Deduct', callback_data: `admin_ded_bal_${targetId}` }
+                        ],
+                        [{ text: '◀️ Back to Users', callback_data: 'admin_back_users' }]
+                    ]
+                }
+            });
+
+        } catch (error) {
+            logger.error('Impersonate failed', { error: error.message, targetId });
+            ctx.reply(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_users' }]] }
+            });
+        }
+    }
+
+    // ─── 27. Manual Refund ───
+    async promptRefund(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery();
+        ctx.session.awaitingRefund = true;
+        
+        await ctx.editMessageText(
+            `↩️ <b>Manual Refund</b>\n\n` +
+            `Send: <code>USER_ID AMOUNT REASON</code>\n` +
+            `Example: <code>123456789 10.50 Service outage</code>\n\n` +
+            `Or send /cancel to abort.`,
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    async processRefund(ctx, targetId, amount, reason) {
+        try {
+            const { User, Transaction } = await import('../models/index.js');
+            
+            const user = await User.findOneAndUpdate(
+                { userId: targetId },
+                { $inc: { balance: amount } },
+                { new: true }
+            );
+
+            if (!user) {
+                return ctx.reply(`❌ User <code>${targetId}</code> not found.`, { parse_mode: 'HTML' });
+            }
+
+            await Transaction.create({
+                userId: targetId,
+                type: 'REFUND',
+                amount: amount,
+                status: 'COMPLETED',
+                reason: reason,
+                createdAt: new Date()
+            });
+
+            await ctx.reply(
+                `↩️ <b>Refund Processed</b>\n\n` +
+                `👤 User: <code>${targetId}</code>\n` +
+                `💰 Amount: <b>$${amount.toFixed(2)}</b>\n` +
+                `📝 Reason: <i>${reason}</i>\n` +
+                `💳 New Balance: <b>$${user.balance.toFixed(2)}</b>`,
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+                }
+            );
+
+        } catch (error) {
+            logger.error('Refund failed', { error: error.message });
+            ctx.reply(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+        }
+    }
+
+    // ─── 28. Adjust Transaction ───
+    async promptAdjustTransaction(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery();
+        ctx.session.awaitingAdjustTx = true;
+        
+        await ctx.editMessageText(
+            `✏️ <b>Adjust Transaction</b>\n\n` +
+            `Send: <code>TX_ID NEW_AMOUNT</code>\n` +
+            `Example: <code>507f1f77bcf86cd799439011 25.00</code>\n\n` +
+            `⚠️ This modifies historical data!\n` +
+            `Or send /cancel to abort.`,
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    async processAdjustTransaction(ctx, txId, newAmount) {
+        try {
+            const { Transaction } = await import('../models/index.js');
+            const tx = await Transaction.findByIdAndUpdate(
+                txId,
+                { $set: { amount: newAmount, adjustedBy: ctx.from.id.toString(), adjustedAt: new Date() } },
+                { new: true }
+            );
+
+            if (!tx) {
+                return ctx.reply(`❌ Transaction <code>${txId}</code> not found.`, { parse_mode: 'HTML' });
+            }
+
+            await ctx.reply(
+                `✏️ <b>Transaction Adjusted</b>\n\n` +
+                `🆔 ID: <code>${txId}</code>\n` +
+                `💰 New Amount: <b>$${newAmount.toFixed(2)}</b>\n` +
+                `📊 Type: <b>${tx.type}</b>\n` +
+                `👤 User: <code>${tx.userId}</code>`,
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+                }
+            );
+
+        } catch (error) {
+            logger.error('Adjust tx failed', { error: error.message });
+            ctx.reply(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+        }
+    }
+
+    // ─── 35. Provider Balance Check ───
+    async handleProviderBalance(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('💳 Checking balances...');
+
+        try {
+            if (!this.smsProviderManager) {
+                throw new Error('SMS Provider Manager not initialized');
+            }
+
+            const balances = await this.smsProviderManager.checkBalances();
+            
+            let text = `💳 <b>SMS Provider Balances</b>\n\n`;
+            
+            if (!balances || balances.length === 0) {
+                text += `<i>No providers configured or all offline.</i>`;
+            } else {
+                balances.forEach(b => {
+                    const status = b.available ? '🟢' : '🔴';
+                    text += `${status} <b>${b.provider}</b>: ${b.balance} ${b.currency || 'credits'}\n` +
+                           `   📊 Success Rate: <b>${(b.successRate * 100).toFixed(1)}%</b>\n\n`;
+                });
+            }
+
+            await ctx.editMessageText(text, {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔄 Refresh', callback_data: 'admin_provider_balance' }],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_sms' }]
+                    ]
+                }
+            });
+
+        } catch (error) {
+            logger.error('Provider balance failed', { error: error.message });
+            ctx.editMessageText(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_sms' }]] }
+            });
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  NEW FEATURES (38, 39, 45, 51, 56, 60)
+    // ═══════════════════════════════════════════════════════
+
+    // ─── 38. Auto-Blacklist Toggle ───
+    async handleAutoBlacklistToggle(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        // Toggle setting
+        const current = config.autoBlacklist || false;
+        config.autoBlacklist = !current;
+        
+        const status = config.autoBlacklist ? '🟢 ENABLED' : '🔴 DISABLED';
+        await ctx.answerCbQuery(`Auto-blacklist: ${status}`, { show_alert: true });
+
+        await ctx.editMessageText(
+            `🤖 <b>Auto-Blacklist System</b>\n\n` +
+            `Status: <b>${status}</b>\n\n` +
+            `📋 <b>Rules:</b>\n` +
+            `• >3 failed OTPs in 10 min → Auto-ban\n` +
+            `• >5 deposits in 1 hour → Flag for review\n` +
+            `• Rapid-fire commands (>20/min) → Temp ban\n\n` +
+            `${config.autoBlacklist 
+                ? '✅ Bot will automatically enforce these rules.' 
+                : '🔒 Manual review required for all cases.'}`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ 
+                            text: config.autoBlacklist ? '🔴 Disable' : '🟢 Enable', 
+                            callback_data: 'admin_fraud_auto' 
+                        }],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_fraud' }]
+                    ]
+                }
+            }
+        );
+    }
+
+    // ─── 39. IP/Device Fingerprinting ───
+    async handleIPFingerprinting(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('📍 Analyzing fingerprints...');
+
+        try {
+            const { User } = await import('../models/index.js');
+            
+            // Find users sharing IPs (simplified — you'd store IP in user model)
+            const suspicious = await User.aggregate([
+                { $match: { lastIP: { $exists: true } } },
+                { $group: { 
+                    _id: '$lastIP', 
+                    count: { $sum: 1 }, 
+                    users: { $push: '$userId' } 
+                }},
+                { $match: { count: { $gt: 1 } } },
+                { $sort: { count: -1 } },
+                { $limit: 10 }
+            ]);
+
+            let text = `📍 <b>IP Fingerprinting</b>\n\n`;
+            
+            if (suspicious.length === 0) {
+                text += `<i>No multi-account IPs detected.</i>`;
+            } else {
+                text += `⚠️ <b>${suspicious.length} suspicious IPs found:</b>\n\n`;
+                suspicious.forEach(s => {
+                    text += `🌐 <code>${s._id}</code>\n` +
+                           `   👥 Accounts: <b>${s.count}</b>\n` +
+                           `   🔗 IDs: <code>${s.users.slice(0, 3).join(', ')}${s.users.length > 3 ? '...' : ''}</code>\n\n`;
+                });
+            }
+
+            await ctx.editMessageText(text, {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔄 Refresh', callback_data: 'admin_fraud_ip' }],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_fraud' }]
+                    ]
+                }
+            });
+
+        } catch (error) {
+            logger.error('IP fingerprint failed', { error: error.message });
+            ctx.editMessageText(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_fraud' }]] }
+            });
+        }
+    }
+
+    // ─── 45. Provider Failover (Low Balance Alert + Auto-Switch) ───
+    async handleProviderFailover(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('🔀 Checking failover...');
+
+        try {
+            if (!this.smsProviderManager) {
+                throw new Error('SMS Provider Manager not initialized');
+            }
+
+            const settings = await this.smsProviderManager.getFailoverSettings();
+            const current = settings.enabled ? '🟢 ENABLED' : '🔴 DISABLED';
+
+            await ctx.editMessageText(
+                `🔀 <b>Provider Failover</b>\n\n` +
+                `Status: <b>${current}</b>\n\n` +
+                `📋 <b>Settings:</b>\n` +
+                `• Trigger: Success rate < <b>${settings.threshold || 80}%</b>\n` +
+                `• Check interval: <b>${settings.interval || 5} min</b>\n` +
+                `• Fallback order: <b>${settings.fallbackOrder?.join(' → ') || 'Not set'}</b>\n\n` +
+                `💡 When primary fails, bot auto-switches to next provider.`,
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ 
+                                text: settings.enabled ? '🔴 Disable' : '🟢 Enable', 
+                                callback_data: 'admin_provider_failover' 
+                            }],
+                            [{ text: '⚙️ Edit Settings', callback_data: 'admin_provider_failover_settings' }],
+                            [{ text: '◀️ Back', callback_data: 'admin_back_automation' }]
+                        ]
+                    }
+                }
+            );
+
+        } catch (error) {
+            logger.error('Provider failover failed', { error: error.message });
+            ctx.editMessageText(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_automation' }]] }
+            });
+        }
+    }
+
+    // ─── 51. Churn Prediction ───
+    async handleChurnPrediction(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('📉 Analyzing churn...');
+
+        try {
+            const { User, Transaction } = await import('../models/index.js');
+            const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+            
+            // Users who haven't transacted in 7 days but were active before
+            const churnRisk = await User.find({
+                lastActive: { $lt: sevenDaysAgo },
+                totalSpent: { $gt: 0 },
+                blacklisted: { $ne: true }
+            }).sort({ totalSpent: -1 }).limit(20);
+
+            let text = `📉 <b>Churn Risk Users</b>\n\n` +
+                       `Users inactive >7 days but previously spent:\n\n`;
+
+            if (churnRisk.length === 0) {
+                text += `<i>No churn risk users. Great retention!</i>`;
+            } else {
+                churnRisk.forEach((u, i) => {
+                    const daysSince = u.lastActive 
+                        ? Math.floor((Date.now() - u.lastActive) / 86400000) 
+                        : 'N/A';
+                    text += `${i + 1}. <code>${u.userId}</code>\n` +
+                           `   💰 LTV: <b>$${u.totalSpent?.toFixed(2) || '0.00'}</b>\n` +
+                           `   📅 Last active: <b>${daysSince} days ago</b>\n` +
+                           `   💬 <i>Consider re-engagement message</i>\n\n`;
+                });
+            }
+
+            await ctx.editMessageText(text, {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '📢 Message All', callback_data: 'admin_churn_message_all' }],
+                        [{ text: '🔄 Refresh', callback_data: 'admin_churn' }],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_automation' }]
+                    ]
+                }
+            });
+
+        } catch (error) {
+            logger.error('Churn prediction failed', { error: error.message });
+            ctx.editMessageText(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_automation' }]] }
+            });
+        }
+    }
+
+    // ─── 56. User Notes/Tags ───
+    async promptUserNotes(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery();
+        ctx.session.awaitingUserNotes = true;
+        
+        await ctx.editMessageText(
+            `📋 <b>User Notes & Tags</b>\n\n` +
+            `Send: <code>USER_ID | NOTE</code>\n` +
+            `Example: <code>123456789 | VIP customer, always pays on time</code>\n\n` +
+            `Or send /cancel to abort.`,
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    async processUserNotes(ctx, targetId, note) {
+        try {
+            const { User } = await import('../models/index.js');
+            
+            const user = await User.findOneAndUpdate(
+                { userId: targetId },
+                { 
+                    $push: { 
+                        adminNotes: { 
+                            note, 
+                            by: ctx.from.id.toString(), 
+                            at: new Date() 
+                        } 
+                    } 
+                },
+                { new: true }
+            );
+
+            if (!user) {
+                return ctx.reply(`❌ User <code>${targetId}</code> not found.`, { parse_mode: 'HTML' });
+            }
+
+            await ctx.reply(
+                `📋 <b>Note Added</b>\n\n` +
+                `👤 User: <code>${targetId}</code>\n` +
+                `📝 Note: <i>${note}</i>\n` +
+                `📊 Total notes: <b>${user.adminNotes?.length || 1}</b>`,
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_users' }]] }
+                }
+            );
+
+        } catch (error) {
+            logger.error('User notes failed', { error: error.message });
+            ctx.reply(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_users' }]] }
+            });
+        }
+    }
+
+    // ─── 60. Balance Freeze/Unfreeze ───
+    async promptBalanceFreeze(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery();
+        ctx.session.awaitingBalanceFreeze = true;
+        
+        await ctx.editMessageText(
+            `🔒 <b>Balance Freeze/Unfreeze</b>\n\n` +
+            `Send: <code>USER_ID freeze|unfreeze REASON</code>\n` +
+            `Example: <code>123456789 freeze Investigation pending</code>\n\n` +
+            `⚠️ Frozen users can still use bot but cannot withdraw/transfer.\n` +
+            `Or send /cancel to abort.`,
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    async processBalanceFreeze(ctx, targetId, action, reason) {
+        try {
+            const { User } = await import('../models/index.js');
+            
+            const isFrozen = action === 'freeze';
+            const user = await User.findOneAndUpdate(
+                { userId: targetId },
+                { 
+                    $set: { 
+                        balanceFrozen: isFrozen,
+                        balanceFrozenAt: isFrozen ? new Date() : null,
+                        balanceFrozenReason: isFrozen ? reason : null,
+                        balanceFrozenBy: isFrozen ? ctx.from.id.toString() : null
+                    } 
+                },
+                { new: true }
+            );
+
+            if (!user) {
+                return ctx.reply(`❌ User <code>${targetId}</code> not found.
