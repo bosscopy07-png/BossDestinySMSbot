@@ -1,5 +1,6 @@
 // ═══════════════════════════════════════════════════════════
 //  bot/TelegramBot.js — High-Performance Production Bot
+//  Button-Based Admin Dashboard Edition
 // ═══════════════════════════════════════════════════════════
 
 import { Telegraf, session as telegrafSession } from 'telegraf';
@@ -28,19 +29,16 @@ class TelegramBot {
         // ─── Initialize Telegraf with optimized config ───
         this.bot = new Telegraf(config.bot.token, {
             telegram: {
-                // Connection pooling for faster API calls
                 agent: null,
-                // Retry failed requests
                 retryAfter: 1,
-                // Handle 429 rate limits automatically
                 handle429: true
             },
-            // Process updates concurrently (default is sequential)
-            handlerTimeout: 90000 // 90s timeout for long operations
+            handlerTimeout: 90000
         });
 
         this.walletService = new WalletService();
-        this.smsProviderManager = null; // Initialized in launch()
+        this.smsProviderManager = null;
+        this.referralService = null; // Add if you have one
         
         // ─── Performance tracking ───
         this.metrics = {
@@ -61,7 +59,6 @@ class TelegramBot {
         // ─── Initialize in order ───
         this.setupErrorHandling();
         this.setupMiddleware();
-        // setupCommands() moved to launch() to await async initialization
         this.setupWorkerPool();
     }
 
@@ -70,17 +67,13 @@ class TelegramBot {
     // ═══════════════════════════════════════════════════════
 
     setupWorkerPool() {
-        // Workers for heavy computations (crypto, aggregations)
         for (let i = 0; i < this.maxWorkers; i++) {
-            // Lazy init — create workers on first use
             this.workerPool.push(null);
         }
     }
 
     async runInWorker(task, data) {
-        // Simple promise-based worker execution
         return new Promise((resolve, reject) => {
-            // For now, execute in main thread with setImmediate to not block event loop
             setImmediate(() => {
                 try {
                     const result = task(data);
@@ -98,7 +91,6 @@ class TelegramBot {
 
     setupMiddleware() {
         // ─── 1. Session (in-memory with LRU-like behavior) ───
-        // For production with many users, swap to Redis/Mongo session store
         this.bot.use(telegrafSession({
             defaultSession: () => ({
                 awaitingBroadcast: null,
@@ -106,6 +98,13 @@ class TelegramBot {
                 awaitingDeductBalance: null,
                 awaitingBlacklistReason: null,
                 awaitingMessageUser: null,
+                awaitingClearHistory: null,
+                awaitingResetSession: null,
+                awaitingImpersonate: null,
+                awaitingRefund: null,
+                awaitingAdjustTx: null,
+                awaitingUserNotes: null,
+                awaitingBalanceFreeze: null,
                 broadcastMessage: null,
                 broadcastTarget: null,
                 broadcastFilter: null,
@@ -116,16 +115,14 @@ class TelegramBot {
             })
         }));
 
-        // ─── 2. Fast-path for common operations (skip auth for /start) ───
+        // ─── 2. Fast-path for common operations ───
         this.bot.use(async (ctx, next) => {
             const startTime = Date.now();
             
-            // Track active users
             if (ctx.from?.id) {
                 this.metrics.activeUsers.add(ctx.from.id.toString());
             }
 
-            // Performance tracking
             ctx.state.startTime = startTime;
             
             try {
@@ -136,14 +133,13 @@ class TelegramBot {
             }
         });
 
-        // ─── 3. Rate limiting (distributed-safe) ───
+        // ─── 3. Rate limiting ───
         this.bot.use(rateLimit({
             window: 60,
-            max: 50, // Increased for better UX
+            max: 50,
             keyPrefix: 'bot_ratelimit',
             onLimitExceeded: async (ctx) => {
                 logger.warn('Rate limit exceeded', { userId: ctx.from?.id });
-                // Don't await — fire and forget for speed
                 ctx.reply('⏳ Too many requests. Please slow down.').catch(() => {});
             }
         }));
@@ -151,13 +147,12 @@ class TelegramBot {
         // ─── 4. Auth middleware ───
         this.bot.use(requireAuth);
 
-        // ─── 5. Maintenance guard (FAST — checks before any command processing) ───
+        // ─── 5. Maintenance guard ───
         this.bot.use(async (ctx, next) => {
             if (this.isShuttingDown) {
                 return ctx.reply('🔴 Bot is restarting. Please try again in a moment.').catch(() => {});
             }
 
-            // Skip maintenance check for admins
             const adminIds = (config.bot?.adminId || '')
                 .toString()
                 .split(',')
@@ -167,7 +162,6 @@ class TelegramBot {
             const isAdmin = adminIds.includes(ctx.from?.id?.toString());
 
             if (config.maintenance && !isAdmin) {
-                // Fast reply — don't block event loop
                 return ctx.reply(
                     '🔧 <b>Maintenance Mode</b>\n\n' +
                     'The bot is currently under maintenance. Please try again later.\n\n' +
@@ -193,19 +187,17 @@ class TelegramBot {
     }
 
     // ═══════════════════════════════════════════════════════
-    //  COMMAND SETUP — Concurrent & Fast (NOW ASYNC)
+    //  COMMAND SETUP — Async with SMS Provider Init
     // ═══════════════════════════════════════════════════════
 
     async setupCommands() {
         // ─── Initialize SMS Provider Manager FIRST ───
-        // This must happen before AdminCommands is instantiated
         try {
             this.smsProviderManager = new SMSProviderManager();
             await this.smsProviderManager.initialize();
             logger.info('SMS Provider Manager initialized in bot');
         } catch (error) {
             logger.error('Failed to initialize SMS Provider Manager', { error: error.message });
-            // Continue without pool — AdminCommands will handle null gracefully
             this.smsProviderManager = null;
         }
 
@@ -213,21 +205,20 @@ class TelegramBot {
         const userCommands = new UserCommands(this.bot, this.walletService);
         const otpCommands = new OTPCommands(this.bot, this.walletService, this.smsProviderManager);
         
-        // FIXED: Pass smsProviderManager to AdminCommands (4th argument)
+        // FIXED: Pass all dependencies to AdminCommands
         const adminCommands = new AdminCommands(
             this.bot, 
             this.walletService, 
-            null, // referralService — add if you have one
+            this.referralService,
             this.smsProviderManager
         );
 
         this.commandModules.set('user', userCommands);
-        this.commandModules.set('otp', otpCommands);
+        this.commandCommands.set('otp', otpCommands);
         this.commandModules.set('admin', adminCommands);
 
-        // ─── Global start handler (optimized) ───
+        // ─── Global start handler ───
         this.bot.start(async (ctx) => {
-            // Fire and forget analytics
             this.trackEvent('command_start', ctx.from?.id);
             
             try {
@@ -238,10 +229,25 @@ class TelegramBot {
             }
         });
 
+        // ─── Admin Dashboard Entry Point ───
+        // Admin opens dashboard via /admin or button from existing menu
+        this.bot.command('admin', async (ctx) => {
+            const adminIds = (config.bot?.adminId || '')
+                .toString()
+                .split(',')
+                .map(id => id.trim())
+                .filter(Boolean);
+            
+            if (!adminIds.includes(ctx.from?.id?.toString())) {
+                return ctx.reply('⛔ <b>Admin only.</b>', { parse_mode: 'HTML' });
+            }
+            
+            await adminCommands.showDashboard(ctx, false);
+        });
+
         // ─── Help action ───
         this.bot.action('help', async (ctx) => {
             try {
-                // Answer callback immediately for perceived speed
                 ctx.answerCbQuery().catch(() => {});
                 
                 const helpMessage = [
@@ -276,9 +282,23 @@ class TelegramBot {
             }
         });
 
+        // ─── Admin Dashboard Button (add to your existing menu) ───
+        this.bot.action('open_admin_dashboard', async (ctx) => {
+            const adminIds = (config.bot?.adminId || '')
+                .toString()
+                .split(',')
+                .map(id => id.trim())
+                .filter(Boolean);
+            
+            if (!adminIds.includes(ctx.from?.id?.toString())) {
+                return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+            }
+            
+            await adminCommands.showDashboard(ctx, true);
+        });
+
         // ─── Text message handler for session-based inputs ───
         this.bot.on(message('text'), async (ctx, next) => {
-            // Handle awaiting inputs (broadcast, balance, blacklist, message)
             if (!ctx.session) return next();
 
             const adminIds = (config.bot?.adminId || '')
@@ -289,7 +309,13 @@ class TelegramBot {
 
             const isAdmin = adminIds.includes(ctx.from?.id?.toString());
 
-            // ─── Admin awaiting inputs ───
+            // ─── Admin text inputs (NEW: handles all admin prompts) ───
+            if (isAdmin) {
+                const handled = await adminCommands.handleTextInput(ctx);
+                if (handled) return;
+            }
+
+            // ─── Legacy admin awaiting inputs (keep for backward compat) ───
             if (isAdmin) {
                 if (ctx.session.awaitingBroadcast) {
                     const { target, filter, label } = ctx.session.awaitingBroadcast;
@@ -342,13 +368,11 @@ class TelegramBot {
     // ═══════════════════════════════════════════════════════
 
     setupErrorHandling() {
-        // ─── Telegraf error catcher ───
         this.bot.catch((err, ctx) => {
             this.metrics.requestsFailed++;
 
-            // Don't log known benign errors
             if (err.message?.includes('ETELEGRAM') && err.message?.includes('403')) {
-                return; // User blocked bot
+                return;
             }
             if (err.message?.includes('ETELEGRAM') && err.message?.includes('429')) {
                 logger.warn('Telegram rate limit', { userId: ctx.from?.id });
@@ -361,7 +385,6 @@ class TelegramBot {
                 updateType: ctx.updateType
             });
 
-            // User-friendly error
             if (err.message?.includes('WALLET_NOT_READY')) {
                 ctx.reply('⏳ Blockchain connection warming up. Try again shortly.').catch(() => {});
             } else {
@@ -369,7 +392,6 @@ class TelegramBot {
             }
         });
 
-        // ─── Process-level handlers ───
         process.on('uncaughtException', (err) => {
             logger.error('Uncaught Exception', { error: err.message });
             if (!this.isShuttingDown) this.gracefulShutdown('uncaughtException');
@@ -396,11 +418,11 @@ class TelegramBot {
                 if (this.walletService?.isReady) {
                     this.walletService.startDepositScanner(30000);
                     logger.info('Deposit scanner started');
-                    retryDelay = 5000; // Reset on success
+                    retryDelay = 5000;
                 } else {
                     logger.warn('Wallet not ready, retrying...');
                     setTimeout(checkAndStart, retryDelay);
-                    retryDelay = Math.min(retryDelay * 2, maxRetryDelay); // Exponential backoff
+                    retryDelay = Math.min(retryDelay * 2, maxRetryDelay);
                 }
             } catch (error) {
                 logger.error('Deposit scanner error', { error: error.message });
@@ -440,12 +462,10 @@ class TelegramBot {
             this.isReady = true;
             logger.info('Bot launched successfully');
 
-            // Graceful shutdown
             process.once('SIGINT', () => this.gracefulShutdown('SIGINT'));
             process.once('SIGTERM', () => this.gracefulShutdown('SIGTERM'));
 
-            // Periodic metrics logging
-            setInterval(() => this.logMetrics(), 300000); // Every 5 min
+            setInterval(() => this.logMetrics(), 300000);
 
         } catch (error) {
             logger.error('Launch failed', { error: error.message });
@@ -469,7 +489,6 @@ class TelegramBot {
 
         this.stopDepositScanner();
 
-        // Shutdown SMS Provider Manager
         if (this.smsProviderManager) {
             try {
                 await this.smsProviderManager.shutdown();
@@ -485,7 +504,7 @@ class TelegramBot {
             ]);
         } catch (e) {}
 
-        setTimeout(() => process.exit(1), 10000); // Force exit after 10s
+        setTimeout(() => process.exit(1), 10000);
         process.exit(0);
     }
 
@@ -495,16 +514,13 @@ class TelegramBot {
 
     updateMetrics(duration) {
         this.metrics.requestsHandled++;
-        // Running average
         this.metrics.avgResponseTime = 
             (this.metrics.avgResponseTime * (this.metrics.requestsHandled - 1) + duration) 
             / this.metrics.requestsHandled;
     }
 
     trackEvent(event, userId) {
-        // Fire and forget — don't block response
         setImmediate(() => {
-            // Send to analytics if configured
             logger.debug('Event tracked', { event, userId });
         });
     }
@@ -525,17 +541,4 @@ class TelegramBot {
             status: this.isShuttingDown ? 'shutting_down' : this.isReady ? 'healthy' : 'starting',
             uptime: process.uptime(),
             memory: process.memoryUsage(),
-            metrics: {
-                requests: this.metrics.requestsHandled,
-                failed: this.metrics.requestsFailed,
-                avgResponseTime: Math.round(this.metrics.avgResponseTime),
-                activeUsers: this.metrics.activeUsers.size
-            },
-            walletReady: this.walletService?.isReady || false,
-            smsProviderReady: !!this.smsProviderManager?.isInitialized,
-            timestamp: new Date().toISOString()
-        };
-    }
-}
-
-export default TelegramBot;
+            m
