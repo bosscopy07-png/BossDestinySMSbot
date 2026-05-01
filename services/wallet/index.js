@@ -531,7 +531,6 @@ class WalletService {
     // ═══════════════════════════════════════════════════════════
     //  REFERRAL SYSTEM
     // ═══════════════════════════════════════════════════════════
-
     async processReferralDeposit(userId, amount) {
         try {
             const user = await User.findOne({ userId });
@@ -559,4 +558,436 @@ class WalletService {
                 type: 'REFERRAL_REWARD',
                 amount: rewardAmount,
                 currency: 'USD',
-                status: 'PENDING
+                status: 'PENDING',
+                metadata: {
+                    referredUserId: userId,
+                    depositAmount: amount,
+                    percentage: config.referral?.percentage ?? 0.05,
+                    requiresApproval: true
+                }
+            });
+
+            await User.updateOne(
+                { userId: referrer.userId },
+                {
+                    $inc: {
+                        referralCount: 1,
+                        referralEarnings: rewardAmount
+                    }
+                }
+            );
+
+            logger.info('Referral reward created (pending approval)', {
+                referrerId: referrer.userId,
+                referredId: userId,
+                amount: rewardAmount
+            });
+
+        } catch (error) {
+            logger.error('Referral processing failed', { userId, error: error.message });
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  FUND MANAGEMENT — LOCK / CAPTURE / RELEASE (FIXED)
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Lock funds from user balance for a pending purchase
+     * Funds are reserved but NOT deducted from balance yet
+     */
+    async lockFunds(userId, amount, purpose) {
+        const txId = generateId();
+
+        try {
+            // Validate amount
+            amount = parseFloat(amount);
+            if (isNaN(amount) || amount <= 0) {
+                throw new Error('INVALID_AMOUNT: Amount must be positive');
+            }
+
+            const user = await User.findOne({ userId });
+            if (!user) {
+                throw new Error('USER_NOT_FOUND');
+            }
+
+            const availableBalance = (user.balance || 0) - (user.lockedBalance || 0);
+            if (availableBalance < amount) {
+                throw new Error('INSUFFICIENT_FUNDS');
+            }
+
+            // Create lock transaction
+            await Transaction.create({
+                txId,
+                userId,
+                type: 'LOCK',
+                amount: -amount,
+                currency: 'USD',
+                status: 'PENDING',
+                metadata: { 
+                    purpose, 
+                    lockedAt: new Date(),
+                    originalBalance: user.balance,
+                    originalLockedBalance: user.lockedBalance
+                }
+            });
+
+            // Increment lockedBalance (balance stays the same)
+            const updateResult = await User.updateOne(
+                { userId },
+                { $inc: { lockedBalance: amount } }
+            );
+
+            if (updateResult.matchedCount === 0) {
+                // Rollback: delete transaction
+                await Transaction.deleteOne({ txId });
+                throw new Error('USER_UPDATE_FAILED');
+            }
+
+            logger.info('Funds locked', { userId, amount, purpose, txId });
+
+            return txId;
+
+        } catch (error) {
+            logger.error('Failed to lock funds', { userId, amount, error: error.message });
+            throw error;
+        }
+    }
+
+    /**
+     * FIXED: Capture locked funds — DEDUCTS from actual balance
+     * Previously: Only removed from lockedBalance, never touched balance
+     * Now: Deducts from balance, removes from lockedBalance, increments totalSpent
+     */
+    async captureFunds(txId, userId) {
+        try {
+            const tx = await Transaction.findOne({ txId, userId });
+            if (!tx || tx.status !== 'PENDING') {
+                throw new Error('INVALID_TRANSACTION: Transaction not found or not pending');
+            }
+
+            const amount = Math.abs(tx.amount);
+            if (amount <= 0) {
+                throw new Error('INVALID_AMOUNT');
+            }
+
+            // Get user for validation
+            const user = await User.findOne({ userId });
+            if (!user) {
+                throw new Error('USER_NOT_FOUND');
+            }
+
+            // Validate sufficient locked balance
+            if ((user.lockedBalance || 0) < amount) {
+                throw new Error('INSUFFICIENT_LOCKED_BALANCE');
+            }
+
+            // Update transaction to COMPLETED
+            await Transaction.updateOne(
+                { txId },
+                {
+                    $set: {
+                        status: 'COMPLETED',
+                        'metadata.capturedAt': new Date()
+                    }
+                }
+            );
+
+            // FIXED: Atomically deduct from balance, remove from locked, track totalSpent
+            const updateResult = await User.updateOne(
+                { userId },
+                {
+                    $inc: {
+                        balance: -amount,        // ← FIXED: Actually deduct from real balance
+                        lockedBalance: -amount,   // ← Remove from locked
+                        totalSpent: amount        // ← Track for stats
+                    }
+                }
+            );
+
+            if (updateResult.matchedCount === 0) {
+                // Attempt rollback
+                await Transaction.updateOne(
+                    { txId },
+                    { $set: { status: 'PENDING' } }
+                );
+                throw new Error('USER_UPDATE_FAILED');
+            }
+
+            logger.info('Funds captured', { userId, amount, txId, newBalance: user.balance - amount });
+
+            return true;
+
+        } catch (error) {
+            logger.error('Failed to capture funds', { txId, userId, error: error.message });
+            throw error;
+        }
+    }
+
+    /**
+     * FIXED: Release locked funds back to user (cancel/refund)
+     * Previously: Returned false silently on invalid tx
+     * Now: Throws error so caller knows refund failed
+     * Preserves original transaction type, only changes status to CANCELLED
+     */
+    async releaseFunds(txId, userId, reason) {
+        try {
+            const tx = await Transaction.findOne({ txId, userId });
+            if (!tx || tx.status !== 'PENDING') {
+                throw new Error(`INVALID_TRANSACTION: Transaction not found or status is ${tx?.status || 'missing'}`);
+            }
+
+            const amount = Math.abs(tx.amount);
+            if (amount <= 0) {
+                throw new Error('INVALID_AMOUNT');
+            }
+
+            // Get user for validation
+            const user = await User.findOne({ userId });
+            if (!user) {
+                throw new Error('USER_NOT_FOUND');
+            }
+
+            // Validate sufficient locked balance
+            if ((user.lockedBalance || 0) < amount) {
+                logger.warn('Locked balance less than release amount', {
+                    userId,
+                    lockedBalance: user.lockedBalance,
+                    releaseAmount: amount
+                });
+                // Continue anyway — don't block refund
+            }
+
+            // FIXED: Preserve original transaction type, only change status
+            await Transaction.updateOne(
+                { txId },
+                {
+                    $set: {
+                        status: 'CANCELLED',
+                        'metadata.releasedAt': new Date(),
+                        'metadata.releaseReason': reason
+                    }
+                }
+            );
+
+            // Remove from lockedBalance (balance stays the same — was never deducted)
+            const updateResult = await User.updateOne(
+                { userId },
+                { $inc: { lockedBalance: -amount } }
+            );
+
+            if (updateResult.matchedCount === 0) {
+                throw new Error('USER_UPDATE_FAILED');
+            }
+
+            logger.info('Funds released', { userId, amount, reason, txId });
+
+            return true;
+
+        } catch (error) {
+            logger.error('Failed to release funds', { txId, userId, error: error.message });
+            throw error;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ADMIN BALANCE OPERATIONS
+    // ═══════════════════════════════════════════════════════════
+
+    async addBalance(userId, amount, adminId, reason) {
+        const txId = generateId();
+
+        if (isNaN(amount) || amount <= 0) {
+            throw new Error('INVALID_AMOUNT');
+        }
+
+        const user = await User.findOne({ userId }).select('_id userId');
+        if (!user) {
+            throw new Error('USER_NOT_FOUND');
+        }
+
+        let txCreated = false;
+
+        try {
+            await Transaction.create({
+                txId,
+                userId,
+                type: 'ADMIN_ADD',
+                amount,
+                currency: 'USD',
+                status: 'COMPLETED',
+                processedBy: adminId,
+                metadata: { reason, isCredit: true }
+            });
+            txCreated = true;
+
+            const userUpdate = await User.updateOne(
+                { userId },
+                { $inc: { balance: amount } }
+            );
+
+            if (userUpdate.matchedCount === 0) {
+                throw new Error('USER_UPDATE_FAILED');
+            }
+
+            logger.info('Balance added by admin', { userId, amount, adminId, reason, txId });
+
+            return txId;
+
+        } catch (error) {
+            if (txCreated) {
+                try {
+                    await Transaction.deleteOne({ txId });
+                    logger.warn('Rolled back orphaned transaction', { txId, reason: error.message });
+                } catch (rollbackError) {
+                    logger.error('Failed to rollback transaction', { txId, error: rollbackError.message });
+                }
+            }
+
+            logger.error('Failed to add balance', { userId, amount, adminId, error: error.message });
+            throw error;
+        }
+    }
+
+    async deductBalance(userId, amount, adminId, reason) {
+        const txId = generateId();
+
+        if (isNaN(amount) || amount <= 0) {
+            throw new Error('INVALID_AMOUNT');
+        }
+
+        let txCreated = false;
+
+        try {
+            const user = await User.findOneAndUpdate(
+                {
+                    userId,
+                    $expr: { $gte: ['$balance', amount] }
+                },
+                { $inc: { balance: -amount } },
+                { new: true }
+            );
+
+            if (!user) {
+                throw new Error('INSUFFICIENT_BALANCE');
+            }
+
+            await Transaction.create({
+                txId,
+                userId,
+                type: 'ADMIN_DEDUCT',
+                amount: -amount,
+                currency: 'USD',
+                status: 'COMPLETED',
+                processedBy: adminId,
+                metadata: { reason, isDebit: true }
+            });
+            txCreated = true;
+
+            logger.info('Balance deducted by admin', { userId, amount, adminId, reason, txId });
+
+            return txId;
+
+        } catch (error) {
+            if (txCreated === false && error.message !== 'INSUFFICIENT_BALANCE' && error.message !== 'INVALID_AMOUNT') {
+                try {
+                    await User.updateOne({ userId }, { $inc: { balance: amount } });
+                    logger.warn('Restored user balance after failed transaction creation', { userId, amount, txId });
+                } catch (rollbackError) {
+                    logger.error('CRITICAL: Failed to restore user balance', { userId, amount, txId, error: rollbackError.message });
+                }
+            }
+
+            if (txCreated) {
+                try {
+                    await Transaction.deleteOne({ txId });
+                    logger.warn('Rolled back orphaned transaction', { txId, reason: error.message });
+                } catch (rollbackError) {
+                    logger.error('Failed to rollback transaction', { txId, error: rollbackError.message });
+                }
+            }
+
+            logger.error('Failed to deduct balance', { userId, amount, adminId, error: error.message });
+            throw error;
+        }
+    }
+
+    async getDepositAddress(userId) {
+        const user = await User.findOne({ userId });
+        if (user && user.depositAddress) {
+            return user.depositAddress;
+        }
+        const info = await this.getDepositInfo(userId);
+        return info.address;
+    }
+
+    getMasterAddress() {
+        return this.masterAddress || 'WALLET_NOT_READY';
+    }
+
+    async getMasterBalance() {
+        await this.ensureReady();
+
+        try {
+            const bnbBalance = await this.provider.getBalance(this.masterWallet.address);
+            const usdtBalance = await this.usdtContract.balanceOf(this.masterWallet.address);
+            
+            return {
+                bnb: ethers.formatEther(bnbBalance),
+                usdt: ethers.formatUnits(usdtBalance, this.decimals)
+            };
+        } catch (error) {
+            logger.error('Failed to get master balance', { error: error.message });
+            throw new Error('BALANCE_CHECK_FAILED — ' + error.message);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  BACKGROUND SCANNER
+    // ═══════════════════════════════════════════════════════════
+
+    startDepositScanner(intervalMs = 30000) {
+        if (!this.isReady) {
+            logger.warn('Cannot start scanner — wallet not ready');
+            return;
+        }
+
+        if (this.scanInterval) {
+            clearInterval(this.scanInterval);
+        }
+
+        logger.info('Starting deposit scanner', { interval: intervalMs });
+
+        this.scanInterval = setInterval(async () => {
+            try {
+                await this.checkAllDeposits();
+            } catch (error) {
+                logger.error('Deposit scanner error', { error: error.message });
+            }
+        }, intervalMs);
+
+        this.scanInterval.unref?.();
+    }
+
+    stopDepositScanner() {
+        if (this.scanInterval) {
+            clearInterval(this.scanInterval);
+            this.scanInterval = null;
+            logger.info('Deposit scanner stopped');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  GRACEFUL SHUTDOWN
+    // ═══════════════════════════════════════════════════════════
+
+    async disconnect() {
+        this.stopDepositScanner();
+        this.provider?.removeAllListeners?.();
+        this.provider = null;
+        this.isReady = false;
+        logger.info('Wallet service disconnected');
+    }
+}
+
+export default WalletService;
