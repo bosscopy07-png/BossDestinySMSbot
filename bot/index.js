@@ -540,4 +540,20 @@ class TelegramBot {
 
     getHealth() {
         return {
-            status: this.isShuttingDown ? 'shutting_down' : this.isReady ? 'hea
+            status: this.isShuttingDown ? 'shutting_down' : this.isReady ? 'healthy' : 'starting',
+            uptime: process.uptime(),
+            memory: process.memoryUsage(),
+            metrics: {
+                requests: this.metrics.requestsHandled,
+                failed: this.metrics.requestsFailed,
+                avgResponseTime: Math.round(this.metrics.avgResponseTime),
+                activeUsers: this.metrics.activeUsers.size
+            },
+            walletReady: this.walletService?.isReady || false,
+            smsProviderReady: !!this.smsProviderManager?.isInitialized,
+            timestamp: new Date().toISOString()
+        };
+    }
+}
+
+export default TelegramBot;
