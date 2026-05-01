@@ -4076,4 +4076,119 @@ class Admin {
         if (ctx.session.awaitingForceConfirm) {
             delete ctx.session.awaitingForceConfirm;
             const txId = ctx.message.text.trim();
-            if (txId === '/cancel') return ctx.replyWithPhoto(
+            if (txId === '/cancel') return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { caption: '❌ Cancelled.' });
+            return this.processForceConfirm(ctx, txId);
+        }
+
+        if (ctx.session.awaitingShadowBan) {
+            delete ctx.session.awaitingShadowBan;
+            const text = ctx.message.text.trim();
+            if (text === '/cancel') return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { caption: '❌ Cancelled.' });
+            const parts = text.split(' ');
+            const targetId = parts[0];
+            const action = parts[1];
+            if (!['on', 'off'].includes(action)) return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { caption: '❌ Use "on" or "off".' });
+            return this.processShadowBan(ctx, targetId, action);
+        }
+
+        if (ctx.session.awaitingAccountMerge) {
+            delete ctx.session.awaitingAccountMerge;
+            const text = ctx.message.text.trim();
+            if (text === '/cancel') return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { caption: '❌ Cancelled.' });
+            const parts = text.split(' ');
+            const keepId = parts[0];
+            const deleteId = parts[1];
+            return this.processAccountMerge(ctx, keepId, deleteId);
+        }
+
+        if (ctx.session.awaitingInvoice) {
+            delete ctx.session.awaitingInvoice;
+            const text = ctx.message.text.trim();
+            if (text === '/cancel') return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { caption: '❌ Cancelled.' });
+            const parts = text.split(' ');
+            const targetId = parts[0];
+            const month = parts[1];
+            return this.processInvoice(ctx, targetId, month);
+        }
+
+        if (ctx.session.awaitingRefund) {
+            delete ctx.session.awaitingRefund;
+            const text = ctx.message.text.trim();
+            if (text === '/cancel') return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { caption: '❌ Cancelled.' });
+            const parts = text.split(' ');
+            const targetId = parts[0];
+            const amount = parseFloat(parts[1]);
+            const reason = parts.slice(2).join(' ') || 'Manual refund';
+            if (isNaN(amount)) return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { caption: '❌ Invalid amount.' });
+            return this.processRefund(ctx, targetId, amount, reason);
+        }
+
+        if (ctx.session.awaitingAdjustTx) {
+            delete ctx.session.awaitingAdjustTx;
+            const text = ctx.message.text.trim();
+            if (text === '/cancel') return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { caption: '❌ Cancelled.' });
+            const parts = text.split(' ');
+            const txId = parts[0];
+            const amount = parseFloat(parts[1]);
+            if (isNaN(amount)) return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { caption: '❌ Invalid amount.' });
+            return this.processAdjustTransaction(ctx, txId, amount);
+        }
+
+        if (ctx.session.awaitingUserNotes) {
+            delete ctx.session.awaitingUserNotes;
+            const text = ctx.message.text.trim();
+            if (text === '/cancel') return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { caption: '❌ Cancelled.' });
+            const [targetId, ...noteParts] = text.split('|');
+            const note = noteParts.join('|').trim();
+            if (!note) return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { caption: '❌ Note cannot be empty.' });
+            return this.processUserNotes(ctx, targetId.trim(), note);
+        }
+
+        if (ctx.session.awaitingBalanceFreeze) {
+            delete ctx.session.awaitingBalanceFreeze;
+            const text = ctx.message.text.trim();
+            if (text === '/cancel') return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { caption: '❌ Cancelled.' });
+            const parts = text.split(' ');
+            const targetId = parts[0];
+            const action = parts[1];
+            const reason = parts.slice(2).join(' ');
+            if (!['freeze', 'unfreeze'].includes(action)) {
+                return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { caption: '❌ Action must be "freeze" or "unfreeze".' });
+            }
+            return this.processBalanceFreeze(ctx, targetId, action, reason);
+        }
+
+        if (ctx.session.awaitingClearHistory) {
+            delete ctx.session.awaitingClearHistory;
+            const targetId = ctx.message.text.trim();
+            if (targetId === '/cancel') return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { caption: '❌ Cancelled.' });
+            return this.processClearHistory(ctx, targetId);
+        }
+
+        if (ctx.session.awaitingResetSession) {
+            delete ctx.session.awaitingResetSession;
+            const targetId = ctx.message.text.trim();
+            if (targetId === '/cancel') return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { caption: '❌ Cancelled.' });
+            return this.processResetSession(ctx, targetId);
+        }
+
+        if (ctx.session.awaitingImpersonate) {
+            delete ctx.session.awaitingImpersonate;
+            const targetId = ctx.message.text.trim();
+            if (targetId === '/cancel') return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { caption: '❌ Cancelled.' });
+            return this.processImpersonate(ctx, targetId);
+        }
+
+        return false;
+    }
+
+    replyError(ctx, text) {
+        return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { 
+            caption: text, 
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: [[{ text: '◀️ Dashboard', callback_data: 'admin_dashboard' }]] }
+        });
+    }
+}
+
+export default Admin;
