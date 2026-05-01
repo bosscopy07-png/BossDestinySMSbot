@@ -5,6 +5,11 @@
 import { fixNegativeLockedBalances } from '../../scripts/index.js';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
+// WRONG (current):
+const { User, Session } = await import('../models/index.js');
+
+// CORRECT:
+const { User, Session } = await import('../../models/index.js');
 
 // ─── SAFE EDIT HELPER ───
 // Prevents "no text in the message to edit" crashes
