@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════
 //  bot/TelegramBot.js — High-Performance Production Bot
-//  Button-Based Admin Dashboard Edition
+//  Integrates existing admin + new advanced admin dashboard
 // ═══════════════════════════════════════════════════════════
 
 import { Telegraf, session as telegrafSession } from 'telegraf';
@@ -12,8 +12,8 @@ import { requireAuth } from './middleware/auth.js';
 import { rateLimit } from './middleware/rateLimit.js';
 import UserCommands from './commands/user.js';
 import OTPCommands from './commands/otp.js';
-import AdminCommands from './commands/admin.js';
-import Admin from './commands/extra.js';
+import AdminCommands from './commands/admin.js';        // ← YOUR EXISTING admin
+import Admin from './commands/extra.js';                 // ← NEW advanced dashboard (renamed by you)
 import WalletService from '../services/wallet/index.js';
 import SMSProviderManager from '../services/sms/index.js';
 
@@ -39,7 +39,7 @@ class TelegramBot {
 
         this.walletService = new WalletService();
         this.smsProviderManager = null;
-        this.referralService = null; // Add if you have one
+        this.referralService = null;
         
         // ─── Performance tracking ───
         this.metrics = {
@@ -64,7 +64,7 @@ class TelegramBot {
     }
 
     // ═══════════════════════════════════════════════════════
-    //  WORKER POOL (for CPU-intensive tasks)
+    //  WORKER POOL
     // ═══════════════════════════════════════════════════════
 
     setupWorkerPool() {
@@ -87,36 +87,39 @@ class TelegramBot {
     }
 
     // ═══════════════════════════════════════════════════════
-    //  MIDDLEWARE SETUP — Optimized for speed
+    //  MIDDLEWARE SETUP
     // ═══════════════════════════════════════════════════════
 
     setupMiddleware() {
-        // ─── 1. Session (in-memory with LRU-like behavior) ───
+        // ─── 1. Session ───
         this.bot.use(telegrafSession({
             defaultSession: () => ({
+                // ─── Existing admin session states ───
                 awaitingBroadcast: null,
                 awaitingAddBalance: null,
                 awaitingDeductBalance: null,
                 awaitingBlacklistReason: null,
                 awaitingMessageUser: null,
-                awaitingClearHistory: null,
-                awaitingResetSession: null,
-                awaitingImpersonate: null,
-                awaitingRefund: null,
-                awaitingAdjustTx: null,
-                awaitingUserNotes: null,
-                awaitingBalanceFreeze: null,
                 broadcastMessage: null,
                 broadcastTarget: null,
                 broadcastFilter: null,
                 lastCommand: null,
                 commandTimestamp: null,
                 adminState: { state: 'none', data: {}, timestamp: null },
-                poolPurchase: null
+                poolPurchase: null,
+                
+                // ─── NEW: Advanced admin session states ───
+                awaitingClearHistory: null,
+                awaitingResetSession: null,
+                awaitingImpersonate: null,
+                awaitingRefund: null,
+                awaitingAdjustTx: null,
+                awaitingUserNotes: null,
+                awaitingBalanceFreeze: null
             })
         }));
 
-        // ─── 2. Fast-path for common operations ───
+        // ─── 2. Performance tracking ───
         this.bot.use(async (ctx, next) => {
             const startTime = Date.now();
             
@@ -174,7 +177,7 @@ class TelegramBot {
             return next();
         });
 
-        // ─── 6. Response time logging (development only) ───
+        // ─── 6. Dev response time logging ───
         if (process.env.NODE_ENV === 'development') {
             this.bot.use(async (ctx, next) => {
                 const start = Date.now();
@@ -188,11 +191,11 @@ class TelegramBot {
     }
 
     // ═══════════════════════════════════════════════════════
-    //  COMMAND SETUP — Async with SMS Provider Init
+    //  COMMAND SETUP — Both existing + new admin integrated
     // ═══════════════════════════════════════════════════════
 
     async setupCommands() {
-        // ─── Initialize SMS Provider Manager FIRST ───
+        // ─── Initialize SMS Provider Manager ───
         try {
             this.smsProviderManager = new SMSProviderManager();
             await this.smsProviderManager.initialize();
@@ -206,8 +209,11 @@ class TelegramBot {
         const userCommands = new UserCommands(this.bot, this.walletService);
         const otpCommands = new OTPCommands(this.bot, this.walletService, this.smsProviderManager);
         
-        // FIXED: Pass all dependencies to AdminCommands
-        const adminCommands = new AdminCommands(
+        // ─── YOUR EXISTING admin (kept exactly as before) ───
+        const adminCommands = new AdminCommands(this.bot);
+        
+        // ─── NEW advanced admin dashboard (extra.js, export: Admin) ───
+        const advancedAdmin = new Admin(
             this.bot, 
             this.walletService, 
             this.referralService,
@@ -215,10 +221,15 @@ class TelegramBot {
         );
 
         this.commandModules.set('user', userCommands);
-        this.commandCommands.set('otp', otpCommands);
-        this.commandModules.set('admin', adminCommands);
+        this.commandModules.set('otp', otpCommands);
+        this.commandModules.set('admin', adminCommands);        // ← Your existing
+        this.commandModules.set('advancedAdmin', advancedAdmin); // ← New one
 
-        // ─── Global start handler ───
+        // ═══════════════════════════════════════════════════
+        //  GLOBAL HANDLERS (unchanged from your existing)
+        // ═══════════════════════════════════════════════════
+
+        // ─── Start handler ───
         this.bot.start(async (ctx) => {
             this.trackEvent('command_start', ctx.from?.id);
             
@@ -228,22 +239,6 @@ class TelegramBot {
                 logger.error('Start handler error', { error: error.message, userId: ctx.from?.id });
                 ctx.reply('❌ Failed to start. Please try /start again.').catch(() => {});
             }
-        });
-
-        // ─── Admin Dashboard Entry Point ───
-        // Admin opens dashboard via /admin or button from existing menu
-        this.bot.command('admin', async (ctx) => {
-            const adminIds = (config.bot?.adminId || '')
-                .toString()
-                .split(',')
-                .map(id => id.trim())
-                .filter(Boolean);
-            
-            if (!adminIds.includes(ctx.from?.id?.toString())) {
-                return ctx.reply('⛔ <b>Admin only.</b>', { parse_mode: 'HTML' });
-            }
-            
-            await adminCommands.showDashboard(ctx, false);
         });
 
         // ─── Help action ───
@@ -283,7 +278,11 @@ class TelegramBot {
             }
         });
 
-        // ─── Admin Dashboard Button (add to your existing menu) ───
+        // ═══════════════════════════════════════════════════
+        //  NEW: Advanced Admin Dashboard Entry Point
+        // ═══════════════════════════════════════════════════
+        
+        // This action opens the NEW advanced dashboard from your existing admin panel
         this.bot.action('open_admin_dashboard', async (ctx) => {
             const adminIds = (config.bot?.adminId || '')
                 .toString()
@@ -295,10 +294,13 @@ class TelegramBot {
                 return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
             }
             
-            await adminCommands.showDashboard(ctx, true);
+            await advancedAdmin.showDashboard(ctx, true);
         });
 
-        // ─── Text message handler for session-based inputs ───
+        // ═══════════════════════════════════════════════════
+        //  TEXT MESSAGE HANDLER — Both existing + new admin
+        // ═══════════════════════════════════════════════════
+
         this.bot.on(message('text'), async (ctx, next) => {
             if (!ctx.session) return next();
 
@@ -310,13 +312,13 @@ class TelegramBot {
 
             const isAdmin = adminIds.includes(ctx.from?.id?.toString());
 
-            // ─── Admin text inputs (NEW: handles all admin prompts) ───
+            // ─── NEW: Advanced admin text inputs ───
             if (isAdmin) {
-                const handled = await adminCommands.handleTextInput(ctx);
+                const handled = await advancedAdmin.handleTextInput(ctx);
                 if (handled) return;
             }
 
-            // ─── Legacy admin awaiting inputs (keep for backward compat) ───
+            // ─── YOUR EXISTING admin awaiting inputs (unchanged) ───
             if (isAdmin) {
                 if (ctx.session.awaitingBroadcast) {
                     const { target, filter, label } = ctx.session.awaitingBroadcast;
@@ -365,7 +367,7 @@ class TelegramBot {
     }
 
     // ═══════════════════════════════════════════════════════
-    //  ERROR HANDLING — Graceful degradation
+    //  ERROR HANDLING
     // ═══════════════════════════════════════════════════════
 
     setupErrorHandling() {
@@ -405,7 +407,7 @@ class TelegramBot {
     }
 
     // ═══════════════════════════════════════════════════════
-    //  DEPOSIT SCANNER — Robust with backoff
+    //  DEPOSIT SCANNER
     // ═══════════════════════════════════════════════════════
 
     startDepositScanner() {
@@ -444,7 +446,7 @@ class TelegramBot {
     }
 
     // ═══════════════════════════════════════════════════════
-    //  LAUNCH — With health checks
+    //  LAUNCH
     // ═══════════════════════════════════════════════════════
 
     async launch() {
@@ -452,7 +454,6 @@ class TelegramBot {
             logger.info('Initializing database...');
             await initModels();
 
-            // FIXED: Initialize commands AFTER SMSProviderManager is ready
             await this.setupCommands();
 
             this.startDepositScanner();
@@ -475,7 +476,7 @@ class TelegramBot {
     }
 
     // ═══════════════════════════════════════════════════════
-    //  GRACEFUL SHUTDOWN — Fast & clean
+    //  GRACEFUL SHUTDOWN
     // ═══════════════════════════════════════════════════════
 
     async gracefulShutdown(signal) {
@@ -539,20 +540,4 @@ class TelegramBot {
 
     getHealth() {
         return {
-            status: this.isShuttingDown ? 'shutting_down' : this.isReady ? 'healthy' : 'starting',
-            uptime: process.uptime(),
-            memory: process.memoryUsage(),
-            metrics: {
-                requests: this.metrics.requestsHandled,
-                failed: this.metrics.requestsFailed,
-                avgResponseTime: Math.round(this.metrics.avgResponseTime),
-                activeUsers: this.metrics.activeUsers.size
-            },
-            walletReady: this.walletService?.isReady || false,
-            smsProviderReady: !!this.smsProviderManager?.isInitialized,
-            timestamp: new Date().toISOString()
-        };
-    }
-}
-
-export default TelegramBot;
+            status: this.isShuttingDown ? 'shutting_down' : this.isReady ? 'hea
