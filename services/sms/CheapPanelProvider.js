@@ -961,5 +961,30 @@ async checkAvailability(country, service) {
             totalSent,
             totalSuccess,
             totalFailed,
-            successRate: to
-    
+            successRate: totalSent > 0
+                ? Number((totalSuccess / totalSent * 100).toFixed(2))
+                : 100,
+            failureRate: totalSent > 0
+                ? Number((totalFailed / totalSent * 100).toFixed(2))
+                : 0,
+            avgResponseTime: Math.round(avgResponseTime),
+            totalCost: Number(totalCost.toFixed(4)),
+            avgCost: totalSent > 0
+                ? Number((totalCost / totalSent).toFixed(4))
+                : 0
+        };
+    }
+
+    resetStats() {
+        this.stats = {
+            totalSent: 0,
+            totalSuccess: 0,
+            totalFailed: 0,
+            avgResponseTime: 0,
+            totalCost: 0
+        };
+        return this.getStats();
+    }
+}
+
+export default CheapPanelProvider;
