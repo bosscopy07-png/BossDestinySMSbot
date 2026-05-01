@@ -318,34 +318,31 @@ class SessionManager {
                 // Non-critical — OTP already delivered, 5SIM will auto-expire
             }
         }
-
-        // Create transaction record for paid modes (CHEAP only, since VIP/BUNDLE don't use lockTxId)
-        if (session.cost > 0 && session.mode === 'CHEAP') {
-            try {
-                await Transaction.create({
-                    txId: generateId(),  // FIXED: Use generateId() instead of hardcoded
-                    userId: session.userId,
-                    type: 'OTP_PURCHASE',
-                    amount: -session.cost,
-                    currency: 'USD',
-                    status: 'COMPLETED',
-                    metadata: {
-                        sessionId,
-                        service: session.service,
-                        mode: session.mode,
-                        number: session.number,
-                        provider: session.provider,
-                        providerNumberId: session.providerNumberId,
-                        otpDeliveredAt: new Date()
-                    }
-                });
-            } catch (txError) {
-                logger.error('Transaction record failed', { sessionId, error: txError.message });
-                // Non-critical — OTP delivered, but accounting record missing
-                // Log for manual reconciliation
-            }
+            // Create transaction record for paid modes
+    if (session.cost > 0 && session.mode === 'CHEAP') {
+        try {
+            await Transaction.create({
+                txId: generateId(),
+                userId: session.userId,
+                type: 'OTP_PURCHASE',  // ← FIXED: Use valid enum value
+                amount: -session.cost,
+                currency: 'USD',
+                status: 'COMPLETED',
+                metadata: {
+                    sessionId,
+                    service: session.service,
+                    mode: session.mode,
+                    number: session.number,
+                    provider: session.provider,
+                    providerNumberId: session.providerNumberId,
+                    otpDeliveredAt: new Date()
+                }
+            });
+        } catch (txError) {
+            logger.error('Transaction record failed', { sessionId, error: txError.message });
         }
-
+    }
+    
         // Cleanup memory timers
         this._cleanupSession(sessionId);
 
