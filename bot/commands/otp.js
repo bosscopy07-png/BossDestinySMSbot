@@ -1741,79 +1741,90 @@ class OTPCommands {
     //  CANCEL HANDLER
     // ═══════════════════════════════════════════════════════════════════════
 
+    /**
+     * Handle session cancellation
+     * FIXED:
+     * - Cancels on 5SIM first (for CHEAP mode)
+     * - Calls sessionManager.cancelSession which handles ALL refunds
+     * - NO duplicate _refundSession call
+     * - Shows actual refunded amount from cancel result
+     */
     async handleCancel(ctx) {
-    const userId = ctx.from.id.toString();
+        const userId = ctx.from.id.toString();
 
-    try {
-        const activeSession = await Session.findOne({ 
-            userId, 
-            status: { $in: ['WAITING', 'CHECKING'] } 
-        });
-        
-        if (!activeSession) {
-            return this.sendPhotoWithCaption(ctx, IMAGES.default, 
-                '❌ No active session to cancel.',
+        try {
+            const activeSession = await Session.findOne({ 
+                userId, 
+                status: { $in: ['WAITING', 'CHECKING'] } 
+            });
+            
+            if (!activeSession) {
+                return this.sendPhotoWithCaption(ctx, IMAGES.default, 
+                    '❌ No active session to cancel.',
+                    KEYBOARDS.backToMenu(), 'HTML'
+                );
+            }
+
+            // Step 1: Cancel on 5SIM FIRST (for CHEAP mode)
+            if (activeSession.mode === 'CHEAP' && activeSession.providerNumberId) {
+                try {
+                    const cancelResult = await this.smsProviderManager.cancelCheapNumber(
+                        activeSession.providerNumberId
+                    );
+                    logger.info('5SIM cancel result', { 
+                        sessionId: activeSession.sessionId,
+                        activationId: activeSession.providerNumberId,
+                        result: cancelResult 
+                    });
+                } catch (cancelError) {
+                    logger.error('5SIM cancel failed during user cancel', {
+                        sessionId: activeSession.sessionId,
+                        activationId: activeSession.providerNumberId,
+                        error: cancelError.message
+                    });
+                    // Continue — 5SIM cancel is best-effort
+                }
+            }
+
+            // Step 2: Cancel on free provider (for FREE mode)
+            if (activeSession.mode === 'FREE' && activeSession.providerNumberId && this.smsProviderManager) {
+                await this.smsProviderManager.cancelNumber('FREE_PUBLIC', activeSession.providerNumberId)
+                    .catch(() => {});
+            }
+
+            // Step 3: Cancel session — handles ALL refunds internally
+            // FIXED: No duplicate _refundSession! cancelSession does everything.
+            const cancelResult = await sessionManager.cancelSession(activeSession.sessionId, userId);
+
+            // Step 4: Show result to user
+            const refundedText = cancelResult.releasedAmount > 0 
+                ? `💰 Refunded: ${formatCurrency(cancelResult.releasedAmount)}\n`
+                : '';
+
+            const message = 
+                `✅ <b>Session Cancelled</b>\n\n` +
+                `📱 Number: <code>${activeSession.number}</code>\n` +
+                `🎯 Service: ${activeSession.service}\n` +
+                refundedText +
+                `\nAny used credits have been restored.\n` +
+                `You can start a new request now.`;
+            
+            await this.sendPhotoWithCaption(ctx, IMAGES.default, message, 
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 New OTP Request', 'menu')],
+                    [Markup.button.callback('🔙 Main Menu', 'menu')]
+                ]), 'HTML'
+            );
+            
+        } catch (error) {
+            logger.error('Cancel failed', { userId, error: error.message });
+            await this.sendPhotoWithCaption(ctx, IMAGES.default, 
+                '❌ Failed to cancel session. Please try again.',
                 KEYBOARDS.backToMenu(), 'HTML'
             );
         }
-
-        // FIXED: For CHEAP mode, cancel on 5SIM FIRST before releasing funds
-        // This ensures 5SIM refunds YOU before you refund the user
-        if (activeSession.mode === 'CHEAP' && activeSession.providerNumberId) {
-            try {
-                const cancelResult = await this.smsProviderManager.cancelCheapNumber(
-                    activeSession.providerNumberId  // Uses activation ID "1001025384"
-                );
-                logger.info('5SIM cancel result', { 
-                    sessionId: activeSession.sessionId,
-                    activationId: activeSession.providerNumberId,
-                    result: cancelResult 
-                });
-            } catch (cancelError) {
-                logger.error('5SIM cancel failed during user cancel', {
-                    sessionId: activeSession.sessionId,
-                    activationId: activeSession.providerNumberId,
-                    error: cancelError.message
-                });
-                // Continue with refund even if 5SIM cancel fails
-                // (user experience > provider cleanup)
-            }
-        }
-
-        // For FREE mode, cancel on free provider
-        if (activeSession.mode === 'FREE' && activeSession.providerNumberId && this.smsProviderManager) {
-            await this.smsProviderManager.cancelNumber('FREE_PUBLIC', activeSession.providerNumberId)
-                .catch(() => {});
-        }
-
-        // Cancel session in our system (releases funds, restores credits)
-        await sessionManager.cancelSession(activeSession.sessionId, userId);
-        await this._refundSession(activeSession);
-
-        const message = 
-            `✅ <b>Session Cancelled</b>\n\n` +
-            `📱 Number: <code>${activeSession.number}</code>\n` +
-            `🎯 Service: ${activeSession.service}\n` +
-            `💰 Refunded: ${formatCurrency(activeSession.cost || 0)}\n\n` +
-            `Any used credits have been refunded.\n` +
-            `You can start a new request now.`;
-        
-        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, 
-            Markup.inlineKeyboard([
-                [Markup.button.callback('📱 New OTP Request', 'menu')],
-                [Markup.button.callback('🔙 Main Menu', 'menu')]
-            ]), 'HTML'
-        );
-        
-    } catch (error) {
-        logger.error('Cancel failed', { userId, error: error.message });
-        await this.sendPhotoWithCaption(ctx, IMAGES.default, 
-            '❌ Failed to cancel session. Please try again.',
-            KEYBOARDS.backToMenu(), 'HTML'
-        );
-    }
-    }
-    
+                }
+                        
     // ═══════════════════════════════════════════════════════════════════════
     //  BUNDLE PURCHASES
     // ═══════════════════════════════════════════════════════════════════════
