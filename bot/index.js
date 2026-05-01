@@ -13,7 +13,7 @@ import { rateLimit } from './middleware/rateLimit.js';
 import UserCommands from './commands/user.js';
 import OTPCommands from './commands/otp.js';
 import AdminCommands from './commands/admin.js';
-import Admin from './commands/exist.js';
+import Admin from './commands/extra.js';
 import WalletService from '../services/wallet/index.js';
 import SMSProviderManager from '../services/sms/index.js';
 
