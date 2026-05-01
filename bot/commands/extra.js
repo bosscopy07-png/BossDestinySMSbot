@@ -2302,7 +2302,222 @@ async showDevopsMenu(ctx) {
             ]);
 
             let csv = `Month,Revenue,Transactions\n`;
-            let totalRe
+            let totalRevenue = 0;
+            
+            report.forEach(r => {
+                const monthName = new Date(2026, r._id - 1).toLocaleString('default', { month: 'long' });
+                csv += `${monthName},${r.revenue.toFixed(2)},${r.count}\n`;
+                totalRevenue += r.revenue;
+            });
+
+            csv += `TOTAL,${totalRevenue.toFixed(2)},${report.reduce((a, b) => a + b.count, 0)}\n`;
+
+            await ctx.replyWithDocument({
+                source: Buffer.from(csv),
+                filename: `tax_report_${year}.csv`
+            }, {
+                caption: `📑 <b>Tax Report ${year}</b>\n\nTotal Revenue: <b>$${totalRevenue.toFixed(2)}</b>`,
+                parse_mode: 'HTML'
+            });
+
+        } catch (error) {
+            logger.error('Tax export failed', { error: error.message });
+            ctx.reply(`❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+        }
+    }
+
+    // ─── 66. Audit Trail ───
+    async handleAuditTrail(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('📋 Loading audit trail...');
+
+        try {
+            const { AuditLog } = await import('../../models/index.js');
+            
+            const logs = await AuditLog.find()
+                .sort({ createdAt: -1 })
+                .limit(20);
+
+            let text = `📋 <b>Audit Trail (Last 20)</b>\n\n`;
+            
+            if (logs.length === 0) {
+                text += `<i>No audit logs found. Enable auditing in settings.</i>`;
+            } else {
+                logs.forEach(log => {
+                    text += `🕐 <i>${log.createdAt?.toLocaleString()}</i>\n` +
+                           `👤 <code>${log.adminId}</code>\n` +
+                           `⚡ <b>${log.action}</b>\n` +
+                           `📝 ${log.details?.substring(0, 50) || 'N/A'}\n\n`;
+                });
+            }
+
+            await safeEditMessage(ctx, text, {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔄 Refresh', callback_data: 'admin_audit' }],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_finance' }]
+                    ]
+                }
+            });
+
+        } catch (error) {
+            logger.error('Audit trail failed', { error: error.message });
+            safeEditMessage(ctx, `❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+        }
+    }
+
+    // ─── 67. Webhook Tester ───
+    async handleWebhookTest(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('🔔 Testing webhooks...');
+
+        try {
+            // Test deposit webhook
+            const depositTest = await fetch(config.webhookUrl + '/deposit', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ test: true, timestamp: Date.now() })
+            });
+
+            const otpTest = await fetch(config.webhookUrl + '/otp', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ test: true, timestamp: Date.now() })
+            });
+
+            const text = 
+                `🔔 <b>Webhook Test Results</b>\n\n` +
+                `📥 Deposit Webhook: ${depositTest.ok ? '✅ OK' : '❌ FAIL'}\n` +
+                `📱 OTP Webhook: ${otpTest.ok ? '✅ OK' : '❌ FAIL'}\n\n` +
+                `URL: <code>${config.webhookUrl}</code>`;
+
+            await safeEditMessage(ctx, text, {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔄 Retest', callback_data: 'admin_webhook_test' }],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_devops' }]
+                    ]
+                }
+            });
+
+        } catch (error) {
+            logger.error('Webhook test failed', { error: error.message });
+            safeEditMessage(ctx, `❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_devops' }]] }
+            });
+        }
+    }
+
+    // ─── 68. Config Hot-Reload ───
+    async handleHotReload(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('♻️ Reloading config...');
+
+        try {
+            // Reload config from file or DB
+            delete require.cache[require.resolve('../../config/env.js')];
+            const newConfig = (await import('../../config/env.js')).default;
+            Object.assign(config, newConfig);
+
+            await safeEditMessage(ctx,
+                `♻️ <b>Config Hot-Reloaded</b>\n\n` +
+                `✅ Configuration refreshed without restart.\n` +
+                `⏰ Time: <i>${new Date().toLocaleString()}</i>\n\n` +
+                `<i>Some changes may require restart to take full effect.</i>`,
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: '🔄 Reload Again', callback_data: 'admin_hot_reload' }],
+                            [{ text: '◀️ Back', callback_data: 'admin_back_devops' }]
+                        ]
+                    }
+                }
+            );
+
+        } catch (error) {
+            logger.error('Hot reload failed', { error: error.message });
+            safeEditMessage(ctx, `❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_devops' }]] }
+            });
+        }
+    }
+
+    // ─── 69. A/B Testing ───
+    async handleABTesting(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('🧪 Loading A/B tests...');
+
+        const tests = config.abTests || [];
+
+        let text = `🧪 <b>A/B Testing</b>\n\n`;
+        
+        if (tests.length === 0) {
+            text += `<i>No active tests.</i>\n\n` +
+                   `Create tests to compare OTP prices, UI variants, etc.`;
+        } else {
+            tests.forEach(t => {
+                text += `📊 <b>${t.name}</b>\n` +
+                       `   Variant A: <b>${t.variantA}%</b>\n` +
+                       `   Variant B: <b>${t.variantB}%</b>\n` +
+                       `   Status: <b>${t.active ? '🟢 Active' : '🔴 Paused'}</b>\n\n`;
+            });
+        }
+
+        await safeEditMessage(ctx, text, {
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '➕ Create Test', callback_data: 'admin_ab_create' }],
+                    [{ text: '🔄 Refresh', callback_data: 'admin_ab_test' }],
+                    [{ text: '◀️ Back', callback_data: 'admin_back_devops' }]
+                ]
+            }
+        });
+    }
+
+    // ─── 70. API Key Rotation ───
+    async handleKeyRotation(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('🔑 Rotating keys...');
+
+        await safeEditMessage(ctx,
+            `🔑 <b>API Key Rotation</b>\n\n` +
+            `Select provider to rotate:`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '📱 SMS Provider', callback_data: 'admin_rotate_sms' },
+                            { text: '⛓️ Blockchain', callback_data: 'admin_rotate_blockchain' }
+                        ],
+                        [
+                            { text: '🔐 Telegram Bot', callback_data: 'admin_rotate_telegram' },
+                            { text: '💳 Payment', callback_data: 'admin_rotate_payment' }
+                        ],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_devops' }]
+                    ]
+                }
+            }
+        );
+                }
 
 
                 // ═══════════════════════════════════════════════════════
