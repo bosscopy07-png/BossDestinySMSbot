@@ -568,7 +568,7 @@ class FreeProvider {
         return this.releaseSession(sessionId);
     }
 
-    releaseSession(sessionId) {
+        releaseSession(sessionId) {
         const session = this.activeSessions.get(sessionId);
         if (!session) return { success: true };
 
@@ -576,4 +576,80 @@ class FreeProvider {
         this.activeSessions.delete(sessionId);
 
         return { success: true, status: 'RELEASED' };
-                            }
+    }
+
+    delay(ms) {
+        return new Promise(r => setTimeout(r, ms));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  OTP EXTRACTION
+    // ═══════════════════════════════════════════════════════════════════════
+
+    extractOTP(text) {
+        if (!text) return null;
+
+        const patterns = [
+            /\b\d{4,8}\b/,
+            /code[:\s]+(\d{4,8})/i,
+            /otp[:\s]+(\d{4,8})/i,
+            /verification[:\s]+(\d{4,8})/i,
+            /(\d{4,8})[:\s]*is your/i,
+            /your code is (\d{4,8})/i,
+            /验证码[:\s]*(\d{4,8})/i,
+            /код[:\s]+(\d{4,8})/i,
+            /pin[:\s]+(\d{4,8})/i
+        ];
+
+        for (const p of patterns) {
+            const m = text.match(p);
+            if (m) {
+                const otp = m[1] || m[0];
+                if (/^\d{4,8}$/.test(otp)) return otp;
+            }
+        }
+
+        const digits = text.match(/\b\d{4,8}\b/g);
+        return digits?.[digits.length - 1] || null;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STATS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    getProviderHealth() {
+        return this.providers.map(p => ({
+            id: p.id,
+            name: p.name,
+            enabled: p.enabled
+        }));
+    }
+
+    getActiveSessions() {
+        return Array.from(this.activeSessions.entries()).map(([id, s]) => ({
+            sessionId: id,
+            number: this.maskPhone(s.number),
+            status: s.status,
+            service: s.service,
+            messages: s.messages.length
+        }));
+    }
+
+    getStats() {
+        return {
+            name: this.name,
+            isActive: this.isActive,
+            activeSessions: this.activeSessions.size,
+            providers: this.providers.length
+        };
+    }
+
+    maskPhone(phone) {
+        if (!phone) return '****';
+        const str = phone.toString();
+        if (str.length < 4) return '****';
+        return str.slice(0, -4).replace(/./g, '*') + str.slice(-4);
+    }
+}
+
+export default FreeProvider;
