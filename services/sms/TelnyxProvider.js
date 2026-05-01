@@ -9,7 +9,8 @@ import config from '../../config/env.js';
  * - Country validated before ANY API call
  * - Payload logged before every request
  * - BASE_URL validated for webhook configuration
- * - Empty payload protection on number_orders
+ * - FLAT payload for number_orders (no data wrapper)
+ * - Proper error handling with response logging
  */
 class TelnyxProvider {
     constructor() {
@@ -18,10 +19,10 @@ class TelnyxProvider {
         this.isActive = false;
         this.baseUrl = 'https://api.telnyx.com/v2';
 
-        // FIXED: Validate BASE_URL for webhook configuration
+        // Validate BASE_URL for webhook configuration
         const baseUrl = process.env.BASE_URL || config.baseUrl;
         if (!baseUrl) {
-            logger.warn('TelnyxProvider — BASE_URL not set. Webhooks will not be configured for purchased numbers.');
+            logger.warn('TelnyxProvider — BASE_URL not set. Webhooks will not be configured.');
             this.webhookUrl = null;
         } else {
             this.webhookUrl = `${baseUrl.replace(/\/$/, '')}/webhooks/telnyx`;
@@ -38,8 +39,7 @@ class TelnyxProvider {
         if (!apiKey.startsWith('KEY') || apiKey.length < 20) {
             logger.error('TelnyxProvider disabled — API key malformed', {
                 startsWith: apiKey.slice(0, 3),
-                length: apiKey.length,
-                hint: 'Key must start with "KEY" and be 40+ characters. Check env config.'
+                length: apiKey.length
             });
             return;
         }
@@ -92,8 +92,9 @@ class TelnyxProvider {
                 payload.messaging_profile_id = this.messagingProfileId;
             }
 
-            // FIXED: Log payload before API call
-            logger.debug('Telnyx SMS payload', { payload: { ...payload, text: payload.text?.slice(0, 20) + '...' } });
+            logger.debug('Telnyx SMS payload', { 
+                payload: { ...payload, text: payload.text?.slice(0, 20) + '...' } 
+            });
 
             const response = await axios.post(
                 `${this.baseUrl}/messages`,
@@ -156,23 +157,23 @@ class TelnyxProvider {
         }
     }
 
-    // ─── Number Lifecycle (Pool Manager Interface) ───────────────────────
+    // ─── Number Lifecycle ────────────────────────────────────────────────
 
     /**
-     * FIXED: Country validated before ANY API call.
-     * Payload logged before number_orders POST.
-     * Never sends empty phone_numbers array.
+     * Buy a number from Telnyx.
+     * FIXED: Uses FLAT payload (no data wrapper) for number_orders endpoint.
      */
     async buyNumber(country = 'US') {
         if (!this.isActive) {
             throw new Error('TELNYX_NOT_CONFIGURED');
         }
 
-        // FIXED: Validate country parameter
+        // Validate country
         if (!country || typeof country !== 'string' || country.length !== 2) {
-            throw new Error(`TELNYX_INVALID_COUNTRY: Country must be a 2-letter ISO code. Got: ${country}`);
+            throw new Error(`TELNYX_INVALID_COUNTRY: Country must be 2-letter ISO code. Got: ${country}`);
         }
 
+        // Check stock
         const hasStock = await this.hasAvailableNumbers(country);
         if (!hasStock) {
             throw new Error(`TELNYX_NO_NUMBERS: No available numbers in ${country}`);
@@ -206,45 +207,40 @@ class TelnyxProvider {
         const numberData = available[0];
         const phoneNumber = numberData.phone_number;
 
-        // FIXED: Validate phone number before building payload
         if (!phoneNumber || typeof phoneNumber !== 'string') {
             throw new Error(`TELNYX_INVALID_NUMBER: Search returned invalid phone number: ${phoneNumber}`);
         }
 
-        // Step 2: Build and validate purchase payload
+        // Step 2: Build FLAT purchase payload (NOT wrapped in data)
         const purchasePayload = {
-            data: {
-                phone_numbers: [{ phone_number: phoneNumber }],
-                customer_reference: `otp-pool-${Date.now()}`
-            }
+            phone_numbers: [{ phone_number: phoneNumber }],
+            customer_reference: `otp-pool-${Date.now()}`
         };
 
-        // Add optional fields only if they exist
         if (this.messagingProfileId) {
-            purchasePayload.data.messaging_profile_id = this.messagingProfileId;
+            purchasePayload.messaging_profile_id = this.messagingProfileId;
         }
         if (this.connectionId) {
-            purchasePayload.data.connection_id = this.connectionId;
+            purchasePayload.connection_id = this.connectionId;
         }
         if (config.telnyx?.billingGroupId) {
-            purchasePayload.data.billing_group_id = config.telnyx.billingGroupId;
+            purchasePayload.billing_group_id = config.telnyx.billingGroupId;
         }
 
-        // FIXED: Validate payload has phone_numbers array with at least one entry
-        if (!purchasePayload.data.phone_numbers || purchasePayload.data.phone_numbers.length === 0) {
+        // Validate payload
+        if (!purchasePayload.phone_numbers || purchasePayload.phone_numbers.length === 0) {
             throw new Error('TELNYX_EMPTY_PAYLOAD: phone_numbers array is empty');
         }
 
-        // FIXED: Log payload before API call
         logger.info('Telnyx number purchase payload', {
             country,
             phoneNumber: this.maskPhone(phoneNumber),
-            payloadKeys: Object.keys(purchasePayload.data),
-            hasMessagingProfile: !!purchasePayload.data.messaging_profile_id,
-            hasConnectionId: !!purchasePayload.data.connection_id
+            payload: JSON.stringify(purchasePayload),
+            hasMessagingProfile: !!purchasePayload.messaging_profile_id,
+            hasConnectionId: !!purchasePayload.connection_id
         });
 
-        // Step 3: Purchase the number
+        // Step 3: Purchase with FLAT payload
         let purchaseResponse;
         try {
             purchaseResponse = await axios.post(
@@ -255,15 +251,14 @@ class TelnyxProvider {
         } catch (error) {
             const msg = error.response?.data?.errors?.[0]?.detail || error.message;
             const code = error.response?.status;
+            const responseData = error.response?.data;
             
-            // FIXED: Enhanced error logging for 400 responses
-            if (code === 400) {
-                logger.error('Telnyx 400 error on number purchase', {
-                    message: msg,
-                    payload: purchasePayload,
-                    response: error.response?.data
-                });
-            }
+            logger.error('Telnyx purchase failed', {
+                status: code,
+                message: msg,
+                payload: purchasePayload,
+                response: responseData
+            });
             
             throw new Error(`TELNYX_PURCHASE_FAILED: ${msg}`);
         }
@@ -289,6 +284,13 @@ class TelnyxProvider {
         };
     }
 
+    /**
+     * Get a number — alias for buyNumber (pool manager interface)
+     */
+    async getNumber(country = 'US') {
+        return this.buyNumber(country);
+    }
+
     async releaseNumber(sid) {
         if (!this.isActive) {
             throw new Error('TELNYX_NOT_CONFIGURED');
@@ -308,6 +310,14 @@ class TelnyxProvider {
             logger.error('Telnyx release failed', { sid, error: msg });
             throw new Error(`TELNYX_RELEASE_FAILED: ${msg}`);
         }
+    }
+
+    async cancelNumber(sid) {
+        return this.releaseNumber(sid);
+    }
+
+    async finishNumber(sid) {
+        return this.releaseNumber(sid);
     }
 
     async getNumberDetails(sid) {
@@ -375,3 +385,4 @@ class TelnyxProvider {
 }
 
 export default TelnyxProvider;
+        
