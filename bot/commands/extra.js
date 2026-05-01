@@ -2,9 +2,9 @@
 //  bot/commands/admin.js — Button-Based Admin Dashboard
 // ═══════════════════════════════════════════════════════════
 
-import { fixNegativeLockedBalances } from '../scripts/index.js';
-import logger from '../utils/logger.js';
-import config from '../config/env.js';
+import { fixNegativeLockedBalances } from '../../scripts/index.js';
+import logger from '../../utils/logger.js';
+import config from '../../config/env.js';
 
 /**
  * Admin command handlers — Button-Based Dashboard
