@@ -1375,6 +1375,7 @@ class Admin {
         );
     }
 
+    
     async processBlacklist(ctx, targetId, reason) {
         try {
             const { User } = await import('../../models/index.js');
@@ -1401,14 +1402,7 @@ class Admin {
 
             await ctx.replyWithPhoto(ADMIN_IMAGE_URL, {
                 caption: 
-                    `🚫 <b>User Black I need to continue from where the output was cut off. Let me complete the remaining parts of the file. This is a massive file that needs to be split into parts. Let me continue with Part 2 continuation and Part 3.
-
----
-
-## **Part 2 Continuation**
-
-```javascript
-listed</b>\n\n` +
+                    `🚫 <b>User Blacklisted</b>\n\n` +
                     `👤 User: <code>${targetId}</code>\n` +
                     `📝 Reason: <i>${reason}</i>\n` +
                     `⏰ Time: <i>${new Date().toLocaleString()}</i>\n\n` +
@@ -1426,7 +1420,7 @@ listed</b>\n\n` +
             });
         }
     }
-
+    
     // ─── 20. Whitelist User ───
     async promptWhitelist(ctx) {
         const userId = ctx.from?.id?.toString();
@@ -3208,6 +3202,399 @@ listed</b>\n\n` +
         }
         }
                     async handleDynamicPricing(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('💹 Loading pricing...');
+
+        const current = config.dynamicPricing || false;
+        const status = current ? '🟢 ENABLED' : '🔴 DISABLED';
+
+        await safeEditWithImage(ctx,
+            `💹 <b>Dynamic Pricing Engine</b>\n\n` +
+            `Status: <b>${status}</b>\n\n` +
+            `📋 <b>Rules:</b>\n` +
+            `• High demand (>50 OTPs/hour): Price +20%\n` +
+            `• Low demand (<10 OTPs/hour): Price -10%\n` +
+            `• Peak hours (18:00-22:00): Price +15%\n` +
+            `• Current base: <b>$${config.otpPrice || 'N/A'}</b>\n\n` +
+            `${current 
+                ? '✅ Prices adjust automatically based on demand.' 
+                : '🔒 Static pricing is active.'}`,
+            {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ 
+                            text: current ? '🔴 Disable' : '🟢 Enable', 
+                            callback_data: 'admin_toggle_dynamic_price' 
+                        }],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_finance' }]
+                    ]
+                }
+            }
+        );
+    }
+
+    async handlePromoCodes(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('🎫 Loading promos...');
+
+        await safeEditWithImage(ctx,
+            `🎫 <b>Promo Code Generator</b>\n\n` +
+            `Select action:`,
+            {
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '➕ Create Code', callback_data: 'admin_promo_create' },
+                            { text: '📋 List Active', callback_data: 'admin_promo_list' }
+                        ],
+                        [
+                            { text: '🗑️ Deactivate', callback_data: 'admin_promo_deactivate' },
+                            { text: '📊 Usage Stats', callback_data: 'admin_promo_stats' }
+                        ],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_finance' }]
+                    ]
+                }
+            }
+        );
+    }
+
+    async handleCommissionSplit(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('💰 Loading commissions...');
+
+        const partners = config.commissionPartners || [];
+
+        let text = `💰 <b>Commission Split</b>\n\n`;
+        
+        if (partners.length === 0) {
+            text += `<i>No partners configured.</i>\n\n` +
+                   `Add partners in config to enable auto-split.`;
+        } else {
+            text += `<b>Active Partners:</b>\n\n`;
+            partners.forEach(p => {
+                text += `👤 <b>${p.name}</b>\n` +
+                       `   📊 Share: <b>${p.percentage}%</b>\n` +
+                       `   💰 Total Paid: <b>$${p.totalPaid?.toFixed(2) || '0.00'}</b>\n\n`;
+            });
+        }
+
+        await safeEditWithImage(ctx, text, {
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '➕ Add Partner', callback_data: 'admin_add_partner' }],
+                    [{ text: '🔄 Refresh', callback_data: 'admin_commission' }],
+                    [{ text: '◀️ Back', callback_data: 'admin_back_finance' }]
+                ]
+            }
+        });
+    }
+
+    async handleInvoiceGenerator(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('🧾 Generating invoice...');
+
+        await safeEditWithImage(ctx,
+            `🧾 <b>Invoice Generator</b>\n\n` +
+            `Send: <code>USER_ID MONTH</code>\n` +
+            `Example: <code>123456789 2026-05</code>\n\n` +
+            `Or send /cancel to abort.`,
+            { parse_mode: 'HTML' }
+        );
+    }
+
+    async processInvoice(ctx, targetId, month) {
+        try {
+            const { User, Transaction } = await import('../../models/index.js');
+            
+            const [startDate, endDate] = [
+                new Date(`${month}-01`),
+                new Date(`${month}-01T23:59:59.999Z`)
+            ];
+            endDate.setMonth(endDate.getMonth() + 1);
+
+            const user = await User.findOne({ userId: targetId });
+            if (!user) {
+                return ctx.replyWithPhoto(ADMIN_IMAGE_URL, { 
+                    caption: `❌ User <code>${targetId}</code> not found.`, 
+                    parse_mode: 'HTML' 
+                });
+            }
+
+            const txs = await Transaction.find({
+                userId: targetId,
+                createdAt: { $gte: startDate, $lt: endDate },
+                status: 'COMPLETED'
+            });
+
+            const total = txs.reduce((sum, tx) => sum + (tx.amount || 0), 0);
+
+            const invoiceText = 
+                `🧾 <b>INVOICE</b>\n` +
+                `━━━━━━━━━━━━━━━\n\n` +
+                `To: <b>${user.firstName || 'Customer'} ${user.lastName || ''}</b>\n` +
+                `ID: <code>${targetId}</code>\n` +
+                `Period: <b>${month}</b>\n\n` +
+                `Items: <b>${txs.length}</b>\n` +
+                `Total: <b>$${total.toFixed(2)}</b>\n\n` +
+                `━━━━━━━━━━━━━━━\n` +
+                `Thank you for your business!`;
+
+            await ctx.replyWithPhoto(ADMIN_IMAGE_URL, {
+                caption: invoiceText,
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+
+        } catch (error) {
+            logger.error('Invoice failed', { error: error.message });
+            ctx.replyWithPhoto(ADMIN_IMAGE_URL, { 
+                caption: `❌ Error: ${error.message}`, 
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+        }
+    }
+
+    async handleTaxExport(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('📑 Generating tax report...');
+
+        try {
+            const { Transaction } = await import('../../models/index.js');
+            
+            const year = new Date().getFullYear();
+            const startOfYear = new Date(`${year}-01-01`);
+            
+            const report = await Transaction.aggregate([
+                { $match: { status: 'COMPLETED', createdAt: { $gte: startOfYear } } },
+                { $group: { 
+                    _id: { $month: '$createdAt' }, 
+                    revenue: { $sum: '$amount' },
+                    count: { $sum: 1 }
+                }},
+                { $sort: { _id: 1 } }
+            ]);
+
+            let csv = `Month,Revenue,Transactions\n`;
+            let totalRevenue = 0;
+            
+            report.forEach(r => {
+                const monthName = new Date(2026, r._id - 1).toLocaleString('default', { month: 'long' });
+                csv += `${monthName},${r.revenue.toFixed(2)},${r.count}\n`;
+                totalRevenue += r.revenue;
+            });
+
+            csv += `TOTAL,${totalRevenue.toFixed(2)},${report.reduce((a, b) => a + b.count, 0)}\n`;
+
+            await ctx.replyWithDocument({
+                source: Buffer.from(csv),
+                filename: `tax_report_${year}.csv`
+            }, {
+                caption: `📑 <b>Tax Report ${year}</b>\n\nTotal Revenue: <b>$${totalRevenue.toFixed(2)}</b>`,
+                parse_mode: 'HTML'
+            });
+
+        } catch (error) {
+            logger.error('Tax export failed', { error: error.message });
+            ctx.replyWithPhoto(ADMIN_IMAGE_URL, { 
+                caption: `❌ Error: ${error.message}`, 
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+        }
+    }
+
+    async handleAuditTrail(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('📋 Loading audit trail...');
+
+        try {
+            const { AuditLog } = await import('../../models/index.js');
+            
+            const logs = await AuditLog.find()
+                .sort({ createdAt: -1 })
+                .limit(20);
+
+            let text = `📋 <b>Audit Trail (Last 20)</b>\n\n`;
+            
+            if (logs.length === 0) {
+                text += `<i>No audit logs found. Enable auditing in settings.</i>`;
+            } else {
+                logs.forEach(log => {
+                    text += `🕐 <i>${log.createdAt?.toLocaleString()}</i>\n` +
+                           `👤 <code>${log.adminId}</code>\n` +
+                           `⚡ <b>${log.action}</b>\n` +
+                           `📝 ${log.details?.substring(0, 50) || 'N/A'}\n\n`;
+                });
+            }
+
+            await safeEditWithImage(ctx, text, {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔄 Refresh', callback_data: 'admin_audit' }],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_finance' }]
+                    ]
+                }
+            });
+
+        } catch (error) {
+            logger.error('Audit trail failed', { error: error.message });
+            await safeEditWithImage(ctx, `❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_finance' }]] }
+            });
+        }
+    }
+
+    async handleWebhookTest(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('🔔 Testing webhooks...');
+
+        try {
+            const depositTest = await fetch(config.webhookUrl + '/deposit', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ test: true, timestamp: Date.now() })
+            });
+
+            const otpTest = await fetch(config.webhookUrl + '/otp', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ test: true, timestamp: Date.now() })
+            });
+
+            const text = 
+                `🔔 <b>Webhook Test Results</b>\n\n` +
+                `📥 Deposit Webhook: ${depositTest.ok ? '✅ OK' : '❌ FAIL'}\n` +
+                `📱 OTP Webhook: ${otpTest.ok ? '✅ OK' : '❌ FAIL'}\n\n` +
+                `URL: <code>${config.webhookUrl}</code>`;
+
+            await safeEditWithImage(ctx, text, {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔄 Retest', callback_data: 'admin_webhook_test' }],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_devops' }]
+                    ]
+                }
+            });
+
+        } catch (error) {
+            logger.error('Webhook test failed', { error: error.message });
+            await safeEditWithImage(ctx, `❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_devops' }]] }
+            });
+        }
+    }
+
+    async handleHotReload(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('♻️ Reloading config...');
+
+        try {
+            delete require.cache[require.resolve('../../config/env.js')];
+            const newConfig = (await import('../../config/env.js')).default;
+            Object.assign(config, newConfig);
+
+            await safeEditWithImage(ctx,
+                `♻️ <b>Config Hot-Reloaded</b>\n\n` +
+                `✅ Configuration refreshed without restart.\n` +
+                `⏰ Time: <i>${new Date().toLocaleString()}</i>\n\n` +
+                `<i>Some changes may require restart to take full effect.</i>`,
+                {
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: '🔄 Reload Again', callback_data: 'admin_hot_reload' }],
+                            [{ text: '◀️ Back', callback_data: 'admin_back_devops' }]
+                        ]
+                    }
+                }
+            );
+
+        } catch (error) {
+            logger.error('Hot reload failed', { error: error.message });
+            await safeEditWithImage(ctx, `❌ Error: ${error.message}`, {
+                reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_devops' }]] }
+            });
+        }
+    }
+
+    async handleABTesting(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('🧪 Loading A/B tests...');
+
+        const tests = config.abTests || [];
+
+        let text = `🧪 <b>A/B Testing</b>\n\n`;
+        
+        if (tests.length === 0) {
+            text += `<i>No active tests.</i>\n\n` +
+                   `Create tests to compare OTP prices, UI variants, etc.`;
+        } else {
+            tests.forEach(t => {
+                text += `📊 <b>${t.name}</b>\n` +
+                       `   Variant A: <b>${t.variantA}%</b>\n` +
+                       `   Variant B: <b>${t.variantB}%</b>\n` +
+                       `   Status: <b>${t.active ? '🟢 Active' : '🔴 Paused'}</b>\n\n`;
+            });
+        }
+
+        await safeEditWithImage(ctx, text, {
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '➕ Create Test', callback_data: 'admin_ab_create' }],
+                    [{ text: '🔄 Refresh', callback_data: 'admin_ab_test' }],
+                    [{ text: '◀️ Back', callback_data: 'admin_back_devops' }]
+                ]
+            }
+        });
+    }
+
+    async handleKeyRotation(ctx) {
+        const userId = ctx.from?.id?.toString();
+        if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+
+        await ctx.answerCbQuery('🔑 Rotating keys...');
+
+        await safeEditWithImage(ctx,
+            `🔑 <b>API Key Rotation</b>\n\n` +
+            `Select provider to rotate:`,
+            {
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '📱 SMS Provider', callback_data: 'admin_rotate_sms' },
+                            { text: '⛓️ Blockchain', callback_data: 'admin_rotate_blockchain' }
+                        ],
+                        [
+                            { text: '🔐 Telegram Bot', callback_data: 'admin_rotate_telegram' },
+                            { text: '💳 Payment', callback_data: 'admin_rotate_payment' }
+                        ],
+                        [{ text: '◀️ Back', callback_data: 'admin_back_devops' }]
+                    ]
+                }
+            }
+        );
+    }
+
+                
+        async handleDynamicPricing(ctx) {
         const userId = ctx.from?.id?.toString();
         if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
 
