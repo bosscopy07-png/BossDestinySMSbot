@@ -8,6 +8,7 @@ import config from '../../config/env.js';
 // ─── Image URLs ───
 const IMG_SUCCESS = 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231499/file_000000006c1c724685bb402218b7c208_ste2ky.png';
 const IMG_ERROR = 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231497/file_0000000034547246812a74392b500be0_gelms4.png';
+const requireAdmin = (ctx, next) => this.requireAdmin(ctx, next);
 
 // ─── Transaction type constants ───
 const TX_TYPES = Object.freeze({
@@ -192,23 +193,23 @@ class AdminCommands {
     }
 
     // ─── Admin middleware ───
-    get requireAdmin() {
-        return async (ctx, next) => {
-            const adminIds = (config.bot?.adminId || '')
-                .toString()
-                .split(',')
-                .map(id => id.trim())
-                .filter(Boolean);
+        // ─── Admin middleware ───
+    requireAdmin(ctx, next) {
+        const adminIds = (config.bot?.adminId || '')
+            .toString()
+            .split(',')
+            .map(id => id.trim())
+            .filter(Boolean);
 
-            if (!adminIds.includes(ctx.from.id.toString())) {
-                return this.replyError(ctx, '🚫 <b>Admin access required.</b>\n\nYou do not have permission to use this command.');
-            }
+        if (!adminIds.includes(ctx.from.id.toString())) {
+            return this.replyError(ctx, '🚫 <b>Admin access required.</b>\n\nYou do not have permission to use this command.');
+        }
 
-            ctx.state.isAdmin = true;
-            this.admins.add(ctx.from.id.toString());
-            return next();
-        };
+        ctx.state.isAdmin = true;
+        this.admins.add(ctx.from.id.toString());
+        return next();
     }
+    
 
     // ─── Maintenance middleware ───
     get maintenanceGuard() {
@@ -347,38 +348,36 @@ class AdminCommands {
         this.bot.action('admin_dailyreport', this.requireAdmin, this.handleDailyReport.bind(this));
         this.bot.action('admin_resetfree', this.requireAdmin, this.handleResetFreeMenu.bind(this));
         this.bot.action('admin_givevip', this.requireAdmin, this.handleGiveVipMenu.bind(this));
-                // Pool management buttons
-        this.bot.action('admin_pool', this.requireAdmin, this.handlePoolMenu.bind(this));
-        this.bot.action('pool_buy_numbers', this.requireAdmin, this.handlePoolBuyMenu.bind(this));
-        this.bot.action('pool_monitor', this.requireAdmin, this.handlePoolMonitor.bind(this));
-        this.bot.action('pool_retire', this.requireAdmin, this.handlePoolRetireMenu.bind(this));
-        this.bot.action('pool_vip_users', this.requireAdmin, this.handlePoolVipUsers.bind(this));
+                                                                                                                            
+        // ═════════════════════════════════════════════════════════════════
+        //  ADMIN POOL MANAGEMENT — Fixed requireAdmin binding
+        // ═════════════════════════════════════════════════════════════════
+
+        this.bot.action('admin_pool', requireAdmin, this.handlePoolMenu.bind(this));
+        this.bot.action('pool_buy_numbers', requireAdmin, this.handlePoolBuyMenu.bind(this));
+        this.bot.action('pool_monitor', requireAdmin, this.handlePoolMonitor.bind(this));
+        this.bot.action('pool_retire', requireAdmin, this.handlePoolRetireMenu.bind(this));
+        this.bot.action('pool_vip_users', requireAdmin, this.handlePoolVipUsers.bind(this));
         
-        // Pool provider selection
-        this.bot.action('pool_provider_twilio', this.requireAdmin, (ctx) => this.handlePoolProviderSelect(ctx, 'twilio'));
-        this.bot.action('pool_provider_telnyx', this.requireAdmin, (ctx) => this.handlePoolProviderSelect(ctx, 'telnyx'));
-        this.bot.action('pool_provider_any', this.requireAdmin, (ctx) => this.handlePoolProviderSelect(ctx, 'any'));
+        this.bot.action('pool_provider_twilio', requireAdmin, (ctx) => this.handlePoolProviderSelect(ctx, 'twilio'));
+        this.bot.action('pool_provider_telnyx', requireAdmin, (ctx) => this.handlePoolProviderSelect(ctx, 'telnyx'));
+        this.bot.action('pool_provider_any', requireAdmin, (ctx) => this.handlePoolProviderSelect(ctx, 'any'));
         
-        this.bot.action(/adminpool_co_(.+)/, (ctx, next) => {
-    const userId = ctx.from?.id?.toString();
-    if (!this.isAdmin(userId)) {
-        return next(); // Pass to next handler (user flow)
-    }
-    const country = ctx.match[1];
-    return this.handlePoolCountrySelect(ctx, country);
-});
+        this.bot.action(/adminpool_co_(.+)/, requireAdmin, (ctx) => {
+            const country = ctx.match[1];
+            return this.handlePoolCountrySelect(ctx, country);
+        });
         
-        
-        // Pool quantity selection
-        this.bot.action(/pool_qty_(\d+)/, this.requireAdmin, (ctx) => {
+        this.bot.action(/pool_qty_(\d+)/, requireAdmin, (ctx) => {
             const qty = parseInt(ctx.match[1]);
             return this.handlePoolQuantitySelect(ctx, qty);
         });
         
-        // Confirm pool purchase
-        this.bot.action('confirm_pool_purchase', this.requireAdmin, this.executePoolPurchase.bind(this));
-                                                                                                            
+        this.bot.action('confirm_pool_purchase', requireAdmin, this.executePoolPurchase.bind(this));
 
+
+
+        
         // Cancel VIP flow
         this.bot.action('cancelvip_search', this.requireAdmin, (ctx) => {
             this._setAdminState(ctx, ADMIN_STATE.AWAITING_CANCEL_VIP_USER, { mode: 'search' });
