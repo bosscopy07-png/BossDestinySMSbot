@@ -659,6 +659,10 @@ async checkAvailability(country, service) {
     //  SMS CHECKING
     // ═══════════════════════════════════════════════════════════
 
+        // ═══════════════════════════════════════════════════════════
+    //  SMS CHECKING (FIXED — 5SIM returns "sms" not "text")
+    // ═════════════════════════════════════════════════════════==
+
     async checkSMS(activationId) {
         try {
             if (!this.isActive) {
@@ -685,20 +689,21 @@ async checkAvailability(country, service) {
                 activationId,
                 status: data?.status,
                 hasCode: !!data?.code,
-                hasText: !!data?.text
+                hasSms: !!data?.sms
             });
 
             const status = (data?.status || '').toUpperCase();
 
             if (status === 'RECEIVED' || status === 'FINISHED') {
-                const otp = this.extractOTP(data.code, data.text);
+                // FIXED: 5SIM API returns SMS text in field "sms", NOT "text"
+                const otp = this.extractOTP(data.code, data.sms);
                 
                 if (otp) {
                     return {
                         success: true,
                         otp,
                         status: 'RECEIVED',
-                        fullText: data.text || null,
+                        fullText: data.sms || null,
                         receivedAt: new Date()
                     };
                 }
@@ -706,7 +711,7 @@ async checkAvailability(country, service) {
                 return {
                     success: false,
                     status: 'CHECKING',
-                    rawText: data.text,
+                    rawText: data.sms,
                     message: 'SMS received but OTP extraction failed'
                 };
             }
@@ -726,6 +731,7 @@ async checkAvailability(country, service) {
             return { success: false, error: error.message, status: 'ERROR' };
         }
     }
+    
 
     // ═══════════════════════════════════════════════════════════
     //  NUMBER MANAGEMENT (FIXED — proper cancel handling)
