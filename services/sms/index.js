@@ -593,8 +593,7 @@ class SMSProviderManager {
 
         throw new Error('FREE_PROVIDER_NO_CHECK_METHOD: FreeProvider missing checkSMS/pollForSMS/getSMS');
     }
-
-    /**
+      /**
      * Check SMS for POOL number (VIP/BUNDLE).
      * Pool numbers use webhooks — check database/session status.
      */
@@ -684,7 +683,14 @@ class SMSProviderManager {
 
         return this.getFreeNumber(country, service);
     }
-
+    /**
+     * Get first active provider name (legacy compatibility)
+     */
+    getCurrentProvider() {
+        const active = this.getActiveProviders();
+        return active.length > 0 ? active[0] : null;
+    }
+    
     /**
      * Get free provider health status.
      */
