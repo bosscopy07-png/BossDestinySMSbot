@@ -419,7 +419,126 @@ class SMSProviderManager {
                 throw new Error(`INVALID_TIER: "${tier}". Must be VIP, BUNDLE, CHEAP, or FREE`);
         }
     }
+    // ═══════════════════════════════════════════════════════════════════════
+    //  BALANCE CHECKING (NEW — fixes "checkBalances is not a function")
+    // ═══════════════════════════════════════════════════════════════════════
 
+    /**
+     * Check balances for all active providers
+     * Returns { providerName: { balance, currency, success, error } }
+     */
+    async checkBalances() {
+        const results = {};
+        
+        for (const [name, provider] of this.providers) {
+            if (!provider.isActive) {
+                results[name] = { success: false, error: 'INACTIVE', balance: 0 };
+                continue;
+            }
+
+            try {
+                if (typeof provider.checkBalance === 'function') {
+                    const balance = await provider.checkBalance();
+                    results[name] = { 
+                        success: true, 
+                        balance: balance.balance || 0,
+                        currency: balance.currency || 'USD',
+                        rating: balance.rating,
+                        raw: balance
+                    };
+                } else {
+                    results[name] = { 
+                        success: false, 
+                        error: 'METHOD_NOT_SUPPORTED',
+                        balance: 0 
+                    };
+                }
+            } catch (error) {
+                results[name] = { 
+                    success: false, 
+                    error: error.message,
+                    balance: 0 
+                };
+            }
+        }
+
+        if (this.numberPool) {
+            try {
+                const poolStats = this.numberPool.getPoolStats?.() || {};
+                results['POOL'] = {
+                    success: true,
+                    balance: poolStats.totalNumbers || 0,
+                    currency: 'NUMBERS',
+                    available: poolStats.available || 0,
+                    active: poolStats.active || 0
+                };
+            } catch (e) {
+                results['POOL'] = { success: false, error: e.message };
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * Get available providers with their status
+     * Returns array of { name, tier, isActive, hasBalance, balance }
+     */
+    async getAvailableProviders() {
+        const balances = await this.checkBalances();
+        const providers = [];
+
+        for (const [name, provider] of this.providers) {
+            const balanceInfo = balances[name] || { success: false, balance: 0 };
+            
+            providers.push({
+                name: provider.name || name,
+                tier: provider.tier || 'UNKNOWN',
+                isActive: provider.isActive,
+                hasBalance: balanceInfo.success && (balanceInfo.balance > 0 || name === 'FREE_PUBLIC'),
+                balance: balanceInfo.balance,
+                currency: balanceInfo.currency,
+                rating: balanceInfo.rating,
+                error: balanceInfo.error
+            });
+        }
+
+        providers.sort((a, b) => {
+            if (a.isActive !== b.isActive) return b.isActive - a.isActive;
+            if (a.hasBalance !== b.hasBalance) return b.hasBalance - a.hasBalance;
+            return a.name.localeCompare(b.name);
+        });
+
+        return providers;
+    }
+
+    /**
+     * Check if a specific provider has sufficient balance
+     */
+    async hasSufficientBalance(providerName, requiredAmount = 0) {
+        const balances = await this.checkBalances();
+        const providerBalance = balances[providerName];
+        
+        if (!providerBalance || !providerBalance.success) {
+            return { sufficient: false, reason: 'BALANCE_CHECK_FAILED' };
+        }
+
+        if (requiredAmount > 0 && providerBalance.balance < requiredAmount) {
+            return { 
+                sufficient: false, 
+                reason: 'INSUFFICIENT_BALANCE',
+                required: requiredAmount,
+                available: providerBalance.balance
+            };
+        }
+
+        return { 
+            sufficient: true, 
+            available: providerBalance.balance,
+            currency: providerBalance.currency
+        };
+                }
+            
     // ═══════════════════════════════════════════════════════════════════════
     //  SMS CHECKING — Each provider uses its own correct method
     // ═══════════════════════════════════════════════════════════════════════
