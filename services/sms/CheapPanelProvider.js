@@ -872,9 +872,15 @@ async checkAvailability(country, service) {
         return this.fakeNumbers.has(clean) || this.fakeNumbers.has(phone);
     }
 
-    extractOTP(code, text) {
-        if (code && /^\d{4,8}$/.test(code.toString().trim())) {
-            return code.toString().trim();
+        extractOTP(code, text) {
+        // FIXED: Handle 5SIM code field which can be string, number, or null
+        if (code !== null && code !== undefined) {
+            const codeStr = code.toString().trim();
+            // 5SIM sometimes returns code with spaces or dashes
+            const cleanCode = codeStr.replace(/[\s\-]/g, '');
+            if (/^\d{4,8}$/.test(cleanCode)) {
+                return cleanCode;
+            }
         }
 
         if (!text) return null;
@@ -891,14 +897,18 @@ async checkAvailability(country, service) {
             /code[:\s]*(\d{4,8})/i,
             /(\d{4,8})[:\s]*код/i,
             /pin[:\s]+(\d{4,8})/i,
-            /password[:\s]+(\d{4,8})/i
+            /password[:\s]+(\d{4,8})/i,
+            /(\d{4,8})[:\s]*验证码/i,
+            /your[:\s]+code[:\s]+is[:\s]+(\d{4,8})/i,
+            /security[:\s]+code[:\s]+(\d{4,8})/i
         ];
 
         for (const pattern of patterns) {
             const match = text.match(pattern);
             if (match) {
                 const otp = match[1] || match[0];
-                if (/^\d{4,8}$/.test(otp)) return otp;
+                const cleanOtp = otp.toString().replace(/\D/g, '');
+                if (/^\d{4,8}$/.test(cleanOtp)) return cleanOtp;
             }
         }
 
@@ -906,8 +916,8 @@ async checkAvailability(country, service) {
         if (digits?.length > 0) return digits[digits.length - 1];
 
         return null;
-    }
-
+            }
+            
     getHeaders() {
         return {
             'Authorization': `Bearer ${this.apiKey}`,
