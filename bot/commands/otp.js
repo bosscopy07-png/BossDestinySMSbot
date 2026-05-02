@@ -435,27 +435,47 @@ class OTPCommands {
         }).sort({ createdAt: -1 });
     }
 
+        /**
+     * Refund session credits (BUNDLE/VIP/FREE only)
+     * FIXED: Removed CHEAP mode — releaseFunds() in handleTimeout() already handles it.
+     *        CHEAP refunds go through walletService.releaseFunds() which is transaction-safe.
+     *        This method now only handles credit-based modes (BUNDLE, VIP, FREE).
+     */
     async _refundSession(session) {
-        const { userId, mode, cost } = session;
+        const { userId, mode, cost, lockTxId } = session;
+        
         try {
+            // CHEAP mode is handled by walletService.releaseFunds() in handleTimeout()
+            // Calling it here would double-refund (balance += cost, lockedBalance -= cost)
+            if (mode === 'CHEAP') {
+                logger.debug('CHEAP mode refund skipped — handled by releaseFunds', { 
+                    userId, 
+                    lockTxId,
+                    reason: 'releaseFunds handles CHEAP refunds transactionally' 
+                });
+                return true;
+            }
+
             if (mode === 'BUNDLE') {
                 await User.updateOne({ userId }, { $inc: { bundleRemaining: 1 } });
+                logger.info('Bundle credit restored', { userId, sessionId: session.sessionId });
             } else if (mode === 'VIP') {
                 await User.updateOne({ userId }, { $inc: { vipDailyUsed: -1 } });
-            } else if (mode === 'CHEAP' && (cost || 0) > 0) {
-                await User.updateOne(
-                    { userId }, 
-                    { $inc: { lockedBalance: -cost, balance: cost } }
-                );
+                logger.info('VIP daily quota restored', { userId, sessionId: session.sessionId });
+            } else if (mode === 'FREE') {
+                await User.updateOne({ userId }, { $inc: { freeUsedToday: -1 } });
+                logger.info('Free daily quota restored', { userId, sessionId: session.sessionId });
             }
+            
             return true;
         } catch (error) {
-            logger.error('Session refund failed', { userId, error: error.message });
+            logger.error('Session refund failed', { userId, mode, error: error.message });
             return false;
         }
-    }
+                    }
+    
 
-        async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
+            async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
         try {
             const delayMs = new Date(timeoutAt) - new Date();
             if (delayMs <= 0) return;
@@ -467,22 +487,38 @@ class OTPCommands {
                         status: { $in: ['WAITING', 'CHECKING'] } 
                     });
                     
-                    if (!session) return; // Already handled (cancelled, received, etc.)
+                    if (!session) return;
 
-                    await Session.updateOne(
-                        { sessionId },
-                        { $set: { status: 'TIMEOUT', endTime: new Date() } }
-                    );
+                    // FIXED: Do NOT call _refundSession here for CHEAP mode.
+                    // handleTimeout() already calls walletService.releaseFunds() 
+                    // which properly marks tx CANCELLED and adjusts lockedBalance.
+                    // _refundSession for CHEAP was adding balance back directly,
+                    // causing double refund (balance += cost from here, 
+                    // lockedBalance -= cost from both places).
+                    //
+                    // Only refund credit-based modes here (BUNDLE, VIP, FREE).
+                    // CHEAP refund is handled by the timeout handler in _startMonitoring().
+                    if (session.mode !== 'CHEAP') {
+                        await this._refundSession(session);
+                    }
 
-                    await this._refundSession(session);
+                    // Update session status if still waiting
+                    // (handleTimeout may have already done this, so check first)
+                    const currentSession = await Session.findOne({ sessionId }).lean();
+                    if (currentSession && ['WAITING', 'CHECKING'].includes(currentSession.status)) {
+                        await Session.updateOne(
+                            { sessionId },
+                            { $set: { status: 'TIMEOUT', endTime: new Date() } }
+                        );
+                    }
 
-                    // ONLY send timeout message if session wasn't already handled by polling
-                    // The polling code already sends timeout message for FREE tier
+                    // Send timeout message (skip for FREE — polling handles it)
                     if (session.mode !== 'FREE') {
                         const refundText = {
                             BUNDLE: 'Bundle credit restored',
                             VIP: 'VIP daily quota restored',
-                            CHEAP: 'Funds returned to balance'
+                            CHEAP: 'Funds returned to balance',
+                            FREE: 'Free quota restored'
                         }[session.mode] || 'Funds handled';
 
                         const timeoutMessage = 
@@ -510,7 +546,8 @@ class OTPCommands {
         } catch (error) {
             logger.error('Failed to schedule timeout', { userId, sessionId, error: error.message });
         }
-                    }
+                            }
+                            
                 
     
                     // ═══════════════════════════════════════════════════════════════════════════════
