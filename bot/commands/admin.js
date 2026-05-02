@@ -934,6 +934,15 @@ this.bot.action(/numpool_country_(.+)/, (ctx) => {
     // ═══════════════════════════════════════════════════════════
     //  POOL MANAGEMENT
     // ═══════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
+    //  ADMIN POOL PURCHASE — FULL REWRITE
+    //  Flow: Provider → Available Countries+Prices → Pick Country → 
+    //        Quantity → Balance Check → Confirm → Purchase
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Show pool management menu
+     */
     async handlePoolMenu(ctx) {
         try {
             const stats = this.smsProviderManager?.getPoolStats?.() || { available: false, pools: {} };
@@ -969,15 +978,36 @@ Manage your Twilio/Telnyx number pool:
         }
     }
 
+    /**
+     * Step 1: Show provider selection
+     */
     async handlePoolBuyMenu(ctx) {
         if (!this.smsProviderManager?.numberPool) {
             return this.replyError(ctx, '❌ <b>Pool not available.</b>\n\nNumber pool is not configured.');
         }
 
+        // Check provider balances first
+        let balanceInfo = '';
+        try {
+            const balances = await this.smsProviderManager.checkBalances();
+            
+            if (balances['TWILIO']?.success) {
+                balanceInfo += `🏢 Twilio: <code>${balances['TWILIO'].balance > 999 ? 'Post-paid' : '$' + balances['TWILIO'].balance}</code>\n`;
+            }
+            if (balances['TELNYX']?.success) {
+                balanceInfo += `🏢 Telnyx: <code>${balances['TELNYX'].balance > 999 ? 'Post-paid' : '$' + balances['TELNYX'].balance}</code>\n`;
+            }
+        } catch (e) {
+            balanceInfo = '<i>Balance check unavailable</i>';
+        }
+
         const message = `
 <b>🛒 Buy Numbers for Pool</b>
 
-Select provider:
+<b>Provider Balances:</b>
+${balanceInfo || '<i>Unknown</i>'}
+
+Select provider to see available countries and prices:
         `;
 
         const keyboard = Markup.inlineKeyboard([
@@ -989,143 +1019,296 @@ Select provider:
 
         await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
     }
-    
-async handlePoolCountryButton(ctx, countryCode) {
-    // Simulate the user sending the country code
-    ctx.message = { text: countryCode };
-    return this.handlePoolCountrySelect(ctx, countryCode);
+
+    /**
+     * Step 2: Provider selected — fetch available countries + prices
+     */
+    async handlePoolProviderSelect(ctx, provider) {
+        ctx.session = ctx.session || {};
+        ctx.session.poolPurchase = { preferredProvider: provider };
+        this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_COUNTRY, { provider });
+
+        const providerUpper = provider?.toUpperCase() || 'ANY';
+        let availabilityInfo = '';
+        let countryButtons = [];
+        let availableCountries = [];
+
+        try {
+            if (this.smsProviderManager) {
+                // Get the actual provider instance
+                const targetProvider = providerUpper === 'ANY' 
+                    ? null 
+                    : this.smsProviderManager.getProvider(providerUpper);
+
+                if (targetProvider && typeof targetProvider.hasAvailableNumbers === 'function') {
+                    // Check common countries for availability + pricing
+                    const checkCountries = [
+                        { code: 'US', flag: '🇺🇸', name: 'United States' },
+                        { code: 'CA', flag: '🇨🇦', name: 'Canada' },
+                        { code: 'GB', flag: '🇬🇧', name: 'United Kingdom' },
+                        { code: 'AU', flag: '🇦🇺', name: 'Australia' },
+                        { code: 'DE', flag: '🇩🇪', name: 'Germany' },
+                        { code: 'FR', flag: '🇫🇷', name: 'France' },
+                        { code: 'ES', flag: '🇪🇸', name: 'Spain' },
+                        { code: 'IT', flag: '🇮🇹', name: 'Italy' },
+                        { code: 'NL', flag: '🇳🇱', name: 'Netherlands' },
+                        { code: 'SE', flag: '🇸🇪', name: 'Sweden' },
+                        { code: 'IE', flag: '🇮🇪', name: 'Ireland' },
+                        { code: 'PL', flag: '🇵🇱', name: 'Poland' },
+                        { code: 'BE', flag: '🇧🇪', name: 'Belgium' },
+                        { code: 'AT', flag: '🇦🇹', name: 'Austria' },
+                        { code: 'PT', flag: '🇵🇹', name: 'Portugal' },
+                        { code: 'DK', flag: '🇩🇰', name: 'Denmark' },
+                        { code: 'FI', flag: '🇫🇮', name: 'Finland' },
+                        { code: 'NO', flag: '🇳🇴', name: 'Norway' },
+                        { code: 'CH', flag: '🇨🇭', name: 'Switzerland' },
+                        { code: 'NZ', flag: '🇳🇿', name: 'New Zealand' },
+                        { code: 'JP', flag: '🇯🇵', name: 'Japan' },
+                        { code: 'SG', flag: '🇸🇬', name: 'Singapore' },
+                        { code: 'HK', flag: '🇭🇰', name: 'Hong Kong' },
+                        { code: 'BR', flag: '🇧🇷', name: 'Brazil' },
+                        { code: 'MX', flag: '🇲🇽', name: 'Mexico' },
+                        { code: 'ZA', flag: '🇿🇦', name: 'South Africa' },
+                        { code: 'IN', flag: '🇮🇳', name: 'India' },
+                        { code: 'AE', flag: '🇦🇪', name: 'UAE' },
+                        { code: 'IL', flag: '🇮🇱', name: 'Israel' },
+                        { code: 'TR', flag: '🇹🇷', name: 'Turkey' }
+                    ];
+
+                    for (const country of checkCountries) {
+                        try {
+                            const hasStock = await targetProvider.hasAvailableNumbers(country.code);
+                            if (hasStock) {
+                                const cost = targetProvider.estimateMonthlyCost?.(country.code) || 1.00;
+                                availableCountries.push({ ...country, cost });
+                            }
+                        } catch (e) {
+                            // Country not available, skip silently
+                        }
+                    }
+                } else if (providerUpper === 'ANY') {
+                    // For "Any", check both providers and merge results
+                    const twilio = this.smsProviderManager.getProvider('TWILIO');
+                    const telnyx = this.smsProviderManager.getProvider('TELNYX');
+                    
+                    const checkCountries = ['US', 'CA', 'GB', 'AU', 'DE', 'FR', 'ES', 'IT', 'NL', 'SE'];
+                    
+                    for (const code of checkCountries) {
+                        let hasStock = false;
+                        let cost = 1.00;
+                        let providerName = '';
+                        
+                        try {
+                            if (twilio?.isActive && await twilio.hasAvailableNumbers(code)) {
+                                hasStock = true;
+                                cost = twilio.estimateMonthlyCost?.(code) || 1.00;
+                                providerName = 'Twilio';
+                            }
+                        } catch (e) {}
+                        
+                        if (!hasStock && telnyx?.isActive) {
+                            try {
+                                if (await telnyx.hasAvailableNumbers(code)) {
+                                    hasStock = true;
+                                    cost = telnyx.estimateMonthlyCost?.(code) || 1.50;
+                                    providerName = 'Telnyx';
+                                }
+                            } catch (e) {}
+                        }
+                        
+                        if (hasStock) {
+                            const flagMap = {
+                                'US': '🇺🇸', 'CA': '🇨🇦', 'GB': '🇬🇧', 'AU': '🇦🇺',
+                                'DE': '🇩🇪', 'FR': '🇫🇷', 'ES': '🇪🇸', 'IT': '🇮🇹',
+                                'NL': '🇳🇱', 'SE': '🇸🇪'
+                            };
+                            availableCountries.push({
+                                code,
+                                flag: flagMap[code] || '🏳️',
+                                name: code,
+                                cost,
+                                provider: providerName
+                            });
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            logger.error('Pool availability check failed', { provider, error: e.message });
+        }
+
+        // Build display and buttons
+        if (availableCountries.length > 0) {
+            // Group by row of 2 for keyboard
+            const rows = [];
+            for (let i = 0; i < availableCountries.length; i += 2) {
+                const row = [];
+                row.push(Markup.button.callback(
+                    `${availableCountries[i].flag} ${availableCountries[i].code} (~$${availableCountries[i].cost.toFixed(2)})`,
+                    `pool_country_${availableCountries[i].code}`
+                ));
+                if (availableCountries[i + 1]) {
+                    row.push(Markup.button.callback(
+                        `${availableCountries[i + 1].flag} ${availableCountries[i + 1].code} (~$${availableCountries[i + 1].cost.toFixed(2)})`,
+                        `pool_country_${availableCountries[i + 1].code}`
+                    ));
+                }
+                rows.push(row);
+            }
+            countryButtons = rows;
+
+            availabilityInfo = availableCountries.map(c => 
+                `${c.flag} <b>${c.code}</b>: ~$${c.cost.toFixed(2)}/mo${c.provider ? ` (${c.provider})` : ''}`
+            ).join('\n');
+        } else {
+            availabilityInfo = '<i>No countries available from this provider right now.</i>\n\nYou can still try sending any 2-letter country code.';
+        }
+
+        // Add manual input option
+        countryButtons.push([Markup.button.callback('✏️ Type Custom Code', 'pool_country_custom')]);
+        countryButtons.push([Markup.button.callback('❌ Cancel', 'admin_pool')]);
+
+        const message = `
+<b>🛒 Buy Numbers — ${providerUpper}</b>
+
+<b>Available Countries with Prices:</b>
+${availabilityInfo}
+
+<i>Tap a country or type a custom 2-letter code (e.g., US, GB, DE)</i>
+        `;
+
+        await this.replySuccess(ctx, message, {
+            reply_markup: Markup.inlineKeyboard(countryButtons).reply_markup,
+            parse_mode: 'HTML'
+        });
     }
-    
- async handlePoolProviderSelect(ctx, provider) {
-    ctx.session = ctx.session || {};
-    ctx.session.poolPurchase = { preferredProvider: provider };
-    this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_COUNTRY, { provider });
-    
-    const countries = [
-        { code: 'US', name: '🇺🇸 United States' },
-        { code: 'CA', name: '🇨🇦 Canada' },
-        { code: 'GB', name: '🇬🇧 United Kingdom' },
-        { code: 'AU', name: '🇦🇺 Australia' },
-        { code: 'DE', name: '🇩🇪 Germany' },
-        { code: 'FR', name: '🇫🇷 France' },
-        { code: 'ES', name: '🇪🇸 Spain' },
-        { code: 'IT', name: '🇮🇹 Italy' },
-        { code: 'NL', name: '🇳🇱 Netherlands' },
-        { code: 'SE', name: '🇸🇪 Sweden' },
-        { code: 'IE', name: '🇮🇪 Ireland' },
-        { code: 'PL', name: '🇵🇱 Poland' },
-        { code: 'BE', name: '🇧🇪 Belgium' },
-        { code: 'AT', name: '🇦🇹 Austria' },
-        { code: 'PT', name: '🇵🇹 Portugal' },
-        { code: 'DK', name: '🇩🇰 Denmark' },
-        { code: 'FI', name: '🇫🇮 Finland' },
-        { code: 'NO', name: '🇳🇴 Norway' },
-        { code: 'CH', name: '🇨🇭 Switzerland' },
-        { code: 'NZ', name: '🇳🇿 New Zealand' },
-        { code: 'JP', name: '🇯🇵 Japan' },
-        { code: 'SG', name: '🇸🇬 Singapore' },
-        { code: 'HK', name: '🇭🇰 Hong Kong' },
-        { code: 'BR', name: '🇧🇷 Brazil' },
-        { code: 'MX', name: '🇲🇽 Mexico' },
-        { code: 'ZA', name: '🇿🇦 South Africa' },
-        { code: 'IN', name: '🇮🇳 India' },
-        { code: 'AE', name: '🇦🇪 UAE' },
-        { code: 'IL', name: '🇮🇱 Israel' },
-        { code: 'TR', name: '🇹🇷 Turkey' },
-        { code: 'AR', name: '🇦🇷 Argentina' },
-        { code: 'CL', name: '🇨🇱 Chile' },
-        { code: 'CO', name: '🇨🇴 Colombia' },
-        { code: 'PE', name: '🇵🇪 Peru' }
-    ];
 
-    // Build copyable country list
-    const countryList = countries.map(c => 
-        `${c.name}  <code>${c.code}</code>`
-    ).join('\n');
+    /**
+     * Step 3: Country selected (from button)
+     */
+    async handlePoolCountryButton(ctx, countryCode) {
+        return this.handlePoolCountrySelect(ctx, countryCode);
+    }
 
-    const message = `
-<b>🛒 Buy Numbers — ${(provider || 'Any Provider').toUpperCase()}</b>
-
-Send the country code (2 letters):
-
-${countryList}
-    `;
-
-    const keyboard = Markup.inlineKeyboard([
-        [Markup.button.callback('❌ Cancel', 'admin_pool')]
-    ]);
-
-    await this.replySuccess(ctx, message, {
-        reply_markup: keyboard.reply_markup,
-        parse_mode: 'HTML'
-    });
- }
-    
-
+    /**
+     * Step 3: Country selected — ask for quantity
+     */
     async handlePoolCountrySelect(ctx, country) {
-    ctx.session.poolPurchase = { ...ctx.session.poolPurchase, country };
-    this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_QTY, { country });
-    
-    const message = `
-<b>🛒 Buy Numbers — 🇺🇳 ${country}</b>
+        ctx.session.poolPurchase = { ...ctx.session.poolPurchase, country };
+        this._setAdminState(ctx, ADMIN_STATE.AWAITING_POOL_PURCHASE_QTY, { country });
+
+        // Get estimated price for display
+        let priceEstimate = '';
+        try {
+            const provider = ctx.session.poolPurchase.preferredProvider;
+            const providerInstance = provider && provider !== 'any'
+                ? this.smsProviderManager?.getProvider(provider.toUpperCase())
+                : null;
+            
+            if (providerInstance?.estimateMonthlyCost) {
+                const cost = providerInstance.estimateMonthlyCost(country);
+                priceEstimate = `\n💰 Est. cost: <code>~$${cost.toFixed(2)}</code> per number/month`;
+            }
+        } catch (e) {}
+
+        const message = `
+<b>🛒 Buy Numbers — ${ctx.session.poolPurchase.preferredProvider?.toUpperCase() || 'ANY'}</b>
+
+🌍 Country: <code>${country}</code>${priceEstimate}
 
 How many numbers do you want?
-    `;
+        `;
 
-    const keyboard = Markup.inlineKeyboard([
-        [
-            Markup.button.callback('1️⃣  1', 'pool_qty_1'),
-            Markup.button.callback('5️⃣  5', 'pool_qty_5'),
-            Markup.button.callback('🔟  10', 'pool_qty_10')
-        ],
-        [
-            Markup.button.callback('2️⃣0️⃣  20', 'pool_qty_20'),
-            Markup.button.callback('5️⃣0️⃣  50', 'pool_qty_50'),
-            Markup.button.callback('1️⃣0️⃣0️⃣  100', 'pool_qty_100')
-        ],
-        [
-            Markup.button.callback('✏️ Custom Amount', 'pool_qty_custom')
-        ],
-        [
-            Markup.button.callback('🔙 Back', 'pool_buy_numbers'),
-            Markup.button.callback('❌ Cancel', 'admin_pool')
-        ]
-    ]);
+        const keyboard = Markup.inlineKeyboard([
+            [
+                Markup.button.callback('1️⃣  1', 'pool_qty_1'),
+                Markup.button.callback('5️⃣  5', 'pool_qty_5'),
+                Markup.button.callback('🔟  10', 'pool_qty_10')
+            ],
+            [
+                Markup.button.callback('2️⃣0️⃣  20', 'pool_qty_20'),
+                Markup.button.callback('5️⃣0️⃣  50', 'pool_qty_50'),
+                Markup.button.callback('1️⃣0️⃣0️⃣  100', 'pool_qty_100')
+            ],
+            [
+                Markup.button.callback('✏️ Custom Amount', 'pool_qty_custom')
+            ],
+            [
+                Markup.button.callback('🔙 Back', 'pool_buy_numbers'),
+                Markup.button.callback('❌ Cancel', 'admin_pool')
+            ]
+        ]);
 
-    await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
+        await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
     }
-    
 
+    /**
+     * Step 4: Quantity selected
+     */
     async handlePoolQuantitySelect(ctx, qty) {
-        ctx.session.poolPurchase = { ...ctx.session.poolPurchase, quantity: qty };
+        ctx.session.poolPurchase = { ...ctx.session.poolPurchase, quantity: parseInt(qty) || 1 };
         return this.showPoolPurchaseConfirm(ctx);
     }
 
+    /**
+     * Step 5: Show confirmation with balance check
+     */
     async showPoolPurchaseConfirm(ctx) {
         const purchase = ctx.session.poolPurchase;
         if (!purchase?.country || !purchase?.quantity) {
             return this.replyError(ctx, '❌ <b>Invalid purchase data.</b>\n\nPlease start over.');
         }
 
+        // Get estimated total cost
+        let totalEstimate = 0;
+        let providerBalance = null;
+        
+        try {
+            const providerName = purchase.preferredProvider === 'any' 
+                ? 'TWILIO' 
+                : purchase.preferredProvider.toUpperCase();
+            
+            const providerInstance = this.smsProviderManager?.getProvider(providerName);
+            if (providerInstance?.estimateMonthlyCost) {
+                totalEstimate = providerInstance.estimateMonthlyCost(purchase.country) * purchase.quantity;
+            } else {
+                totalEstimate = purchase.quantity * 1.50; // Fallback
+            }
+
+            // Check provider balance
+            const balanceCheck = await this.smsProviderManager?.hasSufficientBalance?.(providerName, totalEstimate);
+            providerBalance = balanceCheck;
+        } catch (e) {
+            logger.warn('Balance check failed for confirmation', { error: e.message });
+        }
+
+        const balanceWarning = providerBalance && !providerBalance.sufficient
+            ? `\n\n⚠️ <b>Warning:</b> ${providerBalance.reason}\nAvailable: $${providerBalance.available?.toFixed(2) || 0}\nRequired: ~$${totalEstimate.toFixed(2)}`
+            : '';
+
         const message = `
 <b>✅ Confirm Pool Purchase</b>
 
+🏢 Provider: <code>${(purchase.preferredProvider || 'any').toUpperCase()}</code>
 🌍 Country: <code>${purchase.country}</code>
 📦 Quantity: <code>${purchase.quantity}</code>
-🏢 Provider: <code>${purchase.preferredProvider || 'Any'}</code>
+💰 Est. Total: <code>~$${totalEstimate.toFixed(2)}</code>${balanceWarning}
 
 Proceed with purchase?
         `;
 
         const keyboard = Markup.inlineKeyboard([
             [Markup.button.callback('✅ Confirm Purchase', 'confirm_pool_purchase')],
+            [Markup.button.callback('🔙 Back', `pool_country_${purchase.country}`)],
             [Markup.button.callback('❌ Cancel', 'admin_pool')]
         ]);
 
         await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
     }
 
-
+    /**
+     * Step 6: Execute purchase with balance validation
+     */
     async executePoolPurchase(ctx) {
         const purchase = ctx.session?.poolPurchase;
         if (!purchase) {
@@ -1133,6 +1316,46 @@ Proceed with purchase?
         }
 
         try {
+            const providerName = purchase.preferredProvider === 'any' 
+                ? null 
+                : purchase.preferredProvider.toUpperCase();
+
+            // Calculate estimated cost
+            let estimatedCost = 0;
+            try {
+                const p = providerName ? this.smsProviderManager?.getProvider(providerName) : null;
+                if (p?.estimateMonthlyCost) {
+                    estimatedCost = p.estimateMonthlyCost(purchase.country) * purchase.quantity;
+                } else {
+                    estimatedCost = purchase.quantity * 1.50;
+                }
+            } catch (e) {
+                estimatedCost = purchase.quantity * 1.50;
+            }
+
+            // NEW: Check provider balance before purchase
+            if (providerName && this.smsProviderManager?.hasSufficientBalance) {
+                const balanceCheck = await this.smsProviderManager.hasSufficientBalance(
+                    providerName, 
+                    estimatedCost
+                );
+                
+                if (!balanceCheck.sufficient) {
+                    ctx.session.poolPurchase = null;
+                    return this.replyError(ctx, 
+                        `❌ <b>Insufficient ${providerName} Balance</b>\n\n` +
+                        `💰 Required: ~$${estimatedCost.toFixed(2)}\n` +
+                        `💳 Available: $${balanceCheck.available?.toFixed(2) || 0}\n\n` +
+                        `Please top up your ${providerName} account before purchasing.`, {
+                            reply_markup: Markup.inlineKeyboard([
+                                [Markup.button.callback('🔄 Try Again', 'pool_buy_numbers')],
+                                [Markup.button.callback('🔙 Back', 'admin_pool')]
+                            ]).reply_markup
+                        });
+                }
+            }
+
+            // Execute purchase
             const result = await this.smsProviderManager.buyPoolNumbers(
                 purchase.country,
                 purchase.quantity,
@@ -1156,7 +1379,10 @@ Proceed with purchase?
                             metadata: num
                         });
                     } catch (dbError) {
-                        logger.warn('Failed to store number in DB', { phone: num.phoneNumber, error: dbError.message });
+                        logger.warn('Failed to store number in DB', { 
+                            phone: num.phoneNumber, 
+                            error: dbError.message 
+                        });
                     }
                 }
 
@@ -1164,52 +1390,13 @@ Proceed with purchase?
                     `• <code>${n.phoneNumber}</code> (${n.provider})`
                 ).join('\n');
 
+                const actualCost = result.totalCost || (result.purchased.length * 1.00);
+
                 const message = `
 <b>✅ Pool Purchase Complete!</b>
 
-🌍 Country: <code>${purchase.country}</code>
-📦 Purchased: <code>${result.purchased.length}</code> numbers
-❌ Failed: <code>${result.failed || 0}</code>
-💰 Total Cost: <code>${formatCurrency(result.totalCost || 0)}</code>
-
-<b>Numbers:</b>
-${numbersList}
-                `;
-
-                await this.replySuccess(ctx, message, {
-                    reply_markup: Markup.inlineKeyboard([
-                        [Markup.button.callback('🛒 Buy More', 'pool_buy_numbers')],
-                        [Markup.button.callback('📊 Pool Monitor', 'pool_monitor')],
-                        [Markup.button.callback('🔙 Back', 'admin_pool')]
-                    ]).reply_markup
-                });
-
-                await this.logAdminAction(
-                    ctx.from.id.toString(),
-                    'POOL_PURCHASE',
-                    null,
-                    { country: purchase.country, quantity: purchase.quantity, purchased: result.purchased.length }
-                );
-            } else {
-                await this.replyError(ctx, 
-                    `❌ <b>Purchase Failed</b>\n\nNo numbers were purchased.\nError: ${result.errors?.[0]?.error || 'Unknown error'}`, {
-                        reply_markup: Markup.inlineKeyboard([
-                            [Markup.button.callback('🔄 Retry', 'pool_buy_numbers')],
-                            [Markup.button.callback('🔙 Back', 'admin_pool')]
-                        ]).reply_markup
-                    });
-            }
-        } catch (error) {
-            logger.error('Pool purchase failed', { error: error.message, purchase });
-            await this.replyError(ctx, `❌ <b>Purchase Failed:</b> ${error.message}`, {
-                reply_markup: Markup.inlineKeyboard([
-                    [Markup.button.callback('🔄 Retry', 'pool_buy_numbers')],
-                    [Markup.button.callback('🔙 Back', 'admin_pool')]
-                ]).reply_markup
-            });
-        }
-             }
-
+🏢 Provider: <code>${purcha
+                                
                 
     async handlePoolMonitor(ctx) {
         try {
