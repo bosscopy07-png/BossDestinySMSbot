@@ -943,7 +943,26 @@ this.bot.action(/numpool_country_(.+)/, (ctx) => {
     /**
      * Show pool management menu
      */
-    async handlePoolMenu(ctx) {
+    async handlePoolBuyMenu(ctx) {
+    // DEBUG: Check why pool is unavailable
+    const providerStatus = this.smsProviderManager ? {
+        hasManager: true,
+        twilio: this.smsProviderManager.getProvider('TWILIO')?.isActive,
+        telnyx: this.smsProviderManager.getProvider('TELNYX')?.isActive,
+        hasPool: !!this.smsProviderManager.numberPool,
+        hasBuyer: !!this.smsProviderManager.numberBuyer
+    } : { hasManager: false };
+
+    logger.info('Pool availability debug', providerStatus);
+
+    if (!this.smsProviderManager?.numberPool) {
+        return this.replyError(ctx, 
+            `❌ <b>Pool not available.</b>\n\n` +
+            `Twilio: ${providerStatus.twilio ? '✅' : '❌'}\n` +
+            `Telnyx: ${providerStatus.telnyx ? '✅' : '❌'}\n\n` +
+            `Check your API credentials in config.`
+        );
+    }
         try {
             const stats = this.smsProviderManager?.getPoolStats?.() || { available: false, pools: {} };
             
