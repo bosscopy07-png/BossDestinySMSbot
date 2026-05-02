@@ -318,7 +318,45 @@ class TwilioProvider {
             return { success: false, error: error.message, code: error.code };
         }
     }
+    /**
+     * Check Twilio account balance
+     */
+    async checkBalance() {
+        if (!this.isActive) {
+            return { success: false, error: 'TWILIO_NOT_CONFIGURED', balance: 0 };
+        }
 
+        try {
+            const response = await axios.get(
+                'https://api.twilio.com/2010-04-01/Accounts.json',
+                { 
+                    auth: { username: this.client.username, password: this.client.password },
+                    timeout: 10000 
+                }
+            );
+
+            // Twilio doesn't have a simple balance endpoint in REST API
+            // Use account fetch as proxy — if auth works, account is active
+            const account = await this.client.api.accounts(this.client.accountSid).fetch();
+            
+            return {
+                success: true,
+                balance: account.balance ? parseFloat(account.balance) : 999999, // Unlimited or high for Twilio (post-paid)
+                currency: 'USD',
+                status: account.status,
+                type: account.type
+            };
+
+        } catch (error) {
+            logger.error('Twilio balance check failed', { error: error.message });
+            return { 
+                success: false, 
+                error: error.message,
+                balance: 0 
+            };
+        }
+    }
+    
     async listNumbers(country = null) {
         if (!this.isActive) {
             return { success: false, error: 'TWILIO_NOT_CONFIGURED' };
