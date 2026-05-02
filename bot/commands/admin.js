@@ -1390,16 +1390,59 @@ Proceed with purchase?
 
                 const actualCost = result.totalCost || (result.purchased.length * 1.00);
 
-                const message = `
+                                const message = `
 <b>✅ Pool Purchase Complete!</b>
 
 🏢 Provider: <code>${purchase.preferredProvider?.toUpperCase() || 'ANY'}</code>
 🌍 Country: <code>${purchase.country}</code>
 📦 Purchased: <code>${result.purchased.length}</code> numbers
 ❌ Failed: <code>${result.failed || 0}</code>
-💰 Total Cost:
-    
-        
+💰 Total Cost: <code>$${actualCost.toFixed(2)}</code>
+
+<b>Numbers:</b>
+${numbersList}
+                `;
+
+                await this.replySuccess(ctx, message, {
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🛒 Buy More', 'pool_buy_numbers')],
+                        [Markup.button.callback('📊 Pool Monitor', 'pool_monitor')],
+                        [Markup.button.callback('🔙 Back', 'admin_pool')]
+                    ]).reply_markup
+                });
+
+                await this.logAdminAction(
+                    ctx.from.id.toString(),
+                    'POOL_PURCHASE',
+                    null,
+                    { 
+                        country: purchase.country, 
+                        quantity: purchase.quantity, 
+                        purchased: result.purchased.length,
+                        provider: purchase.preferredProvider,
+                        cost: actualCost
+                    }
+                );
+            } else {
+                await this.replyError(ctx, 
+                    `❌ <b>Purchase Failed</b>\n\nNo numbers were purchased.\nError: ${result.errors?.[0]?.error || 'Unknown error'}`, {
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('🔄 Retry', 'pool_buy_numbers')],
+                            [Markup.button.callback('🔙 Back', 'admin_pool')]
+                        ]).reply_markup
+                    });
+            }
+        } catch (error) {
+            ctx.session.poolPurchase = null;
+            logger.error('Pool purchase failed', { error: error.message, purchase });
+            await this.replyError(ctx, `❌ <b>Purchase Failed:</b> ${error.message}`, {
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Retry', 'pool_buy_numbers')],
+                    [Markup.button.callback('🔙 Back', 'admin_pool')]
+                ]).reply_markup
+            });
+        }
+    }
                 
     async handlePoolMonitor(ctx) {
         try {
