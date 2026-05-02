@@ -2106,6 +2106,7 @@ class Admin {
     // ═══════════════════════════════════════════════════════
 
     // ─── 33. Switch SMS Provider ───
+        // ─── 33. Switch SMS Provider (FIXED) ───
     async handleSwitchProvider(ctx) {
         const userId = ctx.from?.id?.toString();
         if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
@@ -2120,12 +2121,13 @@ class Admin {
             const providers = await this.smsProviderManager.getAvailableProviders();
             
             let text = `🔄 <b>Switch SMS Provider</b>\n\n`;
-            text += `Current: <b>${this.smsProviderManager.getCurrentProvider() || 'None'}</b>\n\n`;
+            // FIXED: Use getActiveProviders instead of getCurrentProvider
+            text += `Current: <b>${this.smsProviderManager.getActiveProviders?.()[0] || 'None'}</b>\n\n`;
             text += `Available providers:\n`;
 
             const buttons = providers.map(p => ([{
-                text: `${p.active ? '✅ ' : ''}${p.name}`,
-                callback_data: `admin_switch_to_${p.id}`
+                text: `${p.isActive ? '✅ ' : ''}${p.name}`,
+                callback_data: `admin_switch_to_${p.name}`
             }]));
 
             buttons.push([{ text: '◀️ Back', callback_data: 'admin_back_sms' }]);
@@ -2141,8 +2143,11 @@ class Admin {
             });
         }
     }
-
+    
     // ─── 34. Provider Balance Check ───
+    
+     
+        // ─── 34. Provider Balance Check (FIXED) ───
     async handleProviderBalance(ctx) {
         const userId = ctx.from?.id?.toString();
         if (!this.isAdmin(userId)) return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
@@ -2158,13 +2163,16 @@ class Admin {
             
             let text = `💳 <b>SMS Provider Balances</b>\n\n`;
             
-            if (!balances || balances.length === 0) {
+            // FIXED: checkBalances returns object, not array
+            const providers = Object.entries(balances || {});
+            
+            if (providers.length === 0) {
                 text += `<i>No providers configured or all offline.</i>`;
             } else {
-                balances.forEach(b => {
-                    const status = b.available ? '🟢' : '🔴';
-                    text += `${status} <b>${b.provider}</b>: ${b.balance} ${b.currency || 'credits'}\n` +
-                           `   📊 Success Rate: <b>${(b.successRate * 100).toFixed(1)}%</b>\n\n`;
+                providers.forEach(([name, b]) => {
+                    const status = b.success ? '🟢' : '🔴';
+                    text += `${status} <b>${name}</b>: ${b.balance?.toFixed?.(4) || b.balance || 0} ${b.currency || 'USD'}\n` +
+                           `   📊 Status: <b>${b.success ? 'Active' : b.error || 'Error'}</b>\n\n`;
                 });
             }
 
@@ -2183,8 +2191,8 @@ class Admin {
                 reply_markup: { inline_keyboard: [[{ text: '◀️ Back', callback_data: 'admin_back_sms' }]] }
             });
         }
-    }
-
+                                   }
+                
     // ─── 35. Retry Failed OTP ───
     async handleRetryFailedOTP(ctx) {
         const userId = ctx.from?.id?.toString();
