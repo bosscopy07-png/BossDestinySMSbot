@@ -359,7 +359,7 @@ class AdminCommands {
         this.bot.action('pool_provider_telnyx', this.requireAdmin, (ctx) => this.handlePoolProviderSelect(ctx, 'telnyx'));
         this.bot.action('pool_provider_any', this.requireAdmin, (ctx) => this.handlePoolProviderSelect(ctx, 'any'));
         
-        this.bot.action(/adminpool_country_(.+)/, (ctx, next) => {
+        this.bot.action(/adminpool_co_(.+)/, (ctx, next) => {
     const userId = ctx.from?.id?.toString();
     if (!this.isAdmin(userId)) {
         return next(); // Pass to next handler (user flow)
@@ -1151,12 +1151,12 @@ Select provider to see available countries and prices:
                 const row = [];
                 row.push(Markup.button.callback(
                     `${availableCountries[i].flag} ${availableCountries[i].code} (~$${availableCountries[i].cost.toFixed(2)})`,
-                    `adminpool_country_${availableCountries[i].code}`
+                    `adminpool_co_${availableCountries[i].code}`
                 ));
                 if (availableCountries[i + 1]) {
                     row.push(Markup.button.callback(
                         `${availableCountries[i + 1].flag} ${availableCountries[i + 1].code} (~$${availableCountries[i + 1].cost.toFixed(2)})`,
-                        `adminpool_country_${availableCountries[i + 1].code}`
+                        `adminpool_co_${availableCountries[i + 1].code}`
                     ));
                 }
                 rows.push(row);
@@ -1170,7 +1170,7 @@ Select provider to see available countries and prices:
             availabilityInfo = '<i>No countries available from this provider right now.</i>\n\nYou can still try sending any 2-letter country code.';
         }
 
-        countryButtons.push([Markup.button.callback('✏️ Type Custom Code', 'adminpool_country_custom')]);
+        countryButtons.push([Markup.button.callback('✏️ Type Custom Code', 'adminpool_co_custom')]);
         countryButtons.push([Markup.button.callback('🔙 Back', 'pool_buy_numbers')]);
 
         const message = `
