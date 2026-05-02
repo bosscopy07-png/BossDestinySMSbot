@@ -212,7 +212,7 @@ class TelegramBot {
         // ─── YOUR EXISTING admin (kept exactly as before) ───
         
 // AFTER (fixed):
-const adminCommands = new AdminCommands(bot, walletService, referralService, smsProviderManager);
+const adminCommands = new AdminCommands(this.bot, this.walletService, this.referralService, this.smsProviderManager);
         
         // ─── NEW advanced admin dashboard (extra.js, export: Admin) ───
         const advancedAdmin = new Admin(
