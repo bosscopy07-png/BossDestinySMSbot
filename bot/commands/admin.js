@@ -194,21 +194,24 @@ class AdminCommands {
 
     // ─── Admin middleware ───
         // ─── Admin middleware ───
-    requireAdmin(ctx, next) {
-        const adminIds = (config.bot?.adminId || '')
-            .toString()
-            .split(',')
-            .map(id => id.trim())
-            .filter(Boolean);
+    get requireAdmin() {
+        return async (ctx, next) => {
+            const adminIds = (config.bot?.adminId || '')
+                .toString()
+                .split(',')
+                .map(id => id.trim())
+                .filter(Boolean);
 
-        if (!adminIds.includes(ctx.from.id.toString())) {
-            return this.replyError(ctx, '🚫 <b>Admin access required.</b>\n\nYou do not have permission to use this command.');
-        }
+            if (!adminIds.includes(ctx.from.id.toString())) {
+                return this.replyError(ctx, '🚫 <b>Admin access required.</b>\n\nYou do not have permission to use this command.');
+            }
 
-        ctx.state.isAdmin = true;
-        this.admins.add(ctx.from.id.toString());
-        return next();
+            ctx.state.isAdmin = true;
+            this.admins.add(ctx.from.id.toString());
+            return next();
+        };
     }
+    
     
 
     // ─── Maintenance middleware ───
