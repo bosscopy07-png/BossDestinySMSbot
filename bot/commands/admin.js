@@ -194,7 +194,7 @@ class AdminCommands {
 
     // ─── Admin middleware ───
         // ─── Admin middleware ───
-    get requireAdmin() {
+    requireAdmin() {
         return async (ctx, next) => {
             const adminIds = (config.bot?.adminId || '')
                 .toString()
