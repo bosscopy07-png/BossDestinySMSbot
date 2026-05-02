@@ -524,4 +524,231 @@ class TelegramBot {
             if (isAdmin) {
                 if (ctx.session.awaitingBroadcast) {
                     const { target, filter, label } = ctx.session.awaitingBroadcast;
-                    delete ctx.session.awaitingBro
+                    delete ctx.session.awaitingBroadcast;
+                    return adminCommands.executeBroadcast(ctx, filter, label, ctx.message.text);
+                }
+
+                if (ctx.session.awaitingAddBalance) {
+                    const targetId = ctx.session.awaitingAddBalance;
+                    delete ctx.session.awaitingAddBalance;
+                    const amount = parseFloat(ctx.message.text);
+                    if (isNaN(amount) || amount <= 0) {
+                        return adminCommands.replyError(ctx, '❌ <b>Invalid amount.</b>');
+                    }
+                    return adminCommands.processAddBalance(ctx, targetId, amount, 'Admin credit via inline');
+                }
+
+                if (ctx.session.awaitingDeductBalance) {
+                    const targetId = ctx.session.awaitingDeductBalance;
+                    delete ctx.session.awaitingDeductBalance;
+                    const amount = parseFloat(ctx.message.text);
+                    if (isNaN(amount) || amount <= 0) {
+                        return adminCommands.replyError(ctx, '❌ <b>Invalid amount.</b>');
+                    }
+                    return adminCommands.processDeductBalance(ctx, targetId, amount, 'Admin deduction via inline');
+                }
+
+                if (ctx.session.awaitingBlacklistReason) {
+                    const targetId = ctx.session.awaitingBlacklistReason;
+                    delete ctx.session.awaitingBlacklistReason;
+                    const reason = ctx.message.text.trim().toLowerCase() === 'skip' 
+                        ? 'Manual blacklist' 
+                        : ctx.message.text.trim();
+                    return adminCommands.processBlacklist(ctx, targetId, reason);
+                }
+
+                if (ctx.session.awaitingMessageUser) {
+                    const targetId = ctx.session.awaitingMessageUser;
+                    delete ctx.session.awaitingMessageUser;
+                    return adminCommands.processMessageUser(ctx, targetId, ctx.message.text);
+                }
+            }
+
+            return next();
+        });
+    }
+
+    setupErrorHandling() {
+        this.bot.catch((err, ctx) => {
+            this.metrics.requestsFailed++;
+
+            if (!err.message?.includes('403') && !err.message?.includes('429')) {
+                this.alertAdmins(err, {
+                    userId: ctx.from?.id,
+                    updateType: ctx.updateType,
+                    command: ctx.message?.text || ctx.callbackQuery?.data
+                });
+            }
+
+            if (err.message?.includes('ETELEGRAM') && err.message?.includes('403')) {
+                return;
+            }
+            if (err.message?.includes('ETELEGRAM') && err.message?.includes('429')) {
+                logger.warn('Telegram rate limit', { userId: ctx.from?.id });
+                return;
+            }
+
+            logger.error('Bot error', {
+                error: err.message,
+                userId: ctx.from?.id,
+                updateType: ctx.updateType
+            });
+
+            if (err.message?.includes('WALLET_NOT_READY')) {
+                ctx.reply('⏳ Blockchain connection warming up. Try again shortly.').catch(() => {});
+            } else {
+                ctx.reply('❌ An error occurred. Please try again.').catch(() => {});
+            }
+        });
+
+        process.on('uncaughtException', (err) => {
+            logger.error('Uncaught Exception', { error: err.message });
+            this.alertAdmins(err, { updateType: 'process', command: 'uncaughtException' });
+            if (!this.isShuttingDown) this.gracefulShutdown('uncaughtException');
+        });
+
+        process.on('unhandledRejection', (reason) => {
+            const err = reason instanceof Error ? reason : new Error(String(reason));
+            logger.error('Unhandled Rejection', { reason: String(reason) });
+            this.alertAdmins(err, { updateType: 'process', command: 'unhandledRejection' });
+            if (!this.isShuttingDown) this.gracefulShutdown('unhandledRejection');
+        });
+    }
+
+    startDepositScanner() {
+        let retryDelay = 5000;
+        const maxRetryDelay = 60000;
+
+        const checkAndStart = async () => {
+            if (this.isShuttingDown) return;
+
+            try {
+                if (this.walletService?.isReady) {
+                    this.walletService.startDepositScanner(30000);
+                    logger.info('Deposit scanner started');
+                    retryDelay = 5000;
+                } else {
+                    logger.warn('Wallet not ready, retrying...');
+                    setTimeout(checkAndStart, retryDelay);
+                    retryDelay = Math.min(retryDelay * 2, maxRetryDelay);
+                }
+            } catch (error) {
+                logger.error('Deposit scanner error', { error: error.message });
+                this.alertAdmins(error, { updateType: 'scanner', command: 'deposit_scanner' });
+                setTimeout(checkAndStart, retryDelay);
+                retryDelay = Math.min(retryDelay * 2, maxRetryDelay);
+            }
+        };
+
+        setTimeout(checkAndStart, 3000);
+    }
+
+    stopDepositScanner() {
+        try {
+            this.walletService?.stopDepositScanner?.();
+        } catch (error) {
+            logger.error('Error stopping scanner', { error: error.message });
+        }
+    }
+
+    async launch() {
+        try {
+            logger.info('Initializing database...');
+            await initModels();
+
+            await this.setupCommands();
+
+            this.startDepositScanner();
+
+            await this.bot.telegram.deleteWebhook({ drop_pending_updates: true });
+            await this.bot.launch();
+
+            this.isReady = true;
+            logger.info('Bot launched successfully');
+
+            process.once('SIGINT', () => this.gracefulShutdown('SIGINT'));
+            process.once('SIGTERM', () => this.gracefulShutdown('SIGTERM'));
+
+            setInterval(() => this.logMetrics(), 300000);
+
+        } catch (error) {
+            logger.error('Launch failed', { error: error.message });
+            this.alertAdmins(error, { updateType: 'launch', command: 'bot_launch' });
+            throw error;
+        }
+    }
+
+    async gracefulShutdown(signal) {
+        if (this.isShuttingDown) return;
+        this.isShuttingDown = true;
+
+        logger.info(`Shutting down (${signal})`);
+
+        try {
+            this.bot.stop(signal);
+        } catch (e) {}
+
+        this.stopDepositScanner();
+
+        if (this.smsProviderManager) {
+            try {
+                await this.smsProviderManager.shutdown();
+            } catch (e) {
+                logger.warn('SMS Provider Manager shutdown failed', { error: e.message });
+            }
+        }
+
+        try {
+            await Promise.race([
+                this.walletService?.disconnect?.(),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+            ]);
+        } catch (e) {}
+
+        setTimeout(() => process.exit(1), 10000);
+        process.exit(0);
+    }
+
+    updateMetrics(duration) {
+        this.metrics.requestsHandled++;
+        this.metrics.avgResponseTime = 
+            (this.metrics.avgResponseTime * (this.metrics.requestsHandled - 1) + duration) 
+            / this.metrics.requestsHandled;
+    }
+
+    trackEvent(event, userId) {
+        setImmediate(() => {
+            logger.debug('Event tracked', { event, userId });
+        });
+    }
+
+    logMetrics() {
+        const uptime = (Date.now() - this.metrics.startTime) / 1000;
+        logger.info('Bot metrics', {
+            uptime: `${Math.floor(uptime / 60)}m`,
+            requestsHandled: this.metrics.requestsHandled,
+            requestsFailed: this.metrics.requestsFailed,
+            avgResponseTime: `${Math.round(this.metrics.avgResponseTime)}ms`,
+            activeUsers: this.metrics.activeUsers.size
+        });
+    }
+
+    getHealth() {
+        return {
+            status: this.isShuttingDown ? 'shutting_down' : this.isReady ? 'healthy' : 'starting',
+            uptime: process.uptime(),
+            memory: process.memoryUsage(),
+            metrics: {
+                requests: this.metrics.requestsHandled,
+                failed: this.metrics.requestsFailed,
+                avgResponseTime: Math.round(this.metrics.avgResponseTime),
+                activeUsers: this.metrics.activeUsers.size
+            },
+            walletReady: this.walletService?.isReady || false,
+            smsProviderReady: !!this.smsProviderManager?.isInitialized,
+            timestamp: new Date().toISOString()
+        };
+    }
+}
+
+export default TelegramBot;
