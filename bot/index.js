@@ -565,7 +565,9 @@ class TelegramBot {
             if (!this.isShuttingDown) this.gracefulShutdown('unhandledRejection');
         });
                 }
-                                                      startDepositScanner() {
+                                                      
+    
+            startDepositScanner() {
         let retryDelay = 5000;
         const maxRetryDelay = 60000;
 
@@ -710,3 +712,4 @@ class TelegramBot {
 }
 
 export default TelegramBot;
+                
