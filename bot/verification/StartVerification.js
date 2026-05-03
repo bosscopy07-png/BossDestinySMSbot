@@ -1,8 +1,6 @@
 // ═══════════════════════════════════════════════════════════
 //  bot/verification/StartVerification.js
 //  Dedicated module for mandatory channel join verification.
-//  This is the ONLY entry point for /start. It decides whether
-//  to show verification or forward to the real start command.
 // ═══════════════════════════════════════════════════════════
 
 import logger from '../../utils/logger.js';
@@ -14,9 +12,12 @@ const MANDATORY_CHANNELS = [
 
 const WELCOME_IMAGE_URL = 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231499/file_000000006c1c724685bb402218b7c208_ste2ky.png';
 
+// Re-verify membership every 24 hours
+const VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
+
 class StartVerification {
     constructor(bot, userCommands, isAdminFn, alertAdminsFn) {
-        if (!bot || !userCommands || typeof isAdminFn !== 'function') {
+        if (!bot || !userCommands || typeof isAdminFn !== 'function' || typeof alertAdminsFn !== 'function') {
             throw new Error('StartVerification requires: bot, userCommands, isAdminFn, alertAdminsFn');
         }
 
@@ -29,7 +30,7 @@ class StartVerification {
     }
 
     // ═══════════════════════════════════════════════════════
-    //  PUBLIC API: Call this from the main bot's /start handler
+    //  PUBLIC API: Main entry point for /start
     // ═══════════════════════════════════════════════════════
 
     async handleStart(ctx) {
@@ -44,11 +45,23 @@ class StartVerification {
         if (this.isAdmin(userId)) {
             logger.debug('[StartVerification] Admin bypass', { userId });
             ctx.session.joinVerified = true;
+            ctx.session.joinVerifiedAt = Date.now();
             return await this._runUserStart(ctx);
         }
 
-        // ─── Always perform live membership check ───
-        // Never trust session cache on /start entry
+        // ─── Check if verification is still fresh ───
+        const isFresh = ctx.session?.joinVerified === true &&
+                        ctx.session?.joinVerifiedAt &&
+                        (Date.now() - ctx.session.joinVerifiedAt < VERIFICATION_TTL_MS);
+
+        if (isFresh) {
+            logger.debug('[StartVerification] Using fresh verification', { userId });
+            return await this._runUserStart(ctx);
+        }
+
+        // ─── Verification expired or never done — re-check live ───
+        logger.debug('[StartVerification] Performing live membership check', { userId });
+
         let membership;
         try {
             membership = await this._checkMembership(userId);
@@ -64,6 +77,7 @@ class StartVerification {
                 note: 'Membership API failure — user shown join requirement as fail-safe'
             });
             ctx.session.joinVerified = false;
+            delete ctx.session.joinVerifiedAt;
             return await this._sendJoinRequirement(ctx);
         }
 
@@ -71,6 +85,7 @@ class StartVerification {
         if (membership.allJoined) {
             logger.info('[StartVerification] User verified', { userId, channels: membership.memberships });
             ctx.session.joinVerified = true;
+            ctx.session.joinVerifiedAt = Date.now();
             return await this._runUserStart(ctx);
         }
 
@@ -80,6 +95,7 @@ class StartVerification {
             missing: membership.memberships.filter(m => !m.joined).map(m => m.channel)
         });
         ctx.session.joinVerified = false;
+        delete ctx.session.joinVerifiedAt;
         return await this._sendJoinRequirement(ctx);
     }
 
@@ -88,7 +104,7 @@ class StartVerification {
     // ═══════════════════════════════════════════════════════
 
     async handleVerifyCallback(ctx) {
-        const userId = ctx.from?.id;
+        const userId = ctx.from?.Id = ctx.from?.id;
         if (!userId) return;
 
         try {
@@ -113,6 +129,7 @@ class StartVerification {
 
             if (membership.allJoined) {
                 ctx.session.joinVerified = true;
+                ctx.session.joinVerifiedAt = Date.now();
                 await ctx.deleteMessage().catch(() => {});
                 await ctx.reply('✅ <b>Welcome aboard!</b> You now have full access to the bot.', { parse_mode: 'HTML' });
                 return await this._runUserStart(ctx);
@@ -139,7 +156,46 @@ class StartVerification {
     }
 
     // ═══════════════════════════════════════════════════════
-    //  PRIVATE: Register the callback action with the bot
+    //  PUBLIC: Re-check membership for an already-verified user
+    //  Call this from middleware when verification is stale.
+    //  Returns true if still joined, false if revoked.
+    // ═══════════════════════════════════════════════════════
+
+    async reverifyUser(userId, ctx) {
+        try {
+            const membership = await this._checkMembership(userId);
+
+            if (membership.allJoined) {
+                ctx.session.joinVerified = true;
+                ctx.session.joinVerifiedAt = Date.now();
+                return true;
+            }
+
+            // User left — revoke access
+            logger.warn('[StartVerification] Membership revoked — user left channels', {
+                userId,
+                missing: membership.memberships.filter(m => !m.joined).map(m => m.channel)
+            });
+            ctx.session.joinVerified = false;
+            delete ctx.session.joinVerifiedAt;
+
+            await ctx.reply(
+                '⛔ <b>Access Revoked</b>\n\n' +
+                'You left one or more required channels. Please re-join to continue using the bot.\n\n' +
+                'Tap /start to verify again.',
+                { parse_mode: 'HTML' }
+            );
+            return false;
+
+        } catch (checkErr) {
+            logger.error('[StartVerification] Re-verify check failed', { userId, error: checkErr.message });
+            // Fail-safe: assume still valid to avoid disrupting user
+            return true;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  PRIVATE: Register callback actions
     // ═══════════════════════════════════════════════════════
 
     _registerCallbacks() {
@@ -257,3 +313,4 @@ class StartVerification {
 }
 
 export default StartVerification;
+                         
