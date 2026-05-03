@@ -7,13 +7,11 @@ import config from '../../config/env.js';
 /**
  * WalletService — Blockchain deposits, fund locking, balance management
  * 
- * FIXED:
- * - captureFunds now ACTUALLY deducts from user balance (was missing)
- * - releaseFunds throws on invalid tx instead of silent false
- * - lockFunds uses generic 'LOCK' type, preserves audit trail
- * - releaseFunds preserves original tx type, only changes status
- * - Atomic balance checks prevent negative balances
- * - All methods have proper error handling and rollback
+ * RPC FALLBACK ORDER:
+ * 1. Configured RPC (env.js)
+ * 2. Personal BSC RPC 2 (Alchemy)
+ * 3. Personal BSC RPC 3 (BlockPI)
+ * 4. Public fallbacks (Ankr, Binance, Defibit, Ninicoin)
  */
 class WalletService {
     constructor() {
@@ -44,17 +42,35 @@ class WalletService {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  INITIALIZATION
+    //  RPC ENDPOINTS — PRIORITY ORDER
     // ═══════════════════════════════════════════════════════════
 
-    async initialize() {
-        const rpcEndpoints = [
+    _getRpcEndpoints() {
+        const endpoints = [
+            // 1. Configured RPC from env
             config.blockchain?.rpc,
+            // 2. Personal BSC RPC 2 (Alchemy)
+            'https://bnb-mainnet.g.alchemy.com/v2/tPaAwIeLlNsxo2Ye1TOKr',
+            // 3. Personal BSC RPC 3 (BlockPI)
+            'https://bsc.blockpi.network/v1/rpc/8ca241ff53aa72bd97b543bf72e1ad9a1231049c',
+            // 4. Public fallbacks
             'https://rpc.ankr.com/bsc',
             'https://bsc-dataseed.binance.org/',
             'https://bsc-dataseed1.defibit.io/',
             'https://bsc-dataseed1.ninicoin.io/'
-        ].filter((url, i, self) => url && self.indexOf(url) === i);
+        ];
+
+        // Remove duplicates and empty values
+        return endpoints.filter((url, i, self) => url && self.indexOf(url) === i);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  INITIALIZATION
+    // ═══════════════════════════════════════════════════════════
+
+    async initialize() {
+        const rpcEndpoints = this._getRpcEndpoints();
+        let lastError = null;
 
         for (const rpcUrl of rpcEndpoints) {
             try {
@@ -65,7 +81,7 @@ class WalletService {
 
                 const testPromise = this.provider.getNetwork();
                 const timeoutPromise = new Promise((_, reject) => 
-                    setTimeout(() => reject(new Error('RPC_TIMEOUT')), 5000)
+                    setTimeout(() => reject(new Error('RPC_TIMEOUT')), 8000)
                 );
                 
                 await Promise.race([testPromise, timeoutPromise]);
@@ -92,25 +108,38 @@ class WalletService {
 
                 logger.info('Wallet service initialized', {
                     masterAddress: this.masterAddress,
-                    rpc: rpcUrl.replace(/\/\/.*@/, '//***@')
+                    rpc: this._maskRpcUrl(rpcUrl),
+                    rpcIndex: rpcEndpoints.indexOf(rpcUrl)
                 });
 
                 await this.initializeDecimals();
                 return;
 
             } catch (error) {
+                lastError = error;
                 logger.warn('RPC failed, trying next...', { 
-                    rpc: rpcUrl?.replace(/\/\/.*@/, '//***@'),
-                    error: error.message 
+                    rpc: this._maskRpcUrl(rpcUrl),
+                    error: error.message,
+                    code: error.code
                 });
                 this.provider = null;
             }
         }
 
-        logger.error('All RPC endpoints failed — running in degraded mode');
+        // All RPCs failed — degraded mode
+        logger.error('All RPC endpoints failed — running in degraded mode', {
+            lastError: lastError?.message,
+            totalEndpoints: rpcEndpoints.length
+        });
+        
         this.masterWallet = new ethers.Wallet(config.blockchain?.masterPrivateKey);
         this.masterAddress = this.masterWallet.address;
         this.isReady = false;
+    }
+
+    _maskRpcUrl(url) {
+        if (!url) return 'undefined';
+        return url.replace(/\/\/.*@/, '//***@').replace(/\/v2\/.*/, '/v2/***');
     }
 
     async initializeDecimals() {
@@ -139,8 +168,7 @@ class WalletService {
             throw new Error('WALLET_NOT_READY — blockchain connection unavailable. Check RPC URL or try again later.');
         }
     }
-
-    // ═══════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════
     //  DEPOSIT SYSTEM
     // ═══════════════════════════════════════════════════════════
 
@@ -526,11 +554,11 @@ class WalletService {
 
             throw error;
         }
-    }
-
-    // ═══════════════════════════════════════════════════════════
+                    }
+                    // ═══════════════════════════════════════════════════════════
     //  REFERRAL SYSTEM
     // ═══════════════════════════════════════════════════════════
+
     async processReferralDeposit(userId, amount) {
         try {
             const user = await User.findOne({ userId });
@@ -589,14 +617,10 @@ class WalletService {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  FUND MANAGEMENT — LOCK / CAPTURE / RELEASE (FIXED)
+    //  FUND MANAGEMENT — LOCK / CAPTURE / RELEASE
     // ═══════════════════════════════════════════════════════════
 
-    /**
-     * Lock funds from user balance for a pending purchase
-     * Funds are reserved but NOT deducted from balance yet
-     */
-        async lockFunds(userId, amount, purpose) {
+    async lockFunds(userId, amount, purpose) {
         const txId = generateId();
 
         try {
@@ -615,7 +639,6 @@ class WalletService {
                 throw new Error('INSUFFICIENT_FUNDS');
             }
 
-            // FIXED: Use 'LOCK' enum value (added to schema)
             await Transaction.create({
                 txId,
                 userId,
@@ -672,13 +695,12 @@ class WalletService {
                 throw new Error('INSUFFICIENT_LOCKED_BALANCE');
             }
 
-            // FIXED: Update transaction to COMPLETED with type CAPTURE
             await Transaction.updateOne(
                 { txId },
                 {
                     $set: {
                         status: 'COMPLETED',
-                        type: 'CAPTURE',  // ← Track that this was a capture
+                        type: 'CAPTURE',
                         'metadata.capturedAt': new Date()
                     }
                 }
@@ -713,17 +735,8 @@ class WalletService {
         }
     }
 
-        /**
-     * Release locked funds back to user (cancel/refund)
-     * FIXED:
-     * - Uses aggregation with $max to prevent negative lockedBalance
-     * - Validates tx is PENDING before releasing
-     * - Calculates actual release amount (never more than lockedBalance)
-     * - Returns detailed result for logging
-     */
     async releaseFunds(txId, userId, reason) {
         try {
-            // Validate transaction exists and is PENDING
             const tx = await Transaction.findOne({ txId, userId });
             if (!tx) {
                 throw new Error('TRANSACTION_NOT_FOUND');
@@ -748,13 +761,11 @@ class WalletService {
                 throw new Error('INVALID_AMOUNT');
             }
 
-            // Get user for validation
             const user = await User.findOne({ userId });
             if (!user) {
                 throw new Error('USER_NOT_FOUND');
             }
 
-            // FIXED: Calculate actual release amount — never more than lockedBalance
             const currentLocked = user.lockedBalance || 0;
             const releaseAmount = Math.min(amount, currentLocked);
             
@@ -769,7 +780,6 @@ class WalletService {
                 });
             }
 
-            // Update transaction to CANCELLED
             await Transaction.updateOne(
                 { txId },
                 {
@@ -784,8 +794,6 @@ class WalletService {
                 }
             );
 
-            // FIXED: Use aggregation pipeline to prevent negative lockedBalance
-            // $max ensures lockedBalance never goes below 0
             const updateResult = await User.updateOne(
                 { userId },
                 [
@@ -803,7 +811,6 @@ class WalletService {
             );
 
             if (updateResult.matchedCount === 0) {
-                // Rollback transaction status
                 await Transaction.updateOne(
                     { txId },
                     { $set: { status: 'PENDING' } }
@@ -837,12 +844,7 @@ class WalletService {
             });
             throw error;
         }
-                }
-    
-    
-
-            
-    
+    }
 
     // ═══════════════════════════════════════════════════════════
     //  ADMIN BALANCE OPERATIONS
@@ -1045,3 +1047,4 @@ class WalletService {
 }
 
 export default WalletService;
+                                             
