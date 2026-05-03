@@ -1,5 +1,6 @@
 // ═══════════════════════════════════════════════════════════
 //  bot/verification/StartVerification.js
+//  Mandatory CAPTCHA + Channel Join Verification
 // ═══════════════════════════════════════════════════════════
 
 import logger from '../../utils/logger.js';
@@ -11,8 +12,9 @@ const MANDATORY_CHANNELS = [
 
 const WELCOME_IMAGE_URL = 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231499/file_000000006c1c724685bb402218b7c208_ste2ky.png';
 
-// Re-verify membership every 24 hours
 const VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
+const CAPTCHA_MAX_ATTEMPTS = 3;
+const CAPTCHA_BLOCK_DURATION_MS = 10 * 60 * 1000;
 
 class StartVerification {
     constructor(bot, userCommands, isAdminFn, alertAdminsFn) {
@@ -48,6 +50,16 @@ class StartVerification {
             return await this._runUserStart(ctx);
         }
 
+        // ─── Check if user is blocked from CAPTCHA failures ───
+        if (ctx.session?.captchaBlockedUntil && Date.now() < ctx.session.captchaBlockedUntil) {
+            const remaining = Math.ceil((ctx.session.captchaBlockedUntil - Date.now()) / 60000);
+            return ctx.reply(
+                `⛔ <b>Too many failed attempts.</b>\n\n` +
+                `Please try again in <code>${remaining}</code> minute(s).`,
+                { parse_mode: 'HTML' }
+            ).catch(() => {});
+        }
+
         // ─── Check if verification is still fresh ───
         const isFresh = ctx.session?.joinVerified === true &&
                         ctx.session?.joinVerifiedAt &&
@@ -58,8 +70,13 @@ class StartVerification {
             return await this._runUserStart(ctx);
         }
 
-        // ─── Verification expired or never done — re-check live ───
-        logger.debug('[StartVerification] Performing live membership check', { userId });
+        // ─── CAPTCHA not passed yet ───
+        if (ctx.session?.captchaPassed !== true) {
+            return await this._sendCaptchaChallenge(ctx);
+        }
+
+        // ─── CAPTCHA passed, now check channel membership ───
+        logger.debug('[StartVerification] CAPTCHA passed, checking membership', { userId });
 
         let membership;
         try {
@@ -80,7 +97,6 @@ class StartVerification {
             return await this._sendJoinRequirement(ctx);
         }
 
-        // ─── Evaluate result ───
         if (membership.allJoined) {
             logger.info('[StartVerification] User verified', { userId, channels: membership.memberships });
             ctx.session.joinVerified = true;
@@ -88,7 +104,6 @@ class StartVerification {
             return await this._runUserStart(ctx);
         }
 
-        // ─── Not joined — enforce requirement ───
         logger.info('[StartVerification] User not joined', {
             userId,
             missing: membership.memberships.filter(m => !m.joined).map(m => m.channel)
@@ -96,6 +111,169 @@ class StartVerification {
         ctx.session.joinVerified = false;
         delete ctx.session.joinVerifiedAt;
         return await this._sendJoinRequirement(ctx);
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  CAPTCHA: Generate and send math challenge
+    // ═══════════════════════════════════════════════════════
+
+    async _sendCaptchaChallenge(ctx) {
+        const challenge = this._generateMathChallenge();
+        ctx.session.captchaAnswer = challenge.answer;
+        ctx.session.captchaAttempts = ctx.session.captchaAttempts || 0;
+
+        const message =
+            '🤖 <b>Human Verification</b>\n\n' +
+            'Solve this to continue:\n\n' +
+            `<code>${challenge.question}</code>\n\n` +
+            `<i>Attempt ${ctx.session.captchaAttempts + 1}/${CAPTCHA_MAX_ATTEMPTS}</i>`;
+
+        // Shuffle options so correct answer isn't always in same position
+        const options = this._shuffleArray([...challenge.options]);
+
+        const keyboard = {
+            inline_keyboard: options.map(opt => ([
+                { text: String(opt), callback_data: `captcha_${opt}` }
+            ]))
+        };
+
+        try {
+            await ctx.reply(message, { parse_mode: 'HTML', reply_markup: keyboard });
+        } catch (err) {
+            logger.error('[StartVerification] Failed to send CAPTCHA', { error: err.message });
+            await this.alertAdmins(err, {
+                userId: ctx.from?.id,
+                updateType: 'message',
+                command: '/start',
+                note: 'CAPTCHA send failed'
+            });
+            ctx.reply('❌ Error starting verification. Please try /start again.').catch(() => {});
+        }
+    }
+
+    _generateMathChallenge() {
+        const ops = ['+', '-', '*'];
+        const op = ops[Math.floor(Math.random() * ops.length)];
+        let a, b, answer;
+
+        switch (op) {
+            case '+':
+                a = Math.floor(Math.random() * 20) + 1;
+                b = Math.floor(Math.random() * 20) + 1;
+                answer = a + b;
+                break;
+            case '-':
+                a = Math.floor(Math.random() * 20) + 10;
+                b = Math.floor(Math.random() * 10) + 1;
+                answer = a - b;
+                break;
+            case '*':
+                a = Math.floor(Math.random() * 9) + 2;
+                b = Math.floor(Math.random() * 9) + 2;
+                answer = a * b;
+                break;
+        }
+
+        const question = `${a} ${op} ${b} = ?`;
+
+        // Generate 3 wrong answers close to correct
+        const options = new Set([answer]);
+        while (options.size < 4) {
+            const offset = Math.floor(Math.random() * 10) - 5;
+            const wrong = answer + offset;
+            if (wrong !== answer && wrong >= 0) {
+                options.add(wrong);
+            }
+        }
+
+        return { question, answer, options: Array.from(options) };
+    }
+
+    _shuffleArray(array) {
+        const arr = [...array];
+        for (let i = arr.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [arr[i], arr[j]] = [arr[j], arr[i]];
+        }
+        return arr;
+    }
+
+    // ═══════════════════════════════════════════════════════
+    //  CAPTCHA: Handle answer callback
+    // ═══════════════════════════════════════════════════════
+
+    async handleCaptchaAnswer(ctx) {
+        const userId = ctx.from?.id;
+        if (!userId) return;
+
+        try {
+            await ctx.answerCbQuery().catch(() => {});
+
+            const selectedAnswer = parseInt(ctx.callbackQuery.data.replace('captcha_', ''), 10);
+            const correctAnswer = ctx.session?.captchaAnswer;
+
+            if (isNaN(selectedAnswer) || correctAnswer === undefined) {
+                return ctx.reply('❌ Session expired. Please tap /start again.').catch(() => {});
+            }
+
+            // Check if blocked
+            if (ctx.session?.captchaBlockedUntil && Date.now() < ctx.session.captchaBlockedUntil) {
+                const remaining = Math.ceil((ctx.session.captchaBlockedUntil - Date.now()) / 60000);
+                return ctx.answerCbQuery(`⛔ Blocked for ${remaining}m`, { show_alert: true });
+            }
+
+            if (selectedAnswer === correctAnswer) {
+                // Correct!
+                logger.info('[StartVerification] CAPTCHA passed', { userId });
+                ctx.session.captchaPassed = true;
+                ctx.session.captchaAttempts = 0;
+                delete ctx.session.captchaAnswer;
+
+                await ctx.deleteMessage().catch(() => {});
+                await ctx.reply('✅ <b>Verified!</b> Now let\'s check your channel membership...', { parse_mode: 'HTML' });
+
+                // Continue to membership check
+                return await this.handleStart(ctx);
+            }
+
+            // Wrong answer
+            ctx.session.captchaAttempts = (ctx.session.captchaAttempts || 0) + 1;
+            const remainingAttempts = CAPTCHA_MAX_ATTEMPTS - ctx.session.captchaAttempts;
+
+            if (remainingAttempts <= 0) {
+                // Block user
+                ctx.session.captchaBlockedUntil = Date.now() + CAPTCHA_BLOCK_DURATION_MS;
+                delete ctx.session.captchaAnswer;
+                delete ctx.session.captchaPassed;
+
+                logger.warn('[StartVerification] CAPTCHA max attempts exceeded', { userId });
+                await ctx.deleteMessage().catch(() => {});
+                return ctx.reply(
+                    '⛔ <b>Too many failed attempts.</b>\n\n' +
+                    'You are blocked for <code>10 minutes</code>.\n\n' +
+                    'Please try /start again later.',
+                    { parse_mode: 'HTML' }
+                );
+            }
+
+            // Show new challenge
+            await ctx.deleteMessage().catch(() => {});
+            await ctx.reply(
+                `❌ <b>Wrong answer.</b>\n\n` +
+                `<i>${remainingAttempts} attempt(s) remaining.</i>`,
+                { parse_mode: 'HTML' }
+            );
+            return await this._sendCaptchaChallenge(ctx);
+
+        } catch (error) {
+            logger.error('[StartVerification] CAPTCHA callback error', { error: error.message, userId });
+            await this.alertAdmins(error, {
+                userId,
+                updateType: 'callback_query',
+                command: 'captcha_answer',
+                note: 'CAPTCHA callback crash'
+            });
+        }
     }
 
     // ═══════════════════════════════════════════════════════
@@ -168,7 +346,6 @@ class StartVerification {
                 return true;
             }
 
-            // User left — revoke access
             logger.warn('[StartVerification] Membership revoked — user left channels', {
                 userId,
                 missing: membership.memberships.filter(m => !m.joined).map(m => m.channel)
@@ -186,7 +363,6 @@ class StartVerification {
 
         } catch (checkErr) {
             logger.error('[StartVerification] Re-verify check failed', { userId, error: checkErr.message });
-            // Fail-safe: assume still valid to avoid disrupting user
             return true;
         }
     }
@@ -197,6 +373,9 @@ class StartVerification {
 
     _registerCallbacks() {
         this.bot.action('verify_join_status', (ctx) => this.handleVerifyCallback(ctx));
+
+        // Register CAPTCHA answer handler — matches any captcha_N callback
+        this.bot.action(/^captcha_(-?\d+)$/, (ctx) => this.handleCaptchaAnswer(ctx));
     }
 
     // ═══════════════════════════════════════════════════════
@@ -240,7 +419,7 @@ class StartVerification {
 
         return { allJoined, memberships };
     }
-            // ═══════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════
     //  PRIVATE: Send the join requirement UI
     // ═══════════════════════════════════════════════════════
 
