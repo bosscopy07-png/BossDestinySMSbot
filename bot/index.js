@@ -17,19 +17,9 @@ import AdminCommands from './commands/admin.js';
 import Admin from './commands/extra.js';
 import WalletService from '../services/wallet/index.js';
 import SMSProviderManager from '../services/sms/index.js';
+import StartVerification from './verification/StartVerification.js';
 import { Worker } from 'worker_threads';
 import { cpus } from 'os';
-
-// ═══════════════════════════════════════════════════════
-//  MANDATORY JOIN CONFIGURATION
-// ═══════════════════════════════════════════════════════
-
-const MANDATORY_CHANNELS = [
-    { id: '@Swiftsmscommunity', name: 'SwiftSMS Community', url: 'https://t.me/Swiftsmscommunity' },
-    { id: '@swiftsmstech', name: 'SwiftSMS Tech', url: 'https://t.me/swiftsmstech' }
-];
-
-const WELCOME_IMAGE_URL = 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231499/file_000000006c1c724685bb402218b7c208_ste2ky.png';
 
 class TelegramBot {
     constructor() {
@@ -49,7 +39,7 @@ class TelegramBot {
         this.walletService = new WalletService();
         this.smsProviderManager = null;
         this.referralService = null;
-        
+
         this.metrics = {
             requestsHandled: 0,
             requestsFailed: 0,
@@ -64,11 +54,9 @@ class TelegramBot {
         this.workerPool = [];
         this.maxWorkers = Math.min(cpus().length, 4);
 
-        // Error alert deduplication
         this.errorAlertCooldown = new Map();
         this.errorAlertInterval = 300000;
 
-        // Cached admin IDs
         this._adminIds = null;
         this._adminIdsTimestamp = 0;
 
@@ -97,125 +85,52 @@ class TelegramBot {
     }
 
     // ═══════════════════════════════════════════════════════
-    //  ADMIN ERROR ALERTS
+    //  ADMIN ERROR ALERTS — Catches EVERY single error
     // ═══════════════════════════════════════════════════════
 
     async alertAdmins(error, context = {}) {
-        const adminIds = this.getAdminIds();
-        if (!adminIds.length) return;
-
-        const errorKey = `${error.name}:${error.message?.slice(0, 50)}`;
-        const lastAlert = this.errorAlertCooldown.get(errorKey);
-        const now = Date.now();
-
-        if (lastAlert && now - lastAlert < this.errorAlertInterval) {
-            return;
-        }
-        this.errorAlertCooldown.set(errorKey, now);
-
-        const stack = error.stack ? error.stack.split('\n').slice(0, 5).join('\n') : 'No stack';
-        const alertText = [
-            '🚨 <b>Bot Error Alert</b>',
-            '',
-            `<b>Error:</b> <code>${error.name}</code>`,
-            `<b>Message:</b> <code>${error.message?.slice(0, 400) || 'N/A'}</code>`,
-            `<b>Time:</b> ${new Date().toISOString()}`,
-            `<b>Env:</b> ${process.env.NODE_ENV || 'production'}`,
-            context.userId ? `<b>User:</b> <code>${context.userId}</code>` : '',
-            context.updateType ? `<b>Update:</b> ${context.updateType}` : '',
-            context.command ? `<b>Command:</b> ${context.command}` : '',
-            '',
-            '<b>Stack:</b>',
-            `<pre>${stack}</pre>`
-        ].filter(Boolean).join('\n');
-
-        await Promise.allSettled(adminIds.map(async (adminId) => {
-            try {
-                await this.bot.telegram.sendMessage(adminId, alertText, {
-                    parse_mode: 'HTML',
-                    disable_notification: false
-                });
-            } catch (sendErr) {
-                logger.error('Failed to alert admin', { adminId, error: sendErr.message });
-            }
-        }));
-    }
-
-    // ═══════════════════════════════════════════════════════
-    //  JOIN VERIFICATION
-    // ═══════════════════════════════════════════════════════
-
-    async checkUserMembership(userId) {
-        const results = await Promise.allSettled(
-            MANDATORY_CHANNELS.map(async (channel) => {
-                try {
-                    const member = await this.bot.telegram.getChatMember(channel.id, userId);
-                    const status = member.status;
-                    return {
-                        channel: channel.id,
-                        joined: ['member', 'administrator', 'creator'].includes(status),
-                        status
-                    };
-                } catch (err) {
-                    logger.warn('Membership check failed', { 
-                        channel: channel.id, 
-                        userId, 
-                        error: err.message,
-                        code: err.code,
-                        description: err.description
-                    });
-                    return { channel: channel.id, joined: false, status: 'error', error: err.message };
-                }
-            })
-        );
-
-        const memberships = results.map(r => 
-            r.status === 'fulfilled' ? r.value : { channel: 'unknown', joined: false, status: 'error' }
-        );
-        
-        const allJoined = memberships.every(m => m.joined);
-
-        return { allJoined, memberships };
-    }
-
-    async sendJoinRequirement(ctx) {
-        const keyboard = {
-            inline_keyboard: [
-                ...MANDATORY_CHANNELS.map(ch => ([
-                    { text: `📢 Join ${ch.name}`, url: ch.url }
-                ])),
-                [{ text: '✅ I\'ve Joined — Continue', callback_data: 'verify_join_status' }]
-            ]
-        };
-
-        const caption = [
-            '<b>👋 Welcome to SwiftSMS Bot!</b>',
-            '',
-            '📌 <b>To get started, please join our community:</b>',
-            '',
-            '1️⃣ <b>SwiftSMS Community</b> — Updates & announcements',
-            '2️⃣ <b>SwiftSMS Tech</b> — Support & discussions',
-            '',
-            '<i>Click the buttons below, join both, then tap "I\'ve Joined".</i>'
-        ].join('\n');
-
         try {
-            await ctx.replyWithPhoto(WELCOME_IMAGE_URL, {
-                caption,
-                parse_mode: 'HTML',
-                reply_markup: keyboard
-            });
-        } catch (photoErr) {
-            logger.warn('Photo send failed, falling back to text', { error: photoErr.message });
-            try {
-                await ctx.reply(caption, {
-                    parse_mode: 'HTML',
-                    reply_markup: keyboard
-                });
-            } catch (textErr) {
-                logger.error('Failed to send join requirement text fallback', { error: textErr.message });
-                throw textErr;
+            const adminIds = this.getAdminIds();
+            if (!adminIds.length) return;
+
+            const errorKey = `${error.name || 'Error'}:${(error.message || '').slice(0, 50)}`;
+            const lastAlert = this.errorAlertCooldown.get(errorKey);
+            const now = Date.now();
+
+            if (lastAlert && now - lastAlert < this.errorAlertInterval) {
+                return;
             }
+            this.errorAlertCooldown.set(errorKey, now);
+
+            const stack = error.stack ? error.stack.split('\n').slice(0, 5).join('\n') : 'No stack';
+            const alertText = [
+                '🚨 <b>Bot Error Alert</b>',
+                '',
+                `<b>Error:</b> <code>${error.name || 'Unknown'}</code>`,
+                `<b>Message:</b> <code>${(error.message || 'N/A').slice(0, 400)}</code>`,
+                `<b>Time:</b> ${new Date().toISOString()}`,
+                `<b>Env:</b> ${process.env.NODE_ENV || 'production'}`,
+                context.userId ? `<b>User:</b> <code>${context.userId}</code>` : '',
+                context.updateType ? `<b>Update:</b> ${context.updateType}` : '',
+                context.command ? `<b>Command:</b> ${context.command}` : '',
+                context.note ? `<b>Note:</b> ${context.note}` : '',
+                '',
+                '<b>Stack:</b>',
+                `<pre>${stack}</pre>`
+            ].filter(Boolean).join('\n');
+
+            await Promise.allSettled(adminIds.map(async (adminId) => {
+                try {
+                    await this.bot.telegram.sendMessage(adminId, alertText, {
+                        parse_mode: 'HTML',
+                        disable_notification: false
+                    });
+                } catch (sendErr) {
+                    logger.error('Failed to alert admin', { adminId, error: sendErr.message });
+                }
+            }));
+        } catch (alertErr) {
+            logger.error('alertAdmins itself crashed', { error: alertErr.message });
         }
     }
 
@@ -266,13 +181,10 @@ class TelegramBot {
 
         this.bot.use(async (ctx, next) => {
             const startTime = Date.now();
-            
             if (ctx.from?.id) {
                 this.metrics.activeUsers.add(ctx.from.id.toString());
             }
-
             ctx.state.startTime = startTime;
-            
             try {
                 await next();
             } finally {
@@ -295,68 +207,73 @@ class TelegramBot {
 
         // ═══════════════════════════════════════════════════
         //  GLOBAL JOIN VERIFICATION MIDDLEWARE
-        //  Blocks ALL commands/actions EXCEPT /start and verify callback
-        //  until user joins mandatory channels.
-        //  /start is allowed through because it performs its own live check.
+        //  Blocks everything EXCEPT /start and verify callback
         // ═══════════════════════════════════════════════════
 
         this.bot.use(async (ctx, next) => {
-            // Skip verification for admins
-            if (this.isAdmin(ctx.from?.id)) {
-                return next();
-            }
-
-            const text = ctx.message?.text || '';
-            const isStartCommand = text === '/start' || /^\/start@/.test(text);
-
-            // Allow /start to handle its own verification flow with live check
-            if (isStartCommand) {
-                return next();
-            }
-
-            // Allow the verification callback itself
-            if (ctx.callbackQuery?.data === 'verify_join_status') {
-                return next();
-            }
-
-            // Check if user is verified
-            if (ctx.session?.joinVerified === true) {
-                return next();
-            }
-
-            // User is not verified — block and show join requirement
             try {
+                if (this.isAdmin(ctx.from?.id)) {
+                    return next();
+                }
+
+                const text = ctx.message?.text || '';
+                const isStartCommand = text === '/start' || /^\/start@/.test(text);
+
+                if (isStartCommand) {
+                    return next();
+                }
+
+                if (ctx.callbackQuery?.data === 'verify_join_status') {
+                    return next();
+                }
+
+                if (ctx.session?.joinVerified === true) {
+                    return next();
+                }
+
                 await ctx.reply(
                     '⛔ <b>Access Denied</b>\n\n' +
                     'You must join our community channels before using this bot.\n\n' +
                     'Please tap /start to complete verification.',
                     { parse_mode: 'HTML' }
                 );
-            } catch (replyErr) {
-                logger.warn('Failed to send verification block message', { 
-                    userId: ctx.from?.id, 
-                    error: replyErr.message 
+            } catch (err) {
+                logger.error('Global verification middleware error', { error: err.message, userId: ctx.from?.id });
+                await this.alertAdmins(err, {
+                    userId: ctx.from?.id,
+                    updateType: ctx.updateType,
+                    command: ctx.message?.text || ctx.callbackQuery?.data,
+                    note: 'Global join verification middleware crash'
                 });
             }
         });
 
         this.bot.use(async (ctx, next) => {
-            if (this.isShuttingDown) {
-                return ctx.reply('🔴 Bot is restarting. Please try again in a moment.').catch(() => {});
+            try {
+                if (this.isShuttingDown) {
+                    return ctx.reply('🔴 Bot is restarting. Please try again in a moment.').catch(() => {});
+                }
+
+                const isAdmin = this.isAdmin(ctx.from?.id);
+
+                if (config.maintenance && !isAdmin) {
+                    return ctx.reply(
+                        '🔧 <b>Maintenance Mode</b>\n\n' +
+                        'The bot is currently under maintenance. Please try again later.\n\n' +
+                        '<i>We apologize for any inconvenience.</i>',
+                        { parse_mode: 'HTML' }
+                    ).catch(() => {});
+                }
+
+                return next();
+            } catch (err) {
+                logger.error('Maintenance middleware error', { error: err.message });
+                await this.alertAdmins(err, {
+                    userId: ctx.from?.id,
+                    updateType: ctx.updateType,
+                    note: 'Maintenance middleware crash'
+                });
             }
-
-            const isAdmin = this.isAdmin(ctx.from?.id);
-
-            if (config.maintenance && !isAdmin) {
-                return ctx.reply(
-                    '🔧 <b>Maintenance Mode</b>\n\n' +
-                    'The bot is currently under maintenance. Please try again later.\n\n' +
-                    '<i>We apologize for any inconvenience.</i>',
-                    { parse_mode: 'HTML' }
-                ).catch(() => {});
-            }
-
-            return next();
         });
 
         if (process.env.NODE_ENV === 'development') {
@@ -370,7 +287,8 @@ class TelegramBot {
             });
         }
     }
-        async setupCommands() {
+
+    async setupCommands() {
         try {
             this.smsProviderManager = new SMSProviderManager();
             await this.smsProviderManager.initialize();
@@ -378,20 +296,19 @@ class TelegramBot {
         } catch (error) {
             logger.error('Failed to initialize SMS Provider Manager', { error: error.message });
             this.smsProviderManager = null;
+            await this.alertAdmins(error, {
+                updateType: 'setup',
+                command: 'setupCommands',
+                note: 'SMS Provider Manager init failed — bot continues without SMS'
+            });
         }
-
-        // ═══════════════════════════════════════════════════
-        //  INSTANTIATE COMMAND MODULES
-        //  Note: We instantiate UserCommands but we will register
-        //  our own /start handler BEFORE any module can register theirs.
-        // ═══════════════════════════════════════════════════
 
         const userCommands = new UserCommands(this.bot, this.walletService);
         const otpCommands = new OTPCommands(this.bot, this.walletService, this.smsProviderManager);
         const adminCommands = new AdminCommands(this.bot, this.walletService, this.referralService, this.smsProviderManager);
         const advancedAdmin = new Admin(
-            this.bot, 
-            this.walletService, 
+            this.bot,
+            this.walletService,
             this.referralService,
             this.smsProviderManager
         );
@@ -402,109 +319,37 @@ class TelegramBot {
         this.commandModules.set('advancedAdmin', advancedAdmin);
 
         // ═══════════════════════════════════════════════════
-        //  JOIN VERIFICATION CALLBACK
+        //  START VERIFICATION MODULE
+        //  This owns /start completely. UserCommands must NOT
+        //  register its own bot.start() handler.
         // ═══════════════════════════════════════════════════
 
-        this.bot.action('verify_join_status', async (ctx) => {
-            try {
-                await ctx.answerCbQuery('⏳ Checking...').catch(() => {});
-
-                const userId = ctx.from?.id;
-                if (!userId) return;
-
-                const membership = await this.checkUserMembership(userId);
-
-                if (membership.allJoined) {
-                    ctx.session.joinVerified = true;
-
-                    await ctx.deleteMessage().catch(() => {});
-                    await ctx.reply('✅ <b>Welcome aboard!</b> You now have full access to the bot.', { parse_mode: 'HTML' });
-                    
-                    await userCommands.handleStart(ctx);
-                } else {
-                    const notJoined = membership.memberships
-                        .filter(m => !m.joined)
-                        .map(m => {
-                            const ch = MANDATORY_CHANNELS.find(c => c.id === m.channel);
-                            return ch ? ch.name : m.channel;
-                        });
-
-                    await ctx.answerCbQuery(`❌ Still missing: ${notJoined.join(', ')}`, { show_alert: true });
-                }
-            } catch (error) {
-                logger.error('Join verification error', { error: error.message, userId: ctx.from?.id });
-                this.alertAdmins(error, { userId: ctx.from?.id, updateType: 'callback_query', command: 'verify_join_status' });
-                await ctx.answerCbQuery('❌ Error checking. Please try again.', { show_alert: true }).catch(() => {});
-            }
-        });
-
-        // ═══════════════════════════════════════════════════
-        //  START HANDLER — LIVE MEMBERSHIP CHECK, NO CACHE TRUST
-        //  This handler is registered BEFORE any UserCommands /start
-        //  to ensure it takes precedence.
-        // ═══════════════════════════════════════════════════
+        const startVerification = new StartVerification(
+            this.bot,
+            userCommands,
+            (userId) => this.isAdmin(userId),
+            (err, ctx) => this.alertAdmins(err, ctx)
+        );
 
         this.bot.start(async (ctx) => {
-            this.trackEvent('command_start', ctx.from?.id);
-            
             try {
-                const userId = ctx.from?.id;
-                if (!userId) {
-                    logger.warn('Start handler: missing userId');
-                    return ctx.reply('❌ Unable to identify user.').catch(() => {});
-                }
-
-                // ─── STEP 1: Admin bypass ───
-                if (this.isAdmin(userId)) {
-                    logger.debug('Start handler: admin bypass', { userId });
-                    ctx.session.joinVerified = true;
-                    return await userCommands.handleStart(ctx);
-                }
-
-                // ─── STEP 2: ALWAYS check live membership for non-admins ───
-                // Do NOT trust ctx.session.joinVerified on /start.
-                // Persisted sessions from old versions may have stale or missing flags.
-                logger.debug('Start handler: performing live membership check', { userId });
-
-                let membership;
-                try {
-                    membership = await this.checkUserMembership(userId);
-                } catch (checkErr) {
-                    logger.error('Start handler: membership check threw', { 
-                        userId, 
-                        error: checkErr.message 
-                    });
-                    // Fail-safe: if API check fails, require join (don't allow free access)
-                    ctx.session.joinVerified = false;
-                    return await this.sendJoinRequirement(ctx);
-                }
-
-                // ─── STEP 3: Evaluate membership result ───
-                if (membership.allJoined) {
-                    logger.info('Start handler: user verified, joined all channels', { userId });
-                    ctx.session.joinVerified = true;
-                    return await userCommands.handleStart(ctx);
-                }
-
-                // ─── STEP 4: Not joined — enforce requirement ───
-                logger.info('Start handler: user not joined, enforcing requirement', { 
-                    userId, 
-                    missing: membership.memberships.filter(m => !m.joined).map(m => m.channel)
+                this.trackEvent('command_start', ctx.from?.id);
+                return await startVerification.handleStart(ctx);
+            } catch (err) {
+                logger.error('Bot.start wrapper error', { error: err.message, userId: ctx.from?.id });
+                await this.alertAdmins(err, {
+                    userId: ctx.from?.id,
+                    updateType: 'message',
+                    command: '/start',
+                    note: 'Outer bot.start catch — StartVerification failed'
                 });
-                ctx.session.joinVerified = false;
-                return await this.sendJoinRequirement(ctx);
-
-            } catch (error) {
-                logger.error('Start handler error', { error: error.message, userId: ctx.from?.id });
-                this.alertAdmins(error, { userId: ctx.from?.id, updateType: 'message', command: '/start' });
-                ctx.reply('❌ Failed to start. Please try /start again.').catch(() => {});
+                return ctx.reply('❌ Failed to start. Please try /start again.').catch(() => {});
             }
         });
 
         this.bot.action('help', async (ctx) => {
             try {
                 ctx.answerCbQuery().catch(() => {});
-                
                 const helpMessage = [
                     "<b>❓ Help & Commands</b>",
                     "",
@@ -520,11 +365,14 @@ class TelegramBot {
                     "<b>Admin Only:</b>",
                     "🔐 <code>/admin</code> — Admin dashboard"
                 ].join("\n");
-
                 await ctx.reply(helpMessage, { parse_mode: 'HTML' });
             } catch (error) {
                 logger.error('Help action error', { error: error.message });
-                this.alertAdmins(error, { userId: ctx.from?.id, updateType: 'callback_query', command: 'help' });
+                await this.alertAdmins(error, {
+                    userId: ctx.from?.id,
+                    updateType: 'callback_query',
+                    command: 'help'
+                });
             }
         });
 
@@ -534,257 +382,126 @@ class TelegramBot {
                 await userCommands.handleMenu(ctx);
             } catch (error) {
                 logger.error('Menu action error', { error: error.message });
-                this.alertAdmins(error, { userId: ctx.from?.id, updateType: 'callback_query', command: 'menu' });
+                await this.alertAdmins(error, {
+                    userId: ctx.from?.id,
+                    updateType: 'callback_query',
+                    command: 'menu'
+                });
             }
         });
 
         this.bot.action('open_admin_dashboard', async (ctx) => {
-            if (!this.isAdmin(ctx.from?.id)) {
-                return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+            try {
+                if (!this.isAdmin(ctx.from?.id)) {
+                    return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+                }
+                await advancedAdmin.showDashboard(ctx, true);
+            } catch (err) {
+                logger.error('Admin dashboard action error', { error: err.message });
+                await this.alertAdmins(err, {
+                    userId: ctx.from?.id,
+                    updateType: 'callback_query',
+                    command: 'open_admin_dashboard'
+                });
             }
-            
-            await advancedAdmin.showDashboard(ctx, true);
         });
 
         this.bot.on(message('text'), async (ctx, next) => {
-            if (!ctx.session) return next();
+            try {
+                if (!ctx.session) return next();
 
-            const isAdmin = this.isAdmin(ctx.from?.id);
+                const isAdmin = this.isAdmin(ctx.from?.id);
 
-            if (isAdmin) {
-                const handled = await advancedAdmin.handleTextInput(ctx);
-                if (handled) return;
-            }
-
-            if (isAdmin) {
-                if (ctx.session.awaitingBroadcast) {
-                    const { target, filter, label } = ctx.session.awaitingBroadcast;
-                    delete ctx.session.awaitingBroadcast;
-                    return adminCommands.executeBroadcast(ctx, filter, label, ctx.message.text);
+                if (isAdmin) {
+                    const handled = await advancedAdmin.handleTextInput(ctx);
+                    if (handled) return;
                 }
 
-                if (ctx.session.awaitingAddBalance) {
-                    const targetId = ctx.session.awaitingAddBalance;
-                    delete ctx.session.awaitingAddBalance;
-                    const amount = parseFloat(ctx.message.text);
-                    if (isNaN(amount) || amount <= 0) {
-                        return adminCommands.replyError(ctx, '❌ <b>Invalid amount.</b>');
+                if (isAdmin) {
+                    if (ctx.session.awaitingBroadcast) {
+                        const { target, filter, label } = ctx.session.awaitingBroadcast;
+                        delete ctx.session.awaitingBroadcast;
+                        return adminCommands.executeBroadcast(ctx, filter, label, ctx.message.text);
                     }
-                    return adminCommands.processAddBalance(ctx, targetId, amount, 'Admin credit via inline');
-                }
 
-                if (ctx.session.awaitingDeductBalance) {
-                    const targetId = ctx.session.awaitingDeductBalance;
-                    delete ctx.session.awaitingDeductBalance;
-                    const amount = parseFloat(ctx.message.text);
-                    if (isNaN(amount) || amount <= 0) {
-                        return adminCommands.replyError(ctx, '❌ <b>Invalid amount.</b>');
+                    if (ctx.session.awaitingAddBalance) {
+                        const targetId = ctx.session.awaitingAddBalance;
+                        delete ctx.session.awaitingAddBalance;
+                        const amount = parseFloat(ctx.message.text);
+                        if (isNaN(amount) || amount <= 0) {
+                            return adminCommands.replyError(ctx, '❌ <b>Invalid amount.</b>');
+                        }
+                        return adminCommands.processAddBalance(ctx, targetId, amount, 'Admin credit via inline');
                     }
-                    return adminCommands.processDeductBalance(ctx, targetId, amount, 'Admin deduction via inline');
+
+                    if (ctx.session.awaitingDeductBalance) {
+                        const targetId = ctx.session.awaitingDeductBalance;
+                        delete ctx.session.awaitingDeductBalance;
+                        const amount = parseFloat(ctx.message.text);
+                        if (isNaN(amount) || amount <= 0) {
+                            return adminCommands.replyError(ctx, '❌ <b>Invalid amount.</b>');
+                        }
+                        return adminCommands.processDeductBalance(ctx, targetId, amount, 'Admin deduction via inline');
+                    }
+
+                    if (ctx.session.awaitingBlacklistReason) {
+                        const targetId = ctx.session.awaitingBlacklistReason;
+                        delete ctx.session.awaitingBlacklistReason;
+                        const reason = ctx.message.text.trim().toLowerCase() === 'skip'
+                            ? 'Manual blacklist'
+                            : ctx.message.text.trim();
+                        return adminCommands.processBlacklist(ctx, targetId, reason);
+                    }
+
+                    if (ctx.session.awaitingMessageUser) {
+                        const targetId = ctx.session.awaitingMessageUser;
+                        delete ctx.session.awaitingMessageUser;
+                        return adminCommands.processMessageUser(ctx, targetId, ctx.message.text);
+                    }
                 }
 
-                if (ctx.session.awaitingBlacklistReason) {
-                    const targetId = ctx.session.awaitingBlacklistReason;
-                    delete ctx.session.awaitingBlacklistReason;
-                    const reason = ctx.message.text.trim().toLowerCase() === 'skip' 
-                        ? 'Manual blacklist' 
-                        : ctx.message.text.trim();
-                    return adminCommands.processBlacklist(ctx, targetId, reason);
-                }
-
-                if (ctx.session.awaitingMessageUser) {
-                    const targetId = ctx.session.awaitingMessageUser;
-                    delete ctx.session.awaitingMessageUser;
-                    return adminCommands.processMessageUser(ctx, targetId, ctx.message.text);
-                }
+                return next();
+            } catch (err) {
+                logger.error('Text message handler error', { error: err.message, userId: ctx.from?.id });
+                await this.alertAdmins(err, {
+                    userId: ctx.from?.id,
+                    updateType: 'message',
+                    command: ctx.message?.text,
+                    note: 'Text handler crash'
+                });
             }
-
-            return next();
         });
     }
 
     setupErrorHandling() {
-        this.bot.catch((err, ctx) => {
+        this.bot.catch(async (err, ctx) => {
             this.metrics.requestsFailed++;
 
-            if (!err.message?.includes('403') && !err.message?.includes('429')) {
-                this.alertAdmins(err, {
-                    userId: ctx.from?.id,
-                    updateType: ctx.updateType,
-                    command: ctx.message?.text || ctx.callbackQuery?.data
-                });
-            }
-
-            if (err.message?.includes('ETELEGRAM') && err.message?.includes('403')) {
-                return;
-            }
-            if (err.message?.includes('ETELEGRAM') && err.message?.includes('429')) {
-                logger.warn('Telegram rate limit', { userId: ctx.from?.id });
-                return;
-            }
-
-            logger.error('Bot error', {
-                error: err.message,
-                userId: ctx.from?.id,
-                updateType: ctx.updateType
-            });
-
-            if (err.message?.includes('WALLET_NOT_READY')) {
-                ctx.reply('⏳ Blockchain connection warming up. Try again shortly.').catch(() => {});
-            } else {
-                ctx.reply('❌ An error occurred. Please try again.').catch(() => {});
-            }
-        });
-
-        process.on('uncaughtException', (err) => {
-            logger.error('Uncaught Exception', { error: err.message });
-            this.alertAdmins(err, { updateType: 'process', command: 'uncaughtException' });
-            if (!this.isShuttingDown) this.gracefulShutdown('uncaughtException');
-        });
-
-        process.on('unhandledRejection', (reason) => {
-            const err = reason instanceof Error ? reason : new Error(String(reason));
-            logger.error('Unhandled Rejection', { reason: String(reason) });
-            this.alertAdmins(err, { updateType: 'process', command: 'unhandledRejection' });
-            if (!this.isShuttingDown) this.gracefulShutdown('unhandledRejection');
-        });
-    }
-
-    startDepositScanner() {
-        let retryDelay = 5000;
-        const maxRetryDelay = 60000;
-
-        const checkAndStart = async () => {
-            if (this.isShuttingDown) return;
-
             try {
-                if (this.walletService?.isReady) {
-                    this.walletService.startDepositScanner(30000);
-                    logger.info('Deposit scanner started');
-                    retryDelay = 5000;
-                } else {
-                    logger.warn('Wallet not ready, retrying...');
-                    setTimeout(checkAndStart, retryDelay);
-                    retryDelay = Math.min(retryDelay * 2, maxRetryDelay);
+                if (!err.message?.includes('403') && !err.message?.includes('429')) {
+                    await this.alertAdmins(err, {
+                        userId: ctx.from?.id,
+                        updateType: ctx.updateType,
+                        command: ctx.message?.text || ctx.callbackQuery?.data,
+                        note: 'bot.catch triggered'
+                    });
                 }
-            } catch (error) {
-                logger.error('Deposit scanner error', { error: error.message });
-                this.alertAdmins(error, { updateType: 'scanner', command: 'deposit_scanner' });
-                setTimeout(checkAndStart, retryDelay);
-                retryDelay = Math.min(retryDelay * 2, maxRetryDelay);
-            }
-        };
 
-        setTimeout(checkAndStart, 3000);
-    }
+                if (err.message?.includes('ETELEGRAM') && err.message?.includes('403')) {
+                    return;
+                }
+                if (err.message?.includes('ETELEGRAM') && err.message?.includes('429')) {
+                    logger.warn('Telegram rate limit', { userId: ctx.from?.id });
+                    return;
+                }
 
-    stopDepositScanner() {
-        try {
-            this.walletService?.stopDepositScanner?.();
-        } catch (error) {
-            logger.error('Error stopping scanner', { error: error.message });
-        }
-    }
+                logger.error('Bot error', {
+                    error: err.message,
+                    userId: ctx.from?.id,
+                    updateType: ctx.updateType
+                });
 
-    async launch() {
-        try {
-            logger.info('Initializing database...');
-            await initModels();
-
-            await this.setupCommands();
-
-            this.startDepositScanner();
-
-            await this.bot.telegram.deleteWebhook({ drop_pending_updates: true });
-            await this.bot.launch();
-
-            this.isReady = true;
-            logger.info('Bot launched successfully');
-
-            process.once('SIGINT', () => this.gracefulShutdown('SIGINT'));
-            process.once('SIGTERM', () => this.gracefulShutdown('SIGTERM'));
-
-            setInterval(() => this.logMetrics(), 300000);
-
-        } catch (error) {
-            logger.error('Launch failed', { error: error.message });
-            this.alertAdmins(error, { updateType: 'launch', command: 'bot_launch' });
-            throw error;
-        }
-    }
-
-    async gracefulShutdown(signal) {
-        if (this.isShuttingDown) return;
-        this.isShuttingDown = true;
-
-        logger.info(`Shutting down (${signal})`);
-
-        try {
-            this.bot.stop(signal);
-        } catch (e) {}
-
-        this.stopDepositScanner();
-
-        if (this.smsProviderManager) {
-            try {
-                await this.smsProviderManager.shutdown();
-            } catch (e) {
-                logger.warn('SMS Provider Manager shutdown failed', { error: e.message });
-            }
-        }
-
-        try {
-            await Promise.race([
-                this.walletService?.disconnect?.(),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
-            ]);
-        } catch (e) {}
-
-        setTimeout(() => process.exit(1), 10000);
-        process.exit(0);
-    }
-
-    updateMetrics(duration) {
-        this.metrics.requestsHandled++;
-        this.metrics.avgResponseTime = 
-            (this.metrics.avgResponseTime * (this.metrics.requestsHandled - 1) + duration) 
-            / this.metrics.requestsHandled;
-    }
-
-    trackEvent(event, userId) {
-        setImmediate(() => {
-            logger.debug('Event tracked', { event, userId });
-        });
-    }
-
-    logMetrics() {
-        const uptime = (Date.now() - this.metrics.startTime) / 1000;
-        logger.info('Bot metrics', {
-            uptime: `${Math.floor(uptime / 60)}m`,
-            requestsHandled: this.metrics.requestsHandled,
-            requestsFailed: this.metrics.requestsFailed,
-            avgResponseTime: `${Math.round(this.metrics.avgResponseTime)}ms`,
-            activeUsers: this.metrics.activeUsers.size
-        });
-    }
-
-    getHealth() {
-        return {
-            status: this.isShuttingDown ? 'shutting_down' : this.isReady ? 'healthy' : 'starting',
-            uptime: process.uptime(),
-            memory: process.memoryUsage(),
-            metrics: {
-                requests: this.metrics.requestsHandled,
-                failed: this.metrics.requestsFailed,
-                avgResponseTime: Math.round(this.metrics.avgResponseTime),
-                activeUsers: this.metrics.activeUsers.size
-            },
-            walletReady: this.walletService?.isReady || false,
-            smsProviderReady: !!this.smsProviderManager?.isInitialized,
-            timestamp: new Date().toISOString()
-        };
-    }
-}
-
-export default TelegramBot;
-                            
+                if (err.message?.includes('WALLET_NOT_READY')) {
+                    ctx.reply('⏳ Blockchain connection warming up. Try again shortly.').catch(() => {});
+                } else {
+                    ctx.reply('❌ An erro
