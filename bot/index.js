@@ -237,11 +237,10 @@ class TelegramBot {
         });
 
         this.bot.use(requireAuth);
-
         // ═══════════════════════════════════════════════════
         //  GLOBAL JOIN VERIFICATION + REVOCATION CHECK
-        //  Only enforces in PRIVATE chats. Silently ignores groups.
-        //  Re-checks membership if verification is stale (24h).
+        //  Only enforces in PRIVATE chats.
+        //  Allows CAPTCHA callbacks and verify callback through.
         // ═══════════════════════════════════════════════════
 
         this.bot.use(async (ctx, next) => {
@@ -256,7 +255,12 @@ class TelegramBot {
                     return next();
                 }
 
-                // ─── Allow verify callback ───
+                // ─── Allow CAPTCHA answer callbacks ───
+                if (ctx.callbackQuery?.data && /^captcha_(-?\d+)$/.test(ctx.callbackQuery.data)) {
+                    return next();
+                }
+
+                // ─── Allow verify_join_status callback ───
                 if (ctx.callbackQuery?.data === 'verify_join_status') {
                     return next();
                 }
@@ -265,8 +269,8 @@ class TelegramBot {
                 if (ctx.session?.joinVerified !== true) {
                     await ctx.reply(
                         '⛔ <b>Access Denied</b>\n\n' +
-                        'You must join our community channels before using this bot.\n\n' +
-                        'Please tap /start to complete verification.',
+                        'You must complete verification before using this bot.\n\n' +
+                        'Please tap /start to begin.',
                         { parse_mode: 'HTML' }
                     );
                     return;
@@ -279,7 +283,7 @@ class TelegramBot {
                 if (!isFresh && this.startVerification) {
                     const stillJoined = await this.startVerification.reverifyUser(ctx.from?.id, ctx);
                     if (!stillJoined) {
-                        return; // Access revoked — reverifyUser already sent message
+                        return;
                     }
                 }
 
@@ -295,6 +299,7 @@ class TelegramBot {
                 });
             }
         });
+        
 
         this.bot.use(async (ctx, next) => {
             try {
