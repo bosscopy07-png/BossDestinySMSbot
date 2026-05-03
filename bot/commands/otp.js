@@ -2296,11 +2296,11 @@ class OTPCommands {
 
     async handleContactSupport(ctx) {
         await ctx.reply(
-            '📞 <b>Contact Support</b>\n\nNeed help? Contact us at @Swiftsmssupport\n\nOur team is available 24/7.',
+            '📞 <b>Contact Support</b>\n\nNeed help? Contact us at @swiftsmssupport_bot\n\nOur team is available 24/7.',
             { 
                 parse_mode: 'HTML',
                 reply_markup: Markup.inlineKeyboard([
-                    [Markup.button.url('📞 Contact @Swiftsmssupport', 'https://t.me/Swiftsmssupport')],
+                    [Markup.button.url('📞 Contact @swiftsmssupport_bot', 'https://t.me/swiftsmssupport_bot')],
                     [Markup.button.callback('🔙 Back', 'menu')]
                 ]).reply_markup
             }
