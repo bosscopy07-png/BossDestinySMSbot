@@ -307,7 +307,7 @@ class UserCommands {
         const vipRemaining = isVip ? this._vipRemaining(user) : 0;
 
         const welcomeMessage =
-            '👋 <b>Welcome to SwiftOTP</b>, ' + (ctx.from.first_name || 'there') + '!\n\n' +
+            '👋 <b>Welcome to SwiftSMS</b>, ' + (ctx.from.first_name || 'there') + '!\n\n' +
             '🔐 Get verification codes instantly for any service.\n\n' +
             (isVip ? '👑 <b>VIP Active</b> — ' + vipRemaining + ' left today\n' : '') +
             '💰 Balance: <code>' + formatCurrency(user.balance || 0) + '</code>\n' +
