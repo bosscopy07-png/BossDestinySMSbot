@@ -473,6 +473,7 @@ class TelegramBot {
         });
     }
 
+    
     setupErrorHandling() {
         this.bot.catch(async (err, ctx) => {
             this.metrics.requestsFailed++;
@@ -504,4 +505,185 @@ class TelegramBot {
                 if (err.message?.includes('WALLET_NOT_READY')) {
                     ctx.reply('⏳ Blockchain connection warming up. Try again shortly.').catch(() => {});
                 } else {
-                    ctx.reply('❌ An erro
+                    ctx.reply('❌ An error occurred. Please try again.').catch(() => {});
+                }
+            } catch (catchErr) {
+                logger.error('Error inside bot.catch', { error: catchErr.message });
+            }
+        });
+
+        process.on('uncaughtException', async (err) => {
+            try {
+                logger.error('Uncaught Exception', { error: err.message, stack: err.stack });
+                await this.alertAdmins(err, {
+                    updateType: 'process',
+                    command: 'uncaughtException',
+                    note: 'Process crash — immediate shutdown required'
+                });
+            } catch (alertErr) {
+                logger.error('Failed to alert on uncaughtException', { error: alertErr.message });
+            }
+            if (!this.isShuttingDown) this.gracefulShutdown('uncaughtException');
+        });
+
+        process.on('unhandledRejection', async (reason) => {
+            try {
+                const err = reason instanceof Error ? reason : new Error(String(reason));
+                logger.error('Unhandled Rejection', { reason: String(reason), stack: err.stack });
+                await this.alertAdmins(err, {
+                    updateType: 'process',
+                    command: 'unhandledRejection',
+                    note: 'Unhandled promise rejection'
+                });
+            } catch (alertErr) {
+                logger.error('Failed to alert on unhandledRejection', { error: alertErr.message });
+            }
+            if (!this.isShuttingDown) this.gracefulShutdown('unhandledRejection');
+        });
+    }
+
+    startDepositScanner() {
+        let retryDelay = 5000;
+        const maxRetryDelay = 60000;
+
+        const checkAndStart = async () => {
+            if (this.isShuttingDown) return;
+
+            try {
+                if (this.walletService?.isReady) {
+                    this.walletService.startDepositScanner(30000);
+                    logger.info('Deposit scanner started');
+                    retryDelay = 5000;
+                } else {
+                    logger.warn('Wallet not ready, retrying...');
+                    setTimeout(checkAndStart, retryDelay);
+                    retryDelay = Math.min(retryDelay * 2, maxRetryDelay);
+                }
+            } catch (error) {
+                logger.error('Deposit scanner error', { error: error.message });
+                this.alertAdmins(error, {
+                    updateType: 'scanner',
+                    command: 'deposit_scanner',
+                    note: 'Deposit scanner retry loop error'
+                });
+                setTimeout(checkAndStart, retryDelay);
+                retryDelay = Math.min(retryDelay * 2, maxRetryDelay);
+            }
+        };
+
+        setTimeout(checkAndStart, 3000);
+    }
+
+    stopDepositScanner() {
+        try {
+            this.walletService?.stopDepositScanner?.();
+        } catch (error) {
+            logger.error('Error stopping scanner', { error: error.message });
+        }
+    }
+
+    async launch() {
+        try {
+            logger.info('Initializing database...');
+            await initModels();
+
+            await this.setupCommands();
+
+            this.startDepositScanner();
+
+            await this.bot.telegram.deleteWebhook({ drop_pending_updates: true });
+            await this.bot.launch();
+
+            this.isReady = true;
+            logger.info('Bot launched successfully');
+
+            process.once('SIGINT', () => this.gracefulShutdown('SIGINT'));
+            process.once('SIGTERM', () => this.gracefulShutdown('SIGTERM'));
+
+            setInterval(() => this.logMetrics(), 300000);
+
+        } catch (error) {
+            logger.error('Launch failed', { error: error.message });
+            await this.alertAdmins(error, {
+                updateType: 'launch',
+                command: 'bot_launch',
+                note: 'Bot failed to launch — critical'
+            });
+            throw error;
+        }
+    }
+
+    async gracefulShutdown(signal) {
+        if (this.isShuttingDown) return;
+        this.isShuttingDown = true;
+
+        logger.info(`Shutting down (${signal})`);
+
+        try {
+            this.bot.stop(signal);
+        } catch (e) {}
+
+        this.stopDepositScanner();
+
+        if (this.smsProviderManager) {
+            try {
+                await this.smsProviderManager.shutdown();
+            } catch (e) {
+                logger.warn('SMS Provider Manager shutdown failed', { error: e.message });
+            }
+        }
+
+        try {
+            await Promise.race([
+                this.walletService?.disconnect?.(),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+            ]);
+        } catch (e) {}
+
+        setTimeout(() => process.exit(1), 10000);
+        process.exit(0);
+    }
+
+    updateMetrics(duration) {
+        this.metrics.requestsHandled++;
+        this.metrics.avgResponseTime =
+            (this.metrics.avgResponseTime * (this.metrics.requestsHandled - 1) + duration)
+            / this.metrics.requestsHandled;
+    }
+
+    trackEvent(event, userId) {
+        setImmediate(() => {
+            logger.debug('Event tracked', { event, userId });
+        });
+    }
+
+    logMetrics() {
+        const uptime = (Date.now() - this.metrics.startTime) / 1000;
+        logger.info('Bot metrics', {
+            uptime: `${Math.floor(uptime / 60)}m`,
+            requestsHandled: this.metrics.requestsHandled,
+            requestsFailed: this.metrics.requestsFailed,
+            avgResponseTime: `${Math.round(this.metrics.avgResponseTime)}ms`,
+            activeUsers: this.metrics.activeUsers.size
+        });
+    }
+
+    getHealth() {
+        return {
+            status: this.isShuttingDown ? 'shutting_down' : this.isReady ? 'healthy' : 'starting',
+            uptime: process.uptime(),
+            memory: process.memoryUsage(),
+            metrics: {
+                requests: this.metrics.requestsHandled,
+                failed: this.metrics.requestsFailed,
+                avgResponseTime: Math.round(this.metrics.avgResponseTime),
+                activeUsers: this.metrics.activeUsers.size
+            },
+            walletReady: this.walletService?.isReady || false,
+            smsProviderReady: !!this.smsProviderManager?.isInitialized,
+            timestamp: new Date().toISOString()
+        };
+    }
+}
+
+export default TelegramBot;
