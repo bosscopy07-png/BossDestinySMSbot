@@ -1,6 +1,5 @@
 // ═══════════════════════════════════════════════════════════
 //  bot/verification/StartVerification.js
-//  Dedicated module for mandatory channel join verification.
 // ═══════════════════════════════════════════════════════════
 
 import logger from '../../utils/logger.js';
@@ -104,7 +103,7 @@ class StartVerification {
     // ═══════════════════════════════════════════════════════
 
     async handleVerifyCallback(ctx) {
-        const userId = ctx.from?.Id = ctx.from?.id;
+        const userId = ctx.from?.id;
         if (!userId) return;
 
         try {
@@ -157,8 +156,6 @@ class StartVerification {
 
     // ═══════════════════════════════════════════════════════
     //  PUBLIC: Re-check membership for an already-verified user
-    //  Call this from middleware when verification is stale.
-    //  Returns true if still joined, false if revoked.
     // ═══════════════════════════════════════════════════════
 
     async reverifyUser(userId, ctx) {
@@ -243,8 +240,7 @@ class StartVerification {
 
         return { allJoined, memberships };
     }
-
-    // ═══════════════════════════════════════════════════════
+            // ═══════════════════════════════════════════════════════
     //  PRIVATE: Send the join requirement UI
     // ═══════════════════════════════════════════════════════
 
@@ -313,4 +309,3 @@ class StartVerification {
 }
 
 export default StartVerification;
-                         
