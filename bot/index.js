@@ -60,6 +60,8 @@ class TelegramBot {
         this._adminIds = null;
         this._adminIdsTimestamp = 0;
 
+        this.startVerification = null;
+
         this.setupErrorHandling();
         this.setupMiddleware();
         this.setupWorkerPool();
@@ -86,6 +88,7 @@ class TelegramBot {
 
     // ═══════════════════════════════════════════════════════
     //  ADMIN ERROR ALERTS — Catches EVERY single error
+    //  Wrapped in try-catch so alerting never crashes the bot
     // ═══════════════════════════════════════════════════════
 
     async alertAdmins(error, context = {}) {
@@ -152,6 +155,18 @@ class TelegramBot {
             });
         });
     }
+        // ═══════════════════════════════════════════════════════
+    //  MIDDLEWARE SETUP — ORDER IS CRITICAL
+    //  1. Session
+    //  2. Metrics
+    //  3. Rate limit
+    //  4. /start INTERCEPTOR — catches /start BEFORE requireAuth
+    //     and BEFORE any command handlers (including UserCommands)
+    //  5. requireAuth
+    //  6. Global join verification (blocks non-start commands)
+    //  7. Maintenance mode
+    //  8. Dev logging
+    // ═══════════════════════════════════════════════════════
 
     setupMiddleware() {
         this.bot.use(telegrafSession({
@@ -203,23 +218,57 @@ class TelegramBot {
             }
         }));
 
+        // ═══════════════════════════════════════════════════
+        //  CRITICAL: /start INTERCEPTOR
+        //  This middleware runs BEFORE requireAuth and BEFORE
+        //  any command handlers. It catches /start and routes
+        //  it to StartVerification. It does NOT call next(),
+        //  so the update never reaches UserCommands' handlers.
+        // ═══════════════════════════════════════════════════
+
+        this.bot.use(async (ctx, next) => {
+            try {
+                const text = ctx.message?.text || '';
+                const isStartCommand = text === '/start' || /^\/start@/.test(text);
+
+                if (!isStartCommand) {
+                    return next();
+                }
+
+                // /start detected — route to verification module
+                if (!this.startVerification) {
+                    logger.error('[StartInterceptor] StartVerification not initialized');
+                    return ctx.reply('⏳ Bot is still starting. Please try again in a moment.').catch(() => {});
+                }
+
+                logger.debug('[StartInterceptor] Intercepted /start', { userId: ctx.from?.id });
+                return await this.startVerification.handleStart(ctx);
+
+            } catch (err) {
+                logger.error('[StartInterceptor] Fatal error', { error: err.message, userId: ctx.from?.id });
+                await this.alertAdmins(err, {
+                    userId: ctx.from?.id,
+                    updateType: 'message',
+                    command: '/start',
+                    note: 'Start interceptor crash — this should never happen'
+                });
+                return ctx.reply('❌ Failed to start. Please try /start again.').catch(() => {});
+            }
+        });
+
         this.bot.use(requireAuth);
 
         // ═══════════════════════════════════════════════════
         //  GLOBAL JOIN VERIFICATION MIDDLEWARE
-        //  Blocks everything EXCEPT /start and verify callback
+        //  Blocks ALL commands/actions for unverified users.
+        //  Allows: admins, verify_join_status callback, and
+        //  anything that passed the start interceptor (which
+        //  only lets /start through to verification).
         // ═══════════════════════════════════════════════════
 
         this.bot.use(async (ctx, next) => {
             try {
                 if (this.isAdmin(ctx.from?.id)) {
-                    return next();
-                }
-
-                const text = ctx.message?.text || '';
-                const isStartCommand = text === '/start' || /^\/start@/.test(text);
-
-                if (isStartCommand) {
                     return next();
                 }
 
@@ -287,8 +336,7 @@ class TelegramBot {
             });
         }
     }
-
-    async setupCommands() {
+        async setupCommands() {
         try {
             this.smsProviderManager = new SMSProviderManager();
             await this.smsProviderManager.initialize();
@@ -319,33 +367,23 @@ class TelegramBot {
         this.commandModules.set('advancedAdmin', advancedAdmin);
 
         // ═══════════════════════════════════════════════════
-        //  START VERIFICATION MODULE
-        //  This owns /start completely. UserCommands must NOT
-        //  register its own bot.start() handler.
+        //  INITIALIZE START VERIFICATION MODULE
+        //  This handles /start routing and verify_join_status.
+        //  The interceptor middleware (setup earlier) delegates
+        //  /start to this module. UserCommands NO LONGER
+        //  registers bot.start() — it was removed.
         // ═══════════════════════════════════════════════════
 
-        const startVerification = new StartVerification(
+        this.startVerification = new StartVerification(
             this.bot,
             userCommands,
             (userId) => this.isAdmin(userId),
             (err, ctx) => this.alertAdmins(err, ctx)
         );
 
-        this.bot.start(async (ctx) => {
-            try {
-                this.trackEvent('command_start', ctx.from?.id);
-                return await startVerification.handleStart(ctx);
-            } catch (err) {
-                logger.error('Bot.start wrapper error', { error: err.message, userId: ctx.from?.id });
-                await this.alertAdmins(err, {
-                    userId: ctx.from?.id,
-                    updateType: 'message',
-                    command: '/start',
-                    note: 'Outer bot.start catch — StartVerification failed'
-                });
-                return ctx.reply('❌ Failed to start. Please try /start again.').catch(() => {});
-            }
-        });
+        // DO NOT register bot.start() here — the interceptor handles it.
+        // DO NOT register bot.action('verify_join_status') here —
+        // StartVerification registers it internally.
 
         this.bot.action('help', async (ctx) => {
             try {
@@ -473,7 +511,6 @@ class TelegramBot {
         });
     }
 
-    
     setupErrorHandling() {
         this.bot.catch(async (err, ctx) => {
             this.metrics.requestsFailed++;
@@ -687,3 +724,4 @@ class TelegramBot {
 }
 
 export default TelegramBot;
+                    
