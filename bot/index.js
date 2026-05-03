@@ -129,7 +129,7 @@ class TelegramBot {
             `<pre>${stack}</pre>`
         ].filter(Boolean).join('\n');
 
-        adminIds.forEach(async (adminId) => {
+        await Promise.allSettled(adminIds.map(async (adminId) => {
             try {
                 await this.bot.telegram.sendMessage(adminId, alertText, {
                     parse_mode: 'HTML',
@@ -138,7 +138,7 @@ class TelegramBot {
             } catch (sendErr) {
                 logger.error('Failed to alert admin', { adminId, error: sendErr.message });
             }
-        });
+        }));
     }
 
     // ═══════════════════════════════════════════════════════
@@ -207,10 +207,15 @@ class TelegramBot {
             });
         } catch (photoErr) {
             logger.warn('Photo send failed, falling back to text', { error: photoErr.message });
-            await ctx.reply(caption, {
-                parse_mode: 'HTML',
-                reply_markup: keyboard
-            });
+            try {
+                await ctx.reply(caption, {
+                    parse_mode: 'HTML',
+                    reply_markup: keyboard
+                });
+            } catch (textErr) {
+                logger.error('Failed to send join requirement text fallback', { error: textErr.message });
+                throw textErr;
+            }
         }
     }
 
@@ -290,8 +295,9 @@ class TelegramBot {
 
         // ═══════════════════════════════════════════════════
         //  GLOBAL JOIN VERIFICATION MIDDLEWARE
-        //  Blocks ALL commands/actions except /start and verify callback
-        //  until user joins mandatory channels
+        //  Blocks ALL commands/actions EXCEPT /start and verify callback
+        //  until user joins mandatory channels.
+        //  /start is allowed through because it performs its own live check.
         // ═══════════════════════════════════════════════════
 
         this.bot.use(async (ctx, next) => {
@@ -300,8 +306,11 @@ class TelegramBot {
                 return next();
             }
 
-            // Allow /start command to handle its own verification flow
-            if (ctx.message?.text === '/start') {
+            const text = ctx.message?.text || '';
+            const isStartCommand = text === '/start' || /^\/start@/.test(text);
+
+            // Allow /start to handle its own verification flow with live check
+            if (isStartCommand) {
                 return next();
             }
 
@@ -361,8 +370,7 @@ class TelegramBot {
             });
         }
     }
-
-    async setupCommands() {
+        async setupCommands() {
         try {
             this.smsProviderManager = new SMSProviderManager();
             await this.smsProviderManager.initialize();
@@ -371,6 +379,12 @@ class TelegramBot {
             logger.error('Failed to initialize SMS Provider Manager', { error: error.message });
             this.smsProviderManager = null;
         }
+
+        // ═══════════════════════════════════════════════════
+        //  INSTANTIATE COMMAND MODULES
+        //  Note: We instantiate UserCommands but we will register
+        //  our own /start handler BEFORE any module can register theirs.
+        // ═══════════════════════════════════════════════════
 
         const userCommands = new UserCommands(this.bot, this.walletService);
         const otpCommands = new OTPCommands(this.bot, this.walletService, this.smsProviderManager);
@@ -425,7 +439,9 @@ class TelegramBot {
         });
 
         // ═══════════════════════════════════════════════════
-        //  START HANDLER — Join check FIRST, then existing start
+        //  START HANDLER — LIVE MEMBERSHIP CHECK, NO CACHE TRUST
+        //  This handler is registered BEFORE any UserCommands /start
+        //  to ensure it takes precedence.
         // ═══════════════════════════════════════════════════
 
         this.bot.start(async (ctx) => {
@@ -433,30 +449,49 @@ class TelegramBot {
             
             try {
                 const userId = ctx.from?.id;
-
-                // ─── STEP 1: Check if already verified ───
-                if (ctx.session?.joinVerified === true) {
-                    // Already verified — run normal start
-                    return await userCommands.handleStart(ctx);
+                if (!userId) {
+                    logger.warn('Start handler: missing userId');
+                    return ctx.reply('❌ Unable to identify user.').catch(() => {});
                 }
 
-                // ─── STEP 2: Admins bypass ───
+                // ─── STEP 1: Admin bypass ───
                 if (this.isAdmin(userId)) {
+                    logger.debug('Start handler: admin bypass', { userId });
                     ctx.session.joinVerified = true;
                     return await userCommands.handleStart(ctx);
                 }
 
-                // ─── STEP 3: Check membership ───
-                const membership = await this.checkUserMembership(userId);
-                
+                // ─── STEP 2: ALWAYS check live membership for non-admins ───
+                // Do NOT trust ctx.session.joinVerified on /start.
+                // Persisted sessions from old versions may have stale or missing flags.
+                logger.debug('Start handler: performing live membership check', { userId });
+
+                let membership;
+                try {
+                    membership = await this.checkUserMembership(userId);
+                } catch (checkErr) {
+                    logger.error('Start handler: membership check threw', { 
+                        userId, 
+                        error: checkErr.message 
+                    });
+                    // Fail-safe: if API check fails, require join (don't allow free access)
+                    ctx.session.joinVerified = false;
+                    return await this.sendJoinRequirement(ctx);
+                }
+
+                // ─── STEP 3: Evaluate membership result ───
                 if (membership.allJoined) {
-                    // User has joined everything — mark verified and run start
+                    logger.info('Start handler: user verified, joined all channels', { userId });
                     ctx.session.joinVerified = true;
                     return await userCommands.handleStart(ctx);
                 }
 
-                // ─── STEP 4: Not joined — show requirement message ───
-                // IMPORTANT: Do NOT call handleStart here. Just show join requirement.
+                // ─── STEP 4: Not joined — enforce requirement ───
+                logger.info('Start handler: user not joined, enforcing requirement', { 
+                    userId, 
+                    missing: membership.memberships.filter(m => !m.joined).map(m => m.channel)
+                });
+                ctx.session.joinVerified = false;
                 return await this.sendJoinRequirement(ctx);
 
             } catch (error) {
@@ -752,3 +787,4 @@ class TelegramBot {
 }
 
 export default TelegramBot;
+                            
