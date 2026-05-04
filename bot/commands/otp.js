@@ -435,23 +435,24 @@ class OTPCommands {
         }).sort({ createdAt: -1 });
     }
 
-        /**
+        
+    /**
      * Refund session credits (BUNDLE/VIP/FREE only)
      * FIXED: Removed CHEAP mode — releaseFunds() in handleTimeout() already handles it.
      *        CHEAP refunds go through walletService.releaseFunds() which is transaction-safe.
      *        This method now only handles credit-based modes (BUNDLE, VIP, FREE).
      */
     async _refundSession(session) {
-        const { userId, mode, cost, lockTxId } = session;
-        
+        const { userId, mode } = session;
+
         try {
             // CHEAP mode is handled by walletService.releaseFunds() in handleTimeout()
             // Calling it here would double-refund (balance += cost, lockedBalance -= cost)
             if (mode === 'CHEAP') {
-                logger.debug('CHEAP mode refund skipped — handled by releaseFunds', { 
-                    userId, 
-                    lockTxId,
-                    reason: 'releaseFunds handles CHEAP refunds transactionally' 
+                logger.debug('CHEAP mode refund skipped — handled by releaseFunds', {
+                    userId,
+                    lockTxId: session.lockTxId,
+                    reason: 'releaseFunds handles CHEAP refunds transactionally'
                 });
                 return true;
             }
@@ -466,44 +467,42 @@ class OTPCommands {
                 await User.updateOne({ userId }, { $inc: { freeUsedToday: -1 } });
                 logger.info('Free daily quota restored', { userId, sessionId: session.sessionId });
             }
-            
+
             return true;
         } catch (error) {
             logger.error('Session refund failed', { userId, mode, error: error.message });
             return false;
         }
-                    }
-    
+    }
 
-            async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
+    /**
+     * FIXED: Removed CHEAP refund from timeout notification.
+     *        CHEAP refunds are now handled EXCLUSIVELY by SessionManager.handleTimeout()
+     *        which calls walletService.releaseFunds() — this is the single source of truth.
+     *        _scheduleTimeoutNotification only handles BUNDLE/VIP/FREE credit restoration
+     *        and sends the timeout message. It NEVER touches CHEAP funds.
+     */
+    async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
         try {
             const delayMs = new Date(timeoutAt) - new Date();
             if (delayMs <= 0) return;
 
             setTimeout(async () => {
                 try {
-                    const session = await Session.findOne({ 
-                        sessionId, 
-                        status: { $in: ['WAITING', 'CHECKING'] } 
+                    const session = await Session.findOne({
+                        sessionId,
+                        status: { $in: ['WAITING', 'CHECKING'] }
                     });
-                    
+
                     if (!session) return;
 
-                    // FIXED: Do NOT call _refundSession here for CHEAP mode.
-                    // handleTimeout() already calls walletService.releaseFunds() 
-                    // which properly marks tx CANCELLED and adjusts lockedBalance.
-                    // _refundSession for CHEAP was adding balance back directly,
-                    // causing double refund (balance += cost from here, 
-                    // lockedBalance -= cost from both places).
-                    //
-                    // Only refund credit-based modes here (BUNDLE, VIP, FREE).
-                    // CHEAP refund is handled by the timeout handler in _startMonitoring().
+                    // FIXED: Only refund credit-based modes here (BUNDLE, VIP, FREE).
+                    // CHEAP refund is handled EXCLUSIVELY by SessionManager.handleTimeout().
                     if (session.mode !== 'CHEAP') {
                         await this._refundSession(session);
                     }
 
                     // Update session status if still waiting
-                    // (handleTimeout may have already done this, so check first)
                     const currentSession = await Session.findOne({ sessionId }).lean();
                     if (currentSession && ['WAITING', 'CHECKING'].includes(currentSession.status)) {
                         await Session.updateOne(
@@ -521,7 +520,7 @@ class OTPCommands {
                             FREE: 'Free quota restored'
                         }[session.mode] || 'Funds handled';
 
-                        const timeoutMessage = 
+                        const timeoutMessage =
                             `⏰ <b>OTP Request Timed Out</b>\n\n` +
                             `📱 Number: <code>${session.number}</code>\n` +
                             `🎯 Service: ${session.service}\n` +
@@ -546,9 +545,8 @@ class OTPCommands {
         } catch (error) {
             logger.error('Failed to schedule timeout', { userId, sessionId, error: error.message });
         }
-                            }
-                            
-                
+    }
+                 }
     
                     // ═══════════════════════════════════════════════════════════════════════════════
 //  OTPCommands.js — Part 2: Main Menu, My Number, Mode Handlers, Selection
