@@ -4,14 +4,26 @@ import { generateId } from '../../utils/helpers.js';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
 
+// ═══════════════════════════════════════════════════════════
+//  RPC CONFIGURATION — DUAL-MODE SYSTEM
+// ═══════════════════════════════════════════════════════════
+
+const LIGHT_RPC_URL = 'https://bnb-mainnet.g.alchemy.com/v2/FYyZrOxSDZWjqzljvhIgt';
+const PREMIUM_RPC_TIMEOUT_MS = 15000;
+const IDLE_SCAN_INTERVAL_MS = 60000;      // 60s when idle (light RPC)
+const ACTIVE_SCAN_INTERVAL_MS = 15000;    // 15s when active deposit exists
+const ACTIVE_MODE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes after last deposit init
+const ACTIVE_MODE_EXTENSION_MS = 15 * 60 * 1000; // Extend active mode to 15min total
+
 /**
  * WalletService — Blockchain deposits, fund locking, balance management
  * 
- * RPC FALLBACK ORDER:
- * 1. Configured RPC (env.js)
- * 2. Personal BSC RPC 2 (Alchemy)
- * 3. Personal BSC RPC 3 (BlockPI)
- * 4. Public fallbacks (Ankr, Binance, Defibit, Ninicoin)
+ * DUAL-RPC ARCHITECTURE:
+ * - IDLE MODE: Uses lightweight public RPC, slow interval (60s), minimal credits
+ * - ACTIVE MODE: Uses premium configured RPC, fast interval (15s), triggered by deposit
+ * 
+ * STATE TRANSITIONS:
+ *   IDLE ──[user initiates deposit]──► ACTIVE ──[10-15min no new deposits]──► IDLE
  */
 class WalletService {
     constructor() {
@@ -26,6 +38,13 @@ class WalletService {
         this.notificationCallback = null;
         this.notifiedTxHashes = new Set();
         this.initializationPromise = null;
+        
+        // ═══ DUAL-RPC STATE ═══
+        this.scanMode = 'IDLE';           // 'IDLE' | 'ACTIVE'
+        this.activeModeExpiry = 0;      // Timestamp when active mode expires
+        this.lightProvider = null;      // Lightweight RPC provider
+        this.premiumProvider = null;    // Premium RPC provider
+        this.currentProviderType = null; // 'light' | 'premium'
         
         this.usdtAbi = [
             'function balanceOf(address) view returns (uint256)',
@@ -45,50 +64,66 @@ class WalletService {
     //  RPC ENDPOINTS — PRIORITY ORDER
     // ═══════════════════════════════════════════════════════════
 
-    _getRpcEndpoints() {
+    _getPremiumRpcEndpoints() {
         const endpoints = [
-            // 1. Configured RPC from env
             config.blockchain?.rpc,
-            // 2. Personal BSC RPC 2 (Alchemy)
             'https://go.getblock.us/3d92a58434934d8fb726cd0c12fb5715',
-            // 3. Personal BSC RPC 3 (BlockPI)
             'https://bsc.blockpi.network/v1/rpc/8ca241ff53aa72bd97b543bf72e1ad9a1231049c',
-            // 4. Public fallbacks
             'https://rpc.ankr.com/bsc',
             'https://bsc-dataseed.binance.org/',
             'https://bsc-dataseed1.defibit.io/',
             'https://bsc-dataseed1.ninicoin.io/'
         ];
 
-        // Remove duplicates and empty values
         return endpoints.filter((url, i, self) => url && self.indexOf(url) === i);
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  INITIALIZATION
+    //  DUAL-RPC INITIALIZATION
     // ═══════════════════════════════════════════════════════════
 
     async initialize() {
-        const rpcEndpoints = this._getRpcEndpoints();
+        // ─── Initialize LIGHT provider first (always available) ───
+        try {
+            this.lightProvider = new ethers.JsonRpcProvider(LIGHT_RPC_URL, undefined, {
+                staticNetwork: true,
+                batchMaxCount: 1
+            });
+
+            const lightTest = this.lightProvider.getNetwork();
+            const lightTimeout = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('LIGHT_RPC_TIMEOUT')), 10000)
+            );
+            
+            await Promise.race([lightTest, lightTimeout]);
+            logger.info('Light RPC initialized', { rpc: this._maskRpcUrl(LIGHT_RPC_URL) });
+
+        } catch (error) {
+            logger.error('Light RPC failed to initialize', { error: error.message });
+            this.lightProvider = null;
+        }
+
+        // ─── Initialize PREMIUM provider ───
+        const premiumEndpoints = this._getPremiumRpcEndpoints();
         let lastError = null;
 
-        for (const rpcUrl of rpcEndpoints) {
+        for (const rpcUrl of premiumEndpoints) {
             try {
-                this.provider = new ethers.JsonRpcProvider(rpcUrl, undefined, {
+                this.premiumProvider = new ethers.JsonRpcProvider(rpcUrl, undefined, {
                     staticNetwork: true,
                     batchMaxCount: 1
                 });
 
-                const testPromise = this.provider.getNetwork();
+                const testPromise = this.premiumProvider.getNetwork();
                 const timeoutPromise = new Promise((_, reject) => 
-                    setTimeout(() => reject(new Error('RPC_TIMEOUT')), 8000)
+                    setTimeout(() => reject(new Error('PREMIUM_RPC_TIMEOUT')), 8000)
                 );
                 
                 await Promise.race([testPromise, timeoutPromise]);
 
                 this.masterWallet = new ethers.Wallet(
                     config.blockchain?.masterPrivateKey, 
-                    this.provider
+                    this.premiumProvider
                 );
                 
                 this.usdtContract = new ethers.Contract(
@@ -100,6 +135,9 @@ class WalletService {
                 this.masterAddress = this.masterWallet.address;
                 this.isReady = true;
 
+                // Start in IDLE mode using light provider
+                this._switchToIdleMode();
+
                 try {
                     this.lastCheckedBlock = await this.provider.getBlockNumber();
                 } catch {
@@ -108,8 +146,8 @@ class WalletService {
 
                 logger.info('Wallet service initialized', {
                     masterAddress: this.masterAddress,
-                    rpc: this._maskRpcUrl(rpcUrl),
-                    rpcIndex: rpcEndpoints.indexOf(rpcUrl)
+                    premiumRpc: this._maskRpcUrl(rpcUrl),
+                    lightRpcAvailable: !!this.lightProvider
                 });
 
                 await this.initializeDecimals();
@@ -117,19 +155,17 @@ class WalletService {
 
             } catch (error) {
                 lastError = error;
-                logger.warn('RPC failed, trying next...', { 
+                logger.warn('Premium RPC failed, trying next...', { 
                     rpc: this._maskRpcUrl(rpcUrl),
-                    error: error.message,
-                    code: error.code
+                    error: error.message
                 });
-                this.provider = null;
+                this.premiumProvider = null;
             }
         }
 
-        // All RPCs failed — degraded mode
-        logger.error('All RPC endpoints failed — running in degraded mode', {
-            lastError: lastError?.message,
-            totalEndpoints: rpcEndpoints.length
+        // All premium RPCs failed — degraded mode
+        logger.error('All premium RPC endpoints failed — running in degraded mode', {
+            lastError: lastError?.message
         });
         
         this.masterWallet = new ethers.Wallet(config.blockchain?.masterPrivateKey);
@@ -139,7 +175,7 @@ class WalletService {
 
     _maskRpcUrl(url) {
         if (!url) return 'undefined';
-        return url.replace(/\/\/.*@/, '//***@').replace(/\/v2\/.*/, '/v2/***');
+        return url.replace(/\/\/.*@/, '//***@').replace(/\/v2\/.*/, '/v2/***').replace(/\/v1\/.*/, '/v1/***');
     }
 
     async initializeDecimals() {
@@ -168,8 +204,156 @@ class WalletService {
             throw new Error('WALLET_NOT_READY — blockchain connection unavailable. Check RPC URL or try again later.');
         }
     }
+
+    // ═══════════════════════════════════════════════════════════
+    //  DUAL-RPC MODE SWITCHING
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Switch to IDLE mode: use light RPC, slow interval
+     */
+    _switchToIdleMode() {
+        if (this.scanMode === 'IDLE' && this.currentProviderType === 'light') {
+            return; // Already idle
+        }
+
+        this.scanMode = 'IDLE';
+        this.provider = this.lightProvider;
+        this.currentProviderType = 'light';
+
+        // Re-create contract instance with light provider (read-only)
+        if (this.lightProvider && this.masterAddress) {
+            this.usdtContract = new ethers.Contract(
+                config.blockchain?.usdtContract,
+                this.usdtAbi,
+                this.lightProvider  // read-only, no signer needed for scanning
+            );
+        }
+
+        logger.info('Switched to IDLE scanning mode', {
+            rpc: 'light',
+            interval: `${IDLE_SCAN_INTERVAL_MS}ms`,
+            reason: 'No active deposits or timeout expired'
+        });
+
+        this._restartScanner();
+    }
+
+    /**
+     * Switch to ACTIVE mode: use premium RPC, fast interval
+     * Triggered when user initiates a deposit
+     */
+    _switchToActiveMode() {
+        if (!this.premiumProvider) {
+            logger.warn('Cannot switch to ACTIVE mode — premium RPC unavailable');
+            return;
+        }
+
+        const now = Date.now();
+        const wasAlreadyActive = this.scanMode === 'ACTIVE';
+
+        this.scanMode = 'ACTIVE';
+        this.activeModeExpiry = now + ACTIVE_MODE_TIMEOUT_MS;
+        this.provider = this.premiumProvider;
+        this.currentProviderType = 'premium';
+
+        // Re-create contract with premium provider (has signer for potential writes)
+        this.usdtContract = new ethers.Contract(
+            config.blockchain?.usdtContract,
+            this.usdtAbi,
+            this.masterWallet  // signer attached for full operations
+        );
+
+        const reason = wasAlreadyActive ? 'Deposit initiated — extending active window' : 'Deposit initiated — switching to premium RPC';
+
+        logger.info('Switched to ACTIVE scanning mode', {
+            rpc: 'premium',
+            interval: `${ACTIVE_SCAN_INTERVAL_MS}ms`,
+            expiresIn: `${Math.round((this.activeModeExpiry - now) / 1000)}s`,
+            reason
+        });
+
+        this._restartScanner();
+    }
+
+    /**
+     * Check if we should extend or expire active mode
+     */
+    _evaluateScanMode() {
+        const now = Date.now();
+
+        if (this.scanMode === 'ACTIVE' && now >= this.activeModeExpiry) {
+            // Check if any deposits are still pending before going idle
+            this._checkPendingDeposits().then(hasPending => {
+                if (hasPending) {
+                    // Extend active mode if deposits are still pending
+                    this.activeModeExpiry = now + ACTIVE_MODE_EXTENSION_MS;
+                    logger.info('Extended ACTIVE mode — pending deposits exist', {
+                        newExpiry: new Date(this.activeModeExpiry).toISOString()
+                    });
+                } else {
+                    this._switchToIdleMode();
+                }
+            }).catch(err => {
+                logger.error('Failed to check pending deposits, staying in current mode', { error: err.message });
+            });
+        }
+    }
+
+    /**
+     * Check if any users have pending deposits
+     */
+    async _checkPendingDeposits() {
+        try {
+            const pendingCount = await User.countDocuments({ depositPending: true });
+            return pendingCount > 0;
+        } catch (error) {
+            logger.error('Failed to count pending deposits', { error: error.message });
+            return false; // Fail-safe: assume no pending to avoid staying active forever
+        }
+    }
+
+    /**
+     * Restart scanner with current mode's interval
+     */
+    _restartScanner() {
+        if (this.scanInterval) {
+            clearInterval(this.scanInterval);
+            this.scanInterval = null;
+        }
+
+        const interval = this.scanMode === 'ACTIVE' ? ACTIVE_SCAN_INTERVAL_MS : IDLE_SCAN_INTERVAL_MS;
+
+        if (!this.isReady) {
+            logger.warn('Cannot restart scanner — wallet not ready');
+            return;
+        }
+
+        this.scanInterval = setInterval(async () => {
+            try {
+                // Evaluate mode transition before each scan
+                this._evaluateScanMode();
+
+                // Only scan if we have a valid provider
+                if (!this.provider) {
+                    logger.warn('No provider available for scan');
+                    return;
+                }
+
+                await this.checkAllDeposits();
+            } catch (error) {
+                logger.error('Deposit scanner error', { 
+                    error: error.message,
+                    mode: this.scanMode,
+                    provider: this.currentProviderType
+                });
+            }
+        }, interval);
+
+        this.scanInterval.unref?.();
+    }
         // ═══════════════════════════════════════════════════════════
-    //  DEPOSIT SYSTEM
+    //  DEPOSIT SYSTEM — MODIFIED TO TRIGGER ACTIVE MODE
     // ═══════════════════════════════════════════════════════════
 
     async getDepositInfo(userId, requestedAmount = 10) {
@@ -198,6 +382,9 @@ class WalletService {
             { upsert: true }
         );
 
+        // ═══ TRIGGER ACTIVE MODE when user initiates deposit ═══
+        this._switchToActiveMode();
+
         return {
             address: this.masterAddress,
             amount: trackingAmount,
@@ -219,7 +406,7 @@ class WalletService {
 
         try {
             const latestBlock = await this.provider.getBlockNumber();
-            const scanRange = 500;
+            const scanRange = this.scanMode === 'ACTIVE' ? 200 : 100; // Smaller range in idle
             
             let fromBlock = this.lastCheckedBlock || (latestBlock - scanRange);
             
@@ -254,7 +441,11 @@ class WalletService {
             return processedDeposits;
 
         } catch (error) {
-            logger.error('Deposit check failed', { error: error.message });
+            logger.error('Deposit check failed', { 
+                error: error.message,
+                mode: this.scanMode,
+                provider: this.currentProviderType
+            });
             
             if (error.message?.includes('exceeds the limits') || error.message?.includes('Forbidden')) {
                 try {
@@ -307,7 +498,8 @@ class WalletService {
                 logger.warn('Deposit received but no matching user found', {
                     from: fromAddress,
                     amount,
-                    txHash
+                    txHash,
+                    mode: this.scanMode
                 });
                 return null;
             }
@@ -383,7 +575,8 @@ class WalletService {
                 trackingAmount: amount,
                 trackingFee,
                 txHash,
-                from: fromAddress
+                from: fromAddress,
+                mode: this.scanMode
             });
 
             if (this.notificationCallback && !this.notifiedTxHashes.has(txHash)) {
@@ -492,7 +685,7 @@ class WalletService {
 
         try {
             const latestBlock = await this.provider.getBlockNumber();
-            const scanRange = 500;
+            const scanRange = this.scanMode === 'ACTIVE' ? 200 : 100;
             let fromBlock = Math.max(0, latestBlock - scanRange);
 
             const filter = this.usdtContract.filters.Transfer(null, this.masterAddress);
@@ -554,8 +747,9 @@ class WalletService {
 
             throw error;
         }
-                    }
-                    // ═══════════════════════════════════════════════════════════
+    }
+
+    // ═══════════════════════════════════════════════════════════
     //  REFERRAL SYSTEM
     // ═══════════════════════════════════════════════════════════
 
@@ -732,319 +926,3 @@ class WalletService {
         } catch (error) {
             logger.error('Failed to capture funds', { txId, userId, error: error.message });
             throw error;
-        }
-    }
-
-    async releaseFunds(txId, userId, reason) {
-        try {
-            const tx = await Transaction.findOne({ txId, userId });
-            if (!tx) {
-                throw new Error('TRANSACTION_NOT_FOUND');
-            }
-            if (tx.status !== 'PENDING') {
-                logger.warn('Release skipped: transaction not pending', {
-                    txId,
-                    userId,
-                    currentStatus: tx.status,
-                    reason
-                });
-                return { 
-                    success: false, 
-                    error: 'TRANSACTION_NOT_PENDING',
-                    currentStatus: tx.status,
-                    alreadyReleased: tx.status === 'CANCELLED'
-                };
-            }
-
-            const amount = Math.abs(tx.amount);
-            if (amount <= 0) {
-                throw new Error('INVALID_AMOUNT');
-            }
-
-            const user = await User.findOne({ userId });
-            if (!user) {
-                throw new Error('USER_NOT_FOUND');
-            }
-
-            const currentLocked = user.lockedBalance || 0;
-            const releaseAmount = Math.min(amount, currentLocked);
-            
-            if (releaseAmount < amount) {
-                logger.warn('Partial release: insufficient locked balance', {
-                    userId,
-                    txId,
-                    requestedRelease: amount,
-                    actualRelease: releaseAmount,
-                    currentLockedBalance: currentLocked,
-                    reason
-                });
-            }
-
-            await Transaction.updateOne(
-                { txId },
-                {
-                    $set: {
-                        status: 'CANCELLED',
-                        'metadata.releasedAt': new Date(),
-                        'metadata.releaseReason': reason,
-                        'metadata.requestedAmount': amount,
-                        'metadata.actualReleasedAmount': releaseAmount,
-                        'metadata.previousLockedBalance': currentLocked
-                    }
-                }
-            );
-
-            const updateResult = await User.updateOne(
-                { userId },
-                [
-                    {
-                        $set: {
-                            lockedBalance: {
-                                $max: [
-                                    0,
-                                    { $subtract: ['$lockedBalance', releaseAmount] }
-                                ]
-                            }
-                        }
-                    }
-                ]
-            );
-
-            if (updateResult.matchedCount === 0) {
-                await Transaction.updateOne(
-                    { txId },
-                    { $set: { status: 'PENDING' } }
-                );
-                throw new Error('USER_UPDATE_FAILED');
-            }
-
-            logger.info('Funds released', { 
-                userId, 
-                txId,
-                requestedAmount: amount,
-                releasedAmount: releaseAmount,
-                previousLockedBalance: currentLocked,
-                newLockedBalance: Math.max(0, currentLocked - releaseAmount),
-                reason
-            });
-
-            return { 
-                success: true, 
-                releasedAmount: releaseAmount,
-                requestedAmount: amount,
-                wasPartial: releaseAmount < amount
-            };
-
-        } catch (error) {
-            logger.error('Failed to release funds', { 
-                txId, 
-                userId, 
-                reason,
-                error: error.message 
-            });
-            throw error;
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  ADMIN BALANCE OPERATIONS
-    // ═══════════════════════════════════════════════════════════
-
-    async addBalance(userId, amount, adminId, reason) {
-        const txId = generateId();
-
-        if (isNaN(amount) || amount <= 0) {
-            throw new Error('INVALID_AMOUNT');
-        }
-
-        const user = await User.findOne({ userId }).select('_id userId');
-        if (!user) {
-            throw new Error('USER_NOT_FOUND');
-        }
-
-        let txCreated = false;
-
-        try {
-            await Transaction.create({
-                txId,
-                userId,
-                type: 'ADMIN_ADD',
-                amount,
-                currency: 'USD',
-                status: 'COMPLETED',
-                processedBy: adminId,
-                metadata: { reason, isCredit: true }
-            });
-            txCreated = true;
-
-            const userUpdate = await User.updateOne(
-                { userId },
-                { $inc: { balance: amount } }
-            );
-
-            if (userUpdate.matchedCount === 0) {
-                throw new Error('USER_UPDATE_FAILED');
-            }
-
-            logger.info('Balance added by admin', { userId, amount, adminId, reason, txId });
-
-            return txId;
-
-        } catch (error) {
-            if (txCreated) {
-                try {
-                    await Transaction.deleteOne({ txId });
-                    logger.warn('Rolled back orphaned transaction', { txId, reason: error.message });
-                } catch (rollbackError) {
-                    logger.error('Failed to rollback transaction', { txId, error: rollbackError.message });
-                }
-            }
-
-            logger.error('Failed to add balance', { userId, amount, adminId, error: error.message });
-            throw error;
-        }
-    }
-
-    async deductBalance(userId, amount, adminId, reason) {
-        const txId = generateId();
-
-        if (isNaN(amount) || amount <= 0) {
-            throw new Error('INVALID_AMOUNT');
-        }
-
-        let txCreated = false;
-
-        try {
-            const user = await User.findOneAndUpdate(
-                {
-                    userId,
-                    $expr: { $gte: ['$balance', amount] }
-                },
-                { $inc: { balance: -amount } },
-                { new: true }
-            );
-
-            if (!user) {
-                throw new Error('INSUFFICIENT_BALANCE');
-            }
-
-            await Transaction.create({
-                txId,
-                userId,
-                type: 'ADMIN_DEDUCT',
-                amount: -amount,
-                currency: 'USD',
-                status: 'COMPLETED',
-                processedBy: adminId,
-                metadata: { reason, isDebit: true }
-            });
-            txCreated = true;
-
-            logger.info('Balance deducted by admin', { userId, amount, adminId, reason, txId });
-
-            return txId;
-
-        } catch (error) {
-            if (txCreated === false && error.message !== 'INSUFFICIENT_BALANCE' && error.message !== 'INVALID_AMOUNT') {
-                try {
-                    await User.updateOne({ userId }, { $inc: { balance: amount } });
-                    logger.warn('Restored user balance after failed transaction creation', { userId, amount, txId });
-                } catch (rollbackError) {
-                    logger.error('CRITICAL: Failed to restore user balance', { userId, amount, txId, error: rollbackError.message });
-                }
-            }
-
-            if (txCreated) {
-                try {
-                    await Transaction.deleteOne({ txId });
-                    logger.warn('Rolled back orphaned transaction', { txId, reason: error.message });
-                } catch (rollbackError) {
-                    logger.error('Failed to rollback transaction', { txId, error: rollbackError.message });
-                }
-            }
-
-            logger.error('Failed to deduct balance', { userId, amount, adminId, error: error.message });
-            throw error;
-        }
-    }
-
-    async getDepositAddress(userId) {
-        const user = await User.findOne({ userId });
-        if (user && user.depositAddress) {
-            return user.depositAddress;
-        }
-        const info = await this.getDepositInfo(userId);
-        return info.address;
-    }
-
-    getMasterAddress() {
-        return this.masterAddress || 'WALLET_NOT_READY';
-    }
-
-    async getMasterBalance() {
-        await this.ensureReady();
-
-        try {
-            const bnbBalance = await this.provider.getBalance(this.masterWallet.address);
-            const usdtBalance = await this.usdtContract.balanceOf(this.masterWallet.address);
-            
-            return {
-                bnb: ethers.formatEther(bnbBalance),
-                usdt: ethers.formatUnits(usdtBalance, this.decimals)
-            };
-        } catch (error) {
-            logger.error('Failed to get master balance', { error: error.message });
-            throw new Error('BALANCE_CHECK_FAILED — ' + error.message);
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  BACKGROUND SCANNER
-    // ═══════════════════════════════════════════════════════════
-
-    startDepositScanner(intervalMs = 30000) {
-        if (!this.isReady) {
-            logger.warn('Cannot start scanner — wallet not ready');
-            return;
-        }
-
-        if (this.scanInterval) {
-            clearInterval(this.scanInterval);
-        }
-
-        logger.info('Starting deposit scanner', { interval: intervalMs });
-
-        this.scanInterval = setInterval(async () => {
-            try {
-                await this.checkAllDeposits();
-            } catch (error) {
-                logger.error('Deposit scanner error', { error: error.message });
-            }
-        }, intervalMs);
-
-        this.scanInterval.unref?.();
-    }
-
-    stopDepositScanner() {
-        if (this.scanInterval) {
-            clearInterval(this.scanInterval);
-            this.scanInterval = null;
-            logger.info('Deposit scanner stopped');
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  GRACEFUL SHUTDOWN
-    // ═══════════════════════════════════════════════════════════
-
-    async disconnect() {
-        this.stopDepositScanner();
-        this.provider?.removeAllListeners?.();
-        this.provider = null;
-        this.isReady = false;
-        logger.info('Wallet service disconnected');
-    }
-}
-
-export default WalletService;
-                                             
