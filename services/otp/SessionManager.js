@@ -1,5 +1,9 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// SessionManager.js — Session lifecycle management
+// ═══════════════════════════════════════════════════════════════════════════════
+
 import { Session, User, Transaction } from '../../models/index.js';
-import { generateId, getDuration } from '../../utils/helpers.js';
+import { generateId } from '../../utils/helpers.js';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
 
@@ -45,23 +49,23 @@ class SessionManager {
         this.numberPoolManager = numberPoolManager;
 
         // In-memory session tracking
-        this.activeSessions = new Map();      // sessionId -> sessionData
-        this.sessionTimeouts = new Map();     // sessionId -> timeoutTimer
-        this.pollTimers = new Map();          // sessionId -> pollTimer
+        this.activeSessions = new Map();
+        this.sessionTimeouts = new Map();
+        this.pollTimers = new Map();
 
         // Configuration
         this.config = {
             pollIntervals: {
-                FREE: 10000,      // 10s
-                CHEAP: 5000,      // 5s
-                BUNDLE: 5000,     // 5s
-                VIP: 1000         // 1s
+                FREE: 10000,
+                CHEAP: 5000,
+                BUNDLE: 5000,
+                VIP: 1000
             },
             timeouts: {
-                FREE: 120,        // 2 minutes
-                CHEAP: 180,       // 3 minutes
-                BUNDLE: 180,      // 3 minutes
-                VIP: 60           // 1 minute
+                FREE: 120,
+                CHEAP: 180,
+                BUNDLE: 180,
+                VIP: 60
             },
             maxRetries: {
                 FREE: 0,
@@ -82,42 +86,33 @@ class SessionManager {
         process.on('SIGTERM', this._shutdownHandler);
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  PUBLIC API - Session Creation
-    // ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+//  PUBLIC API - Session Creation
+// ═══════════════════════════════════════════════════════════
 
-    /**
-     * Create a new OTP session (standard flow)
-     */
     async createSession(userId, mode, service, country = 'US') {
         return this._createSessionInternal(userId, mode, service, country);
     }
 
     /**
-     * Create session with pre-assigned number (VIP/CHEAP/FREE flow)
-     * 
+     * Create session with pre-assigned number
      * FIXED: Now accepts providerNumberId and cost as separate params
-     * Previously: (userId, mode, service, country, phoneNumber, provider) — providerNumberId was LOST
-     * Now: (userId, mode, service, country, phoneNumber, provider, providerNumberId, cost)
      */
     async createSessionWithNumber(userId, mode, service, country, phoneNumber, provider, providerNumberId = null, cost = 0) {
         const numberData = {
             phoneNumber,
             provider,
-            providerNumberId: providerNumberId,  // FIXED: Now properly captured
+            providerNumberId: providerNumberId,
             providerInstance: null,
-            cost: parseFloat(cost) || 0  // FIXED: Pass actual cost from 5SIM
+            cost: parseFloat(cost) || 0
         };
         return this._createSessionInternal(userId, mode, service, country, numberData);
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  PUBLIC API - Session Queries
-    // ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+//  PUBLIC API - Session Queries
+// ═══════════════════════════════════════════════════════════
 
-    /**
-     * Check session status by ID (for Check OTP button)
-     */
     async checkSessionStatus(sessionId) {
         const session = await Session.findOne({ sessionId }).lean();
         if (!session) {
@@ -133,7 +128,6 @@ class SessionManager {
                 );
 
                 if (providerResult.success && providerResult.otp) {
-                    // OTP found! Auto-deliver
                     await this.deliverOTP(session, providerResult.otp);
                     return {
                         status: 'RECEIVED',
@@ -144,7 +138,6 @@ class SessionManager {
                     };
                 }
 
-                // Update CHECKING status if we haven't yet
                 if (session.status === 'WAITING') {
                     await Session.updateOne(
                         { sessionId },
@@ -157,7 +150,6 @@ class SessionManager {
             }
         }
 
-        // Return current status
         return {
             sessionId: session.sessionId,
             status: session.status,
@@ -172,9 +164,6 @@ class SessionManager {
         };
     }
 
-    /**
-     * Check session status by user (for manual polling)
-     */
     async checkSessionByUser(userId) {
         const session = await Session.findOne({
             userId,
@@ -188,20 +177,19 @@ class SessionManager {
         return this.checkSessionStatus(session.sessionId);
     }
 
-        /**
+    /**
      * Cancel an active session
      * FIXED:
      * - Only releases funds if lockTx is still PENDING
      * - Prevents double-refund by checking tx status first
      * - Returns detailed cancel result
-     * - Cleans up memory timers properly
      */
     async cancelSession(sessionId, userId) {
         const session = await Session.findOne({ sessionId, userId });
         if (!session) {
             throw new Error('SESSION_NOT_FOUND');
         }
-        
+
         if (!['WAITING', 'CHECKING'].includes(session.status)) {
             throw new Error('SESSION_NOT_CANCELLABLE');
         }
@@ -210,7 +198,6 @@ class SessionManager {
         let providerReleased = false;
 
         try {
-            // Step 1: Release provider number FIRST
             await this._releaseProviderNumber(session, 'USER_CANCELLED');
             providerReleased = true;
         } catch (providerError) {
@@ -218,10 +205,8 @@ class SessionManager {
                 sessionId,
                 error: providerError.message
             });
-            // Continue — provider release is best-effort
         }
 
-        // Step 2: Restore credits (bundle/vip/free counts)
         try {
             await this._restoreCredits(session);
         } catch (creditError) {
@@ -229,16 +214,13 @@ class SessionManager {
                 sessionId,
                 error: creditError.message
             });
-            // Continue — don't block refund if credits fail
         }
 
-        // Step 3: Release locked funds — ONLY if still PENDING
         if (session.lockTxId) {
             try {
-                // Check if transaction is still PENDING before releasing
-                const lockTx = await Transaction.findOne({ 
+                const lockTx = await Transaction.findOne({
                     txId: session.lockTxId,
-                    userId 
+                    userId
                 });
 
                 if (!lockTx) {
@@ -250,17 +232,15 @@ class SessionManager {
                     logger.warn('Lock transaction already processed, skipping release', {
                         sessionId,
                         lockTxId: session.lockTxId,
-                        lockTxStatus: lockTx.status,
-                        lockTxType: lockTx.type
+                        lockTxStatus: lockTx.status
                     });
                 } else {
-                    // FIXED: Only release if actually PENDING
                     const releaseResult = await this.walletService.releaseFunds(
                         session.lockTxId,
                         userId,
                         'USER_CANCELLED'
                     );
-                    
+
                     if (releaseResult.success) {
                         releasedAmount = releaseResult.releasedAmount || session.cost || 0;
                     }
@@ -271,12 +251,9 @@ class SessionManager {
                     lockTxId: session.lockTxId,
                     error: releaseError.message
                 });
-                // Continue — session is still cancelled, but funds may be stuck
-                // Admin should manually review
             }
         }
 
-        // Step 4: Mark session as cancelled
         try {
             await Session.markCancelled(sessionId);
         } catch (dbError) {
@@ -287,12 +264,11 @@ class SessionManager {
             throw new Error('SESSION_CANCEL_DB_FAILED');
         }
 
-        // Step 5: Cleanup memory
         this._cleanupSession(sessionId);
 
-        logger.info('Session cancelled by user', { 
-            sessionId, 
-            userId, 
+        logger.info('Session cancelled by user', {
+            sessionId,
+            userId,
             mode: session.mode,
             releasedAmount,
             providerReleased,
@@ -308,24 +284,17 @@ class SessionManager {
             providerReleased
         };
     }
-    
 
     /**
-     * Deliver OTP to session (called by webhook or polling)
-     */
-        /**
-     * Deliver OTP to session (called by webhook or polling)
+     * Deliver OTP to session
      * FIXED:
-     * - Removes duplicate totalSpent increment (now handled in captureFunds)
+     * - Removes duplicate totalSpent increment
      * - Calls finishNumber on 5SIM after OTP delivery
-     * - Uses generateId() for transaction txId instead of hardcoded
-     * - Wraps Transaction.create in try/catch with proper logging
-     * - Validates providerNumberId before calling finish
+     * - Uses generateId() for transaction txId
      */
     async deliverOTP(session, otp) {
         const sessionId = session.sessionId || session;
 
-        // If string passed, look up session
         if (typeof session === 'string') {
             session = await Session.findOne({ sessionId }).lean();
             if (!session) {
@@ -334,7 +303,6 @@ class SessionManager {
             }
         }
 
-        // Idempotency check — already delivered?
         if (session.status === 'RECEIVED') {
             logger.warn('OTP already delivered', { sessionId });
             return session;
@@ -342,7 +310,6 @@ class SessionManager {
 
         const maskedOtp = this.maskOTP(otp);
 
-        // Update session atomically — only if still in deliverable state
         const updated = await Session.findOneAndUpdate(
             { sessionId, status: { $in: ['WAITING', 'CHECKING'] } },
             {
@@ -365,17 +332,12 @@ class SessionManager {
         if (session.mode === 'CHEAP' && session.lockTxId) {
             try {
                 await this.walletService.captureFunds(session.lockTxId, session.userId);
-                // FIXED: Removed duplicate User.updateOne for totalSpent
-                // captureFunds now handles: balance -= amount, lockedBalance -= amount, totalSpent += amount
             } catch (captureError) {
                 logger.error('Fund capture failed', { sessionId, error: captureError.message });
-                // Continue — OTP is delivered, but funds may not be captured
-                // This is a critical error that needs admin attention
             }
         }
 
         // FIXED: Call finishNumber on 5SIM to mark activation as complete
-        // This prevents 5SIM from keeping the number reserved
         if (session.mode === 'CHEAP' && session.providerNumberId && this.providerManager) {
             try {
                 const finishResult = await this.providerManager.finishNumber(
@@ -393,38 +355,36 @@ class SessionManager {
                     activationId: session.providerNumberId,
                     error: finishError.message
                 });
-                // Non-critical — OTP already delivered, 5SIM will auto-expire
             }
         }
-            // Create transaction record for paid modes
-    if (session.cost > 0 && session.mode === 'CHEAP') {
-        try {
-            await Transaction.create({
-                txId: generateId(),
-                userId: session.userId,
-                type: 'OTP_PURCHASE',  // ← FIXED: Use valid enum value
-                amount: -session.cost,
-                currency: 'USD',
-                status: 'COMPLETED',
-                metadata: {
-                    sessionId,
-                    service: session.service,
-                    mode: session.mode,
-                    number: session.number,
-                    provider: session.provider,
-                    providerNumberId: session.providerNumberId,
-                    otpDeliveredAt: new Date()
-                }
-            });
-        } catch (txError) {
-            logger.error('Transaction record failed', { sessionId, error: txError.message });
+
+        // Create transaction record for paid modes
+        if (session.cost > 0 && session.mode === 'CHEAP') {
+            try {
+                await Transaction.create({
+                    txId: generateId(),
+                    userId: session.userId,
+                    type: 'OTP_PURCHASE',
+                    amount: -session.cost,
+                    currency: 'USD',
+                    status: 'COMPLETED',
+                    metadata: {
+                        sessionId,
+                        service: session.service,
+                        mode: session.mode,
+                        number: session.number,
+                        provider: session.provider,
+                        providerNumberId: session.providerNumberId,
+                        otpDeliveredAt: new Date()
+                    }
+                });
+            } catch (txError) {
+                logger.error('Transaction record failed', { sessionId, error: txError.message });
+            }
         }
-    }
-    
-        // Cleanup memory timers
+
         this._cleanupSession(sessionId);
 
-        // Notify via notification service if available
         if (this.notificationService) {
             try {
                 await this.notificationService.notifyOTPReceived(session.userId, {
@@ -441,17 +401,17 @@ class SessionManager {
         logger.info('OTP delivered', {
             sessionId,
             userId: session.userId,
-            duration: getDuration(session.startTime),
+            duration: this._getDuration(session.startTime),
             mode: session.mode,
             cost: session.cost
         });
 
         return updated;
-        }
-                    
+    }
+
     /**
      * Handle session timeout
-     * FIXED: Now properly cancels on 5SIM using activation ID
+     * FIXED: Now properly cancels on 5SIM using activation ID before refund
      */
     async handleTimeout(session) {
         const sessionId = session.sessionId || session;
@@ -461,18 +421,35 @@ class SessionManager {
             if (!session) return null;
         }
 
-        // Idempotency check
         if (!['WAITING', 'CHECKING'].includes(session.status)) {
             return null;
         }
 
-        // FIXED: Release provider number using correct activation ID for CHEAP
+        // FIXED: Cancel on 5SIM FIRST before releasing funds
+        // This prevents 5SIM from keeping the number reserved for 10min
+        if (session.mode === 'CHEAP' && session.providerNumberId && this.providerManager) {
+            try {
+                await this.providerManager.cancelCheapNumber(session.providerNumberId);
+                logger.info('5SIM cancelled on timeout', {
+                    sessionId,
+                    activationId: session.providerNumberId
+                });
+            } catch (cancelError) {
+                logger.warn('5SIM cancel on timeout failed (non-critical)', {
+                    sessionId,
+                    activationId: session.providerNumberId,
+                    error: cancelError.message
+                });
+            }
+        }
+
+        // Release provider number
         await this._releaseProviderNumber(session, 'TIMEOUT');
 
         // Restore credits
         await this._restoreCredits(session);
 
-        // Release locked funds
+        // Release locked funds — SINGLE SOURCE OF TRUTH for CHEAP refunds
         if (session.lockTxId) {
             await this.walletService.releaseFunds(
                 session.lockTxId,
@@ -481,13 +458,9 @@ class SessionManager {
             );
         }
 
-        // Update session
         await Session.markTimeout(sessionId);
-
-        // Cleanup
         this._cleanupSession(sessionId);
 
-        // Send timeout notification
         if (this.notificationService) {
             try {
                 await this.notificationService.notifyTimeout(session.userId, {
@@ -527,15 +500,12 @@ class SessionManager {
             sessionId,
             userId: session.userId,
             mode: session.mode,
-            duration: getDuration(session.startTime)
+            duration: this._getDuration(session.startTime)
         });
 
         return { retried: false };
     }
 
-    /**
-     * Handle provider-side failure
-     */
     async handleProviderFailure(session, providerStatus) {
         const sessionId = session.sessionId || session;
 
@@ -546,7 +516,6 @@ class SessionManager {
 
         const finalStatus = ProviderStatusMap[providerStatus] || 'FAILED';
 
-        // Release funds
         if (session.lockTxId) {
             await this.walletService.releaseFunds(
                 session.lockTxId,
@@ -555,10 +524,8 @@ class SessionManager {
             );
         }
 
-        // Restore credits
         await this._restoreCredits(session);
 
-        // Update session
         await Session.updateOne(
             { sessionId },
             { $set: { status: finalStatus, endTime: new Date() } }
@@ -576,9 +543,9 @@ class SessionManager {
         return finalStatus;
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  PUBLIC API - Queries
-    // ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+//  PUBLIC API - Queries
+// ═══════════════════════════════════════════════════════════
 
     async getActiveSession(userId) {
         return Session.findOne({
@@ -617,460 +584,11 @@ class SessionManager {
         };
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  INTERNAL - Session Creation
-    // ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+//  INTERNAL - Session Creation
+// ═══════════════════════════════════════════════════════════
 
-            async _createSessionInternal(userId, mode, service, country, preAssignedNumber = null) {
-        // Check for existing active session
+    async _createSessionInternal(userId, mode, service, country, preAssignedNumber = null) {
         const existing = await Session.findOne({
             userId,
-            status: { $in: ['WAITING', 'CHECKING'] }
-        }).lean();
-
-        if (existing) {
-            logger.warn('Active session exists', { userId, existingSessionId: existing.sessionId });
-            throw new Error('ACTIVE_SESSION_EXISTS');
-        }
-
-        // Validate user
-        const user = await User.findOne({ userId });
-        if (!user) throw new Error('USER_NOT_FOUND');
-        if (user.isBlacklisted) throw new Error('USER_BLACKLISTED');
-
-        // Validate mode access
-        await this._validateModeAccess(user, mode);
-
-        // Validate service
-        if (!this.config.services.includes(service)) {
-            throw new Error('INVALID_SERVICE');
-        }
-
-        // Acquire number
-        let numberData;
-        try {
-            if (preAssignedNumber) {
-                numberData = preAssignedNumber;
-            } else if (mode === 'VIP' && this.numberPoolManager) {
-                numberData = await this.numberPoolManager.acquireNumber(country, service, userId);
-            } else {
-                numberData = await this.providerManager.getNumber(mode, country, service);
-            }
-        } catch (error) {
-            logger.error('Number acquisition failed', {
-                userId, mode, service, country, error: error.message
-            });
-            throw new Error('NUMBER_UNAVAILABLE: ' + error.message);
-        }
-
-        // Validate number
-        if (!numberData.phoneNumber || numberData.phoneNumber.length < 7) {
-            logger.error('Invalid phone number', {
-                userId,
-                phone: numberData.phoneNumber,
-                provider: numberData.provider
-            });
-            await this._releaseProviderNumber({ ...numberData, mode }, 'INVALID_NUMBER');
-            throw new Error('INVALID_NUMBER_FROM_PROVIDER');
-        }
-
-        // Handle finances
-        // FIXED: Pass numberData.cost so CHEAP uses actual 5SIM display price, not hardcoded $0.05
-        const { cost, lockTxId } = await this._handleFinances(user, userId, mode, numberData, service);
-
-        // Calculate timeout
-        const timeoutSeconds = this.config.timeouts[mode] || 120;
-        const timeoutAt = new Date(Date.now() + timeoutSeconds * 1000);
-
-        // Create session
-        // FIXED: Store providerNumberId from numberData (activation ID for 5SIM)
-        const session = await Session.create({
-            sessionId: generateId(),
-            userId,
-            mode,
-            service,
-            country,
-            number: numberData.phoneNumber,
-            provider: numberData.provider,
-            providerNumberId: numberData.providerNumberId || null,  // FIXED: Now stores activation ID
-            status: 'WAITING',
-            startTime: new Date(),
-            timeoutAt,
-            cost,
-            lockTxId,
-            maxRetries: this.config.maxRetries[mode] || 0
-        });
-
-        // Start monitoring
-        this._startMonitoring(session, numberData.providerInstance);
-
-        logger.info('Session created', {
-            sessionId: session.sessionId,
-            userId,
-            mode,
-            service,
-            number: this.maskPhone(session.number),
-            provider: numberData.provider,
-            providerNumberId: numberData.providerNumberId,  // Log activation ID for debugging
-            cost,
-            timeoutAt
-        });
-
-        return session;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  INTERNAL - Finances (FIXED)
-    // ═══════════════════════════════════════════════════════════
-
-    /**
-     * FIXED: Now uses actual cost from numberData for CHEAP mode
-     * Previously: Always used config.pricing?.cheapOtp || 0.05
-     * Now: Uses numberData.displayCost or numberData.cost for CHEAP
-     */
-    async _handleFinances(user, userId, mode, numberData, service) {
-        let cost = 0;
-        let lockTxId = null;
-
-        switch (mode) {
-            case 'CHEAP': {
-                // FIXED: Use display price from 5SIM (with profit margin), not hardcoded $0.05
-                // numberData.displayCost = what user pays (e.g. $0.57)
-                // numberData.cost = what 5SIM charges (e.g. $0.37)
-                cost = parseFloat(numberData.displayCost) || parseFloat(numberData.cost) || config.pricing?.cheapOtp || 0.05;
-                
-                // Ensure cost is valid
-                if (cost <= 0) {
-                    cost = config.pricing?.cheapOtp || 0.05;
-                }
-
-                const availableBalance = typeof user.getAvailableBalance === 'function'
-                    ? user.getAvailableBalance()
-                    : (user.balance || 0) - (user.lockedBalance || 0);
-
-                if (availableBalance < cost) {
-                    await this._releaseProviderNumber({ ...numberData, mode }, 'FUNDS_LOCK_FAILED');
-                    throw new Error('INSUFFICIENT_FUNDS');
-                }
-
-                try {
-                    lockTxId = await this.walletService.lockFunds(userId, cost, `OTP_${service}`);
-                } catch (error) {
-                    await this._releaseProviderNumber({ ...numberData, mode }, 'FUNDS_LOCK_FAILED');
-                    throw new Error('INSUFFICIENT_FUNDS');
-                }
-                break;
-            }
-
-            case 'BUNDLE': {
-                const bundleRemaining = user.bundleRemaining || 0;
-                if (bundleRemaining <= 0) {
-                    await this._releaseProviderNumber({ ...numberData, mode }, 'BUNDLE_EMPTY');
-                    throw new Error('BUNDLE_EMPTY');
-                }
-                await User.updateOne({ userId }, { $inc: { bundleRemaining: -1 } });
-                break;
-            }
-
-            case 'VIP': {
-                await User.updateOne({ userId }, { $inc: { vipDailyUsed: 1 } });
-                break;
-            }
-
-            case 'FREE': {
-                await User.updateOne({ userId }, { $inc: { freeUsedToday: 1 } });
-                break;
-            }
-        }
-
-        return { cost, lockTxId };
-    }
-
-    async _restoreCredits(session) {
-        const restoreConfig = CreditRestoreConfig[session.mode];
-        if (!restoreConfig) return;
-
-        try {
-            await User.updateOne(
-                { userId: session.userId },
-                { $inc: { [restoreConfig.field]: restoreConfig.amount } }
-            );
-            logger.info('Credits restored', {
-                sessionId: session.sessionId,
-                mode: session.mode,
-                field: restoreConfig.field,
-                amount: restoreConfig.amount
-            });
-        } catch (error) {
-            logger.error('Credit restoration failed', {
-                sessionId: session.sessionId,
-                error: error.message
-            });
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  INTERNAL - Provider Management (FIXED)
-    // ═══════════════════════════════════════════════════════════
-
-    /**
-     * FIXED: Properly uses providerNumberId for CHEAP mode (5SIM activation ID)
-     * Previously: Used session.providerNumberId || session.number — fell back to phone number
-     * Now: For CHEAP, uses session.providerNumberId (activation ID). Only falls back for other modes.
-     */
-    async _releaseProviderNumber(session, reason) {
-        try {
-            if (session.mode === 'VIP' && this.numberPoolManager && session.providerNumberId) {
-                await this.numberPoolManager.releaseNumber(session.providerNumberId, reason);
-            } else if (session.mode === 'CHEAP' && session.providerNumberId) {
-                // FIXED: CHEAP mode MUST use providerNumberId (activation ID like "1001025384")
-                // NEVER use session.number (phone number like "+4915511298251") for 5SIM cancel
-                await this.providerManager.cancelNumber(
-                    session.provider,
-                    session.providerNumberId  // Activation ID, not phone number
-                );
-            } else if (this.providerManager) {
-                // For other modes or if providerNumberId is missing, use number as fallback
-                await this.providerManager.cancelNumber(
-                    session.provider,
-                    session.providerNumberId || session.number
-                );
-            }
-        } catch (error) {
-            logger.warn('Provider release failed', {
-                sessionId: session.sessionId || 'unknown',
-                mode: session.mode,
-                providerNumberId: session.providerNumberId,
-                number: session.number,
-                reason,
-                error: error.message
-            });
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  INTERNAL - Validation
-    // ═══════════════════════════════════════════════════════════
-
-    async _validateModeAccess(user, mode) {
-        const checks = {
-            FREE: () => {
-                if (typeof user.canUseFree === 'function' ? !user.canUseFree() : (user.freeUsedToday || 0) >= (config.limits?.freeDaily || 3)) {
-                    throw new Error('FREE_LIMIT_REACHED');
-                }
-            },
-            CHEAP: () => {
-                // FIXED: Use dynamic minimum balance check instead of hardcoded $0.05
-                // We can't know exact price yet, so check if they have at least $0.05
-                // The actual price check happens in _handleFinances after number acquisition
-                const minBalance = 0.05; // Minimum to enter CHEAP flow
-                const available = typeof user.getAvailableBalance === 'function'
-                    ? user.getAvailableBalance()
-                    : (user.balance || 0) - (user.lockedBalance || 0);
-                if (available < minBalance) {
-                    throw new Error('INSUFFICIENT_BALANCE');
-                }
-            },
-            VIP: () => {
-                const isActive = typeof user.isVipActive === 'function'
-                    ? user.isVipActive()
-                    : !!(user.vipExpiry && new Date(user.vipExpiry) > new Date());
-                if (!isActive) throw new Error('VIP_EXPIRED');
-
-                const canUse = typeof user.canUseVip === 'function'
-                    ? user.canUseVip()
-                    : (user.vipDailyUsed || 0) < (config.limits?.vipDaily || 50);
-                if (!canUse) throw new Error('VIP_DAILY_LIMIT_REACHED');
-            },
-            BUNDLE: () => {
-                if ((user.bundleRemaining || 0) <= 0) {
-                    throw new Error('BUNDLE_EMPTY');
-                }
-            }
-        };
-
-        const check = checks[mode];
-        if (!check) throw new Error('INVALID_MODE');
-
-        await check();
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  INTERNAL - Monitoring
-    // ═══════════════════════════════════════════════════════════
-
-    _startMonitoring(session, providerInstance) {
-        const sessionId = session.sessionId;
-
-        // Store in memory
-        this.activeSessions.set(sessionId, {
-            session,
-            providerInstance,
-            state: SessionState.CREATED,
-            lastPollAt: null,
-            pollCount: 0
-        });
-
-        // Schedule timeout
-        const timeoutMs = new Date(session.timeoutAt) - Date.now();
-        const timeoutTimer = setTimeout(async () => {
-            try {
-                const current = await Session.findOne({ sessionId }).lean();
-                if (current && ['WAITING', 'CHECKING'].includes(current.status)) {
-                    await this.handleTimeout(current);
-                }
-            } catch (error) {
-                logger.error('Timeout handler error', { sessionId, error: error.message });
-            }
-        }, Math.max(timeoutMs, 0));
-
-        this.sessionTimeouts.set(sessionId, timeoutTimer);
-
-        // Start polling
-        const pollInterval = this.config.pollIntervals[session.mode] || 5000;
-        this._schedulePoll(sessionId, pollInterval);
-    }
-
-    _schedulePoll(sessionId, interval) {
-        const timer = setTimeout(async () => {
-            await this._pollProvider(sessionId, interval);
-        }, interval);
-
-        this.pollTimers.set(sessionId, timer);
-    }
-
-    async _pollProvider(sessionId, interval) {
-        const sessionData = this.activeSessions.get(sessionId);
-        if (!sessionData) return;
-
-        try {
-            const current = await Session.findOne({ sessionId }).lean();
-            if (!current || !['WAITING', 'CHECKING'].includes(current.status)) {
-                this._cleanupSession(sessionId);
-                return;
-            }
-
-            // Check timeout
-            if (new Date() > new Date(current.timeoutAt)) {
-                return; // Timeout handler will take care of this
-            }
-
-            sessionData.lastPollAt = new Date();
-            sessionData.pollCount++;
-            sessionData.state = SessionState.MONITORING;
-
-            // Update to CHECKING after first poll
-            if (current.status === 'WAITING') {
-                await Session.updateOne(
-                    { sessionId },
-                    { $set: { status: 'CHECKING' } }
-                );
-            }
-
-            // Poll provider
-            const result = await this.providerManager.checkSMS(
-                current.provider,
-                current.providerNumberId || current.number
-            );
-
-            if (result.success && result.otp) {
-                await this.deliverOTP(current, result.otp);
-                return;
-            }
-
-            if (result.status && ['CANCELLED', 'TIMEOUT', 'EXPIRED', 'ERROR', 'BANNED'].includes(result.status)) {
-                await this.handleProviderFailure(current, result.status);
-                return;
-            }
-
-            // Schedule next poll
-            this._schedulePoll(sessionId, interval);
-
-        } catch (error) {
-            logger.error('Poll error', {
-                sessionId,
-                error: error.message,
-                pollCount: sessionData.pollCount
-            });
-
-            // Continue polling on error
-            this._schedulePoll(sessionId, interval);
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  INTERNAL - Cleanup
-    // ═══════════════════════════════════════════════════════════
-
-    _cleanupSession(sessionId) {
-        // Clear poll timer
-        const pollTimer = this.pollTimers.get(sessionId);
-        if (pollTimer) {
-            clearTimeout(pollTimer);
-            this.pollTimers.delete(sessionId);
-        }
-
-        // Clear timeout timer
-        const timeoutTimer = this.sessionTimeouts.get(sessionId);
-        if (timeoutTimer) {
-            clearTimeout(timeoutTimer);
-            this.sessionTimeouts.delete(sessionId);
-        }
-
-        // Remove from active sessions
-        const sessionData = this.activeSessions.get(sessionId);
-        if (sessionData) {
-            sessionData.state = SessionState.CLEANED;
-            this.activeSessions.delete(sessionId);
-        }
-
-        logger.debug('Session cleaned up', { sessionId });
-    }
-
-    async _gracefulShutdown() {
-        logger.info('SessionManager shutting down...', {
-            activeSessions: this.activeSessions.size
-        });
-
-        // Cancel all active sessions
-        const promises = [];
-        for (const [sessionId, sessionData] of this.activeSessions) {
-            promises.push(
-                this.handleProviderFailure(sessionData.session, 'CANCELLED').catch(err => {
-                    logger.error('Shutdown cleanup error', { sessionId, error: err.message });
-                })
-            );
-        }
-
-        await Promise.allSettled(promises);
-
-        // Clear all timers
-        for (const timer of this.pollTimers.values()) clearTimeout(timer);
-        for (const timer of this.sessionTimeouts.values()) clearTimeout(timer);
-
-        this.activeSessions.clear();
-        this.pollTimers.clear();
-        this.sessionTimeouts.clear();
-
-        process.removeListener('SIGINT', this._shutdownHandler);
-        process.removeListener('SIGTERM', this._shutdownHandler);
-
-        logger.info('SessionManager shutdown complete');
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  UTILITIES
-    // ═══════════════════════════════════════════════════════════
-
-    maskOTP(otp) {
-        if (!otp || otp.length <= 3) return '***';
-        return '*'.repeat(otp.length - 3) + otp.slice(-3);
-    }
-
-    maskPhone(phone) {
-        if (!phone || phone.length < 4) return '****';
-        return phone.slice(0, -4).replace(/\d/g, '*') + phone.slice(-4);
-    }
-}
-
-export default SessionManager;
+     
