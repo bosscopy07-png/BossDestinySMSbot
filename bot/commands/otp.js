@@ -105,28 +105,14 @@ class OTPCommands {
     // ═══════════════════════════════════════════════════════════════════════
     
     _canUseFree(user) {
-    // DEFENSIVE: Handle missing or malformed user object
-    if (!user || typeof user !== 'object') {
-        return false;
+    const limit = config.limits?.freeDaily || 3;
+    return (user.freeUsedToday || 0) < limit;
     }
 
-    const freeUsedToday = user.freeUsedToday ?? 0;
-    const freeDailyLimit = user.freeDailyLimit ?? (config.limits?.freeDaily ?? 3);
-
-    return freeUsedToday < freeDailyLimit;
-}
-
-_freeRemaining(user) {
-    // DEFENSIVE: Handle missing or malformed user object
-    if (!user || typeof user !== 'object') {
-        return 0;
+    _freeRemaining(user) {
+    const limit = config.limits?.freeDaily || 3;
+    return Math.max(0, limit - (user.freeUsedToday || 0));
     }
-
-    const freeUsedToday = user.freeUsedToday ?? 0;
-    const freeDailyLimit = user.freeDailyLimit ?? (config.limits?.freeDaily ?? 3);
-
-    return Math.max(0, freeDailyLimit - freeUsedToday);
-}
     
     _canUseVip(user) {
         if (!this._isVipActive(user)) return false;
