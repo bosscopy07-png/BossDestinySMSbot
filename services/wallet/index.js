@@ -50,7 +50,7 @@ class WalletService {
             // 1. Configured RPC from env
             config.blockchain?.rpc,
             // 2. Personal BSC RPC 2 (Alchemy)
-            'https://bnb-mainnet.g.alchemy.com/v2/tPaAwIeLlNsxo2Ye1TOKr',
+            'https://go.getblock.us/3d92a58434934d8fb726cd0c12fb5715',
             // 3. Personal BSC RPC 3 (BlockPI)
             'https://bsc.blockpi.network/v1/rpc/8ca241ff53aa72bd97b543bf72e1ad9a1231049c',
             // 4. Public fallbacks
