@@ -365,7 +365,7 @@ class TelegramBot {
                 });
             });
         }
-            }
+                    }
                         async setupCommands() {
         try {
             this.smsProviderManager = new SMSProviderManager();
@@ -529,9 +529,7 @@ class TelegramBot {
             }
         });
     }
-    
 
-    
     setupErrorHandling() {
         this.bot.catch(async (err, ctx) => {
             this.metrics.requestsFailed++;
@@ -709,13 +707,6 @@ class TelegramBot {
             / this.metrics.requestsHandled;
     }
 
-walletReady: this.walletService?.isReady || false,
-walletScanMode: this.walletService?.scanMode || 'unknown',
-walletRpcType: this.walletService?.currentProviderType || 'none',
-walletActiveExpiry: this.walletService?.activeModeExpiry 
-    ? new Date(this.walletService.activeModeExpiry).toISOString() 
-    : null,
-    
     trackEvent(event, userId) {
         setImmediate(() => {
             logger.debug('Event tracked', { event, userId });
@@ -745,6 +736,8 @@ walletActiveExpiry: this.walletService?.activeModeExpiry
                 activeUsers: this.metrics.activeUsers.size
             },
             walletReady: this.walletService?.isReady || false,
+            walletScanMode: this.walletService?.scanMode || 'unknown',
+            walletRpcType: this.walletService?.currentProviderType || 'none',
             smsProviderReady: !!this.smsProviderManager?.isInitialized,
             timestamp: new Date().toISOString()
         };
@@ -752,4 +745,4 @@ walletActiveExpiry: this.walletService?.activeModeExpiry
 }
 
 export default TelegramBot;
-    
+            
