@@ -30,19 +30,30 @@ class StartVerification {
         this._registerCallbacks();
     }
 
+    /**
+     * Resolves the effective user ID from a context.
+     * Handles anonymous channel/group posts where ctx.from is the sender_chat.
+     */
+    _getEffectiveUserId(ctx) {
+        if (ctx.senderChat?.id) {
+            return ctx.senderChat.id;
+        }
+        return ctx.from?.id;
+    }
+
     // ═══════════════════════════════════════════════════════
     //  PUBLIC API: Main entry point for /start
     // ═══════════════════════════════════════════════════════
 
     async handleStart(ctx) {
-        const userId = ctx.from?.id;
+        const userId = this._getEffectiveUserId(ctx);
 
         if (!userId) {
             logger.warn('[StartVerification] Missing userId in /start');
             return ctx.reply('❌ Unable to identify user. Please try again.').catch(() => {});
         }
 
-        // ─── Admin bypass ───
+        // ─── Admin bypass (supports anonymous posts) ───
         if (this.isAdmin(userId)) {
             logger.debug('[StartVerification] Admin bypass', { userId });
             ctx.session.joinVerified = true;
@@ -203,7 +214,7 @@ class StartVerification {
     // ═══════════════════════════════════════════════════════
 
     async handleCaptchaAnswer(ctx) {
-        const userId = ctx.from?.id;
+        const userId = this._getEffectiveUserId(ctx);
         if (!userId) return;
 
         try {
@@ -281,7 +292,7 @@ class StartVerification {
     // ═══════════════════════════════════════════════════════
 
     async handleVerifyCallback(ctx) {
-        const userId = ctx.from?.id;
+        const userId = this._getEffectiveUserId(ctx);
         if (!userId) return;
 
         try {
@@ -334,6 +345,7 @@ class StartVerification {
 
     // ═══════════════════════════════════════════════════════
     //  PUBLIC: Re-check membership for an already-verified user
+    //  FAIL-CLOSED: Returns false on error (revokes access)
     // ═══════════════════════════════════════════════════════
 
     async reverifyUser(userId, ctx) {
@@ -362,12 +374,20 @@ class StartVerification {
             return false;
 
         } catch (checkErr) {
-            logger.error('[StartVerification] Re-verify check failed', { userId, error: checkErr.message });
-            return true;
+            // FAIL-CLOSED: On API error, revoke access rather than allow
+            logger.error('[StartVerification] Re-verify check failed — revoking access', { userId, error: checkErr.message });
+            ctx.session.joinVerified = false;
+            delete ctx.session.joinVerifiedAt;
+
+            await ctx.reply(
+                '⛔ <b>Verification Error</b>\n\n' +
+                'Unable to verify your channel membership. Please try /start again later.',
+                { parse_mode: 'HTML' }
+            ).catch(() => {});
+            return false;
         }
     }
-
-    // ═══════════════════════════════════════════════════════
+            // ═══════════════════════════════════════════════════════
     //  PRIVATE: Register callback actions
     // ═══════════════════════════════════════════════════════
 
@@ -419,7 +439,8 @@ class StartVerification {
 
         return { allJoined, memberships };
     }
-        // ═══════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════
     //  PRIVATE: Send the join requirement UI
     // ═══════════════════════════════════════════════════════
 
@@ -474,10 +495,10 @@ class StartVerification {
         } catch (err) {
             logger.error('[StartVerification] userCommands.handleStart failed', {
                 error: err.message,
-                userId: ctx.from?.id
+                userId: this._getEffectiveUserId(ctx)
             });
             await this.alertAdmins(err, {
-                userId: ctx.from?.id,
+                userId: this._getEffectiveUserId(ctx),
                 updateType: 'message',
                 command: '/start',
                 note: 'User verified but handleStart threw'
