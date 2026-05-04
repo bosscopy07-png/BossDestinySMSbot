@@ -546,7 +546,7 @@ class OTPCommands {
             logger.error('Failed to schedule timeout', { userId, sessionId, error: error.message });
         }
     }
-                 }
+                 
     
                     // ═══════════════════════════════════════════════════════════════════════════════
 //  OTPCommands.js — Part 2: Main Menu, My Number, Mode Handlers, Selection
