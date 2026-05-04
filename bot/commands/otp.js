@@ -105,14 +105,29 @@ class OTPCommands {
     // ═══════════════════════════════════════════════════════════════════════
     
     _canUseFree(user) {
-    const limit = config.limits?.freeDaily || 3;
-    return (user.freeUsedToday || 0) < limit;
+    // DEFENSIVE: Reject if user object is missing or invalid
+    if (!user || typeof user !== 'object') {
+        return false;
     }
 
-    _freeRemaining(user) {
     const limit = config.limits?.freeDaily || 3;
-    return Math.max(0, limit - (user.freeUsedToday || 0));
+    const used = Number.isFinite(user.freeUsedToday) ? user.freeUsedToday : 0;
+
+    return used < limit;
+}
+
+_freeRemaining(user) {
+    // DEFENSIVE: Reject if user object is missing or invalid
+    if (!user || typeof user !== 'object') {
+        return 0;
     }
+
+    const limit = config.limits?.freeDaily || 3;
+    const used = Number.isFinite(user.freeUsedToday) ? user.freeUsedToday : 0;
+
+    return Math.max(0, limit - used);
+}
+    
     
     _canUseVip(user) {
         if (!this._isVipActive(user)) return false;
@@ -658,10 +673,20 @@ class OTPCommands {
     // ═══════════════════════════════════════════════════════════════════════
     //  MODE HANDLERS
     // ═══════════════════════════════════════════════════════════════════════
+async handleFreeMode(ctx) {
+    const user = ctx.state.user;
 
-    async handleFreeMode(ctx) {
-        const user = ctx.state.user;
-        
+    if (!user) {
+        logger.warn('handleFreeMode: missing user in ctx.state', { 
+            fromId: ctx.from?.id,
+            updateId: ctx.update?.update_id 
+        });
+        return ctx.reply(
+            '⚠️ Session expired. Please send /start to continue.',
+            { parse_mode: 'HTML' }
+        );
+    }
+
         if (!this._canUseFree(user)) {
             const message = 
                 '❌ <b>Free Limit Reached</b>\n\n' +
