@@ -82,9 +82,29 @@ class TelegramBot {
         return this._adminIds;
     }
 
+    /**
+     * Resolves the effective user ID from a context.
+     * Handles anonymous channel/group posts where ctx.from is the sender_chat.
+     */
+    _getEffectiveUserId(ctx) {
+        // Anonymous channel/group post: sender_chat contains the real actor
+        if (ctx.senderChat?.id) {
+            return ctx.senderChat.id;
+        }
+        return ctx.from?.id;
+    }
+
     isAdmin(userId) {
         if (!userId) return false;
         return this.getAdminIds().includes(userId.toString());
+    }
+
+    /**
+     * Checks if the effective user (including anonymous posts) is an admin.
+     */
+    isEffectiveAdmin(ctx) {
+        const effectiveId = this._getEffectiveUserId(ctx);
+        return this.isAdmin(effectiveId);
     }
 
     async alertAdmins(error, context = {}) {
@@ -175,14 +195,19 @@ class TelegramBot {
                 awaitingUserNotes: null,
                 awaitingBalanceFreeze: null,
                 joinVerified: false,
-                joinVerifiedAt: null
+                joinVerifiedAt: null,
+                captchaPassed: false,
+                captchaAnswer: null,
+                captchaAttempts: 0,
+                captchaBlockedUntil: null
             })
         }));
 
         this.bot.use(async (ctx, next) => {
             const startTime = Date.now();
-            if (ctx.from?.id) {
-                this.metrics.activeUsers.add(ctx.from.id.toString());
+            const effectiveUserId = this._getEffectiveUserId(ctx);
+            if (effectiveUserId) {
+                this.metrics.activeUsers.add(effectiveUserId.toString());
             }
             ctx.state.startTime = startTime;
             try {
@@ -237,6 +262,7 @@ class TelegramBot {
         });
 
         this.bot.use(requireAuth);
+
         // ═══════════════════════════════════════════════════
         //  GLOBAL JOIN VERIFICATION + REVOCATION CHECK
         //  Only enforces in PRIVATE chats.
@@ -250,8 +276,8 @@ class TelegramBot {
                     return next();
                 }
 
-                // ─── Admin bypass ───
-                if (this.isAdmin(ctx.from?.id)) {
+                // ─── Admin bypass (supports anonymous posts) ───
+                if (this.isEffectiveAdmin(ctx)) {
                     return next();
                 }
 
@@ -299,7 +325,6 @@ class TelegramBot {
                 });
             }
         });
-        
 
         this.bot.use(async (ctx, next) => {
             try {
@@ -307,7 +332,8 @@ class TelegramBot {
                     return ctx.reply('🔴 Bot is restarting. Please try again in a moment.').catch(() => {});
                 }
 
-                const isAdmin = this.isAdmin(ctx.from?.id);
+                // ─── Use effective admin check for maintenance bypass ───
+                const isAdmin = this.isEffectiveAdmin(ctx);
 
                 if (config.maintenance && !isAdmin) {
                     return ctx.reply(
@@ -340,7 +366,7 @@ class TelegramBot {
             });
         }
             }
-                    async setupCommands() {
+                        async setupCommands() {
         try {
             this.smsProviderManager = new SMSProviderManager();
             await this.smsProviderManager.initialize();
@@ -422,7 +448,7 @@ class TelegramBot {
 
         this.bot.action('open_admin_dashboard', async (ctx) => {
             try {
-                if (!this.isAdmin(ctx.from?.id)) {
+                if (!this.isEffectiveAdmin(ctx)) {
                     return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
                 }
                 await advancedAdmin.showDashboard(ctx, true);
@@ -440,7 +466,8 @@ class TelegramBot {
             try {
                 if (!ctx.session) return next();
 
-                const isAdmin = this.isAdmin(ctx.from?.id);
+                // ─── Use effective admin check for text input handling ───
+                const isAdmin = this.isEffectiveAdmin(ctx);
 
                 if (isAdmin) {
                     const handled = await advancedAdmin.handleTextInput(ctx);
@@ -569,10 +596,9 @@ class TelegramBot {
             }
             if (!this.isShuttingDown) this.gracefulShutdown('unhandledRejection');
         });
-                }
-                                                      
-    
-            startDepositScanner() {
+    }
+
+    startDepositScanner() {
         let retryDelay = 5000;
         const maxRetryDelay = 60000;
 
@@ -717,4 +743,4 @@ class TelegramBot {
 }
 
 export default TelegramBot;
-                
+    
