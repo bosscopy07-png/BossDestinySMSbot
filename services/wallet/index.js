@@ -8,7 +8,7 @@ import config from '../../config/env.js';
 //  RPC CONFIGURATION — DUAL-MODE SYSTEM
 // ═══════════════════════════════════════════════════════════
 
-const LIGHT_RPC_URL = 'https://bnb-mainnet.g.alchemy.com/v2/FYyZrOxSDZWjqzljvhIgt';
+const LIGHT_RPC_URL = 'https://bsc.blockpi.network/v1/rpc/8ca241ff53aa72bd97b543bf72e1ad9a1231049c';
 const PREMIUM_RPC_TIMEOUT_MS = 15000;
 const IDLE_SCAN_INTERVAL_MS = 60000;      // 60s when idle (light RPC)
 const ACTIVE_SCAN_INTERVAL_MS = 15000;    // 15s when active deposit exists
