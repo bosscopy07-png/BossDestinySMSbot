@@ -190,6 +190,38 @@ class AdminCommands {
             return this.replySuccess(ctx, text, extra);
         }
     }
+    
+    /**
+ * Safely edits a message, handling both text and photo messages.
+ * Falls back to sending a new message if edit fails.
+ */
+async _safeEditMessage(ctx, text, keyboard) {
+    try {
+        if (ctx.callbackQuery?.message?.text) {
+            await ctx.editMessageText(text, {
+                parse_mode: 'HTML',
+                reply_markup: keyboard.reply_markup
+            });
+        } else if (ctx.callbackQuery?.message?.caption) {
+            await ctx.editMessageCaption(text, {
+                parse_mode: 'HTML',
+                reply_markup: keyboard.reply_markup
+            });
+        } else {
+            await ctx.reply(text, {
+                parse_mode: 'HTML',
+                reply_markup: keyboard.reply_markup
+            });
+        }
+    } catch (err) {
+        logger.warn('_safeEditMessage failed, sending new message', { error: err.message });
+        await ctx.reply(text, {
+            parse_mode: 'HTML',
+            reply_markup: keyboard.reply_markup
+        });
+    }
+}
+    
 
     // ─── Admin middleware ───
         // ─── Admin middleware ───
@@ -422,7 +454,6 @@ this.bot.action('admin_rpc_control', async (ctx) => {
         await this.replyError(ctx, '❌ Failed to load RPC control panel.');
     }
 });
-
 this.bot.action('rpc_force_idle', async (ctx) => {
     try {
         await ctx.answerCbQuery('⏳ Switching to IDLE...').catch(() => {});
@@ -445,17 +476,14 @@ this.bot.action('rpc_force_idle', async (ctx) => {
             [Markup.button.callback('🏠 Admin Dashboard', 'admin_dashboard')]
         ]);
 
-        await ctx.editMessageText(message, {
-            parse_mode: 'HTML',
-            reply_markup: keyboard.reply_markup
-        });
+        await this._safeEditMessage(ctx, message, keyboard);
 
     } catch (err) {
         logger.error('Force idle error', { error: err.message, userId: ctx.from?.id });
         await this.replyError(ctx, '❌ Failed to switch to IDLE mode.');
     }
 });
-
+    
 this.bot.action('rpc_force_active', async (ctx) => {
     try {
         await ctx.answerCbQuery('⏳ Switching to ACTIVE...').catch(() => {});
@@ -478,17 +506,14 @@ this.bot.action('rpc_force_active', async (ctx) => {
             [Markup.button.callback('🏠 Admin Dashboard', 'admin_dashboard')]
         ]);
 
-        await ctx.editMessageText(message, {
-            parse_mode: 'HTML',
-            reply_markup: keyboard.reply_markup
-        });
+        await this._safeEditMessage(ctx, message, keyboard);
 
     } catch (err) {
         logger.error('Force active error', { error: err.message, userId: ctx.from?.id });
         await this.replyError(ctx, '❌ Failed to switch to ACTIVE mode.');
     }
 });
-
+                                
 this.bot.action('rpc_status', async (ctx) => {
     try {
         await ctx.answerCbQuery().catch(() => {});
@@ -506,12 +531,20 @@ this.bot.action('rpc_status', async (ctx) => {
             ? new Date(ws.activeModeExpiry).toLocaleTimeString() 
             : 'N/A';
 
+        let masterBalance = 'Unavailable';
+        try {
+            const balance = await ws.getMasterBalance();
+            masterBalance = `${balance.usdt} USDT`;
+        } catch {
+            // keep default
+        }
+
         const message = 
             '📊 <b>RPC Status Report</b>\n\n' +
             `⛓️ <b>Current Mode:</b> <code>${ws.scanMode || 'UNKNOWN'}</code>\n` +
             `🔌 <b>Provider:</b> <code>${ws.currentProviderType || 'none'}</code>\n` +
             `📦 <b>Master Address:</b> <code>${ws.getMasterAddress()}</code>\n` +
-            `💰 <b>Master Balance:</b> <code>${await ws.getMasterBalance().then(b => `${b.usdt} USDT`).catch(() => 'Unavailable')}</code>\n\n` +
+            `💰 <b>Master Balance:</b> <code>${masterBalance}</code>\n\n` +
             `⏱️ <b>Active Expires:</b> <code>${expiresAt}</code>\n` +
             `⏳ <b>Time Remaining:</b> <code>${expiresIn}</code>\n\n` +
             `🟢 <b>Light RPC:</b> ${ws.lightProvider ? 'Connected' : 'Disconnected'}\n` +
@@ -524,16 +557,15 @@ this.bot.action('rpc_status', async (ctx) => {
             [Markup.button.callback('🏠 Admin Dashboard', 'admin_dashboard')]
         ]);
 
-        await ctx.editMessageText(message, {
-            parse_mode: 'HTML',
-            reply_markup: keyboard.reply_markup
-        });
+        // Safe edit: handles both text and photo messages
+        await this._safeEditMessage(ctx, message, keyboard);
 
     } catch (err) {
         logger.error('RPC status error', { error: err.message, userId: ctx.from?.id });
         await this.replyError(ctx, '❌ Failed to fetch RPC status.');
     }
 });
+                                    
 
 // Re-open admin dashboard from RPC panel
 this.bot.action('admin_dashboard', async (ctx) => {
@@ -1077,7 +1109,9 @@ this.bot.action(/numpool_country_(.+)/, (ctx) => {
     //        Quantity → Balance Check → Confirm → Purchase
     // ═══════════════════════════════════════════════════════════════════════
    /**
+/**
  * Show RPC Mode Control Panel
+ * Handles both text messages and photo messages (with captions)
  */
 async showRpcControlPanel(ctx) {
     if (!this.walletService) {
@@ -1117,11 +1151,38 @@ async showRpcControlPanel(ctx) {
         ]
     ]);
 
-    await ctx.editMessageText(message, {
-        parse_mode: 'HTML',
-        reply_markup: keyboard.reply_markup
-    });
+    try {
+        // Try to edit existing message text first
+        if (ctx.callbackQuery?.message?.text) {
+            await ctx.editMessageText(message, {
+                parse_mode: 'HTML',
+                reply_markup: keyboard.reply_markup
+            });
+        } 
+        // If it's a photo with caption, edit the caption
+        else if (ctx.callbackQuery?.message?.caption) {
+            await ctx.editMessageCaption(message, {
+                parse_mode: 'HTML',
+                reply_markup: keyboard.reply_markup
+            });
+        } 
+        // Fallback: send new message
+        else {
+            await ctx.reply(message, {
+                parse_mode: 'HTML',
+                reply_markup: keyboard.reply_markup
+            });
+        }
+    } catch (err) {
+        // If edit fails for any reason, send a new message
+        logger.warn('Failed to edit message, sending new one', { error: err.message });
+        await ctx.reply(message, {
+            parse_mode: 'HTML',
+            reply_markup: keyboard.reply_markup
+        });
+    }
 }
+    
     
     // ═══════════════════════════════════════════════════════════════════════
     //  POOL MANAGEMENT — COMPLETE REWRITE
