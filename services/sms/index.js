@@ -343,10 +343,10 @@ class SMSProviderManager {
         return provider.finishNumber(cleanId);
     }
 
-    /**
-     * Get number for FREE tier — uses FreeProvider ONLY
+        /**
+     * Get number for FREE tier — uses FreeProvider with ad-credit system
      */
-    async getFreeNumber(country, service) {
+    async getFreeNumber(country, service, userId = null) {
         if (!this.isInitialized) await this.initialize();
 
         if (!country || typeof country !== 'string' || country.length !== 2) {
@@ -354,7 +354,6 @@ class SMSProviderManager {
         }
 
         const provider = this.providers.get('FREE_PUBLIC');
-
         if (!provider) {
             throw new Error('FREE_PROVIDER_NOT_FOUND: FreeProvider not registered');
         }
@@ -371,24 +370,27 @@ class SMSProviderManager {
             }
 
             return {
-                phoneNumber: result.phoneNumber || result.number,
+                phoneNumber: result.phoneNumber,
                 provider: 'FREE_PUBLIC',
-                providerNumberId: result.sessionId || result.id || `free_${Date.now()}`,
+                providerNumberId: result.sessionId,
                 country: result.country || country,
                 service: result.service || service,
                 tier: 'FREE',
                 acquisitionMethod: 'FREE_PUBLIC',
-                sessionId: result.sessionId || result.id,
-                cost: 0
+                sessionId: result.sessionId,
+                cost: 0,
+                isPublic: true,
+                warning: result.warning
             };
 
         } catch (error) {
             logger.error('FREE number acquisition failed', {
-                country, service, error: error.message
+                country, service, userId, error: error.message
             });
             throw error;
         }
     }
+    
 
 // ═══════════════════════════════════════════════════════════════════════
 //  LEGACY getNumber — DEPRECATED, redirects to strict getters
