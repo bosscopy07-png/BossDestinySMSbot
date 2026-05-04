@@ -409,7 +409,142 @@ this.bot.action('confirm_pool_purchase', this.requireAdmin, this.executePoolPurc
                 '<code>price:5.00,count:100</code>'
             );
         });
+     // ═══════════════════════════════════════════════════════════
+//  RPC MODE CONTROL — Admin Action Handlers
+// ═══════════════════════════════════════════════════════════
 
+this.bot.action('admin_rpc_control', async (ctx) => {
+    try {
+        await ctx.answerCbQuery().catch(() => {});
+        return await this.showRpcControlPanel(ctx);
+    } catch (err) {
+        logger.error('RPC control panel error', { error: err.message, userId: ctx.from?.id });
+        await this.replyError(ctx, '❌ Failed to load RPC control panel.');
+    }
+});
+
+this.bot.action('rpc_force_idle', async (ctx) => {
+    try {
+        await ctx.answerCbQuery('⏳ Switching to IDLE...').catch(() => {});
+        
+        if (!this.walletService) {
+            return await this.replyError(ctx, '❌ Wallet service not available.');
+        }
+
+        this.walletService._switchToIdleMode();
+        
+        const message = 
+            '✅ <b>RPC Mode Switched</b>\n\n' +
+            '⛓️ Mode: <code>IDLE</code>\n' +
+            '🔌 Provider: <code>Light RPC</code>\n' +
+            '⏱️ Interval: <code>60s</code>\n\n' +
+            '<i>Premium RPC credits conserved.</i>';
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('⬅️ Back to RPC Panel', 'admin_rpc_control')],
+            [Markup.button.callback('🏠 Admin Dashboard', 'admin_dashboard')]
+        ]);
+
+        await ctx.editMessageText(message, {
+            parse_mode: 'HTML',
+            reply_markup: keyboard.reply_markup
+        });
+
+    } catch (err) {
+        logger.error('Force idle error', { error: err.message, userId: ctx.from?.id });
+        await this.replyError(ctx, '❌ Failed to switch to IDLE mode.');
+    }
+});
+
+this.bot.action('rpc_force_active', async (ctx) => {
+    try {
+        await ctx.answerCbQuery('⏳ Switching to ACTIVE...').catch(() => {});
+        
+        if (!this.walletService) {
+            return await this.replyError(ctx, '❌ Wallet service not available.');
+        }
+
+        this.walletService._switchToActiveMode();
+        
+        const message = 
+            '✅ <b>RPC Mode Switched</b>\n\n' +
+            '⛓️ Mode: <code>ACTIVE</code>\n' +
+            '🔌 Provider: <code>Premium RPC</code>\n' +
+            '⏱️ Interval: <code>15s</code>\n\n' +
+            '<i>Fast deposit detection enabled.</i>';
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('⬅️ Back to RPC Panel', 'admin_rpc_control')],
+            [Markup.button.callback('🏠 Admin Dashboard', 'admin_dashboard')]
+        ]);
+
+        await ctx.editMessageText(message, {
+            parse_mode: 'HTML',
+            reply_markup: keyboard.reply_markup
+        });
+
+    } catch (err) {
+        logger.error('Force active error', { error: err.message, userId: ctx.from?.id });
+        await this.replyError(ctx, '❌ Failed to switch to ACTIVE mode.');
+    }
+});
+
+this.bot.action('rpc_status', async (ctx) => {
+    try {
+        await ctx.answerCbQuery().catch(() => {});
+        
+        if (!this.walletService) {
+            return await this.replyError(ctx, '❌ Wallet service not available.');
+        }
+
+        const ws = this.walletService;
+        const now = Date.now();
+        const expiresIn = ws.activeModeExpiry > now 
+            ? `${Math.ceil((ws.activeModeExpiry - now) / 1000)}s` 
+            : 'Expired';
+        const expiresAt = ws.activeModeExpiry 
+            ? new Date(ws.activeModeExpiry).toLocaleTimeString() 
+            : 'N/A';
+
+        const message = 
+            '📊 <b>RPC Status Report</b>\n\n' +
+            `⛓️ <b>Current Mode:</b> <code>${ws.scanMode || 'UNKNOWN'}</code>\n` +
+            `🔌 <b>Provider:</b> <code>${ws.currentProviderType || 'none'}</code>\n` +
+            `📦 <b>Master Address:</b> <code>${ws.getMasterAddress()}</code>\n` +
+            `💰 <b>Master Balance:</b> <code>${await ws.getMasterBalance().then(b => `${b.usdt} USDT`).catch(() => 'Unavailable')}</code>\n\n` +
+            `⏱️ <b>Active Expires:</b> <code>${expiresAt}</code>\n` +
+            `⏳ <b>Time Remaining:</b> <code>${expiresIn}</code>\n\n` +
+            `🟢 <b>Light RPC:</b> ${ws.lightProvider ? 'Connected' : 'Disconnected'}\n` +
+            `🔵 <b>Premium RPC:</b> ${ws.premiumProvider ? 'Connected' : 'Disconnected'}\n` +
+            `✅ <b>Wallet Ready:</b> ${ws.isReady ? 'Yes' : 'No'}`;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔄 Refresh', 'rpc_status')],
+            [Markup.button.callback('⬅️ Back to RPC Panel', 'admin_rpc_control')],
+            [Markup.button.callback('🏠 Admin Dashboard', 'admin_dashboard')]
+        ]);
+
+        await ctx.editMessageText(message, {
+            parse_mode: 'HTML',
+            reply_markup: keyboard.reply_markup
+        });
+
+    } catch (err) {
+        logger.error('RPC status error', { error: err.message, userId: ctx.from?.id });
+        await this.replyError(ctx, '❌ Failed to fetch RPC status.');
+    }
+});
+
+// Re-open admin dashboard from RPC panel
+this.bot.action('admin_dashboard', async (ctx) => {
+    try {
+        await ctx.answerCbQuery().catch(() => {});
+        return await this.handleAdmin(ctx);
+    } catch (err) {
+        logger.error('Return to admin dashboard error', { error: err.message });
+    }
+});
+        
         // ─── Search flow ───
         this.bot.action('search_by_id', this.requireAdmin, (ctx) => {
             this._setAdminState(ctx, ADMIN_STATE.AWAITING_SEARCH_QUERY, { mode: 'id' });
@@ -878,48 +1013,52 @@ this.bot.action(/numpool_country_(.+)/, (ctx) => {
         `;
 
         const keyboard = Markup.inlineKeyboard([
-            [
-                Markup.button.callback('👥 Users', 'admin_users'),
-                Markup.button.callback('💰 Profits', 'admin_profits')
-            ],
-            [
-                Markup.button.callback('⚙️ System', 'admin_system'),
-                Markup.button.callback('📋 Logs', 'admin_logs')
-            ],
-            [
-                Markup.button.callback('📢 Broadcast', 'admin_broadcast'),
-                Markup.button.callback('🔧 Settings', 'admin_settings')
-            ],
-            [
-                Markup.button.callback('🔍 Search', 'admin_search'),
-                Markup.button.callback('🏆 Top Users', 'admin_topusers')
-            ],
-            [
-                Markup.button.callback('📊 Daily Report', 'admin_dailyreport'),
-                Markup.button.callback('🔄 Reset Free', 'admin_resetfree')
-            ],
-            [
-                Markup.button.callback('👑 Give VIP', 'admin_givevip'),
-                Markup.button.callback('❌ Cancel VIP', 'admin_cancelvip')
-            ],
-            [
-                Markup.button.callback('📦 Pool', 'admin_pool'),
-                Markup.button.callback('💰 Bundle Prices', 'admin_bundleprices')
-            ],
-            [
-                Markup.button.callback('📱 Numbers', 'admin_numberinventory'),
-                Markup.button.callback('📊 Analytics', 'admin_analytics')
-            ],
-            [
-                Markup.button.callback('⚡ Bulk Actions', 'admin_bulkactions')
-            ],
-            // ═══════════════════════════════════════════════════
-            //  NEW: Advanced Admin Tools Button
-            // ═══════════════════════════════════════════════════
-            [
-                Markup.button.callback('🛠️ Advanced Tools', 'open_admin_dashboard')
-            ]
-        ]);
+    [
+        Markup.button.callback('👥 Users', 'admin_users'),
+        Markup.button.callback('💰 Profits', 'admin_profits')
+    ],
+    [
+        Markup.button.callback('⚙️ System', 'admin_system'),
+        Markup.button.callback('📋 Logs', 'admin_logs')
+    ],
+    [
+        Markup.button.callback('📢 Broadcast', 'admin_broadcast'),
+        Markup.button.callback('🔧 Settings', 'admin_settings')
+    ],
+    [
+        Markup.button.callback('🔍 Search', 'admin_search'),
+        Markup.button.callback('🏆 Top Users', 'admin_topusers')
+    ],
+    [
+        Markup.button.callback('📊 Daily Report', 'admin_dailyreport'),
+        Markup.button.callback('🔄 Reset Free', 'admin_resetfree')
+    ],
+    [
+        Markup.button.callback('👑 Give VIP', 'admin_givevip'),
+        Markup.button.callback('❌ Cancel VIP', 'admin_cancelvip')
+    ],
+    [
+        Markup.button.callback('📦 Pool', 'admin_pool'),
+        Markup.button.callback('💰 Bundle Prices', 'admin_bundleprices')
+    ],
+    [
+        Markup.button.callback('📱 Numbers', 'admin_numberinventory'),
+        Markup.button.callback('📊 Analytics', 'admin_analytics')
+    ],
+    [
+        Markup.button.callback('⚡ Bulk Actions', 'admin_bulkactions')
+    ],
+    [
+        Markup.button.callback('🛠️ Advanced Tools', 'open_admin_dashboard')
+    ],
+    // ═══════════════════════════════════════════════════
+    //  NEW: RPC Mode Control Button
+    // ═══════════════════════════════════════════════════
+    [
+        Markup.button.callback('⛓️ RPC Mode', 'admin_rpc_control')
+    ]
+]);
+        
 
         await this.replySuccess(ctx, message, { reply_markup: keyboard.reply_markup });
     } catch (error) {
@@ -937,6 +1076,53 @@ this.bot.action(/numpool_country_(.+)/, (ctx) => {
     //  Flow: Provider → Available Countries+Prices → Pick Country → 
     //        Quantity → Balance Check → Confirm → Purchase
     // ═══════════════════════════════════════════════════════════════════════
+   /**
+ * Show RPC Mode Control Panel
+ */
+async showRpcControlPanel(ctx) {
+    if (!this.walletService) {
+        return await this.replyError(ctx, '❌ Wallet service not initialized.');
+    }
+
+    const ws = this.walletService;
+    const now = Date.now();
+    
+    const isIdle = ws.scanMode === 'IDLE';
+    const isActive = ws.scanMode === 'ACTIVE';
+    const expiresIn = ws.activeModeExpiry > now 
+        ? `${Math.ceil((ws.activeModeExpiry - now) / 1000)}s` 
+        : 'Expired';
+
+    const message = 
+        '⛓️ <b>RPC Mode Control</b>\n\n' +
+        `Current Mode: <code>${ws.scanMode || 'UNKNOWN'}</code>\n` +
+        `Provider: <code>${ws.currentProviderType || 'none'}</code>\n` +
+        `Wallet Ready: ${ws.isReady ? '✅' : '❌'}\n\n` +
+        (isActive 
+            ? `⏳ Active mode expires in: <code>${expiresIn}</code>\n\n`
+            : '<i>System is in low-power idle mode.</i>\n\n'
+        ) +
+        '<b>Actions:</b>';
+
+    const keyboard = Markup.inlineKeyboard([
+        [
+            Markup.button.callback('🟢 Force IDLE', 'rpc_force_idle'),
+            Markup.button.callback('🔵 Force ACTIVE', 'rpc_force_active')
+        ],
+        [
+            Markup.button.callback('📊 Status', 'rpc_status')
+        ],
+        [
+            Markup.button.callback('🏠 Admin Dashboard', 'admin_dashboard')
+        ]
+    ]);
+
+    await ctx.editMessageText(message, {
+        parse_mode: 'HTML',
+        reply_markup: keyboard.reply_markup
+    });
+}
+    
     // ═══════════════════════════════════════════════════════════════════════
     //  POOL MANAGEMENT — COMPLETE REWRITE
     //  Flow: Menu → Buy → Provider → Countries+Prices → Country → 
