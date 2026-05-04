@@ -530,12 +530,7 @@ class TelegramBot {
         });
     }
     
-walletReady: this.walletService?.isReady || false,
-walletScanMode: this.walletService?.scanMode || 'unknown',
-walletRpcType: this.walletService?.currentProviderType || 'none',
-walletActiveExpiry: this.walletService?.activeModeExpiry 
-    ? new Date(this.walletService.activeModeExpiry).toISOString() 
-    : null,
+
     
     setupErrorHandling() {
         this.bot.catch(async (err, ctx) => {
@@ -714,6 +709,13 @@ walletActiveExpiry: this.walletService?.activeModeExpiry
             / this.metrics.requestsHandled;
     }
 
+walletReady: this.walletService?.isReady || false,
+walletScanMode: this.walletService?.scanMode || 'unknown',
+walletRpcType: this.walletService?.currentProviderType || 'none',
+walletActiveExpiry: this.walletService?.activeModeExpiry 
+    ? new Date(this.walletService.activeModeExpiry).toISOString() 
+    : null,
+    
     trackEvent(event, userId) {
         setImmediate(() => {
             logger.debug('Event tracked', { event, userId });
