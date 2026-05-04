@@ -105,10 +105,29 @@ class OTPCommands {
     // ═══════════════════════════════════════════════════════════════════════
     
     _canUseFree(user) {
-        const limit = config.limits?.freeDaily || 3;
-        return (user.freeUsedToday || 0) < limit;
+    // DEFENSIVE: Handle missing or malformed user object
+    if (!user || typeof user !== 'object') {
+        return false;
     }
 
+    const freeUsedToday = user.freeUsedToday ?? 0;
+    const freeDailyLimit = user.freeDailyLimit ?? (config.limits?.freeDaily ?? 3);
+
+    return freeUsedToday < freeDailyLimit;
+}
+
+_freeRemaining(user) {
+    // DEFENSIVE: Handle missing or malformed user object
+    if (!user || typeof user !== 'object') {
+        return 0;
+    }
+
+    const freeUsedToday = user.freeUsedToday ?? 0;
+    const freeDailyLimit = user.freeDailyLimit ?? (config.limits?.freeDaily ?? 3);
+
+    return Math.max(0, freeDailyLimit - freeUsedToday);
+}
+    
     _canUseVip(user) {
         if (!this._isVipActive(user)) return false;
         const limit = config.limits?.vipDaily || 50;
@@ -123,10 +142,7 @@ class OTPCommands {
         return (user.balance || 0) - (user.lockedBalance || 0);
     }
 
-    _freeRemaining(user) {
-        const limit = config.limits?.freeDaily || 3;
-        return Math.max(0, limit - (user.freeUsedToday || 0));
-    }
+    
 
     _vipRemaining(user) {
         const limit = config.limits?.vipDaily || 50;
