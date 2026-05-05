@@ -963,7 +963,7 @@ class SessionManager {
         this.pollTimers.set(sessionId, timer);
     }
 
-    async _pollProvider(sessionId, interval) {
+        async _pollProvider(sessionId, interval) {
         const sessionData = this.activeSessions.get(sessionId);
         if (!sessionData) return;
 
@@ -974,16 +974,14 @@ class SessionManager {
                 return;
             }
 
-            // Check timeout
             if (new Date() > new Date(current.timeoutAt)) {
-                return; // Timeout handler will take care of this
+                return;
             }
 
             sessionData.lastPollAt = new Date();
             sessionData.pollCount++;
             sessionData.state = SessionState.MONITORING;
 
-            // Update to CHECKING after first poll
             if (current.status === 'WAITING') {
                 await Session.updateOne(
                     { sessionId },
@@ -991,11 +989,38 @@ class SessionManager {
                 );
             }
 
-            // Poll provider
-            const result = await this.providerManager.checkSMS(
-                current.provider,
-                current.providerNumberId || current.number
-            );
+            // ═════════════════════════════════════════════════════════════════
+            //  FIXED: Use tier-specific methods instead of legacy checkSMS()
+            //  This eliminates the "LEGACY checkSMS() called" spam
+            // ═════════════════════════════════════════════════════════════════
+            let result;
+            switch (current.mode) {
+                case 'FREE':
+                    result = await this.providerManager.checkFreeSMS(
+                        current.providerNumberId || current.number
+                    );
+                    break;
+
+                case 'CHEAP':
+                    result = await this.providerManager.checkCheapSMS(
+                        current.providerNumberId || current.number
+                    );
+                    break;
+
+                case 'VIP':
+                case 'BUNDLE':
+                    result = await this.providerManager.checkPoolSMS(
+                        current.providerNumberId || current.number
+                    );
+                    break;
+
+                default:
+                    // Fallback to legacy only for unknown modes
+                    result = await this.providerManager.checkSMS(
+                        current.provider,
+                        current.providerNumberId || current.number
+                    );
+            }
 
             if (result.success && result.otp) {
                 await this.deliverOTP(current, result.otp);
@@ -1007,7 +1032,6 @@ class SessionManager {
                 return;
             }
 
-            // Schedule next poll
             this._schedulePoll(sessionId, interval);
 
         } catch (error) {
@@ -1017,10 +1041,10 @@ class SessionManager {
                 pollCount: sessionData.pollCount
             });
 
-            // Continue polling on error
             this._schedulePoll(sessionId, interval);
         }
-    }
+        }
+    
 
     // ═══════════════════════════════════════════════════════════
     //  INTERNAL - Cleanup
