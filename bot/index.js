@@ -16,7 +16,7 @@ import AdminCommands from './commands/admin.js';
 import Admin from './commands/extra.js';
 import WalletService from '../services/wallet/index.js';
 import SMSProviderManager from '../services/sms/index.js';
-import FreeNumberController from '../services/sms/providers/free/FreeNumberController.js';
+import FreeNumberController from '../services/sms/FreeNumberController.js';
 import StartVerification from './verification/StartVerification.js';
 import { Worker } from 'worker_threads';
 import { cpus } from 'os';
