@@ -1,25 +1,28 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FreeNumberController.js — FREE Tier Integration Controller
+// FreeNumberController.js — Part 1/2: Constructor, Main Flow, Polling Engine
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { Markup } from 'telegraf';
 import FreeProvider from './FreeProvider.js';
-import AdCreditSystem from './AdCreditSystem.js';
 import logger from '../../utils/logger.js';
 
 /**
  * FreeNumberController — Orchestrates FREE tier flow:
  * 1. Check credits / daily limit
  * 2. Show ad prompt if needed
- * 3. Get number from scraper
- * 4. Poll for real SMS
+ * 3. Get number from scraper (parallel, fast)
+ * 4. Poll for real SMS (3s interval)
  * 5. Handle timeout/retry/upgrade prompt
+ *
+ * USAGE: Instantiate in your bot command handler:
+ *   const freeController = new FreeNumberController(bot);
+ *   // In your "mode_free" action handler:
+ *   await freeController.handleFreeRequest(ctx);
  */
 class FreeNumberController {
     constructor(bot) {
         this.bot = bot;
         this.provider = new FreeProvider();
-        this.adSystem = new AdCreditSystem();
 
         this.COOLDOWN_MS = 60000; // 60s between free requests
         this.userLastRequest = new Map();
@@ -31,7 +34,6 @@ class FreeNumberController {
 
     async handleFreeRequest(ctx) {
         const userId = ctx.from.id.toString();
-        const user = ctx.state.user;
 
         try {
             // 1. Check cooldown
@@ -44,8 +46,8 @@ class FreeNumberController {
                 );
             }
 
-            // 2. Check credits / daily limit
-            const creditCheck = await this.adSystem.canRequestNumber(userId);
+            // 2. Check credits / daily limit FIRST (before creating session)
+            const creditCheck = await this.provider.canRequestNumber(userId);
 
             if (!creditCheck.allowed && creditCheck.reason === 'DAILY_LIMIT_REACHED') {
                 return this._sendDailyLimitMessage(ctx, creditCheck);
@@ -56,11 +58,11 @@ class FreeNumberController {
             }
 
             // 3. Deduct credits and proceed
-            await this.adSystem.deductCredits(userId);
+            await this.provider.deductCredits(userId);
             this.userLastRequest.set(userId, Date.now());
 
-            // 4. Get number from provider
-            const numberData = await this.provider.getNumber(null, ctx.session?.otpService || 'Any');
+            // 4. Get number from provider (parallel fast scraping)
+            const numberData = await this.provider.getNumber(null, ctx.session?.otpService || 'Any', userId);
 
             // 5. Send number to user with polling status
             const message =
@@ -86,7 +88,36 @@ class FreeNumberController {
             return numberData;
 
         } catch (error) {
-            logger.error('Free request failed', { userId, error: error.message });
+            logger.error('Free request failed', { userId, error: error.message, code: error.code });
+
+            // Handle specific error codes with targeted responses
+            if (error.code === 'INSUFFICIENT_CREDITS') {
+                return this._sendAdPrompt(ctx, error.creditInfo);
+            }
+
+            if (error.code === 'DAILY_LIMIT_REACHED') {
+                return this._sendDailyLimitMessage(ctx, error.creditInfo);
+            }
+
+            if (error.code === 'NO_FREE_NUMBERS') {
+                return ctx.reply(
+                    `😔 <b>No Free Numbers Available</b>\n\n` +
+                    `All public number sites are currently empty or unreachable.\n\n` +
+                    `💡 Options:\n` +
+                    `• Wait a few minutes and retry\n` +
+                    `• Upgrade to guaranteed delivery:`,
+                    {
+                        parse_mode: 'HTML',
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('💰 CHEAP OTP', 'mode_cheap')],
+                            [Markup.button.callback('📦 Buy Bundle', 'buy_bundle')],
+                            [Markup.button.callback('👑 Upgrade VIP', 'buy_vip')],
+                            [Markup.button.callback('🔄 Retry Free', 'mode_free')]
+                        ]).reply_markup
+                    }
+                );
+            }
+
             return ctx.reply(
                 `❌ <b>Free Number Unavailable</b>\n\n${error.message}\n\n` +
                 `💡 Try again later or upgrade to paid options.`,
@@ -102,7 +133,7 @@ class FreeNumberController {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  POLLING — Background SMS checking with live updates
+    //  POLLING — Background SMS checking with live updates (3s interval)
     // ═══════════════════════════════════════════════════════════════════════
 
     async _startPolling(ctx, userId, sessionId, messageId) {
@@ -140,7 +171,7 @@ class FreeNumberController {
                     return;
                 }
 
-                // Check timeout
+                // Check timeout (90s)
                 if (Date.now() - startTime > 90000) {
                     await this._handleTimeout(ctx, userId, sessionId, messageId);
                     return;
@@ -153,7 +184,7 @@ class FreeNumberController {
                     `📱 Number: <code>${result.number}</code>\n` +
                     `🔍 Poll: ${pollCount} | Elapsed: ${elapsed}s\n` +
                     `⏱ Timeout in: ${90 - elapsed}s\n\n` +
-                    `<i>Checking inbox every 4 seconds...</i>`;
+                    `<i>Checking inbox every 3 seconds...</i>`;
 
                 try {
                     await ctx.telegram.editMessageText(
@@ -173,12 +204,12 @@ class FreeNumberController {
                     // Message might be too old to edit, ignore
                 }
 
-                // Schedule next poll
-                setTimeout(poll, 4000);
+                // Schedule next poll (3s)
+                setTimeout(poll, 3000);
 
             } catch (error) {
                 logger.error('Polling error', { sessionId, error: error.message });
-                setTimeout(poll, 4000);
+                setTimeout(poll, 3000);
             }
         };
 
@@ -192,7 +223,7 @@ class FreeNumberController {
     async _handleTimeout(ctx, userId, sessionId, messageId) {
         try {
             // Try retry once
-            const retryResult = await this.provider.retryWithNewNumber(sessionId);
+            const retryResult = await this.provider.retryWithNewNumber(sessionId, null, 'Any', userId);
 
             if (retryResult.success) {
                 const retryMessage =
@@ -234,7 +265,7 @@ class FreeNumberController {
                 {
                     parse_mode: 'HTML',
                     reply_markup: Markup.inlineKeyboard([
-                        [Markup.button.callback('💰 CHEAP OTP ($0.05)', 'mode_cheap')],
+                        [Markup.button.callback('💰 CHEAP OTP', 'mode_cheap')],
                         [Markup.button.callback('📦 Buy Bundle', 'buy_bundle')],
                         [Markup.button.callback('👑 Upgrade VIP', 'buy_vip')],
                         [Markup.button.callback('🔄 Try Free Again', 'mode_free')]
@@ -245,19 +276,22 @@ class FreeNumberController {
         } catch (error) {
             logger.error('Timeout handling failed', { sessionId, error: error.message });
         }
-    }
+                                                     }
+    // ═══════════════════════════════════════════════════════════════════════════════
+// FreeNumberController.js — Part 2/2: Ad Prompts, Handlers, Stats
+// ═══════════════════════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════════════════
     //  AD PROMPT — Show when user has insufficient credits
     // ═══════════════════════════════════════════════════════════════════════
 
     _sendAdPrompt(ctx, creditCheck) {
-        const shortfall = creditCheck.shortfall;
-        const networks = this.adSystem.getAvailableNetworks();
+        const shortfall = creditCheck.shortfall || (creditCheck.required - creditCheck.credits);
+        const networks = this.provider.getAvailableNetworks();
 
         let message =
             `🎁 <b>Free Number Available!</b>\n\n` +
-            `💳 Credits needed: <code>${creditCheck.required}</code>\n` +
+            `💳 Credits needed: <code>${creditCheck.required || 2}</code>\n` +
             `💳 Your credits: <code>${creditCheck.credits}</code>\n` +
             `❌ Shortfall: <code>${shortfall}</code>\n\n` +
             `Watch an ad to unlock:\n`;
@@ -302,7 +336,7 @@ class FreeNumberController {
         const userId = ctx.from.id.toString();
 
         try {
-            const adView = await this.adSystem.generateAdView(userId, networkId);
+            const adView = await this.provider.generateAdView(userId, networkId);
 
             const message =
                 `📺 <b>Watch Ad to Earn Credits</b>\n\n` +
@@ -324,6 +358,43 @@ class FreeNumberController {
         } catch (error) {
             logger.error('Ad generation failed', { userId, error: error.message });
             await ctx.answerCbQuery('❌ Ad unavailable. Try another network.');
+        }
+    }
+
+    /**
+     * Handle "I Watched It" callback — verify ad completion
+     */
+    async handleVerifyAd(ctx, verificationId) {
+        const userId = ctx.from.id.toString();
+
+        try {
+            // Simulate verification (in production, this checks ad network webhook)
+            const result = await this.provider.handleAdWebhook(verificationId, {
+                completed: true,
+                verified: true
+            });
+
+            if (result.success) {
+                await ctx.answerCbQuery(`✅ +${result.creditsAdded} credits added!`);
+                await ctx.editMessageText(
+                    `✅ <b>Ad Completed!</b>\n\n` +
+                    `💳 Credits added: +${result.creditsAdded}\n` +
+                    `💳 Total credits: ${result.totalCredits?.credits || '?'}\n\n` +
+                    `You can now request a free number!`,
+                    {
+                        parse_mode: 'HTML',
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('📱 Get Free Number', 'mode_free')],
+                            [Markup.button.callback('🔙 Menu', 'menu')]
+                        ]).reply_markup
+                    }
+                );
+            } else {
+                await ctx.answerCbQuery('❌ Verification failed. Try again.');
+            }
+        } catch (error) {
+            logger.error('Ad verification failed', { userId, verificationId, error: error.message });
+            await ctx.answerCbQuery('❌ Verification error.');
         }
     }
 
@@ -350,6 +421,24 @@ class FreeNumberController {
         }
     }
 
+    /**
+     * Handle "Check Now" manual poll
+     */
+    async handleCheckNow(ctx, sessionId) {
+        try {
+            const result = await this.provider.checkSMS(sessionId);
+
+            if (result.success) {
+                await ctx.answerCbQuery('✅ OTP found!');
+                // The polling loop will catch this and update the message
+            } else {
+                await ctx.answerCbQuery(`⏳ ${result.message || 'Still waiting...'}`);
+            }
+        } catch (error) {
+            await ctx.answerCbQuery('❌ Check failed');
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     //  STATS
     // ═══════════════════════════════════════════════════════════════════════
@@ -358,8 +447,8 @@ class FreeNumberController {
         return {
             provider: this.provider.getStats(),
             adSystem: {
-                pendingVerifications: this.adSystem.getPendingVerifications().length,
-                networks: this.adSystem.getAvailableNetworks().length
+                pendingVerifications: this.provider.adSystem.getPendingVerifications().length,
+                networks: this.provider.getAvailableNetworks().length
             },
             cooldowns: this.userLastRequest.size
         };
@@ -367,4 +456,3 @@ class FreeNumberController {
 }
 
 export default FreeNumberController;
-                      
