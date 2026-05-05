@@ -1,21 +1,12 @@
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// AdCreditSystem.js — Time-based ad verification (no external postback)
+// AdCreditSystem.js — Server-side anti-abuse with correct enum values
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { User, AdView } from '../../models/index.js';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
 
-/**
- * AdCreditSystem — Manages ad views → credit conversion via time-based verification
- *
- * Architecture:
- * - Primary URL: omg10.com redirect
- * - Fallback URL: profitablecpmratenetwork.com redirect
- * - Verification: User must spend MIN_WATCH_TIME (30s) on ad before claiming
- * - No external postback required — time gate prevents instant abuse
- */
 class AdCreditSystem {
     constructor() {
         this.PRIMARY_URL = config.adSystem?.primaryUrl || process.env.AD_PRIMARY_URL || 'https://omg10.com/4/10967769';
@@ -26,26 +17,23 @@ class AdCreditSystem {
             DAILY_FREE_LIMIT: config.limits?.freeDaily || 3
         };
 
-        // Minimum time user must spend on ad before credits unlock (milliseconds)
-        this.MIN_WATCH_TIME = 30000; // 30 seconds
+        this.MIN_WATCH_TIME = 30000;
+        this.CLAIM_COOLDOWN = 60000;
+        this.MAX_CLAIMS_PER_HOUR = 10;
+        this.SESSION_DEDUP_WINDOW = 300000;
 
-        // Active ad sessions: verificationId -> { userId, startTime, credits, status, urlType }
         this.activeVerifications = new Map();
+        this.userClaimHistory = new Map();
 
-        // Cleanup interval
         this._startCleanupInterval();
 
         logger.info('AdCreditSystem initialized', {
             primaryUrl: this.PRIMARY_URL.substring(0, 30) + '...',
-            fallbackUrl: this.FALLBACK_URL.substring(0, 30) + '...',
             minWatchTime: `${this.MIN_WATCH_TIME}ms`,
-            costPerRequest: this.COSTS.NUMBER_REQUEST
+            claimCooldown: `${this.CLAIM_COOLDOWN}ms`,
+            maxClaimsPerHour: this.MAX_CLAIMS_PER_HOUR
         });
     }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  CREDIT MANAGEMENT
-    // ═══════════════════════════════════════════════════════════════════════
 
     async getCredits(userId) {
         const user = await User.findOne({ userId }).lean();
@@ -143,10 +131,6 @@ class AdCreditSystem {
         };
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  AD VIEW GENERATION — Records start time when user opens ad
-    // ═══════════════════════════════════════════════════════════════════════
-
     async generateAdView(userId, networkType = 'primary') {
         const verificationId = `ad_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
         const isPrimary = networkType === 'primary';
@@ -155,22 +139,24 @@ class AdCreditSystem {
         const separator = baseUrl.includes('?') ? '&' : '?';
         const adUrl = `${baseUrl}${separator}subId=${verificationId}&userId=${userId}`;
 
-        // Store with startTime = now (user hasn't opened yet, but will soon)
+        // FIXED: Use enum-safe network values
+        const networkEnum = isPrimary ? 'omg10' : 'profitablecpm';
+
         this.activeVerifications.set(verificationId, {
             userId,
             credits: 2,
-            startTime: null, // Set when user actually opens
+            startTime: null,
             createdAt: Date.now(),
             status: 'PENDING',
-            urlType: isPrimary ? 'primary' : 'fallback'
+            urlType: networkEnum  // ← FIXED: 'omg10' or 'profitablecpm'
         });
 
-        logger.info('Ad view generated', { userId, verificationId, type: isPrimary ? 'primary' : 'fallback' });
+        logger.info('Ad view generated', { userId, verificationId, network: networkEnum });
 
         return {
             verificationId,
             adUrl,
-            network: isPrimary ? 'Ad Network' : 'Fallback Network',
+            network: networkEnum,  // ← FIXED: Enum-safe
             type: 'redirect',
             estimatedTime: '30 sec',
             creditValue: 2,
@@ -178,9 +164,6 @@ class AdCreditSystem {
         };
     }
 
-    /**
-     * Record that user opened the ad (called when "Open Ad" button tapped)
-     */
     recordAdStart(verificationId) {
         const verification = this.activeVerifications.get(verificationId);
         if (!verification) {
@@ -204,14 +187,7 @@ class AdCreditSystem {
         };
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  CREDIT CLAIM — User taps "Check My Credits" after watching
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /**
-     * Check if enough time has passed and award credits
-     */
-    async claimCredits(verificationId) {
+    async claimCredits(verificationId, userMetadata = {}) {
         const verification = this.activeVerifications.get(verificationId);
 
         if (!verification) {
@@ -222,6 +198,8 @@ class AdCreditSystem {
             };
         }
 
+        const { userId } = verification;
+
         if (verification.status === 'COMPLETED') {
             return {
                 success: false,
@@ -230,19 +208,16 @@ class AdCreditSystem {
             };
         }
 
-        // Must have started watching
         if (!verification.startTime) {
             return {
                 success: false,
                 error: 'WATCH_NOT_STARTED',
                 message: 'Please open the ad first.',
-                minWatchTime: this.MIN_WATCH_TIME
+                minWatchTime: Math.floor(this.MIN_WATCH_TIME / 1000)
             };
         }
 
         const elapsed = Date.now() - verification.startTime;
-
-        // Time gate: must wait MIN_WATCH_TIME
         if (elapsed < this.MIN_WATCH_TIME) {
             const remaining = Math.ceil((this.MIN_WATCH_TIME - elapsed) / 1000);
             return {
@@ -255,15 +230,37 @@ class AdCreditSystem {
             };
         }
 
-        // Time satisfied — award credits
-        return this._awardCredits(verificationId, verification, { elapsed });
+        const lastClaim = this._getLastClaimTime(userId);
+        if (lastClaim && (Date.now() - lastClaim) < this.CLAIM_COOLDOWN) {
+            const waitSec = Math.ceil((this.CLAIM_COOLDOWN - (Date.now() - lastClaim)) / 1000);
+            return {
+                success: false,
+                error: 'CLAIM_COOLDOWN',
+                message: `Please wait ${waitSec} seconds before your next ad.`,
+                waitSeconds: waitSec
+            };
+        }
+
+        const recentClaims = this._getRecentClaimsCount(userId, 3600000);
+        if (recentClaims >= this.MAX_CLAIMS_PER_HOUR) {
+            return {
+                success: false,
+                error: 'HOURLY_LIMIT_REACHED',
+                message: `Ad limit reached: ${this.MAX_CLAIMS_PER_HOUR} per hour. Try again later.`,
+                limit: this.MAX_CLAIMS_PER_HOUR,
+                resetIn: this._getHourlyResetTime(userId)
+            };
+        }
+
+        return this._awardCredits(verificationId, verification, {
+            elapsed,
+            userMetadata,
+            claimedAt: Date.now()
+        });
     }
 
-    /**
-     * Internal: Award credits and record completion
-     */
     async _awardCredits(verificationId, verification, metadata = {}) {
-        const { userId, credits } = verification;
+        const { userId, credits, urlType } = verification;
 
         try {
             await User.updateOne(
@@ -274,17 +271,23 @@ class AdCreditSystem {
             await AdView.create({
                 viewId: verificationId,
                 userId,
-                network: verification.urlType,
+                network: urlType,  // ← 'omg10' or 'profitablecpm' — now enum-safe
                 creditsEarned: credits,
                 status: 'COMPLETED',
                 completedAt: new Date(),
                 watchDuration: metadata.elapsed,
-                metadata
+                metadata: {
+                    ...metadata,
+                    userAgent: metadata.userMetadata?.userAgent,
+                    source: 'time_based_claim'
+                }
             });
 
             verification.status = 'COMPLETED';
-            verification.completedAt = Date.now();
+            verification.claimedAt = Date.now();
             this.activeVerifications.set(verificationId, verification);
+
+            this._recordClaim(userId);
 
             const totalCredits = await this.getCredits(userId);
 
@@ -293,7 +296,8 @@ class AdCreditSystem {
                 verificationId,
                 credits,
                 watchDuration: metadata.elapsed,
-                type: verification.urlType
+                network: urlType,
+                recentClaims: this._getRecentClaimsCount(userId, 3600000)
             });
 
             return {
@@ -317,9 +321,33 @@ class AdCreditSystem {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  LEGACY POSTBACK — Kept for compatibility if networks ever support it
-    // ═══════════════════════════════════════════════════════════════════════
+    _recordClaim(userId) {
+        if (!this.userClaimHistory.has(userId)) {
+            this.userClaimHistory.set(userId, []);
+        }
+        this.userClaimHistory.get(userId).push(Date.now());
+    }
+
+    _getLastClaimTime(userId) {
+        const history = this.userClaimHistory.get(userId);
+        if (!history || history.length === 0) return null;
+        return history[history.length - 1];
+    }
+
+    _getRecentClaimsCount(userId, windowMs) {
+        const history = this.userClaimHistory.get(userId);
+        if (!history) return 0;
+        const cutoff = Date.now() - windowMs;
+        return history.filter(t => t > cutoff).length;
+    }
+
+    _getHourlyResetTime(userId) {
+        const history = this.userClaimHistory.get(userId);
+        if (!history || history.length < this.MAX_CLAIMS_PER_HOUR) return 0;
+        const sorted = [...history].sort((a, b) => a - b);
+        const oldestInWindow = sorted[sorted.length - this.MAX_CLAIMS_PER_HOUR];
+        return Math.max(0, oldestInWindow + 3600000 - Date.now());
+    }
 
     async handlePostback(query = {}) {
         const { verify, subId, status } = query;
@@ -329,7 +357,6 @@ class AdCreditSystem {
             return { success: false, error: 'MISSING_VERIFICATION_ID' };
         }
 
-        // If network sends completed status, bypass time gate
         if (status === 'completed' || status === 'approved') {
             const verification = this.activeVerifications.get(verificationId);
             if (!verification) {
@@ -343,10 +370,6 @@ class AdCreditSystem {
 
         return { success: false, error: 'STATUS_NOT_COMPLETED' };
     }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  UTILITY
-    // ═══════════════════════════════════════════════════════════════════════
 
     getAvailableNetworks() {
         return [
@@ -369,16 +392,17 @@ class AdCreditSystem {
 
     _startCleanupInterval() {
         setInterval(() => {
-            const cleaned = this.cleanupOldVerifications();
-            if (cleaned > 0) {
-                logger.debug('Cleaned old verifications', { count: cleaned });
+            const verCleaned = this.cleanupOldVerifications();
+            const claimCleaned = this._cleanupOldClaims();
+            if (verCleaned > 0 || claimCleaned > 0) {
+                logger.debug('Cleanup completed', { verCleaned, claimCleaned });
             }
         }, 300000);
     }
 
     cleanupOldVerifications() {
         const now = Date.now();
-        const maxAge = 3600000; // 1 hour
+        const maxAge = 3600000;
         let cleaned = 0;
 
         for (const [id, v] of this.activeVerifications) {
@@ -386,6 +410,23 @@ class AdCreditSystem {
                 this.activeVerifications.delete(id);
                 cleaned++;
             }
+        }
+        return cleaned;
+    }
+
+    _cleanupOldClaims() {
+        const now = Date.now();
+        const maxAge = 7200000;
+        let cleaned = 0;
+
+        for (const [userId, history] of this.userClaimHistory) {
+            const filtered = history.filter(t => now - t < maxAge);
+            if (filtered.length === 0) {
+                this.userClaimHistory.delete(userId);
+            } else {
+                this.userClaimHistory.set(userId, filtered);
+            }
+            cleaned += history.length - filtered.length;
         }
         return cleaned;
     }
@@ -409,4 +450,4 @@ class AdCreditSystem {
 }
 
 export default AdCreditSystem;
-                    
+            
