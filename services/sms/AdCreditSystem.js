@@ -1,5 +1,6 @@
+
 // ═══════════════════════════════════════════════════════════════════════════════
-// AdCreditSystem.js — Simplified: Primary + Fallback redirect URLs
+// AdCreditSystem.js — Time-based ad verification (no external postback)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { User, AdView } from '../../models/index.js';
@@ -7,17 +8,16 @@ import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
 
 /**
- * AdCreditSystem — Manages ad views → credit conversion
+ * AdCreditSystem — Manages ad views → credit conversion via time-based verification
  *
  * Architecture:
- * - Primary URL: omg10.com redirect (no API needed)
- * - Fallback URL: profitablecpmratenetwork.com redirect (no API needed)
- * - Server-side postback for verification via webhook
- * - In-memory verification tracking with automatic cleanup
+ * - Primary URL: omg10.com redirect
+ * - Fallback URL: profitablecpmratenetwork.com redirect
+ * - Verification: User must spend MIN_WATCH_TIME (30s) on ad before claiming
+ * - No external postback required — time gate prevents instant abuse
  */
 class AdCreditSystem {
     constructor() {
-        // Primary and fallback ad URLs from config or env
         this.PRIMARY_URL = config.adSystem?.primaryUrl || process.env.AD_PRIMARY_URL || 'https://omg10.com/4/10967769';
         this.FALLBACK_URL = config.adSystem?.fallbackUrl || process.env.AD_FALLBACK_URL || 'https://www.profitablecpmratenetwork.com/zs5wg1ki?key=cb472c48fad6246f544094483b9f9bcc';
 
@@ -26,15 +26,19 @@ class AdCreditSystem {
             DAILY_FREE_LIMIT: config.limits?.freeDaily || 3
         };
 
-        // Verification tracking: verificationId -> { userId, credits, status, createdAt }
+        // Minimum time user must spend on ad before credits unlock (milliseconds)
+        this.MIN_WATCH_TIME = 30000; // 30 seconds
+
+        // Active ad sessions: verificationId -> { userId, startTime, credits, status, urlType }
         this.activeVerifications = new Map();
 
-        // Start cleanup interval
+        // Cleanup interval
         this._startCleanupInterval();
 
         logger.info('AdCreditSystem initialized', {
             primaryUrl: this.PRIMARY_URL.substring(0, 30) + '...',
             fallbackUrl: this.FALLBACK_URL.substring(0, 30) + '...',
+            minWatchTime: `${this.MIN_WATCH_TIME}ms`,
             costPerRequest: this.COSTS.NUMBER_REQUEST
         });
     }
@@ -43,16 +47,12 @@ class AdCreditSystem {
     //  CREDIT MANAGEMENT
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Get user's current ad credits + daily usage
-     */
     async getCredits(userId) {
         const user = await User.findOne({ userId }).lean();
         if (!user) {
             return { credits: 0, dailyUsed: 0, dailyLimit: this.COSTS.DAILY_FREE_LIMIT };
         }
 
-        // Check if daily reset needed (midnight UTC)
         const lastReset = user.adCreditReset ? new Date(user.adCreditReset) : null;
         const now = new Date();
         const shouldReset = !lastReset ||
@@ -81,13 +81,9 @@ class AdCreditSystem {
         };
     }
 
-    /**
-     * Check if user can request a free number
-     */
     async canRequestNumber(userId) {
         const credits = await this.getCredits(userId);
 
-        // Daily limit check
         if (credits.dailyUsed >= credits.dailyLimit) {
             return {
                 allowed: false,
@@ -98,7 +94,6 @@ class AdCreditSystem {
             };
         }
 
-        // Credit check
         if (credits.credits >= this.COSTS.NUMBER_REQUEST) {
             return {
                 allowed: true,
@@ -109,7 +104,6 @@ class AdCreditSystem {
             };
         }
 
-        // Need more credits — show ad prompt
         return {
             allowed: false,
             reason: 'INSUFFICIENT_CREDITS',
@@ -120,9 +114,6 @@ class AdCreditSystem {
         };
     }
 
-    /**
-     * Deduct credits for number request
-     */
     async deductCredits(userId) {
         const check = await this.canRequestNumber(userId);
         if (!check.allowed) {
@@ -153,26 +144,22 @@ class AdCreditSystem {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  AD VIEW GENERATION
+    //  AD VIEW GENERATION — Records start time when user opens ad
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Generate ad view URL for user
-     * Returns { verificationId, adUrl, network, type, creditValue }
-     */
     async generateAdView(userId, networkType = 'primary') {
         const verificationId = `ad_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
         const isPrimary = networkType === 'primary';
         const baseUrl = isPrimary ? this.PRIMARY_URL : this.FALLBACK_URL;
 
-        // Build tracking URL with verification params
         const separator = baseUrl.includes('?') ? '&' : '?';
         const adUrl = `${baseUrl}${separator}subId=${verificationId}&userId=${userId}`;
 
-        // Store pending verification
+        // Store with startTime = now (user hasn't opened yet, but will soon)
         this.activeVerifications.set(verificationId, {
             userId,
-            credits: 2, // Each ad view = 2 credits
+            credits: 2,
+            startTime: null, // Set when user actually opens
             createdAt: Date.now(),
             status: 'PENDING',
             urlType: isPrimary ? 'primary' : 'fallback'
@@ -185,81 +172,105 @@ class AdCreditSystem {
             adUrl,
             network: isPrimary ? 'Ad Network' : 'Fallback Network',
             type: 'redirect',
-            estimatedTime: '15-30 sec',
-            creditValue: 2
+            estimatedTime: '30 sec',
+            creditValue: 2,
+            minWatchTime: this.MIN_WATCH_TIME
         };
     }
 
     /**
-     * Get available ad options for user
+     * Record that user opened the ad (called when "Open Ad" button tapped)
      */
-    getAvailableNetworks() {
-        return [
-            {
-                id: 'primary',
-                name: 'Watch Ad',
-                creditValue: 2,
-                configured: !!this.PRIMARY_URL
-            },
-            {
-                id: 'fallback',
-                name: 'Watch Ad (Alt)',
-                creditValue: 2,
-                configured: !!this.FALLBACK_URL
-            }
-        ].filter(n => n.configured);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  POSTBACK WEBHOOK HANDLER
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /**
-     * Handle postback from ad network
-     * Route: GET /webhook/ad?verify={verificationId}&status=completed
-     */
-    async handlePostback(query = {}) {
-        const { verify, subId, status, userId: queryUserId } = query;
-
-        const verificationId = verify || subId;
-        if (!verificationId) {
-            return { success: false, error: 'MISSING_VERIFICATION_ID' };
-        }
-
-        // Allow manual override for testing: ?status=completed&verify=xxx
-        const isCompleted = status === 'completed' || status === 'approved';
-
-        return this._processVerification(verificationId, {
-            status: isCompleted ? 'completed' : 'pending',
-            query
-        });
-    }
-
-    /**
-     * Process verified completion — award credits to user
-     */
-    async _processVerification(verificationId, metadata = {}) {
+    recordAdStart(verificationId) {
         const verification = this.activeVerifications.get(verificationId);
-
         if (!verification) {
-            logger.warn('Verification not found or expired', { verificationId });
             return { success: false, error: 'VERIFICATION_NOT_FOUND' };
         }
 
-        if (verification.status === 'COMPLETED') {
-            return { success: false, error: 'ALREADY_COMPLETED' };
+        verification.startTime = Date.now();
+        this.activeVerifications.set(verificationId, verification);
+
+        logger.info('Ad watch started', {
+            userId: verification.userId,
+            verificationId,
+            startedAt: verification.startTime
+        });
+
+        return {
+            success: true,
+            startedAt: verification.startTime,
+            minWatchTime: this.MIN_WATCH_TIME,
+            canClaimAt: verification.startTime + this.MIN_WATCH_TIME
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  CREDIT CLAIM — User taps "Check My Credits" after watching
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Check if enough time has passed and award credits
+     */
+    async claimCredits(verificationId) {
+        const verification = this.activeVerifications.get(verificationId);
+
+        if (!verification) {
+            return {
+                success: false,
+                error: 'VERIFICATION_NOT_FOUND',
+                message: 'Ad session expired. Please watch a new ad.'
+            };
         }
 
+        if (verification.status === 'COMPLETED') {
+            return {
+                success: false,
+                error: 'ALREADY_COMPLETED',
+                message: 'Credits already claimed for this ad.'
+            };
+        }
+
+        // Must have started watching
+        if (!verification.startTime) {
+            return {
+                success: false,
+                error: 'WATCH_NOT_STARTED',
+                message: 'Please open the ad first.',
+                minWatchTime: this.MIN_WATCH_TIME
+            };
+        }
+
+        const elapsed = Date.now() - verification.startTime;
+
+        // Time gate: must wait MIN_WATCH_TIME
+        if (elapsed < this.MIN_WATCH_TIME) {
+            const remaining = Math.ceil((this.MIN_WATCH_TIME - elapsed) / 1000);
+            return {
+                success: false,
+                error: 'TIME_NOT_ELAPSED',
+                message: `Please wait ${remaining} more seconds.`,
+                elapsed: Math.floor(elapsed / 1000),
+                required: Math.floor(this.MIN_WATCH_TIME / 1000),
+                remaining
+            };
+        }
+
+        // Time satisfied — award credits
+        return this._awardCredits(verificationId, verification, { elapsed });
+    }
+
+    /**
+     * Internal: Award credits and record completion
+     */
+    async _awardCredits(verificationId, verification, metadata = {}) {
         const { userId, credits } = verification;
 
         try {
-            // Update user credits
             await User.updateOne(
                 { userId },
                 { $inc: { adCredits: credits } }
             );
 
-            // Record the ad view
             await AdView.create({
                 viewId: verificationId,
                 userId,
@@ -267,27 +278,29 @@ class AdCreditSystem {
                 creditsEarned: credits,
                 status: 'COMPLETED',
                 completedAt: new Date(),
+                watchDuration: metadata.elapsed,
                 metadata
             });
 
-            // Mark as completed
             verification.status = 'COMPLETED';
             verification.completedAt = Date.now();
             this.activeVerifications.set(verificationId, verification);
+
+            const totalCredits = await this.getCredits(userId);
 
             logger.info('Ad credit awarded', {
                 userId,
                 verificationId,
                 credits,
+                watchDuration: metadata.elapsed,
                 type: verification.urlType
             });
-
-            const totalCredits = await this.getCredits(userId);
 
             return {
                 success: true,
                 creditsAdded: credits,
-                totalCredits: totalCredits.credits
+                totalCredits: totalCredits.credits,
+                watchDuration: metadata.elapsed
             };
 
         } catch (error) {
@@ -296,23 +309,65 @@ class AdCreditSystem {
                 userId,
                 error: error.message
             });
-            return { success: false, error: 'AWARD_FAILED', details: error.message };
+            return {
+                success: false,
+                error: 'AWARD_FAILED',
+                message: 'System error. Please try again.'
+            };
         }
     }
 
-    /**
-     * Manual verification for admin/testing
-     */
-    async manualVerify(verificationId) {
-        return this._processVerification(verificationId, { source: 'manual' });
+    // ═══════════════════════════════════════════════════════════════════════
+    //  LEGACY POSTBACK — Kept for compatibility if networks ever support it
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handlePostback(query = {}) {
+        const { verify, subId, status } = query;
+        const verificationId = verify || subId;
+
+        if (!verificationId) {
+            return { success: false, error: 'MISSING_VERIFICATION_ID' };
+        }
+
+        // If network sends completed status, bypass time gate
+        if (status === 'completed' || status === 'approved') {
+            const verification = this.activeVerifications.get(verificationId);
+            if (!verification) {
+                return { success: false, error: 'VERIFICATION_NOT_FOUND' };
+            }
+            if (verification.status === 'COMPLETED') {
+                return { success: false, error: 'ALREADY_COMPLETED' };
+            }
+            return this._awardCredits(verificationId, verification, { source: 'postback' });
+        }
+
+        return { success: false, error: 'STATUS_NOT_COMPLETED' };
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  CLEANUP
+    //  UTILITY
     // ═══════════════════════════════════════════════════════════════════════
 
+    getAvailableNetworks() {
+        return [
+            {
+                id: 'primary',
+                name: 'Watch Ad',
+                creditValue: 2,
+                configured: !!this.PRIMARY_URL,
+                minWatchTime: Math.floor(this.MIN_WATCH_TIME / 1000)
+            },
+            {
+                id: 'fallback',
+                name: 'Watch Ad (Alt)',
+                creditValue: 2,
+                configured: !!this.FALLBACK_URL,
+                minWatchTime: Math.floor(this.MIN_WATCH_TIME / 1000)
+            }
+        ].filter(n => n.configured);
+    }
+
     _startCleanupInterval() {
-        // Clean up old verifications every 5 minutes
         setInterval(() => {
             const cleaned = this.cleanupOldVerifications();
             if (cleaned > 0) {
@@ -343,6 +398,8 @@ class AdCreditSystem {
                 pending.push({
                     id,
                     userId: v.userId,
+                    started: !!v.startTime,
+                    elapsed: v.startTime ? Math.floor((now - v.startTime) / 1000) : 0,
                     age: Math.floor((now - v.createdAt) / 1000)
                 });
             }
@@ -352,4 +409,4 @@ class AdCreditSystem {
 }
 
 export default AdCreditSystem;
-                                                             
+                    
