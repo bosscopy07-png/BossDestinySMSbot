@@ -881,82 +881,154 @@ _freeRemaining(user) {
    //  WATCH AD HANDLER — User clicked an ad network button
    // ═══════════════════════════════════════════════════════════════════════
 
-   async handleWatchAd(ctx, networkId) {
-       const userId = ctx.from?.id?.toString();
+       // ═══════════════════════════════════════════════════════════════════════
+    //  WATCH AD HANDLER — Records start time when user opens ad
+    // ═══════════════════════════════════════════════════════════════════════
 
-       try {
-           const freeProvider = this.smsProviderManager?.getProvider('FREE_PUBLIC');
-           if (!freeProvider) {
-               return ctx.answerCbQuery('❌ Free service unavailable').catch(() => {});
-           }
+    async handleWatchAd(ctx, networkId) {
+        const userId = ctx.from?.id?.toString();
 
-           const adView = await freeProvider.generateAdView(userId, networkId);
+        try {
+            const freeProvider = this.smsProviderManager?.getProvider('FREE_PUBLIC');
+            if (!freeProvider || !freeProvider.adSystem) {
+                return ctx.answerCbQuery('❌ Free service unavailable').catch(() => {});
+            }
 
-           const message =
-               `📺 <b>Watch Ad to Earn Credits</b>\n\n` +
-               `Network: <b>${adView.network}</b>\n` +
-               `Type: ${adView.type}\n` +
-               `Reward: <b>+${adView.creditValue} credit${adView.creditValue > 1 ? 's' : ''}</b>\n` +
-               `Estimated time: ${adView.estimatedTime}\n\n` +
-               `Click below to open the ad.\n\n` +
-               `<i>After completing the ad, tap "✅ Check My Credits"</i>`;
+            const adView = await freeProvider.adSystem.generateAdView(userId, networkId);
 
-           await ctx.editMessageText(message, {
-               parse_mode: 'HTML',
-               reply_markup: Markup.inlineKeyboard([
-                   [Markup.button.url('📺 Open Ad', adView.adUrl)],
-                   [Markup.button.callback('✅ Check My Credits', 'check_credits')],
-                   [Markup.button.callback('🔙 Back', 'menu')]
-               ]).reply_markup
-           });
+            // Record that user is starting to watch
+            const startResult = freeProvider.adSystem.recordAdStart(adView.verificationId);
 
-       } catch (error) {
-           logger.error('handleWatchAd error', { userId, error: error.message });
-           ctx.answerCbQuery('❌ Ad unavailable. Try another.').catch(() => {});
-       }
-   }
+            const message =
+                `📺 <b>Watch Ad to Earn Credits</b>\n\n` +
+                `Reward: <b>+${adView.creditValue} credits</b>\n` +
+                `Required watch time: <b>${Math.floor(adView.minWatchTime / 1000)} seconds</b>\n\n` +
+                `1️⃣ Click "📺 Open Ad" below\n` +
+                `2️⃣ Stay on the page for <b>${Math.floor(adView.minWatchTime / 1000)} seconds</b>\n` +
+                `3️⃣ Return and tap "✅ Check My Credits"\n\n` +
+                `<i>Do not close the ad before time is up or credits will not be awarded.</i>`;
 
-   // ═══════════════════════════════════════════════════════════════════════
-   //  CHECK CREDITS HANDLER — User taps "Check My Credits"
-   // ═══════════════════════════════════════════════════════════════════════
+            // Store verificationId in session for claim
+            ctx.session = ctx.session || {};
+            ctx.session.pendingAdVerification = adView.verificationId;
 
-   async handleCheckCredits(ctx) {
-       const userId = ctx.from?.id?.toString();
+            await ctx.editMessageText(message, {
+                parse_mode: 'HTML',
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.url('📺 Open Ad', adView.adUrl)],
+                    [Markup.button.callback('✅ Check My Credits', 'check_credits')],
+                    [Markup.button.callback('🔙 Back', 'menu')]
+                ]).reply_markup
+            });
 
-       try {
-           const freeProvider = this.smsProviderManager?.getProvider('FREE_PUBLIC');
-           if (!freeProvider) {
-               return ctx.answerCbQuery('❌ Service unavailable').catch(() => {});
-           }
+        } catch (error) {
+            logger.error('handleWatchAd error', { userId, error: error.message });
+            ctx.answerCbQuery('❌ Ad unavailable. Try another.').catch(() => {});
+        }
+    }
 
-           const credits = await freeProvider.getCredits(userId);
-           const required = freeProvider.adSystem?.COSTS?.NUMBER_REQUEST || 2;
+    // ═══════════════════════════════════════════════════════════════════════
+    //  CHECK CREDITS HANDLER — Claims credits after time gate
+    // ═══════════════════════════════════════════════════════════════════════
 
-           if (credits.credits >= required) {
-               await ctx.editMessageText(
-                   `✅ <b>Credits Added!</b>\n\n` +
-                   `💳 Current credits: <code>${credits.credits}</code>\n` +
-                   `✅ You can now request a free OTP!`,
-                   {
-                       parse_mode: 'HTML',
-                       reply_markup: Markup.inlineKeyboard([
-                           [Markup.button.callback('📱 Get Free OTP', 'mode_free')],
-                           [Markup.button.callback('🔙 Menu', 'menu')]
-                       ]).reply_markup
-                   }
-               );
-           } else {
-               await ctx.answerCbQuery(
-                   `⏳ Credits: ${credits.credits}/${required}. Ad may still be processing. Try again in 30s.`,
-                   { show_alert: true }
-               );
-           }
+    async handleCheckCredits(ctx) {
+        const userId = ctx.from?.id?.toString();
 
-       } catch (error) {
-           logger.error('handleCheckCredits error', { userId, error: error.message });
-       }
-   }
+        try {
+            const freeProvider = this.smsProviderManager?.getProvider('FREE_PUBLIC');
+            if (!freeProvider || !freeProvider.adSystem) {
+                return ctx.answerCbQuery('❌ Service unavailable').catch(() => {});
+            }
 
+            // Get pending verification from session
+            const verificationId = ctx.session?.pendingAdVerification;
+
+            if (!verificationId) {
+                return ctx.answerCbQuery(
+                    '❌ No active ad session. Please watch an ad first.',
+                    { show_alert: true }
+                );
+            }
+
+            // Attempt to claim credits
+            const claimResult = await freeProvider.adSystem.claimCredits(verificationId);
+
+            if (claimResult.success) {
+                // Credits awarded! Clear pending and show success
+                delete ctx.session.pendingAdVerification;
+
+                const required = freeProvider.adSystem.COSTS.NUMBER_REQUEST;
+
+                await ctx.editMessageText(
+                    `✅ <b>Credits Added!</b>\n\n` +
+                    `💳 Credits earned: <code>+${claimResult.creditsAdded}</code>\n` +
+                    `💳 Total credits: <code>${claimResult.totalCredits}</code>\n` +
+                    `⏱ Watch time: ${Math.floor(claimResult.watchDuration / 1000)}s\n\n` +
+                    `✅ You can now request a free OTP!`,
+                    {
+                        parse_mode: 'HTML',
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('📱 Get Free OTP', 'mode_free')],
+                            [Markup.button.callback('🔙 Menu', 'menu')]
+                        ]).reply_markup
+                    }
+                );
+
+            } else if (claimResult.error === 'TIME_NOT_ELAPSED') {
+                // Still waiting — show remaining time
+                await ctx.answerCbQuery(
+                    `⏳ Wait ${claimResult.remaining}s more...`,
+                    { show_alert: true }
+                );
+
+                // Update message to show progress
+                const progress = Math.floor((claimResult.elapsed / claimResult.required) * 100);
+                await ctx.editMessageText(
+                    `📺 <b>Watching Ad...</b>\n\n` +
+                    `⏳ Progress: <code>${claimResult.elapsed}/${claimResult.required}s</code> (${progress}%)\n` +
+                    `⏳ Remaining: <code>${claimResult.remaining}s</code>\n\n` +
+                    `<i>Keep the ad page open. Do not close it.</i>`,
+                    {
+                        parse_mode: 'HTML',
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('🔄 Check Again', 'check_credits')],
+                            [Markup.button.callback('🔙 Give Up', 'menu')]
+                        ]).reply_markup
+                    }
+                );
+
+            } else if (claimResult.error === 'WATCH_NOT_STARTED') {
+                await ctx.answerCbQuery(
+                    '❌ Please open the ad first by tapping "📺 Open Ad"',
+                    { show_alert: true }
+                );
+
+            } else {
+                // Session expired or other error
+                delete ctx.session.pendingAdVerification;
+                await ctx.answerCbQuery(
+                    `❌ ${claimResult.message || 'Failed to claim credits'}`,
+                    { show_alert: true }
+                );
+                await ctx.editMessageText(
+                    `❌ <b>Ad Session Expired</b>\n\n` +
+                    `Please watch a new ad to earn credits.`,
+                    {
+                        parse_mode: 'HTML',
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('📺 Watch New Ad', 'mode_free')],
+                            [Markup.button.callback('🔙 Menu', 'menu')]
+                        ]).reply_markup
+                    }
+                );
+            }
+
+        } catch (error) {
+            logger.error('handleCheckCredits error', { userId, error: error.message });
+            ctx.answerCbQuery('❌ Check failed').catch(() => {});
+        }
+    }
+    
    // ═══════════════════════════════════════════════════════════════════════
    //  FREE SERVICE SELECTED — User picks service after credits pass
    // ═══════════════════════════════════════════════════════════════════════
