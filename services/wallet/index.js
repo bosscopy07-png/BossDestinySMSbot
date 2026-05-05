@@ -1,3 +1,8 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// services/wallet/index.js — WalletService Full Implementation
+// Part 1/3 — Imports, Constructor, RPC Configuration & Initialization
+// ═══════════════════════════════════════════════════════════════════════════════
+
 import { ethers } from 'ethers';
 import { User, Transaction } from '../../models/index.js';
 import { generateId } from '../../utils/helpers.js';
@@ -53,6 +58,9 @@ class WalletService {
         this.premiumProvider = null;      // Premium RPC provider
         this.currentProviderType = null;  // 'light' | 'light_fallback' | 'premium'
         this.fallbackExpiry = 0;          // When to return from fallback to primary light
+        
+        // ═══ SCAN PROTECTION ═══
+        this._isScanning = false;         // Prevents overlapping deposit scans
         
         this.usdtAbi = [
             'function balanceOf(address) view returns (uint256)',
@@ -375,8 +383,7 @@ class WalletService {
 
     /**
      * Check if we should extend or expire active mode
-     * CRITICAL FIX: Only extends if the SPECIFIC user who triggered active mode still has pending deposits
-     * AND deposits are not stale (older than 30 minutes)
+     * CRITICAL FIX: Only extends if RECENT pending deposits exist (not stale)
      */
     _evaluateScanMode() {
         const now = Date.now();
@@ -411,7 +418,7 @@ class WalletService {
 
     /**
      * Check if any users have RECENT pending deposits (not stale)
-     * This prevents old/stuck depositPending flags from keeping active mode alive forever
+     * Prevents old/stuck depositPending flags from keeping active mode alive forever
      */
     async _checkRecentPendingDeposits() {
         try {
@@ -431,9 +438,9 @@ class WalletService {
 
     /**
      * Clean up stale depositPending flags (deposits older than 30min that were never completed)
-     * Call this periodically to prevent database pollution
+     * Call this periodically from your main application loop
      */
-    async _cleanupStaleDeposits() {
+    async cleanupStaleDeposits() {
         try {
             const staleThreshold = new Date(Date.now() - STALE_DEPOSIT_TIMEOUT_MS);
             
@@ -502,7 +509,11 @@ class WalletService {
         }, interval);
 
         this.scanInterval.unref?.();
-    }
+}
+                                                                     // ═══════════════════════════════════════════════════════════════════════════════
+// services/wallet/index.js — Part 2/3
+// Deposit System, Atomic Event Processing & User Lookup
+// ═══════════════════════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════
     //  DEPOSIT SYSTEM — MODIFIED TO TRIGGER ACTIVE MODE
@@ -553,8 +564,19 @@ class WalletService {
         return parseFloat(trackingAmount.toFixed(6));
     }
 
+    // ═══════════════════════════════════════════════════════════
+    //  CHECK ALL DEPOSITS — WITH OVERLAP PROTECTION
+    // ═══════════════════════════════════════════════════════════
+
     async checkAllDeposits() {
         await this.ensureReady();
+
+        // Prevent overlapping scans — critical for avoiding double-crediting
+        if (this._isScanning) {
+            logger.debug('Scan already in progress, skipping');
+            return [];
+        }
+        this._isScanning = true;
 
         try {
             const latestBlock = await this.provider.getBlockNumber();
@@ -594,6 +616,7 @@ class WalletService {
                 }
             }
 
+            // Only update lastCheckedBlock after ALL events processed successfully
             this.lastCheckedBlock = latestBlock + 1;
             return processedDeposits;
 
@@ -620,43 +643,91 @@ class WalletService {
             }
             
             throw error;
+        } finally {
+            this._isScanning = false;
         }
     }
 
+    // ═══════════════════════════════════════════════════════════
+    //  ATOMIC DEPOSIT EVENT PROCESSING — PREVENTS DOUBLE CREDITING
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Process a single deposit event with atomic duplicate prevention.
+     * Uses in-memory Set + atomic DB operations to prevent race conditions.
+     */
     async processDepositEvent(event, retryCount = 0) {
         const MAX_RETRIES = 3;
-        
+        const txHash = event.transactionHash;
+
         try {
+            // ─── IMMEDIATE IN-MEMORY DEDUPLICATION ───
+            // Check in-memory first (fastest) — prevents same-process races
+            if (this.notifiedTxHashes.has(txHash)) {
+                logger.debug('Deposit event already processed in memory', { txHash });
+                return null;
+            }
+            this.notifiedTxHashes.add(txHash);
+
             const fromAddress = event.args.from;
             const toAddress = event.args.to;
             const amountRaw = event.args.value;
             const amount = parseFloat(ethers.formatUnits(amountRaw, this.decimals));
-            const txHash = event.transactionHash;
             const blockNumber = event.blockNumber;
 
             if (toAddress.toLowerCase() !== this.masterAddress.toLowerCase()) {
+                this.notifiedTxHashes.delete(txHash); // Release lock
                 return null;
             }
 
+            // ─── ATOMIC DATABASE CHECK ───
             const existing = await Transaction.findOne({ 'blockchain.txHash': txHash });
-            if (existing) return null;
+            if (existing) {
+                logger.debug('Deposit already exists in database', { txHash });
+                return null;
+            }
 
-            let user = await User.findOne({ 
-                depositPending: true,
-                depositTrackingAmount: amount
-            });
-
-            if (!user) {
-                user = await User.findOne({
+            // ─── ATOMIC USER MATCHING & LOCKING ───
+            // findOneAndUpdate with $set: depositPending:false atomically locks the user
+            // Only ONE process gets the user back — others get null
+            let user = await User.findOneAndUpdate(
+                {
                     depositPending: true,
-                    depositTrackingAmount: { 
-                        $gte: amount - 0.01, 
-                        $lte: amount + 0.01 
+                    depositTrackingAmount: amount
+                },
+                {
+                    $set: {
+                        depositPending: false,
+                        depositTrackingAmount: null,
+                        lastDepositAt: new Date()
                     }
-                });
+                },
+                { new: true }
+            );
+
+            // If exact match failed, try fuzzy match
+            if (!user) {
+                user = await User.findOneAndUpdate(
+                    {
+                        depositPending: true,
+                        depositTrackingAmount: {
+                            $gte: amount - 0.01,
+                            $lte: amount + 0.01
+                        }
+                    },
+                    {
+                        $set: {
+                            depositPending: false,
+                            depositTrackingAmount: null,
+                            lastDepositAt: new Date()
+                        }
+                    },
+                    { new: true }
+                );
             }
 
             if (!user) {
+                this.notifiedTxHashes.delete(txHash); // Release lock
                 logger.warn('Deposit received but no matching user found', {
                     from: fromAddress,
                     amount,
@@ -666,6 +737,7 @@ class WalletService {
                 return null;
             }
 
+            // ─── CALCULATE CREDIT AMOUNT ───
             let creditAmount = user.depositRequestedAmount;
             
             if (!creditAmount || creditAmount <= 0) {
@@ -688,30 +760,46 @@ class WalletService {
             const trackingFee = parseFloat((amount - creditAmount).toFixed(6));
 
             if (creditAmount <= 0) {
+                this.notifiedTxHashes.delete(txHash); // Release lock
                 logger.error('Invalid credit amount', { userId: user.userId, creditAmount, trackingAmount: amount });
                 return null;
             }
 
-            const tx = await Transaction.create({
-                txId: generateId(),
-                userId: user.userId,
-                type: 'DEPOSIT',
-                amount: creditAmount,
-                currency: 'USDT',
-                status: 'COMPLETED',
-                blockchain: {
-                    txHash,
-                    blockNumber,
-                    confirmations: 0,
-                    fromAddress,
-                    toAddress,
-                    token: 'USDT',
-                    amountCrypto: amount.toString(),
-                    requestedAmount: creditAmount,
-                    trackingFee: trackingFee
+            // ─── ATOMIC TRANSACTION CREATION ───
+            // Create transaction FIRST — if this fails with duplicate key, another process handled it
+            let tx;
+            try {
+                tx = await Transaction.create({
+                    txId: generateId(),
+                    userId: user.userId,
+                    type: 'DEPOSIT',
+                    amount: creditAmount,
+                    currency: 'USDT',
+                    status: 'COMPLETED',
+                    blockchain: {
+                        txHash,
+                        blockNumber,
+                        confirmations: 0,
+                        fromAddress,
+                        toAddress,
+                        token: 'USDT',
+                        amountCrypto: amount.toString(),
+                        requestedAmount: creditAmount,
+                        trackingFee: trackingFee
+                    }
+                });
+            } catch (createError) {
+                // If duplicate key error (E11000), another process created it first
+                if (createError.message?.includes('E11000') || createError.code === 11000) {
+                    logger.warn('Race condition detected — transaction already created by another process', { txHash });
+                    // Keep user depositPending:false — other process handled it
+                    return null;
                 }
-            });
+                throw createError;
+            }
 
+            // ─── ATOMIC BALANCE UPDATE ───
+            // Only credit AFTER transaction is successfully created
             await User.updateOne(
                 { userId: user.userId },
                 {
@@ -720,15 +808,13 @@ class WalletService {
                         totalDeposited: creditAmount
                     },
                     $set: {
-                        depositPending: false,
-                        depositTrackingAmount: null,
                         depositRequestedAmount: null,
-                        lastDepositAt: new Date(),
                         registeredWallet: fromAddress.toLowerCase()
                     }
                 }
             );
 
+            // ─── REFERRAL PROCESSING ───
             await this.processReferralDeposit(user.userId, creditAmount);
 
             logger.info('Deposit detected and credited', {
@@ -741,9 +827,8 @@ class WalletService {
                 mode: this.scanMode
             });
 
-            if (this.notificationCallback && !this.notifiedTxHashes.has(txHash)) {
-                this.notifiedTxHashes.add(txHash);
-                
+            // ─── NOTIFICATION ───
+            if (this.notificationCallback) {
                 try {
                     await this.notificationCallback(user.userId, {
                         type: 'DEPOSIT_CONFIRMED',
@@ -757,7 +842,7 @@ class WalletService {
                         userId: user.userId, 
                         error: notifyError.message 
                     });
-                    this.notifiedTxHashes.delete(txHash);
+                    // Don't delete from notifiedTxHashes — we don't want to re-process
                 }
             }
         
@@ -771,6 +856,9 @@ class WalletService {
             };
 
         } catch (error) {
+            // Release in-memory lock on error so we can retry
+            this.notifiedTxHashes.delete(txHash);
+
             if (retryCount < MAX_RETRIES && this.isRetryableError(error)) {
                 const delay = 1000 * Math.pow(2, retryCount);
                 logger.warn('Deposit event processing failed, retrying...', { 
@@ -920,7 +1008,11 @@ class WalletService {
 
             throw error;
         }
-    }
+            }
+        // ═══════════════════════════════════════════════════════════════════════════════
+// services/wallet/index.js — Part 3/3
+// Referral System, Fund Management, Admin Balance Operations & Lifecycle
+// ═══════════════════════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════
     //  REFERRAL SYSTEM
@@ -1041,7 +1133,7 @@ class WalletService {
         }
     }
 
-        async captureFunds(txId, userId) {
+    async captureFunds(txId, userId) {
         try {
             const tx = await Transaction.findOne({ txId, userId });
             if (!tx || tx.status !== 'PENDING') {
@@ -1216,8 +1308,8 @@ class WalletService {
     // ═══════════════════════════════════════════════════════════
     //  ADMIN BALANCE OPERATIONS
     // ═══════════════════════════════════════════════════════════
-                    
-      async addBalance(userId, amount, adminId, reason) {
+
+    async addBalance(userId, amount, adminId, reason) {
         const txId = generateId();
 
         if (isNaN(amount) || amount <= 0) {
@@ -1418,3 +1510,4 @@ class WalletService {
 }
 
 export default WalletService;
+        
