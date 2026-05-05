@@ -1,68 +1,40 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// AdCreditSystem.js — Part 1/2: Core Engine, Credit Management, Ad URL Generation
+// AdCreditSystem.js — Simplified: Primary + Fallback redirect URLs
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { User, AdView } from '../../models/index.js';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
-import axios from 'axios';
 
 /**
- * AdCreditSystem — Manages ad views → credit conversion with REAL ad networks
+ * AdCreditSystem — Manages ad views → credit conversion
  *
  * Architecture:
- * - Shorte.st: URL shortening API (token required)
- * - CPAGrip/OGAds: Content locker via direct link + postback
- * - All networks use SERVER-SIDE postback for verification (not client-side)
+ * - Primary URL: omg10.com redirect (no API needed)
+ * - Fallback URL: profitablecpmratenetwork.com redirect (no API needed)
+ * - Server-side postback for verification via webhook
+ * - In-memory verification tracking with automatic cleanup
  */
 class AdCreditSystem {
     constructor() {
-        // Network configs with real API endpoints
-        this.AD_NETWORKS = {
-            shorte_st: {
-                name: 'Shorte.st',
-                type: 'link',
-                creditValue: 1,
-                apiUrl: 'https://api.shorte.st/v1/data/url',
-                // Requires SHORTE_ST_API_TOKEN env var
-            },
-            cpagrip: {
-                name: 'CPAGrip',
-                type: 'locker',
-                creditValue: 2,
-                // Requires CPAGRIP_LOCKER_URL env var (direct link from dashboard)
-            },
-            ogads: {
-                name: 'OGAds',
-                type: 'locker',
-                creditValue: 2,
-                // Requires OGADS_OFFERWALL_URL env var
-                // Postback: BASE_URL/webhook/ad/ogads
-            },
-            admaven: {
-                name: 'AdMaven',
-                type: 'push',
-                creditValue: 1,
-                // Requires ADMAVEN_DIRECT_LINK env var
-            },
-            propeller: {
-                name: 'PropellerAds',
-                type: 'push',
-                creditValue: 1,
-                // Requires PROPELLER_DIRECT_LINK env var
-            }
-        };
+        // Primary and fallback ad URLs from config or env
+        this.PRIMARY_URL = config.adSystem?.primaryUrl || process.env.AD_PRIMARY_URL || 'https://omg10.com/4/10967769';
+        this.FALLBACK_URL = config.adSystem?.fallbackUrl || process.env.AD_FALLBACK_URL || 'https://www.profitablecpmratenetwork.com/zs5wg1ki?key=cb472c48fad6246f544094483b9f9bcc';
 
         this.COSTS = {
             NUMBER_REQUEST: config.adSystem?.creditsPerRequest || 2,
             DAILY_FREE_LIMIT: config.limits?.freeDaily || 3
         };
 
-        // Pending verifications: verificationId -> { userId, network, credits, status }
+        // Verification tracking: verificationId -> { userId, credits, status, createdAt }
         this.activeVerifications = new Map();
 
+        // Start cleanup interval
+        this._startCleanupInterval();
+
         logger.info('AdCreditSystem initialized', {
-            networks: Object.keys(this.AD_NETWORKS).length,
+            primaryUrl: this.PRIMARY_URL.substring(0, 30) + '...',
+            fallbackUrl: this.FALLBACK_URL.substring(0, 30) + '...',
             costPerRequest: this.COSTS.NUMBER_REQUEST
         });
     }
@@ -85,7 +57,8 @@ class AdCreditSystem {
         const now = new Date();
         const shouldReset = !lastReset ||
             lastReset.getUTCDate() !== now.getUTCDate() ||
-            lastReset.getUTCMonth() !== now.getUTCMonth();
+            lastReset.getUTCMonth() !== now.getUTCMonth() ||
+            lastReset.getUTCFullYear() !== now.getUTCFullYear();
 
         if (shouldReset) {
             await User.updateOne(
@@ -180,201 +153,95 @@ class AdCreditSystem {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  AD VIEW GENERATION — Create monetized links for user
+    //  AD VIEW GENERATION
     // ═══════════════════════════════════════════════════════════════════════
 
     /**
      * Generate ad view URL for user
      * Returns { verificationId, adUrl, network, type, creditValue }
      */
-    async generateAdView(userId, network = 'shorte_st') {
-        const networkConfig = this.AD_NETWORKS[network];
-        if (!networkConfig) {
-            throw new Error(`INVALID_NETWORK: ${network}`);
-        }
-
+    async generateAdView(userId, networkType = 'primary') {
         const verificationId = `ad_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        const isPrimary = networkType === 'primary';
+        const baseUrl = isPrimary ? this.PRIMARY_URL : this.FALLBACK_URL;
+
+        // Build tracking URL with verification params
+        const separator = baseUrl.includes('?') ? '&' : '?';
+        const adUrl = `${baseUrl}${separator}subId=${verificationId}&userId=${userId}`;
 
         // Store pending verification
         this.activeVerifications.set(verificationId, {
             userId,
-            network,
-            credits: networkConfig.creditValue,
+            credits: 2, // Each ad view = 2 credits
             createdAt: Date.now(),
-            status: 'PENDING'
+            status: 'PENDING',
+            urlType: isPrimary ? 'primary' : 'fallback'
         });
 
-        // Generate actual ad URL based on network type
-        let adUrl;
-        try {
-            adUrl = await this._buildRealAdUrl(network, verificationId, userId);
-        } catch (error) {
-            this.activeVerifications.delete(verificationId);
-            throw new Error(`AD_URL_FAILED: ${error.message}`);
-        }
-
-        logger.info('Ad view generated', { userId, network, verificationId });
+        logger.info('Ad view generated', { userId, verificationId, type: isPrimary ? 'primary' : 'fallback' });
 
         return {
             verificationId,
             adUrl,
-            network: networkConfig.name,
-            type: networkConfig.type,
-            estimatedTime: networkConfig.type === 'locker' ? '30-60 sec' : '15-30 sec',
-            creditValue: networkConfig.creditValue
+            network: isPrimary ? 'Ad Network' : 'Fallback Network',
+            type: 'redirect',
+            estimatedTime: '15-30 sec',
+            creditValue: 2
         };
     }
 
     /**
-     * Build REAL ad URLs using network APIs
+     * Get available ad options for user
      */
-    async _buildRealAdUrl(network, verificationId, userId) {
-        const baseUrl = process.env.BASE_URL;
-        const callbackUrl = `${baseUrl}/webhook/ad/${verificationId}`;
-
-        switch (network) {
-            case 'shorte_st': {
-                // Shorte.st API: shorten the callback URL
-                const token = process.env.SHORTE_ST_API_TOKEN;
-                if (!token) {
-                    // Fallback: manual short link format
-                    return `https://sh.st/stub/${verificationId}?callback=${encodeURIComponent(callbackUrl)}`;
-                }
-
-                try {
-                    const response = await axios.put(
-                        'https://api.shorte.st/v1/data/url',
-                        { urlToShorten: callbackUrl },
-                        {
-                            headers: {
-                                'public-api-token': token,
-                                'Content-Type': 'application/json'
-                            },
-                            timeout: 10000
-                        }
-                    );
-                    return response.data.shortenedUrl || response.data.shortUrl;
-                } catch (apiError) {
-                    logger.warn('Shorte.st API failed, using fallback', { error: apiError.message });
-                    return `https://sh.st/stub/${verificationId}?fallback=${encodeURIComponent(callbackUrl)}`;
-                }
+    getAvailableNetworks() {
+        return [
+            {
+                id: 'primary',
+                name: 'Watch Ad',
+                creditValue: 2,
+                configured: !!this.PRIMARY_URL
+            },
+            {
+                id: 'fallback',
+                name: 'Watch Ad (Alt)',
+                creditValue: 2,
+                configured: !!this.FALLBACK_URL
             }
-
-            case 'cpagrip': {
-                // CPAGrip: Use direct locker URL with subId for tracking
-                const lockerUrl = process.env.CPAGRIP_LOCKER_URL;
-                if (!lockerUrl) {
-                    throw new Error('CPAGRIP_LOCKER_URL not configured');
-                }
-                // Append tracking parameters
-                const separator = lockerUrl.includes('?') ? '&' : '?';
-                return `${lockerUrl}${separator}subId=${verificationId}&userId=${userId}&callback=${encodeURIComponent(callbackUrl)}`;
-            }
-
-            case 'ogads': {
-                // OGAds: Use offerwall API URL
-                const apiKey = process.env.OGADS_API_KEY;
-                const wallId = process.env.OGADS_WALL_ID;
-                if (!apiKey || !wallId) {
-                    throw new Error('OGADS_API_KEY or OGADS_WALL_ID not configured');
-                }
-
-                // OGAds offerwall URL with postback
-                const postbackUrl = encodeURIComponent(`${baseUrl}/webhook/ad/ogads?verify=${verificationId}`);
-                return `https://ogads.com/api/offerwall?key=${apiKey}&wall=${wallId}&user=${userId}&sub=${verificationId}&postback=${postbackUrl}`;
-            }
-
-            case 'admaven': {
-                const directLink = process.env.ADMAVEN_DIRECT_LINK;
-                if (!directLink) {
-                    throw new Error('ADMAVEN_DIRECT_LINK not configured');
-                }
-                return `${directLink}?sub=${verificationId}&user=${userId}&cb=${encodeURIComponent(callbackUrl)}`;
-            }
-
-            case 'propeller': {
-                const directLink = process.env.PROPELLER_DIRECT_LINK;
-                if (!directLink) {
-                    throw new Error('PROPELLER_DIRECT_LINK not configured');
-                }
-                return `${directLink}?sub=${verificationId}&user=${userId}&cb=${encodeURIComponent(callbackUrl)}`;
-            }
-
-            default:
-                throw new Error(`Unknown network: ${network}`);
-        }
-            }
-                    // ═══════════════════════════════════════════════════════════════════════════════
-// AdCreditSystem.js — Part 2/2: Postback Webhook Handlers, Validation & Cleanup
-// ═══════════════════════════════════════════════════════════════════════════════
+        ].filter(n => n.configured);
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  POSTBACK WEBHOOK HANDLERS — Called by ad networks when user completes offer
-    //  These are the REAL verification methods — client "I watched it" is fake
+    //  POSTBACK WEBHOOK HANDLER
     // ═══════════════════════════════════════════════════════════════════════
 
     /**
-     * Main webhook handler — ad networks ping this when offer completes
-     * Route: POST /webhook/ad/:network or /webhook/ad/:verificationId
+     * Handle postback from ad network
+     * Route: GET /webhook/ad?verify={verificationId}&status=completed
      */
-    async handlePostback(network, payload, query = {}) {
-        logger.info('Ad postback received', { network, payload: !!payload, query });
+    async handlePostback(query = {}) {
+        const { verify, subId, status, userId: queryUserId } = query;
 
-        // OGAds/CPAGrip style: network-specific postback
-        if (network === 'ogads' || network === 'cpagrip') {
-            return this._handleNetworkPostback(network, query);
-        }
-
-        // Generic verificationId-based postback (Shorte.st, AdMaven, etc.)
-        const { verify, sub, subId, status, conversion } = query;
-
-        if (!verify && !sub && !subId) {
+        const verificationId = verify || subId;
+        if (!verificationId) {
             return { success: false, error: 'MISSING_VERIFICATION_ID' };
         }
 
-        const verificationId = verify || sub || subId;
-        return this._processVerification(verificationId, { network, status, conversion, query });
-    }
+        // Allow manual override for testing: ?status=completed&verify=xxx
+        const isCompleted = status === 'completed' || status === 'approved';
 
-    /**
-     * Handle network-specific postback format
-     */
-    async _handleNetworkPostback(network, query) {
-        const {
-            subId,          // Our tracking ID
-            payout,         // Revenue in USD
-            status,         // 'approved', 'pending', 'rejected'
-            offer_id,       // Completed offer ID
-            ip              // User IP
-        } = query;
-
-        if (!subId) {
-            return { success: false, error: 'MISSING_SUBID' };
-        }
-
-        // Validate status
-        if (status && status !== 'approved' && status !== 'completed') {
-            logger.info('Postback rejected — non-approved status', { subId, status });
-            return { success: false, error: 'STATUS_NOT_APPROVED', status };
-        }
-
-        return this._processVerification(subId, {
-            network,
-            payout,
-            offerId: offer_id,
-            ip,
+        return this._processVerification(verificationId, {
+            status: isCompleted ? 'completed' : 'pending',
             query
         });
     }
 
     /**
-     * Process a verified completion — award credits to user
+     * Process verified completion — award credits to user
      */
     async _processVerification(verificationId, metadata = {}) {
         const verification = this.activeVerifications.get(verificationId);
 
         if (!verification) {
-            // Might be a duplicate postback or expired
             logger.warn('Verification not found or expired', { verificationId });
             return { success: false, error: 'VERIFICATION_NOT_FOUND' };
         }
@@ -383,9 +250,7 @@ class AdCreditSystem {
             return { success: false, error: 'ALREADY_COMPLETED' };
         }
 
-        // Award credits
-        const { userId, network, credits } = verification;
-        const networkConfig = this.AD_NETWORKS[network];
+        const { userId, credits } = verification;
 
         try {
             // Update user credits
@@ -398,15 +263,11 @@ class AdCreditSystem {
             await AdView.create({
                 viewId: verificationId,
                 userId,
-                network,
+                network: verification.urlType,
                 creditsEarned: credits,
                 status: 'COMPLETED',
                 completedAt: new Date(),
-                metadata: {
-                    ...metadata,
-                    userAgent: metadata.userAgent,
-                    ip: metadata.ip
-                }
+                metadata
             });
 
             // Mark as completed
@@ -414,18 +275,19 @@ class AdCreditSystem {
             verification.completedAt = Date.now();
             this.activeVerifications.set(verificationId, verification);
 
-            logger.info('Ad credit awarded via postback', {
+            logger.info('Ad credit awarded', {
                 userId,
                 verificationId,
-                network,
                 credits,
-                payout: metadata.payout
+                type: verification.urlType
             });
+
+            const totalCredits = await this.getCredits(userId);
 
             return {
                 success: true,
                 creditsAdded: credits,
-                totalCredits: await this.getCredits(userId)
+                totalCredits: totalCredits.credits
             };
 
         } catch (error) {
@@ -439,62 +301,38 @@ class AdCreditSystem {
     }
 
     /**
-     * LEGACY: Client-side "I watched it" verification
-     * DEPRECATED: Use server-side postbacks instead. Kept for fallback only.
+     * Manual verification for admin/testing
      */
-    async handleClientVerification(verificationId, payload) {
-        logger.warn('Client-side verification used — should migrate to postback', { verificationId });
-
-        const verification = this.activeVerifications.get(verificationId);
-        if (!verification) {
-            return { success: false, error: 'VERIFICATION_NOT_FOUND' };
-        }
-
-        if (verification.status === 'COMPLETED') {
-            return { success: false, error: 'ALREADY_COMPLETED' };
-        }
-
-        // Basic client-side validation (easily faked — not recommended)
-        const isValid = payload && (
-            payload.completed === true ||
-            payload.status === 'completed' ||
-            payload.verified === true
-        );
-
-        if (!isValid) {
-            verification.status = 'FAILED';
-            this.activeVerifications.set(verificationId, verification);
-            return { success: false, error: 'VALIDATION_FAILED' };
-        }
-
-        // Award credits (but log warning about client-side)
-        return this._processVerification(verificationId, {
-            source: 'client_side',
-            payload
-        });
+    async manualVerify(verificationId) {
+        return this._processVerification(verificationId, { source: 'manual' });
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  UTILITY METHODS
+    //  CLEANUP
     // ═══════════════════════════════════════════════════════════════════════
 
-    getAvailableNetworks() {
-        return Object.entries(this.AD_NETWORKS).map(([id, config]) => ({
-            id,
-            ...config,
-            configured: this._isNetworkConfigured(id)
-        }));
+    _startCleanupInterval() {
+        // Clean up old verifications every 5 minutes
+        setInterval(() => {
+            const cleaned = this.cleanupOldVerifications();
+            if (cleaned > 0) {
+                logger.debug('Cleaned old verifications', { count: cleaned });
+            }
+        }, 300000);
     }
 
-    _isNetworkConfigured(network) {
-        switch (network) {
-            case 'shorte_st': return !!process.env.SHORTE_ST_API_TOKEN || true; // Has fallback
-            case 'cpagrip': return !!process.env.CPAGRIP_LOCKER_URL;
-            case 'ogads': return !!process.env.OGADS_API_KEY && !!process.env.OGADS_WALL_ID;
-            case 'admaven': return !!process.env.ADMAVEN_DIRECT_LINK;
-            case 'propeller': return !!process.env.PROPELLER_DIRECT_LINK;
-            default: return false;
+    cleanupOldVerifications() {
+        const now = Date.now();
+        const maxAge = 3600000; // 1 hour
+        let cleaned = 0;
+
+        for (const [id, v] of this.activeVerifications) {
+            if (now - v.createdAt > maxAge || v.status === 'COMPLETED') {
+                this.activeVerifications.delete(id);
+                cleaned++;
+            }
         }
+        return cleaned;
     }
 
     getPendingVerifications() {
@@ -505,25 +343,13 @@ class AdCreditSystem {
                 pending.push({
                     id,
                     userId: v.userId,
-                    network: v.network,
                     age: Math.floor((now - v.createdAt) / 1000)
                 });
             }
         }
         return pending;
     }
-
-    cleanupOldVerifications() {
-        const now = Date.now();
-        let cleaned = 0;
-        for (const [id, v] of this.activeVerifications) {
-            if (now - v.createdAt > 3600000 || v.status === 'COMPLETED') {
-                this.activeVerifications.delete(id);
-                cleaned++;
-            }
-        }
-        return cleaned;
-    }
 }
 
 export default AdCreditSystem;
+                                                             
