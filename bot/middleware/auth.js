@@ -44,6 +44,30 @@ export const requireAuth = async (ctx, next) => {
     if (adminIds.includes(userId)) {
         ctx.state.isAdmin = true;
         ctx.state.userId = userId;
+        
+        // FIX: Lightweight admin user object — no DB hit, satisfies downstream checks
+        ctx.state.user = {
+            userId,
+            isAdmin: true,
+            username: ctx.from?.username || 'admin',
+            firstName: ctx.from?.first_name || 'Admin',
+            lastName: ctx.from?.last_name || null,
+            freeUsedToday: 0,
+            freeDailyLimit: Infinity,
+            balance: Infinity,
+            lockedBalance: 0,
+            bundleRemaining: Infinity,
+            vipExpiry: new Date('2099-12-31'),
+            vipDailyUsed: 0,
+            isBlacklisted: false,
+            createdAt: new Date(),
+            lastActive: new Date(),
+            // Method stubs for middleware compatibility
+            getAvailableBalance() { return Infinity; },
+            canUseFree() { return true; },
+            canUseVip() { return true; }
+        };
+        
         return next();
     }
 
@@ -126,4 +150,3 @@ export const requireBalance = (minAmount) => {
         return next();
     };
 };
-    
