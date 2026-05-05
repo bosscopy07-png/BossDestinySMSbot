@@ -344,8 +344,72 @@ _freeRemaining(user) {
         
         // OTP check with pattern
         this.bot.action(/check_otp_(.+)/, this.handleCheckOTP);
-    }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  AD CREDIT SYSTEM ACTIONS (NEW)
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    // Watch ad button — user selects an ad network
+    this.bot.action(/watch_ad_(.+)/, async (ctx) => {
+        try {
+            await this.handleWatchAd(ctx, ctx.match[1]);
+        } catch (error) {
+            logger.error('watch_ad action error', { error: error.message, userId: ctx.from?.id });
+            ctx.answerCbQuery('❌ Error loading ad').catch(() => {});
+        }
+    });
+
+    // Check credits button — user checks if ad completion awarded credits
+    this.bot.action('check_credits', async (ctx) => {
+        try {
+            await this.handleCheckCredits(ctx);
+        } catch (error) {
+            logger.error('check_credits action error', { error: error.message, userId: ctx.from?.id });
+            ctx.answerCbQuery('❌ Error checking credits').catch(() => {});
+        }
+    });
+
+    // Free service selection — user picks service after credits pass
+    this.bot.action(/free_service_(.+)/, async (ctx) => {
+        try {
+            await this.handleFreeServiceSelected(ctx, ctx.match[1]);
+        } catch (error) {
+            logger.error('free_service action error', { error: error.message, userId: ctx.from?.id });
+            ctx.answerCbQuery('❌ Error').catch(() => {});
+        }
+    });
+
+    // Free country selection — user picks country after service
+    this.bot.action(/free_country_(.+)/, async (ctx) => {
+        try {
+            await this.handleFreeCountrySelected(ctx, ctx.match[1]);
+        } catch (error) {
+            logger.error('free_country action error', { error: error.message, userId: ctx.from?.id });
+            ctx.answerCbQuery('❌ Error').catch(() => {});
+        }
+    });
+
+    // Free session cancel — cancel active free OTP session
+    this.bot.action(/cancel_free_(.+)/, async (ctx) => {
+        try {
+            await this.handleCancelFree(ctx, ctx.match[1]);
+        } catch (error) {
+            logger.error('cancel_free action error', { error: error.message, userId: ctx.from?.id });
+            ctx.answerCbQuery('❌ Cancel failed').catch(() => {});
+        }
+    });
+
+    // Free check now — manual poll for SMS
+    this.bot.action(/check_free_(.+)/, async (ctx) => {
+        try {
+            await this.handleCheckFree(ctx, ctx.match[1]);
+        } catch (error) {
+            logger.error('check_free action error', { error: error.message, userId: ctx.from?.id });
+            ctx.answerCbQuery('❌ Check failed').catch(() => {});
+        }
+    });
+}
+    
     // ═══════════════════════════════════════════════════════════════════════
     //  UTILITY METHODS
     // ═══════════════════════════════════════════════════════════════════════
@@ -637,39 +701,59 @@ _freeRemaining(user) {
     // ═══════════════════════════════════════════════════════════════════════
     //  MODE HANDLERS
     // ═══════════════════════════════════════════════════════════════════════
-async handleFreeMode(ctx) {
-    const user = ctx.state.user;
+     // ═══════════════════════════════════════════════════════════════════════
+    //  FREE MODE — WITH AD CREDIT INTEGRATION
+    //  Replaces/extends your existing handleFreeMode
+    // ═══════════════════════════════════════════════════════════════════════
 
-    if (!user) {
-        logger.warn('handleFreeMode: missing user in ctx.state', { 
-            fromId: ctx.from?.id,
-            updateId: ctx.update?.update_id 
-        });
-        return ctx.reply(
-            '⚠️ Session expired. Please send /start to continue.',
-            { parse_mode: 'HTML' }
-        );
-    }
+    async handleFreeMode(ctx) {
+        const user = ctx.state.user;
+        const userId = ctx.from?.id?.toString();
 
-        if (!this._canUseFree(user)) {
-            const message = 
-                '❌ <b>Free Limit Reached</b>\n\n' +
-                'You\'ve used all your free OTPs today.\n\n' +
-                '💰 Deposit to continue:\n' +
-                '• CHEAP: $0.05 per OTP\n' +
-                '• Bundle: $5 for 100 OTPs\n' +
-                '• VIP: $5/month unlimited';
-                
-            const keyboard = Markup.inlineKeyboard([
-                [Markup.button.callback('💳 Deposit', 'deposit')],
-                [Markup.button.callback('📦 Buy Bundle', 'buy_bundle')],
-                [Markup.button.callback('👑 Upgrade VIP', 'buy_vip')],
-                [Markup.button.callback('🔙 Back', 'menu')]
-            ]);
-            
-            return this.sendPhotoWithCaption(ctx, IMAGES.freeMode, message, keyboard, 'HTML');
+        if (!user) {
+            logger.warn('handleFreeMode: missing user in ctx.state', { 
+                fromId: ctx.from?.id,
+                updateId: ctx.update?.update_id 
+            });
+            return ctx.reply(
+                '⚠️ Session expired. Please send /start to continue.',
+                { parse_mode: 'HTML' }
+            );
         }
 
+        // ─── STEP 1: Check ad credits FIRST (NEW) ──────────────────────────
+        const freeProvider = this.providerManager?.getProvider('FREE_PUBLIC');
+        
+        if (freeProvider?.adSystem) {
+            try {
+                const creditCheck = await freeProvider.canRequestNumber(userId);
+
+                // Daily limit reached — show upgrade (same as before)
+                if (!creditCheck.allowed && creditCheck.reason === 'DAILY_LIMIT_REACHED') {
+                    return this._showFreeLimitReached(ctx, user, creditCheck);
+                }
+
+                // Insufficient credits — show ad prompt (NEW FLOW)
+                if (!creditCheck.allowed && creditCheck.reason === 'INSUFFICIENT_CREDITS') {
+                    return this._showAdPrompt(ctx, creditCheck, freeProvider);
+                }
+
+                // Credits sufficient — deduct now and proceed to warning screen
+                await freeProvider.deductCredits(userId);
+                ctx.session.freeCreditsDeducted = true;
+                
+            } catch (creditError) {
+                logger.error('Ad credit check failed', { userId, error: creditError.message });
+                // Continue to old flow if credit system fails
+            }
+        }
+
+        // ─── STEP 2: Old free limit check (fallback if no ad system) ──────
+        if (!this._canUseFree(user)) {
+            return this._showFreeLimitReached(ctx, user);
+        }
+
+        // ─── STEP 3: Show warning screen (same as before) ───────────────────
         const warningMessage = 
             '⚠️ <b>Free Mode Notice</b>\n\n' +
             '📵 Free numbers are <b>shared</b> and may be <b>blocked</b> by:\n' +
@@ -693,17 +777,189 @@ async handleFreeMode(ctx) {
         return this.sendPhotoWithCaption(ctx, IMAGES.freeMode, warningMessage, warningKeyboard, 'HTML');
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  AD PROMPT SCREEN — Shown when user needs to watch ads (NEW)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    _showAdPrompt(ctx, creditCheck, freeProvider) {
+        const shortfall = creditCheck.shortfall || (creditCheck.required - creditCheck.credits);
+        const networks = freeProvider.getAvailableNetworks().filter(n => n.configured);
+
+        let message =
+            `🎁 <b>Free OTP Available!</b>\n\n` +
+            `💳 Credits needed: <code>${creditCheck.required}</code>\n` +
+            `💳 Your credits: <code>${creditCheck.credits}</code>\n` +
+            `❌ Shortfall: <code>${shortfall}</code>\n\n` +
+            `Watch an ad to earn credits:\n\n` +
+            `<i>Each ad gives you credits instantly after completion.</i>`;
+
+        const buttons = networks.slice(0, 4).map(n => [
+            Markup.button.callback(
+                `📺 ${n.name} (+${n.creditValue} credit${n.creditValue > 1 ? 's' : ''})`,
+                `watch_ad_${n.id}`
+            )
+        ]);
+
+        buttons.push(
+            [Markup.button.callback('💰 Switch to CHEAP', 'mode_cheap')],
+            [Markup.button.callback('🔙 Back', 'menu')]
+        );
+
+        return ctx.reply(message, {
+            parse_mode: 'HTML',
+            reply_markup: Markup.inlineKeyboard(buttons).reply_markup
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  FREE LIMIT REACHED — Extracted reusable screen
+    // ═══════════════════════════════════════════════════════════════════════
+
+    _showFreeLimitReached(ctx, user, creditCheck = null) {
+        const dailyUsed = creditCheck?.dailyUsed || user.freeUsedToday || 0;
+        const dailyLimit = creditCheck?.dailyLimit || 3;
+
+        const message = 
+            '❌ <b>Free Limit Reached</b>\n\n' +
+            `You've used ${dailyUsed}/${dailyLimit} free OTPs today.\n\n` +
+            '💰 Deposit to continue:\n' +
+            '• CHEAP: $0.05 per OTP\n' +
+            '• Bundle: $5 for 100 OTPs\n' +
+            '• VIP: $5/month unlimited';
+            
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('💳 Deposit', 'deposit')],
+            [Markup.button.callback('📦 Buy Bundle', 'buy_bundle')],
+            [Markup.button.callback('👑 Upgrade VIP', 'buy_vip')],
+            [Markup.button.callback('🔙 Back', 'menu')]
+        ]);
+        
+        return this.sendPhotoWithCaption(ctx, IMAGES.freeMode, message, keyboard, 'HTML');
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  WATCH AD HANDLER — User clicked an ad network button (NEW)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleWatchAd(ctx, networkId) {
+        const userId = ctx.from?.id?.toString();
+
+        try {
+            const freeProvider = this.providerManager?.getProvider('FREE_PUBLIC');
+            if (!freeProvider) {
+                return ctx.answerCbQuery('❌ Free service unavailable').catch(() => {});
+            }
+
+            const adView = await freeProvider.generateAdView(userId, networkId);
+
+            const message =
+                `📺 <b>Watch Ad to Earn Credits</b>\n\n` +
+                `Network: <b>${adView.network}</b>\n` +
+                `Type: ${adView.type}\n` +
+                `Reward: <b>+${adView.creditValue} credit${adView.creditValue > 1 ? 's' : ''}</b>\n` +
+                `Estimated time: ${adView.estimatedTime}\n\n` +
+                `Click below to open the ad.\n\n` +
+                `<i>After completing the ad, tap "✅ Check My Credits"</i>`;
+
+            await ctx.editMessageText(message, {
+                parse_mode: 'HTML',
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.url('📺 Open Ad', adView.adUrl)],
+                    [Markup.button.callback('✅ Check My Credits', 'check_credits')],
+                    [Markup.button.callback('🔙 Back', 'menu')]
+                ]).reply_markup
+            });
+
+        } catch (error) {
+            logger.error('handleWatchAd error', { userId, error: error.message });
+            ctx.answerCbQuery('❌ Ad unavailable. Try another.').catch(() => {});
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  CHECK CREDITS HANDLER — User taps "Check My Credits" (NEW)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleCheckCredits(ctx) {
+        const userId = ctx.from?.id?.toString();
+
+        try {
+            const freeProvider = this.providerManager?.getProvider('FREE_PUBLIC');
+            if (!freeProvider) {
+                return ctx.answerCbQuery('❌ Service unavailable').catch(() => {});
+            }
+
+            const credits = await freeProvider.getCredits(userId);
+            const required = freeProvider.adSystem?.COSTS?.NUMBER_REQUEST || 2;
+
+            if (credits.credits >= required) {
+                // Credits sufficient! Show success and route back to free mode
+                await ctx.editMessageText(
+                    `✅ <b>Credits Added!</b>\n\n` +
+                    `💳 Current credits: <code>${credits.credits}</code>\n` +
+                    `✅ You can now request a free OTP!`,
+                    {
+                        parse_mode: 'HTML',
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('📱 Get Free OTP', 'mode_free')],
+                            [Markup.button.callback('🔙 Menu', 'menu')]
+                        ]).reply_markup
+                    }
+                );
+            } else {
+                // Still not enough
+                await ctx.answerCbQuery(
+                    `⏳ Credits: ${credits.credits}/${required}. Ad may still be processing. Try again in 30s.`,
+                    { show_alert: true }
+                );
+            }
+
+        } catch (error) {
+            logger.error('handleCheckCredits error', { userId, error: error.message });
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  CONFIRM FREE MODE — Modified to handle credit deduction fallback
+    // ═══════════════════════════════════════════════════════════════════════
+
     async handleConfirmFreeMode(ctx) {
+        const userId = ctx.from?.id?.toString();
+        
         ctx.session = ctx.session || {};
         ctx.session.otpMode = 'FREE';
-        
+
+        // If credits weren't deducted in handleFreeMode (old flow), deduct now
+        if (!ctx.session.freeCreditsDeducted) {
+            try {
+                const freeProvider = this.providerManager?.getProvider('FREE_PUBLIC');
+                if (freeProvider?.adSystem) {
+                    const creditCheck = await freeProvider.canRequestNumber(userId);
+                    if (!creditCheck.allowed) {
+                        // Shouldn't happen, but handle gracefully
+                        return ctx.editMessageCaption(
+                            '❌ <b>Credit check failed.</b> Please try again.',
+                            { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([
+                                [Markup.button.callback('🔙 Back', 'mode_free')]
+                            ]).reply_markup }
+                        );
+                    }
+                    await freeProvider.deductCredits(userId);
+                    ctx.session.freeCreditsDeducted = true;
+                }
+            } catch (error) {
+                logger.error('Credit deduction in confirm failed', { userId, error: error.message });
+            }
+        }
+
         await ctx.editMessageCaption(
             '⏳ <b>Loading Free Mode...</b>',
             { parse_mode: 'HTML' }
         );
         
         await this.showServiceSelection(ctx, 'FREE', IMAGES.freeMode);
-    }
+                                }
+    
 
     async handleCheapMode(ctx) {
     const user = ctx.state.user;
