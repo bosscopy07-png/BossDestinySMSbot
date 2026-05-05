@@ -545,14 +545,92 @@ class FreeProvider {
     _createSession(sessionId, numberData, service, country, startTime) {
         this.activeSessions.set(sessionId, {
             sessionId,
-            number: numberData
+            number: numberData.number,
+            siteId: numberData.site,
+            siteName: numberData.siteName,
+            assignedAt: Date.now(),
+            service,
+            country: country || numberData.country,
+            status: 'ACTIVE',
+            messages: [],
+            retryCount: 0,
+            otpCode: null,
+            fullText: null
+        });
 
+        this.assignedNumbers.set(numberData.number, {
+            sessionId,
+            assignedAt: Date.now()
+        });
 
+        // Update stats
+        const stats = this.numberStats.get(numberData.number) || { success: 0, failure: 0, lastUsed: 0 };
+        stats.lastUsed = Date.now();
+        this.numberStats.set(numberData.number, stats);
 
+        logger.info('Free number assigned', {
+            sessionId,
+            site: numberData.siteName,
+            number: this.maskPhone(numberData.number),
+            country: numberData.country,
+            duration: Date.now() - startTime
+        });
 
+        return {
+            phoneNumber: numberData.number,
+            provider: this.name,
+            providerNumberId: sessionId,  // sessionId IS the providerNumberId for FREE
+            country: numberData.country,
+            service,
+            cost: 0,
+            isPublic: true,
+            source: numberData.siteName,
+            sessionId,
+            warning: 'FREE TIER: Public/shared number. Anyone can see SMS. Not for sensitive accounts.'
+        };
+    }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  NUMBER EXTRACTION HELPERS
+    // ═══════════════════════════════════════════════════════════════════════
 
+    _extractNumber(text) {
+        if (!text) return null;
 
+        // International format with + prefix
+        const patterns = [
+            /\+(\d[\s\-\.]?){8,14}\d/g,
+            /\+\d{1,3}[\s-]?\d{1,4}[\s-]?\d{1,4}[\s-]?\d{1,4}/g
+        ];
+
+        for (const pattern of patterns) {
+            const matches = text.match(pattern);
+            if (matches && matches.length > 0) {
+                const cleaned = matches[0].replace(/[\s\-\.]/g, '');
+                if (cleaned.length >= 10 && cleaned.length <= 16) {
+                    return cleaned;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    _detectCountry(phoneNumber) {
+        if (!phoneNumber) return 'UNKNOWN';
+
+        for (const [code, data] of Object.entries(COUNTRY_CODES)) {
+            if (data.regex.test(phoneNumber)) {
+                return code;
+            }
+        }
+
+        return 'UNKNOWN';
+    }
+
+    _getFlag(code) {
+        return COUNTRY_CODES[code]?.flag || '🌍';
+    }
             // ═══════════════════════════════════════════════════════════════════════════════
 // FreeProvider.js — Part 2/3: SMS Retrieval, Parallel Message Fetching, Polling
 // ═══════════════════════════════════════════════════════════════════════════════
