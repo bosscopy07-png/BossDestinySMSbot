@@ -1018,6 +1018,60 @@ _freeRemaining(user) {
         await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
     }
     }
+        // ═══════════════════════════════════════════════════════════════════════
+    //  FREE SESSION CANCEL — Cancel active free OTP polling
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleCancelFree(ctx, sessionId) {
+        const userId = ctx.from?.id?.toString();
+
+        try {
+            // Cancel via provider manager
+            await this.providerManager.cancelNumber('FREE_PUBLIC', sessionId);
+            
+            // Credits are auto-restored by SessionManager.cancelSession() or handleTimeout()
+            
+            await ctx.answerCbQuery('✅ Session cancelled');
+            await ctx.editMessageText(
+                '❌ <b>Free Session Cancelled</b>\n\n' +
+                'Your credit has been restored.',
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('📱 New Free Request', 'mode_free')],
+                        [Markup.button.callback('🔙 Menu', 'menu')]
+                    ]).reply_markup
+                }
+            );
+
+        } catch (error) {
+            logger.error('handleCancelFree error', { userId, sessionId, error: error.message });
+            ctx.answerCbQuery('❌ Cancel failed').catch(() => {});
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  FREE CHECK NOW — Manual poll for SMS on free session
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleCheckFree(ctx, sessionId) {
+        try {
+            const result = await this.providerManager.checkFreeSMS(sessionId);
+
+            if (result.success) {
+                await ctx.answerCbQuery('✅ OTP found! Updating...');
+                // The polling loop will catch this and update the message
+            } else if (result.status === 'NOT_FOUND') {
+                await ctx.answerCbQuery('❌ Session expired', { show_alert: true });
+            } else {
+                await ctx.answerCbQuery(`⏳ ${result.message || 'Still waiting...'}`);
+            }
+
+        } catch (error) {
+            logger.error('handleCheckFree error', { sessionId, error: error.message });
+            ctx.answerCbQuery('❌ Check failed').catch(() => {});
+        }
+        }
     
 
     async handleBundleMode(ctx) {
