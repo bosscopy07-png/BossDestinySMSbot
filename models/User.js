@@ -7,6 +7,23 @@ const userSchema = new mongoose.Schema({
         unique: true,
         index: true
     },
+
+
+adCredits: {
+    type: Number,
+    default: 0,
+    min: 0
+},
+adCreditReset: {
+    type: Date,
+    default: null
+},
+freeUsedToday: {
+    type: Number,
+    default: 0,
+    min: 0
+},
+    
     username: { type: String, default: null },
     firstName: { type: String, default: null },
     lastName: { type: String, default: null },
