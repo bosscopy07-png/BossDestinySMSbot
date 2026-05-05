@@ -88,7 +88,10 @@ class OTPCommands {
             'handleCancelVipSubscription', 'handleConfirmVipCancel',
             'handleHistory', 'handleReferral', 'handleStats', 'handleQuickBuy',
             'handleProviderStatus', 'handleSettings', 'handleToggleNotifications',
-            'handleFaq', 'handleTerms', 'handleOTPHub' 
+            'handleFaq', 'handleTerms', 'handleOTPHub',
+            // NEW: Ad system handlers
+            'handleWatchAd', 'handleCheckCredits', 'handleFreeServiceSelected',
+            'handleFreeCountrySelected', 'handleCheckFree'
         ];
         
         for (const name of handlerNames) {
@@ -99,6 +102,7 @@ class OTPCommands {
             }
         }
     }
+    
 
     // ═══════════════════════════════════════════════════════════════════════
     //  USER HELPERS
@@ -312,11 +316,6 @@ _freeRemaining(user) {
         this.bot.action('buy_vip', this.handleBuyVIP);
         this.bot.action('confirm_bundle', this.handleConfirmBundle);
         this.bot.action('confirm_vip', this.handleConfirmVIP);
-                // Mode selection
-        this.bot.action('mode_free', this.handleFreeMode);
-        this.bot.action('mode_cheap', this.handleCheapMode);
-        this.bot.action('mode_vip', this.handleVIPMode);
-        this.bot.action('mode_bundle', this.handleBundleMode);
         
         // OTP Hub
         this.bot.action('otp_hub', this.handleOTPHub);
@@ -345,70 +344,71 @@ _freeRemaining(user) {
         // OTP check with pattern
         this.bot.action(/check_otp_(.+)/, this.handleCheckOTP);
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  AD CREDIT SYSTEM ACTIONS (NEW)
-    // ═══════════════════════════════════════════════════════════════════════
+        // ═════════════════════════════════════════════════════════════════
+        //  AD CREDIT SYSTEM ACTIONS (NEW)
+        // ═════════════════════════════════════════════════════════════════
+        
+        // Watch ad button — user selects an ad network
+        this.bot.action(/watch_ad_(.+)/, async (ctx) => {
+            try {
+                await this.handleWatchAd(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('watch_ad action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error loading ad').catch(() => {});
+            }
+        });
+
+        // Check credits button — user checks if ad completion awarded credits
+        this.bot.action('check_credits', async (ctx) => {
+            try {
+                await this.handleCheckCredits(ctx);
+            } catch (error) {
+                logger.error('check_credits action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error checking credits').catch(() => {});
+            }
+        });
+
+        // Free service selection — user picks service after credits pass
+        this.bot.action(/free_service_(.+)/, async (ctx) => {
+            try {
+                await this.handleFreeServiceSelected(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('free_service action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error').catch(() => {});
+            }
+        });
+
+        // Free country selection — user picks country after service
+        this.bot.action(/free_country_(.+)/, async (ctx) => {
+            try {
+                await this.handleFreeCountrySelected(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('free_country action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error').catch(() => {});
+            }
+        });
+
+        // Free session cancel — route to unified handleCancel
+        this.bot.action(/cancel_free_(.+)/, async (ctx) => {
+            try {
+                await this.handleCancel(ctx);
+            } catch (error) {
+                logger.error('cancel_free action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Cancel failed').catch(() => {});
+            }
+        });
+
+        // Free check now — manual poll for SMS
+        this.bot.action(/check_free_(.+)/, async (ctx) => {
+            try {
+                await this.handleCheckFree(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('check_free action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Check failed').catch(() => {});
+            }
+        });
+    }
     
-    // Watch ad button — user selects an ad network
-    this.bot.action(/watch_ad_(.+)/, async (ctx) => {
-        try {
-            await this.handleWatchAd(ctx, ctx.match[1]);
-        } catch (error) {
-            logger.error('watch_ad action error', { error: error.message, userId: ctx.from?.id });
-            ctx.answerCbQuery('❌ Error loading ad').catch(() => {});
-        }
-    });
-
-    // Check credits button — user checks if ad completion awarded credits
-    this.bot.action('check_credits', async (ctx) => {
-        try {
-            await this.handleCheckCredits(ctx);
-        } catch (error) {
-            logger.error('check_credits action error', { error: error.message, userId: ctx.from?.id });
-            ctx.answerCbQuery('❌ Error checking credits').catch(() => {});
-        }
-    });
-
-    // Free service selection — user picks service after credits pass
-    this.bot.action(/free_service_(.+)/, async (ctx) => {
-        try {
-            await this.handleFreeServiceSelected(ctx, ctx.match[1]);
-        } catch (error) {
-            logger.error('free_service action error', { error: error.message, userId: ctx.from?.id });
-            ctx.answerCbQuery('❌ Error').catch(() => {});
-        }
-    });
-
-    // Free country selection — user picks country after service
-    this.bot.action(/free_country_(.+)/, async (ctx) => {
-        try {
-            await this.handleFreeCountrySelected(ctx, ctx.match[1]);
-        } catch (error) {
-            logger.error('free_country action error', { error: error.message, userId: ctx.from?.id });
-            ctx.answerCbQuery('❌ Error').catch(() => {});
-        }
-    });
-
-    // Free session cancel — cancel active free OTP session
-    this.bot.action(/cancel_free_(.+)/, async (ctx) => {
-        try {
-            await this.handleCancelFree(ctx, ctx.match[1]);
-        } catch (error) {
-            logger.error('cancel_free action error', { error: error.message, userId: ctx.from?.id });
-            ctx.answerCbQuery('❌ Cancel failed').catch(() => {});
-        }
-    });
-
-    // Free check now — manual poll for SMS
-    this.bot.action(/check_free_(.+)/, async (ctx) => {
-        try {
-            await this.handleCheckFree(ctx, ctx.match[1]);
-        } catch (error) {
-            logger.error('check_free action error', { error: error.message, userId: ctx.from?.id });
-            ctx.answerCbQuery('❌ Check failed').catch(() => {});
-        }
-    });
-}
     
     // ═══════════════════════════════════════════════════════════════════════
     //  UTILITY METHODS
