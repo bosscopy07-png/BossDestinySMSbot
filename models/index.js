@@ -6,6 +6,7 @@ import mongoose from 'mongoose';
 import logger from '../utils/logger.js';
 
 import User from './User.js';
+import AdView from './AdView.js';
 import Session from './Session.js';
 import Transaction from './Transaction.js';
 import NumberModel from './Number.js';
@@ -17,6 +18,7 @@ import Settings from './Settings.js';
 const modelRegistry = {
     User,
     Session,
+    AdView,
     Transaction,
     Number: NumberModel,
     Referral,
@@ -103,6 +105,7 @@ export function listModels() {
 
 export {
     User,
+    AdView,
     Session,
     Transaction,
     NumberModel as Number,
