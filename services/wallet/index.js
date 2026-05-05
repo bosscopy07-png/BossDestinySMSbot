@@ -1041,7 +1041,7 @@ class WalletService {
         }
     }
 
-    async captureFunds(txId, userId) {
+        async captureFunds(txId, userId) {
         try {
             const tx = await Transaction.findOne({ txId, userId });
             if (!tx || tx.status !== 'PENDING') {
@@ -1076,6 +1076,147 @@ class WalletService {
             const updateResult = await User.updateOne(
                 { userId },
                 {
+                    $inc: {
+                        balance: -amount,
+                        lockedBalance: -amount,
+                        totalSpent: amount
+                    }
+                }
+            );
+
+            if (updateResult.matchedCount === 0) {
+                await Transaction.updateOne(
+                    { txId },
+                    { $set: { status: 'PENDING', type: 'LOCK' } }
+                );
+                throw new Error('USER_UPDATE_FAILED');
+            }
+
+            logger.info('Funds captured', { userId, amount, txId });
+
+            return true;
+
+        } catch (error) {
+            logger.error('Failed to capture funds', { txId, userId, error: error.message });
+            throw error;
+        }
+    }
+
+    async releaseFunds(txId, userId, reason) {
+        try {
+            const tx = await Transaction.findOne({ txId, userId });
+            if (!tx) {
+                throw new Error('TRANSACTION_NOT_FOUND');
+            }
+            if (tx.status !== 'PENDING') {
+                logger.warn('Release skipped: transaction not pending', {
+                    txId,
+                    userId,
+                    currentStatus: tx.status,
+                    reason
+                });
+                return { 
+                    success: false, 
+                    error: 'TRANSACTION_NOT_PENDING',
+                    currentStatus: tx.status,
+                    alreadyReleased: tx.status === 'CANCELLED'
+                };
+            }
+
+            const amount = Math.abs(tx.amount);
+            if (amount <= 0) {
+                throw new Error('INVALID_AMOUNT');
+            }
+
+            const user = await User.findOne({ userId });
+            if (!user) {
+                throw new Error('USER_NOT_FOUND');
+            }
+
+            const currentLocked = user.lockedBalance || 0;
+            const releaseAmount = Math.min(amount, currentLocked);
+            
+            if (releaseAmount < amount) {
+                logger.warn('Partial release: insufficient locked balance', {
+                    userId,
+                    txId,
+                    requestedRelease: amount,
+                    actualRelease: releaseAmount,
+                    currentLockedBalance: currentLocked,
+                    reason
+                });
+            }
+
+            await Transaction.updateOne(
+                { txId },
+                {
+                    $set: {
+                        status: 'CANCELLED',
+                        'metadata.releasedAt': new Date(),
+                        'metadata.releaseReason': reason,
+                        'metadata.requestedAmount': amount,
+                        'metadata.actualReleasedAmount': releaseAmount,
+                        'metadata.previousLockedBalance': currentLocked
+                    }
+                }
+            );
+
+            const updateResult = await User.updateOne(
+                { userId },
+                [
+                    {
+                        $set: {
+                            lockedBalance: {
+                                $max: [
+                                    0,
+                                    { $subtract: ['$lockedBalance', releaseAmount] }
+                                ]
+                            }
+                        }
+                    }
+                ]
+            );
+
+            if (updateResult.matchedCount === 0) {
+                await Transaction.updateOne(
+                    { txId },
+                    { $set: { status: 'PENDING' } }
+                );
+                throw new Error('USER_UPDATE_FAILED');
+            }
+
+            logger.info('Funds released', { 
+                userId, 
+                txId,
+                requestedAmount: amount,
+                releasedAmount: releaseAmount,
+                previousLockedBalance: currentLocked,
+                newLockedBalance: Math.max(0, currentLocked - releaseAmount),
+                reason
+            });
+
+            return { 
+                success: true, 
+                releasedAmount: releaseAmount,
+                requestedAmount: amount,
+                wasPartial: releaseAmount < amount
+            };
+
+        } catch (error) {
+            logger.error('Failed to release funds', { 
+                txId, 
+                userId, 
+                reason,
+                error: error.message 
+            });
+            throw error;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  ADMIN BALANCE OPERATIONS
+    // ═══════════════════════════════════════════════════════════
+                    
       async addBalance(userId, amount, adminId, reason) {
         const txId = generateId();
 
