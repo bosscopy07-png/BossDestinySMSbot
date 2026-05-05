@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// AdCreditSystem.js — Ad-to-Credit Unlocking System
+// AdCreditSystem.js — Part 1/2: Core Credit Management & Ad View Handling
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { User, AdView, Transaction } from '../../models/index.js';
@@ -8,7 +8,7 @@ import config from '../../config/env.js';
 
 /**
  * AdCreditSystem — Manages ad views → credit conversion
- * 
+ *
  * Model:
  * - 1 ad view = 1 credit
  * - 2-3 credits = 1 number request
@@ -172,7 +172,6 @@ class AdCreditSystem {
         });
 
         // Generate monetized link
-        // NOTE: Replace with actual ad network API integration
         const adUrl = this._buildAdUrl(network, verificationId);
 
         logger.info('Ad view generated', { userId, network, verificationId });
@@ -201,7 +200,7 @@ class AdCreditSystem {
             return { success: false, error: 'ALREADY_COMPLETED' };
         }
 
-        // Validate with ad network (implement actual validation per network)
+        // Validate with ad network
         const isValid = await this._validateAdCompletion(verification, payload);
         if (!isValid) {
             verification.status = 'FAILED';
@@ -242,7 +241,10 @@ class AdCreditSystem {
             creditsAdded: creditsToAdd,
             totalCredits: await this.getCredits(verification.userId)
         };
-    }
+        }
+                // ═══════════════════════════════════════════════════════════════════════════════
+// AdCreditSystem.js — Part 2/2: URL Builders, Validation & Utilities
+// ═══════════════════════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════════════════
     //  AD URL BUILDERS (Replace with actual API integrations)
@@ -317,4 +319,3 @@ class AdCreditSystem {
 }
 
 export default AdCreditSystem;
-                           
