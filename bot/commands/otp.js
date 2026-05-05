@@ -452,52 +452,15 @@ _freeRemaining(user) {
         }).sort({ createdAt: -1 });
     }
 
-        
     /**
-     * Refund session credits (BUNDLE/VIP/FREE only)
-     * FIXED: Removed CHEAP mode — releaseFunds() in handleTimeout() already handles it.
-     *        CHEAP refunds go through walletService.releaseFunds() which is transaction-safe.
-     *        This method now only handles credit-based modes (BUNDLE, VIP, FREE).
-     */
-    async _refundSession(session) {
-        const { userId, mode } = session;
-
-        try {
-            // CHEAP mode is handled by walletService.releaseFunds() in handleTimeout()
-            // Calling it here would double-refund (balance += cost, lockedBalance -= cost)
-            if (mode === 'CHEAP') {
-                logger.debug('CHEAP mode refund skipped — handled by releaseFunds', {
-                    userId,
-                    lockTxId: session.lockTxId,
-                    reason: 'releaseFunds handles CHEAP refunds transactionally'
-                });
-                return true;
-            }
-
-            if (mode === 'BUNDLE') {
-                await User.updateOne({ userId }, { $inc: { bundleRemaining: 1 } });
-                logger.info('Bundle credit restored', { userId, sessionId: session.sessionId });
-            } else if (mode === 'VIP') {
-                await User.updateOne({ userId }, { $inc: { vipDailyUsed: -1 } });
-                logger.info('VIP daily quota restored', { userId, sessionId: session.sessionId });
-            } else if (mode === 'FREE') {
-                await User.updateOne({ userId }, { $inc: { freeUsedToday: -1 } });
-                logger.info('Free daily quota restored', { userId, sessionId: session.sessionId });
-            }
-
-            return true;
-        } catch (error) {
-            logger.error('Session refund failed', { userId, mode, error: error.message });
-            return false;
-        }
-    }
-
-    /**
-     * FIXED: Removed CHEAP refund from timeout notification.
-     *        CHEAP refunds are now handled EXCLUSIVELY by SessionManager.handleTimeout()
-     *        which calls walletService.releaseFunds() — this is the single source of truth.
-     *        _scheduleTimeoutNotification only handles BUNDLE/VIP/FREE credit restoration
-     *        and sends the timeout message. It NEVER touches CHEAP funds.
+     * FIXED: Removed ALL refund logic from timeout notification.
+     * SessionManager.handleTimeout() is the SINGLE SOURCE OF TRUTH for:
+     * - FREE mode: _restoreCredits() handles freeUsedToday
+     * - VIP mode: _restoreCredits() handles vipDailyUsed  
+     * - BUNDLE mode: _restoreCredits() handles bundleRemaining
+     * - CHEAP mode: releaseFunds() handles wallet refund
+     * 
+     * This method now ONLY sends the timeout message. It NEVER touches user credits/balance.
      */
     async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
         try {
@@ -506,21 +469,11 @@ _freeRemaining(user) {
 
             setTimeout(async () => {
                 try {
-                    const session = await Session.findOne({
-                        sessionId,
-                        status: { $in: ['WAITING', 'CHECKING'] }
-                    });
-
-                    if (!session) return;
-
-                    // FIXED: Only refund credit-based modes here (BUNDLE, VIP, FREE).
-                    // CHEAP refund is handled EXCLUSIVELY by SessionManager.handleTimeout().
-                    if (session.mode !== 'CHEAP') {
-                        await this._refundSession(session);
-                    }
-
-                    // Update session status if still waiting
+                    // Just check if session still in waiting state (SessionManager may have already handled it)
                     const currentSession = await Session.findOne({ sessionId }).lean();
+                    
+                    // If session was already handled by SessionManager, just send notification
+                    // If not (edge case), mark it timed out here but DO NOT refund
                     if (currentSession && ['WAITING', 'CHECKING'].includes(currentSession.status)) {
                         await Session.updateOne(
                             { sessionId },
@@ -528,31 +481,32 @@ _freeRemaining(user) {
                         );
                     }
 
-                    // Send timeout message (skip for FREE — polling handles it)
-                    if (session.mode !== 'FREE') {
-                        const refundText = {
-                            BUNDLE: 'Bundle credit restored',
-                            VIP: 'VIP daily quota restored',
-                            CHEAP: 'Funds returned to balance',
-                            FREE: 'Free quota restored'
-                        }[session.mode] || 'Funds handled';
+                    // Skip notification for FREE mode — FreeProvider/FreeNumberController polling handles UX
+                    if (currentSession?.mode === 'FREE') return;
 
-                        const timeoutMessage =
-                            `⏰ <b>OTP Request Timed Out</b>\n\n` +
-                            `📱 Number: <code>${session.number}</code>\n` +
-                            `🎯 Service: ${session.service}\n` +
-                            `⏱ Status: <b>Expired</b>\n\n` +
-                            `💰 ${refundText}\n\n` +
-                            `You can request a new OTP with /otp`;
+                    // Send timeout message ONLY — no refund logic here
+                    const refundText = {
+                        BUNDLE: 'Bundle credit restored',
+                        VIP: 'VIP daily quota restored',
+                        CHEAP: 'Funds returned to balance',
+                        FREE: 'Free quota restored'
+                    }[currentSession?.mode] || 'Funds handled';
 
-                        await this.bot.telegram.sendMessage(userId, timeoutMessage, {
-                            parse_mode: 'HTML',
-                            reply_markup: Markup.inlineKeyboard([
-                                [Markup.button.callback('🔄 Request New OTP', 'menu')],
-                                [Markup.button.callback('📞 Contact Support', 'contact_support')]
-                            ]).reply_markup
-                        });
-                    }
+                    const timeoutMessage =
+                        `⏰ <b>OTP Request Timed Out</b>\n\n` +
+                        `📱 Number: <code>${currentSession?.number || 'unknown'}</code>\n` +
+                        `🎯 Service: ${currentSession?.service || 'Unknown'}\n` +
+                        `⏱ Status: <b>Expired</b>\n\n` +
+                        `💰 ${refundText}\n\n` +
+                        `You can request a new OTP with /otp`;
+
+                    await this.bot.telegram.sendMessage(userId, timeoutMessage, {
+                        parse_mode: 'HTML',
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('🔄 Request New OTP', 'menu')],
+                            [Markup.button.callback('📞 Contact Support', 'contact_support')]
+                        ]).reply_markup
+                    });
 
                 } catch (notifyError) {
                     logger.error('Timeout notification failed', { userId, sessionId, error: notifyError.message });
@@ -563,7 +517,7 @@ _freeRemaining(user) {
             logger.error('Failed to schedule timeout', { userId, sessionId, error: error.message });
         }
     }
-                 
+    
     
                     // ═══════════════════════════════════════════════════════════════════════════════
 //  OTPCommands.js — Part 2: Main Menu, My Number, Mode Handlers, Selection
