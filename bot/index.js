@@ -42,7 +42,7 @@ class TelegramBot {
         this.walletService = new WalletService();
         this.smsProviderManager = null;
         this.referralService = null;
-        this.freeNumberController = null; // NEW: Free tier controller
+        this.freeNumberController = null;
 
         this.metrics = {
             requestsHandled: 0,
@@ -72,20 +72,40 @@ class TelegramBot {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  ADMIN UTILITIES
+    //  ADMIN UTILITIES — STRICT ENV-BASED, GROUP-ID FILTERED
     // ═══════════════════════════════════════════════════════════════════════
 
+    /**
+     * Gets admin IDs from ADMIN_ID env var only.
+     * Validates they are positive numeric user IDs (not group/channel IDs).
+     * Caches for 30 seconds.
+     */
     getAdminIds() {
         const now = Date.now();
         if (this._adminIds && now - this._adminIdsTimestamp < 30000) {
             return this._adminIds;
         }
-        this._adminIds = (config.bot?.adminId || '')
+
+        // STRICT: Read from process.env.ADMIN_ID first, then fallback to config
+        const raw = process.env.ADMIN_ID || config.bot?.adminId || '';
+
+        this._adminIds = raw
             .toString()
             .split(',')
             .map(id => id.trim())
-            .filter(Boolean);
+            .filter(Boolean)
+            .filter(id => {
+                const num = parseInt(id, 10);
+                // Must be positive integer (user ID), reject group IDs (negative) and non-numeric
+                const isValid = !isNaN(num) && num > 0 && num.toString() === id.trim();
+                if (!isValid) {
+                    logger.warn('Invalid admin ID filtered out — must be positive user ID', { id });
+                }
+                return isValid;
+            });
+
         this._adminIdsTimestamp = now;
+        logger.info('Admin IDs resolved from ENV', { count: this._adminIds.length });
         return this._adminIds;
     }
 
@@ -114,14 +134,23 @@ class TelegramBot {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  ERROR ALERTING
+    //  ERROR ALERTING — ADMIN DMs ONLY, NEVER GROUPS
     // ═══════════════════════════════════════════════════════════════════════
 
+    /**
+     * Sends error alerts ONLY to admin private DMs.
+     * Never sends to groups, channels, or non-admin chats.
+     * Deduplicates identical errors within cooldown window.
+     */
     async alertAdmins(error, context = {}) {
         try {
             const adminIds = this.getAdminIds();
-            if (!adminIds.length) return;
+            if (!adminIds.length) {
+                logger.error('No valid admin IDs configured — cannot send alerts');
+                return;
+            }
 
+            // Deduplication key
             const errorKey = `${error.name || 'Error'}:${(error.message || '').slice(0, 50)}`;
             const lastAlert = this.errorAlertCooldown.get(errorKey);
             const now = Date.now();
@@ -131,6 +160,7 @@ class TelegramBot {
             }
             this.errorAlertCooldown.set(errorKey, now);
 
+            // Build alert message
             const stack = error.stack ? error.stack.split('\n').slice(0, 5).join('\n') : 'No stack';
             const alertText = [
                 '🚨 <b>Bot Error Alert</b>',
@@ -139,6 +169,7 @@ class TelegramBot {
                 `<b>Message:</b> <code>${(error.message || 'N/A').slice(0, 400)}</code>`,
                 `<b>Time:</b> ${new Date().toISOString()}`,
                 `<b>Env:</b> ${process.env.NODE_ENV || 'production'}`,
+                context.source ? `<b>Source:</b> ${context.source}` : '',
                 context.userId ? `<b>User:</b> <code>${context.userId}</code>` : '',
                 context.updateType ? `<b>Update:</b> ${context.updateType}` : '',
                 context.command ? `<b>Command:</b> ${context.command}` : '',
@@ -148,16 +179,33 @@ class TelegramBot {
                 `<pre>${stack}</pre>`
             ].filter(Boolean).join('\n');
 
+            // Send ONLY to admin DMs — verify private chat before sending
             await Promise.allSettled(adminIds.map(async (adminId) => {
                 try {
+                    // Verify this is a private chat with a real user
+                    const chat = await this.bot.telegram.getChat(adminId).catch(() => null);
+
+                    if (!chat || chat.type !== 'private') {
+                        logger.warn('Skipping alert — target is not a private user chat', {
+                            adminId,
+                            type: chat?.type || 'unknown'
+                        });
+                        return;
+                    }
+
                     await this.bot.telegram.sendMessage(adminId, alertText, {
                         parse_mode: 'HTML',
                         disable_notification: false
                     });
+
+                    logger.info('Error alert sent to admin', { adminId });
+
                 } catch (sendErr) {
+                    // Don't alert on alert failures — infinite loop risk
                     logger.error('Failed to alert admin', { adminId, error: sendErr.message });
                 }
             }));
+
         } catch (alertErr) {
             logger.error('alertAdmins itself crashed', { error: alertErr.message });
         }
@@ -187,20 +235,23 @@ class TelegramBot {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  ERROR HANDLING
+    //  ERROR HANDLING — GLOBAL CAPTURE FOR ALL ERRORS
     // ═══════════════════════════════════════════════════════════════════════
 
     setupErrorHandling() {
+        // Bot-level catch — all Telegraf handler errors
         this.bot.catch(async (err, ctx) => {
             this.metrics.requestsFailed++;
 
             try {
+                // Skip 403/429 spam
                 if (!err.message?.includes('403') && !err.message?.includes('429')) {
                     await this.alertAdmins(err, {
                         userId: ctx.from?.id,
                         updateType: ctx.updateType,
                         command: ctx.message?.text || ctx.callbackQuery?.data,
-                        note: 'bot.catch triggered'
+                        source: 'bot.catch',
+                        note: 'Telegraf handler error'
                     });
                 }
 
@@ -228,42 +279,47 @@ class TelegramBot {
             }
         });
 
+        // Process-level uncaught exceptions
         process.on('uncaughtException', async (err) => {
             try {
                 logger.error('Uncaught Exception', { error: err.message, stack: err.stack });
                 await this.alertAdmins(err, {
-                    updateType: 'process',
-                    command: 'uncaughtException',
+                    source: 'process.uncaughtException',
                     note: 'Process crash — immediate shutdown required'
                 });
             } catch (alertErr) {
                 logger.error('Failed to alert on uncaughtException', { error: alertErr.message });
             }
-            if (!this.isShuttingDown) this.gracefulShutdown('uncaughtException');
+            if (!this.isShuttingDown) {
+                // Give alert time to send before exit
+                setTimeout(() => this.gracefulShutdown('uncaughtException'), 1500);
+            }
         });
 
+        // Process-level unhandled rejections
         process.on('unhandledRejection', async (reason) => {
             try {
                 const err = reason instanceof Error ? reason : new Error(String(reason));
                 logger.error('Unhandled Rejection', { reason: String(reason), stack: err.stack });
                 await this.alertAdmins(err, {
-                    updateType: 'process',
-                    command: 'unhandledRejection',
+                    source: 'process.unhandledRejection',
                     note: 'Unhandled promise rejection'
                 });
             } catch (alertErr) {
                 logger.error('Failed to alert on unhandledRejection', { error: alertErr.message });
             }
-            if (!this.isShuttingDown) this.gracefulShutdown('unhandledRejection');
+            if (!this.isShuttingDown) {
+                setTimeout(() => this.gracefulShutdown('unhandledRejection'), 1500);
+            }
         });
             }
-                      // ═══════════════════════════════════════════════════════════════════════════════
+                // ═══════════════════════════════════════════════════════════════════════════════
 // bot/TelegramBot.js — Part 2/3
 // Middleware Stack, Command Setup & Free Tier Integration
 // ═══════════════════════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  MIDDLEWARE STACK
+    //  MIDDLEWARE STACK — WITH GLOBAL ERROR WRAPPER
     // ═══════════════════════════════════════════════════════════════════════
 
     setupMiddleware() {
@@ -297,6 +353,7 @@ class TelegramBot {
             })
         }));
 
+        // Global metrics tracking
         this.bot.use(async (ctx, next) => {
             const startTime = Date.now();
             const effectiveUserId = this._getEffectiveUserId(ctx);
@@ -312,6 +369,7 @@ class TelegramBot {
             }
         });
 
+        // Rate limiting
         this.bot.use(rateLimit({
             window: 60,
             max: 50,
@@ -349,13 +407,28 @@ class TelegramBot {
                     userId: ctx.from?.id,
                     updateType: 'message',
                     command: '/start',
+                    source: 'middleware.startInterceptor',
                     note: 'Start interceptor crash'
                 });
                 return ctx.reply('❌ Failed to start. Please try /start again.').catch(() => {});
             }
         });
 
-        this.bot.use(requireAuth);
+        // Auth middleware with error capture
+        this.bot.use(async (ctx, next) => {
+            try {
+                return await requireAuth(ctx, next);
+            } catch (err) {
+                await this.alertAdmins(err, {
+                    userId: ctx.from?.id,
+                    updateType: ctx.updateType,
+                    command: ctx.message?.text || ctx.callbackQuery?.data,
+                    source: 'middleware.requireAuth',
+                    note: 'Auth middleware crash'
+                });
+                throw err;
+            }
+        });
 
         // ═══════════════════════════════════════════════════
         //  GLOBAL JOIN VERIFICATION + REVOCATION CHECK
@@ -407,11 +480,13 @@ class TelegramBot {
                     userId: ctx.from?.id,
                     updateType: ctx.updateType,
                     command: ctx.message?.text || ctx.callbackQuery?.data,
+                    source: 'middleware.joinVerification',
                     note: 'Global join verification middleware crash'
                 });
             }
         });
 
+        // Maintenance mode middleware
         this.bot.use(async (ctx, next) => {
             try {
                 if (this.isShuttingDown) {
@@ -435,6 +510,7 @@ class TelegramBot {
                 await this.alertAdmins(err, {
                     userId: ctx.from?.id,
                     updateType: ctx.updateType,
+                    source: 'middleware.maintenance',
                     note: 'Maintenance middleware crash'
                 });
             }
@@ -465,8 +541,7 @@ class TelegramBot {
             logger.error('Failed to initialize SMS Provider Manager', { error: error.message });
             this.smsProviderManager = null;
             await this.alertAdmins(error, {
-                updateType: 'setup',
-                command: 'setupCommands',
+                source: 'setup.setupCommands',
                 note: 'SMS Provider Manager init failed'
             });
         }
@@ -511,7 +586,9 @@ class TelegramBot {
                 await this.alertAdmins(error, {
                     userId: ctx.from?.id,
                     updateType: 'callback_query',
-                    command: 'mode_free'
+                    command: 'mode_free',
+                    source: 'action.mode_free',
+                    note: 'Free mode entry crash'
                 });
             }
         });
@@ -584,7 +661,9 @@ class TelegramBot {
                 await this.alertAdmins(error, {
                     userId: ctx.from?.id,
                     updateType: 'callback_query',
-                    command: 'help'
+                    command: 'help',
+                    source: 'action.help',
+                    note: 'Help action crash'
                 });
             }
         });
@@ -598,7 +677,9 @@ class TelegramBot {
                 await this.alertAdmins(error, {
                     userId: ctx.from?.id,
                     updateType: 'callback_query',
-                    command: 'menu'
+                    command: 'menu',
+                    source: 'action.menu',
+                    note: 'Menu action crash'
                 });
             }
         });
@@ -614,7 +695,9 @@ class TelegramBot {
                 await this.alertAdmins(err, {
                     userId: ctx.from?.id,
                     updateType: 'callback_query',
-                    command: 'open_admin_dashboard'
+                    command: 'open_admin_dashboard',
+                    source: 'action.openAdminDashboard',
+                    note: 'Admin dashboard action crash'
                 });
             }
         });
@@ -687,11 +770,12 @@ class TelegramBot {
                     userId: ctx.from?.id,
                     updateType: 'message',
                     command: ctx.message?.text,
+                    source: 'handler.textMessage',
                     note: 'Text handler crash'
                 });
             }
         });
-                    }
+                                                                                      }
             // ═══════════════════════════════════════════════════════════════════════════════
 // bot/TelegramBot.js — Part 3/3
 // Launch Sequence, Deposit Scanner, Metrics & Graceful Shutdown
@@ -720,9 +804,8 @@ class TelegramBot {
                 }
             } catch (error) {
                 logger.error('Deposit scanner error', { error: error.message });
-                this.alertAdmins(error, {
-                    updateType: 'scanner',
-                    command: 'deposit_scanner',
+                await this.alertAdmins(error, {
+                    source: 'scanner.depositScanner',
                     note: 'Deposit scanner retry loop error'
                 });
                 setTimeout(checkAndStart, retryDelay);
@@ -751,7 +834,7 @@ class TelegramBot {
             await initModels();
 
             await this.setupCommands();
-            this.setupTextHandler(); // Wire text handler after commands
+            this.setupTextHandler();
 
             this.startDepositScanner();
 
@@ -769,8 +852,7 @@ class TelegramBot {
         } catch (error) {
             logger.error('Launch failed', { error: error.message });
             await this.alertAdmins(error, {
-                updateType: 'launch',
-                command: 'bot_launch',
+                source: 'launch.botLaunch',
                 note: 'Bot failed to launch — critical'
             });
             throw error;
@@ -808,8 +890,8 @@ class TelegramBot {
             ]);
         } catch (e) {}
 
-        setTimeout(() => process.exit(1), 10000);
-        process.exit(0);
+        // Exit with delay to allow final logs/alerts to flush
+        setTimeout(() => process.exit(0), 2000);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -862,4 +944,4 @@ class TelegramBot {
 }
 
 export default TelegramBot;
-             
+            
