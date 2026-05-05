@@ -105,9 +105,14 @@ class OTPCommands {
     // ═══════════════════════════════════════════════════════════════════════
     
     _canUseFree(user) {
-    // DEFENSIVE: Reject if user object is missing or invalid
+    // DEFENSIVE: Missing user = deny
     if (!user || typeof user !== 'object') {
         return false;
+    }
+
+    // Admin bypass: unlimited free
+    if (user.isAdmin === true) {
+        return true;
     }
 
     const limit = config.limits?.freeDaily || 3;
@@ -117,9 +122,14 @@ class OTPCommands {
 }
 
 _freeRemaining(user) {
-    // DEFENSIVE: Reject if user object is missing or invalid
+    // DEFENSIVE: Missing user = zero remaining
     if (!user || typeof user !== 'object') {
         return 0;
+    }
+
+    // Admin bypass: show unlimited
+    if (user.isAdmin === true) {
+        return '∞';
     }
 
     const limit = config.limits?.freeDaily || 3;
