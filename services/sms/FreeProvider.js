@@ -1,18 +1,20 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FreeProvider.js — Part 1: Core Engine, Scrapers, Caching
+// FreeProvider.js — Part 1/3: Core Engine, Fast Parallel Scraping, Ad Credits
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import logger from '../../utils/logger.js';
+import AdCreditSystem from './AdCreditSystem.js';
 
 /**
  * FreeProvider — FREE Tier SMS Number Aggregation Engine
- * 
+ *
  * Architecture:
- * - Multi-site scraper with individual parsers per site
- * - In-memory LRU cache with TTL
+ * - Multi-site scraper with PARALLEL fetching (fast)
+ * - In-memory LRU cache with TTL + background pre-warm
  * - Priority-based number selection (success-rate weighted)
+ * - AdCreditSystem integration: credits required for free numbers
  * - Real SMS retrieval ONLY — no simulation
  */
 
@@ -26,8 +28,8 @@ const SITE_CONFIGS = [
         numbersPath: '/',
         inboxPath: (number) => `/${number.replace('+', '')}`,
         priority: 3,
-        timeout: 15000,
-        retries: 2
+        timeout: 10000,  // REDUCED: 10s for faster response
+        retries: 1
     },
     {
         id: 'smsreceivefree',
@@ -37,8 +39,8 @@ const SITE_CONFIGS = [
         numbersPath: '/',
         inboxPath: (number) => `/info/${number.replace('+', '')}`,
         priority: 2,
-        timeout: 15000,
-        retries: 2
+        timeout: 10000,
+        retries: 1
     },
     {
         id: 'sms_online_co',
@@ -48,8 +50,8 @@ const SITE_CONFIGS = [
         numbersPath: '/free-phone-number',
         inboxPath: (number) => `/receive-sms/${number.replace('+', '')}`,
         priority: 4,
-        timeout: 15000,
-        retries: 2
+        timeout: 10000,
+        retries: 1
     },
     {
         id: 'sellaite',
@@ -59,8 +61,8 @@ const SITE_CONFIGS = [
         numbersPath: '/',
         inboxPath: (number) => `/sms/${number.replace('+', '')}`,
         priority: 1,
-        timeout: 20000,
-        retries: 3
+        timeout: 12000,
+        retries: 2
     },
     {
         id: 'receive_sms_online',
@@ -70,8 +72,8 @@ const SITE_CONFIGS = [
         numbersPath: '/',
         inboxPath: (number) => `/read-sms/${number.replace('+', '')}`,
         priority: 2,
-        timeout: 15000,
-        retries: 2
+        timeout: 10000,
+        retries: 1
     },
     {
         id: 'receivesmsonline',
@@ -81,8 +83,8 @@ const SITE_CONFIGS = [
         numbersPath: '/',
         inboxPath: (number) => `/read-sms/${number.replace('+', '')}`,
         priority: 2,
-        timeout: 15000,
-        retries: 2
+        timeout: 10000,
+        retries: 1
     },
     {
         id: 'smslisten',
@@ -92,8 +94,8 @@ const SITE_CONFIGS = [
         numbersPath: '/',
         inboxPath: (number) => `/receive-sms/${number.replace('+', '')}`,
         priority: 3,
-        timeout: 15000,
-        retries: 2
+        timeout: 10000,
+        retries: 1
     }
 ];
 
@@ -120,6 +122,9 @@ class FreeProvider {
         this.tier = 'FREE';
         this.isActive = true;
 
+        // Ad credit system
+        this.adSystem = new AdCreditSystem();
+
         // Active sessions tracking
         this.activeSessions = new Map();
         this.assignedNumbers = new Map();
@@ -132,15 +137,19 @@ class FreeProvider {
 
         // In-memory cache
         this.cache = new Map();
-        this.CACHE_TTL = 60000; // 60 seconds for numbers
-        this.MESSAGE_CACHE_TTL = 15000; // 15 seconds for messages
+        this.CACHE_TTL = 45000;       // REDUCED: 45s for numbers (was 60s)
+        this.MESSAGE_CACHE_TTL = 10000; // REDUCED: 10s for messages (was 15s)
 
         // Poll configuration
         this.POLL_CONFIG = {
-            interval: 4000,      // 4s between polls
+            interval: 3000,      // REDUCED: 3s between polls (was 4s)
             timeout: 90000,      // 90s total timeout
             maxRetries: 1        // One retry with new number
         };
+
+        // Background cache warming
+        this.warmInterval = null;
+        this.startCacheWarming();
 
         // Cleanup
         this.cleanupInterval = null;
@@ -189,6 +198,43 @@ class FreeProvider {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    //  BACKGROUND CACHE WARMING (NEW)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    startCacheWarming() {
+        // Pre-warm cache every 30 seconds in background
+        this.warmInterval = setInterval(async () => {
+            try {
+                await this._warmCache();
+            } catch (e) {
+                // Silent fail — cache warming is best-effort
+            }
+        }, 30000);
+    }
+
+    stopCacheWarming() {
+        if (this.warmInterval) {
+            clearInterval(this.warmInterval);
+            this.warmInterval = null;
+        }
+    }
+
+    async _warmCache() {
+        // Only warm if cache is empty or stale
+        const cacheKey = 'numbers_all';
+        const cached = this._getCached(cacheKey);
+        if (cached && cached.length > 5) return; // Cache is healthy
+
+        // Fire-and-forget parallel scrape
+        this._scrapeAllSitesParallel(DEFAULT_COUNTRIES).then(numbers => {
+            if (numbers.length > 0) {
+                this._setCached(cacheKey, numbers);
+                logger.debug('Cache warmed', { count: numbers.length });
+            }
+        }).catch(() => {});
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     //  LIFECYCLE
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -197,6 +243,7 @@ class FreeProvider {
         this.cleanupInterval = setInterval(() => {
             this.cleanupStaleSessions();
             this._clearStaleCache();
+            this.adSystem.cleanupOldVerifications();
         }, 120000); // Every 2 minutes
     }
 
@@ -205,6 +252,7 @@ class FreeProvider {
             clearInterval(this.cleanupInterval);
             this.cleanupInterval = null;
         }
+        this.stopCacheWarming();
     }
 
     cleanupStaleSessions() {
@@ -225,18 +273,45 @@ class FreeProvider {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  NUMBER ACQUISITION — Multi-site scraper with priority
+    //  NUMBER ACQUISITION — PARALLEL multi-site scraper with priority
     // ═══════════════════════════════════════════════════════════════════════
 
     /**
      * Get numbers from all enabled sites, filtered by country preference
-     * Returns best available number based on priority + success rate
+     * PARALLEL fetching for speed — returns on first success or aggregated results
+     *
+     * NEW: Integrated AdCreditSystem — checks credits before returning number
      */
-    async getNumber(country = null, service = 'Any') {
+    async getNumber(country = null, service = 'Any', userId = null) {
         const sessionId = `free_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
         const startTime = Date.now();
 
-        // Check cache first
+        // ─── AD CREDIT CHECK (NEW) ─────────────────────────────────────────
+        if (userId) {
+            const creditCheck = await this.adSystem.canRequestNumber(userId);
+
+            if (!creditCheck.allowed && creditCheck.reason === 'DAILY_LIMIT_REACHED') {
+                const error = new Error(`DAILY_LIMIT_REACHED: ${creditCheck.message}`);
+                error.code = 'DAILY_LIMIT_REACHED';
+                error.creditInfo = creditCheck;
+                throw error;
+            }
+
+            if (!creditCheck.allowed && creditCheck.reason === 'INSUFFICIENT_CREDITS') {
+                const error = new Error(`INSUFFICIENT_CREDITS: ${creditCheck.message}`);
+                error.code = 'INSUFFICIENT_CREDITS';
+                error.creditInfo = creditCheck;
+                error.needsAd = true;
+                error.shortfall = creditCheck.shortfall;
+                throw error;
+            }
+
+            // Deduct credits now
+            await this.adSystem.deductCredits(userId);
+        }
+        // ───────────────────────────────────────────────────────────────────
+
+        // Check cache first (fast path)
         const cacheKey = `numbers_${country || 'all'}`;
         const cached = this._getCached(cacheKey);
         if (cached && cached.length > 0) {
@@ -246,53 +321,96 @@ class FreeProvider {
             }
         }
 
-        // Scrape all enabled sites
-        const allNumbers = [];
+        // PARALLEL scrape all enabled sites (FAST)
         const targetCountries = country ? [country] : DEFAULT_COUNTRIES;
-
-        // Sort sites by priority (highest first)
-        const sites = [...SITE_CONFIGS]
-            .filter(s => s.enabled)
-            .sort((a, b) => b.priority - a.priority);
-
-        for (const site of sites) {
-            try {
-                const numbers = await this._scrapeSiteNumbers(site, targetCountries);
-                allNumbers.push(...numbers);
-            } catch (error) {
-                logger.warn(`Site ${site.name} scrape failed`, {
-                    error: error.message,
-                    site: site.id
-                });
-                // Continue to next site — graceful degradation
-            }
-        }
+        const allNumbers = await this._scrapeAllSitesParallel(targetCountries);
 
         if (allNumbers.length === 0) {
-            throw new Error(`NO_FREE_NUMBERS: No numbers available. All sites failed or empty.`);
+            // NEW: When no numbers available, suggest ad-watching or upgrade
+            const error = new Error(`NO_FREE_NUMBERS: No numbers available. All sites failed or empty.`);
+            error.code = 'NO_FREE_NUMBERS';
+            error.suggestAd = true;
+            throw error;
         }
 
         // Cache results
         this._setCached(cacheKey, allNumbers);
 
-        // Select best number (priority + success rate - blacklist)
+        // Select best number
         const selected = this._selectBestNumber(allNumbers);
         if (!selected) {
-            throw new Error(`NO_FREE_NUMBERS: All available numbers blacklisted or exhausted.`);
+            const error = new Error(`NO_FREE_NUMBERS: All available numbers blacklisted or exhausted.`);
+            error.code = 'NO_FREE_NUMBERS';
+            error.suggestAd = true;
+            throw error;
         }
 
         return this._createSession(sessionId, selected, service, country, startTime);
     }
 
     /**
+     * PARALLEL scrape all sites — returns aggregated results from all successful sites
+     * This is the FAST path vs the old sequential approach
+     */
+    async _scrapeAllSitesParallel(targetCountries) {
+        const sites = [...SITE_CONFIGS]
+            .filter(s => s.enabled)
+            .sort((a, b) => b.priority - a.priority);
+
+        // Launch all requests in parallel with individual timeouts
+        const promises = sites.map(site =>
+            this._scrapeSiteWithTimeout(site, targetCountries)
+                .then(numbers => ({ site: site.id, numbers, success: true }))
+                .catch(error => {
+                    logger.debug(`Site ${site.name} failed`, { error: error.message });
+                    return { site: site.id, numbers: [], success: false, error: error.message };
+                })
+        );
+
+        const results = await Promise.allSettled(promises);
+
+        // Aggregate all successful results
+        const allNumbers = [];
+        for (const result of results) {
+            if (result.status === 'fulfilled' && result.value.success) {
+                allNumbers.push(...result.value.numbers);
+            }
+        }
+
+        // Deduplicate across sites
+        const seen = new Set();
+        return allNumbers.filter(n => {
+            if (seen.has(n.number)) return false;
+            seen.add(n.number);
+            return true;
+        });
+    }
+
+    /**
+     * Scrape a single site with timeout wrapper
+     */
+    async _scrapeSiteWithTimeout(site, targetCountries) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), site.timeout);
+
+        try {
+            const numbers = await this._scrapeSiteNumbers(site, targetCountries, controller.signal);
+            return numbers;
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
+    /**
      * Scrape numbers from a single site
      */
-    async _scrapeSiteNumbers(site, targetCountries) {
+    async _scrapeSiteNumbers(site, targetCountries, signal) {
         const url = `${site.baseUrl}${site.numbersPath}`;
         const numbers = [];
 
         const response = await axios.get(url, {
             timeout: site.timeout,
+            signal, // AbortController signal for cancellation
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
@@ -345,7 +463,6 @@ class FreeProvider {
                 break;
 
             case 'sellaite':
-                // Sellaite uses a different structure
                 $('a[href^="/sms/"], .number-list li').each((_, el) => {
                     const text = $(el).text();
                     const num = this._extractNumber(text);
@@ -391,13 +508,7 @@ class FreeProvider {
                 });
         }
 
-        // Deduplicate
-        const seen = new Set();
-        return numbers.filter(n => {
-            if (seen.has(n.number)) return false;
-            seen.add(n.number);
-            return true;
-        });
+        return numbers;
     }
 
     /**
@@ -433,96 +544,22 @@ class FreeProvider {
      */
     _createSession(sessionId, numberData, service, country, startTime) {
         this.activeSessions.set(sessionId, {
-            number: numberData.number,
-            siteId: numberData.site,
-            siteName: numberData.siteName,
-            assignedAt: Date.now(),
-            service,
-            country: country || numberData.country,
-            status: 'ACTIVE',
-            messages: [],
-            retryCount: 0,
-            otpCode: null,
-            fullText: null
-        });
-
-        this.assignedNumbers.set(numberData.number, {
             sessionId,
-            assignedAt: Date.now()
-        });
+            number: numberData
 
-        // Update stats
-        const stats = this.numberStats.get(numberData.number) || { success: 0, failure: 0, lastUsed: 0 };
-        stats.lastUsed = Date.now();
-        this.numberStats.set(numberData.number, stats);
 
-        logger.info('Free number assigned', {
-            sessionId,
-            site: numberData.siteName,
-            number: this.maskPhone(numberData.number),
-            country: numberData.country,
-            duration: Date.now() - startTime
-        });
 
-        return {
-            phoneNumber: numberData.number,
-            provider: this.name,
-            providerNumberId: sessionId,
-            country: numberData.country,
-            service,
-            cost: 0,
-            isPublic: true,
-            source: numberData.siteName,
-            sessionId,
-            warning: 'FREE TIER: Public/shared number. Anyone can see SMS. Not for sensitive accounts.'
-        };
-    }
+
+
+
+
+            // ═══════════════════════════════════════════════════════════════════════════════
+// FreeProvider.js — Part 2/3: SMS Retrieval, Parallel Message Fetching, Polling
+// ═══════════════════════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  NUMBER EXTRACTION HELPERS
-    // ═══════════════════════════════════════════════════════════════════════
-
-    _extractNumber(text) {
-        if (!text) return null;
-
-        // International format with + prefix
-        const patterns = [
-            /\+(\d[\s\-\.]?){8,14}\d/g,
-            /\+\d{1,3}[\s-]?\d{1,4}[\s-]?\d{1,4}[\s-]?\d{1,4}/g
-        ];
-
-        for (const pattern of patterns) {
-            const matches = text.match(pattern);
-            if (matches && matches.length > 0) {
-                // Clean and normalize
-                const cleaned = matches[0].replace(/[\s\-\.]/g, '');
-                // Validate length (E.164: max 15 digits including country code)
-                if (cleaned.length >= 10 && cleaned.length <= 16) {
-                    return cleaned;
-                }
-            }
-        }
-
-        return null;
-    }
-
-    _detectCountry(phoneNumber) {
-        if (!phoneNumber) return 'UNKNOWN';
-
-        for (const [code, data] of Object.entries(COUNTRY_CODES)) {
-            if (data.regex.test(phoneNumber)) {
-                return code;
-            }
-        }
-
-        return 'UNKNOWN';
-    }
-
-    _getFlag(code) {
-        return COUNTRY_CODES[code]?.flag || '🌍';
-        }
-            // ═══════════════════════════════════════════════════════════════════════
     //  SMS RETRIEVAL — Real inbox checking from scraped sites
+    //  OPTIMIZED: Parallel message fetching, smarter caching
     // ═══════════════════════════════════════════════════════════════════════
 
     /**
@@ -547,7 +584,7 @@ class FreeProvider {
             };
         }
 
-        // Check cache for recent messages
+        // Check cache for recent messages (fast path)
         const cacheKey = `messages_${session.number}_${session.siteId}`;
         const cachedMessages = this._getCached(cacheKey, 'messages');
 
@@ -700,7 +737,6 @@ class FreeProvider {
                     const $el = $(el);
                     const text = $el.text().trim();
 
-                    // Must contain digits (likely OTP) and be reasonable length
                     if (text.length > 10 && text.length < 500 && /\d{4,8}/.test(text)) {
                         messages.push({
                             from: 'Unknown',
@@ -722,14 +758,12 @@ class FreeProvider {
      */
     _findNewMessage(session, messages) {
         const sessionStart = session.assignedAt;
-
-        // Also check against already seen messages
         const seenTexts = new Set(session.messages.map(m => m.text));
 
         for (const msg of messages) {
             const msgTime = new Date(msg.time).getTime();
             // Message arrived after session started and not seen before
-            if (msgTime >= sessionStart - 5000 && !seenTexts.has(msg.text)) { // 5s buffer for clock skew
+            if (msgTime >= sessionStart - 5000 && !seenTexts.has(msg.text)) {
                 return msg;
             }
         }
@@ -792,28 +826,30 @@ class FreeProvider {
             }
         } catch (e) {
             // Fallback to relative parsing
-            const now = new Date();
-
-            if (timeStr.includes('just now') || timeStr.includes('now')) {
-                return now.toISOString();
-            }
-            if (timeStr.includes('min')) {
-                const mins = parseInt(timeStr.match(/\d+/)?.[0] || '0');
-                now.setMinutes(now.getMinutes() - mins);
-                return now.toISOString();
-            }
-            if (timeStr.includes('hour')) {
-                const hours = parseInt(timeStr.match(/\d+/)?.[0] || '0');
-                now.setHours(now.getHours() - hours);
-                return now.toISOString();
-            }
         }
 
-        return new Date().toISOString();
+        const now = new Date();
+
+        if (timeStr.includes('just now') || timeStr.includes('now')) {
+            return now.toISOString();
+        }
+        if (timeStr.includes('min')) {
+            const mins = parseInt(timeStr.match(/\d+/)?.[0] || '0');
+            now.setMinutes(now.getMinutes() - mins);
+            return now.toISOString();
+        }
+        if (timeStr.includes('hour')) {
+            const hours = parseInt(timeStr.match(/\d+/)?.[0] || '0');
+            now.setHours(now.getHours() - hours);
+            return now.toISOString();
+        }
+
+        return now.toISOString();
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  POLLING ENGINE — Live poll with real-time status updates
+    //  OPTIMIZED: 3s interval, better status reporting
     // ═══════════════════════════════════════════════════════════════════════
 
     async pollForSMS(sessionId, onStatusUpdate = null) {
@@ -891,7 +927,7 @@ class FreeProvider {
                     return;
                 }
 
-                // Schedule next check
+                // Schedule next check (3s interval)
                 setTimeout(check, this.POLL_CONFIG.interval);
             };
 
@@ -907,7 +943,7 @@ class FreeProvider {
     //  RETRY SYSTEM — One retry with new number on timeout
     // ═══════════════════════════════════════════════════════════════════════
 
-    async retryWithNewNumber(sessionId, country = null, service = 'Any') {
+    async retryWithNewNumber(sessionId, country = null, service = 'Any', userId = null) {
         const session = this.activeSessions.get(sessionId);
         if (!session) throw new Error('SESSION_NOT_FOUND');
 
@@ -926,10 +962,10 @@ class FreeProvider {
         await this.releaseSession(sessionId);
         await this.delay(3000);
 
-        // Try to get new number
+        // Try to get new number (will check credits again if userId provided)
         session.retryCount++;
         try {
-            const newNum = await this.getNumber(country || session.country, service);
+            const newNum = await this.getNumber(country || session.country, service, userId);
             return {
                 success: true,
                 newSessionId: newNum.sessionId,
@@ -940,7 +976,8 @@ class FreeProvider {
             return {
                 success: false,
                 status: 'RETRY_FAILED',
-                error: error.message
+                error: error.message,
+                code: error.code || 'UNKNOWN'
             };
         }
     }
@@ -974,7 +1011,10 @@ class FreeProvider {
 
     delay(ms) {
         return new Promise(r => setTimeout(r, ms));
-    }
+                    }
+                        // ═══════════════════════════════════════════════════════════════════════════════
+// FreeProvider.js — Part 3/3: OTP Extraction, Ad System Proxy, Stats & Health
+// ═══════════════════════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════════════════
     //  OTP EXTRACTION — Extract verification codes from real messages
@@ -1006,11 +1046,58 @@ class FreeProvider {
         // Fallback: standalone 4-8 digit sequences, prefer longer
         const digits = text.match(/\b\d{4,8}\b/g);
         if (digits && digits.length > 0) {
-            // Return longest (most likely to be OTP)
             return digits.reduce((a, b) => a.length >= b.length ? a : b);
         }
 
         return null;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  AD SYSTEM PROXY METHODS (NEW)
+    //  These expose AdCreditSystem to the bot layer without direct imports
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Check if user can request a free number (credit check)
+     * Bot layer calls this before showing "Get Free Number" button
+     */
+    async canRequestNumber(userId) {
+        return this.adSystem.canRequestNumber(userId);
+    }
+
+    /**
+     * Get user's current ad credits
+     */
+    async getCredits(userId) {
+        return this.adSystem.getCredits(userId);
+    }
+
+    /**
+     * Generate ad view for user
+     */
+    async generateAdView(userId, network = 'shorte_st') {
+        return this.adSystem.generateAdView(userId, network);
+    }
+
+    /**
+     * Handle ad completion webhook
+     */
+    async handleAdWebhook(verificationId, payload) {
+        return this.adSystem.handleAdWebhook(verificationId, payload);
+    }
+
+    /**
+     * Get available ad networks
+     */
+    getAvailableNetworks() {
+        return this.adSystem.getAvailableNetworks();
+    }
+
+    /**
+     * Deduct credits (used by bot layer after ad watch)
+     */
+    async deductCredits(userId) {
+        return this.adSystem.deductCredits(userId);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1048,10 +1135,8 @@ class FreeProvider {
             sites: SITE_CONFIGS.length
         };
 
-        // Per-site stats
         stats.siteHealth = this.getProviderHealth();
 
-        // Number pool stats
         stats.numberStats = Array.from(this.numberStats.entries())
             .map(([num, data]) => ({
                 number: this.maskPhone(num),
@@ -1089,4 +1174,4 @@ class FreeProvider {
 }
 
 export default FreeProvider;
-                
+    
