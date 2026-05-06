@@ -576,6 +576,50 @@ this.bot.action('admin_dashboard', async (ctx) => {
         logger.error('Return to admin dashboard error', { error: err.message });
     }
 });
+        // ═══════════════════════════════════════════════════════════════════════
+//  ORPHAN SMS ACTION HANDLERS
+// ═══════════════════════════════════════════════════════════════════════
+
+this.bot.action('admin_orphan_review', async (ctx) => {
+    try {
+        await ctx.answerCbQuery().catch(() => {});
+        await this.handleOrphanReview(ctx);
+    } catch (err) {
+        logger.error('admin_orphan_review error', { error: err.message });
+        await this.replyError(ctx, '❌ Failed to load orphan review.');
+    }
+});
+
+this.bot.action('admin_orphan_markall', async (ctx) => {
+    try {
+        await ctx.answerCbQuery('Marking all as reviewed...').catch(() => {});
+        await this.handleOrphanMarkAll(ctx);
+    } catch (err) {
+        logger.error('admin_orphan_markall error', { error: err.message });
+        await this.replyError(ctx, '❌ Failed to mark orphans.');
+    }
+});
+
+this.bot.action('admin_orphan_export', async (ctx) => {
+    try {
+        await ctx.answerCbQuery('Generating CSV...').catch(() => {});
+        await this.handleOrphanExport(ctx);
+    } catch (err) {
+        logger.error('admin_orphan_export error', { error: err.message });
+        await this.replyError(ctx, '❌ Export failed.');
+    }
+});
+
+this.bot.action('admin_orphan_search', async (ctx) => {
+    try {
+        await ctx.answerCbQuery().catch(() => {});
+        await this.handleOrphanSearch(ctx);
+    } catch (err) {
+        logger.error('admin_orphan_search error', { error: err.message });
+        await this.replyError(ctx, '❌ Search init failed.');
+    }
+});
+        
         
         // ─── Search flow ───
         this.bot.action('search_by_id', this.requireAdmin, (ctx) => {
@@ -1087,8 +1131,10 @@ this.bot.action(/numpool_country_(.+)/, (ctx) => {
     //  NEW: RPC Mode Control Button
     // ═══════════════════════════════════════════════════
     [
-        Markup.button.callback('⛓️ RPC Mode', 'admin_rpc_control')
-    ]
+    Markup.button.callback('📨 Orphan SMS', 'admin_orphan_review'),
+    Markup.button.callback('🛠️ Advanced Tools', 'open_admin_dashboard')
+]
+                                               
 ]);
         
 
@@ -1103,6 +1149,278 @@ this.bot.action(/numpool_country_(.+)/, (ctx) => {
     // ═══════════════════════════════════════════════════════════
     //  POOL MANAGEMENT
     // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
+//  ORPHAN SMS REVIEW — Admin Panel Integration
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Handle orphan SMS review button click
+ */
+async handleOrphanReview(ctx) {
+    try {
+        if (!this._checkCooldown(ctx.from.id, 'orphan_review', 2000)) {
+            return ctx.answerCbQuery?.('Please wait...').catch(() => {});
+        }
+
+        const { OrphanSMS } = await import('../../models/index.js');
+
+        // Get counts
+        const [unreviewedCount, totalCount, recentOrphans] = await Promise.all([
+            OrphanSMS.countDocuments({ reviewed: false }),
+            OrphanSMS.countDocuments(),
+            OrphanSMS.find({ reviewed: false })
+                .sort({ receivedAt: -1 })
+                .limit(10)
+                .lean()
+        ]);
+
+        if (recentOrphans.length === 0) {
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('🔄 Refresh', 'admin_orphan_review')],
+                [Markup.button.callback('⬅️ Back to Admin', 'admin_dashboard')]
+            ]);
+
+            return this.replySuccess(ctx, 
+                '✅ <b>No Unreviewed Orphan SMS</b>\n\n' +
+                `Total orphans in database: <code>${totalCount}</code>\n` +
+                'All caught SMS have been matched to sessions.',
+                { reply_markup: keyboard.reply_markup }
+            );
+        }
+
+        // Build message
+        const lines = recentOrphans.map((orphan, i) => {
+            const timeAgo = this._formatTimeAgo(orphan.receivedAt);
+            const bodyPreview = orphan.body 
+                ? orphan.body.slice(0, 40).replace(/</g, '&lt;') + (orphan.body.length > 40 ? '...' : '')
+                : 'N/A';
+            
+            return [
+                `${i + 1}. <code>${this._maskPhone(orphan.to)}</code> | ${orphan.provider}`,
+                `   🕐 ${timeAgo} | 📱 ${this._maskPhone(orphan.from || 'unknown')}`,
+                `   💬 ${bodyPreview}`,
+                `   🔢 OTP: <code>${orphan.extractedOtp || 'None'}</code>`,
+                `   [${orphan.reviewed ? '✅' : '⏳'}]`
+            ].join('\n');
+        });
+
+        const message = 
+            `📨 <b>Orphan SMS Review</b>\n\n` +
+            `⏳ Unreviewed: <code>${unreviewedCount}</code>\n` +
+            `📊 Total: <code>${totalCount}</code>\n\n` +
+            `<b>Recent Unreviewed (${recentOrphans.length}):</b>\n\n` +
+            lines.join('\n\n');
+
+        const keyboard = Markup.inlineKeyboard([
+            [
+                Markup.button.callback('✅ Mark All Reviewed', 'admin_orphan_markall'),
+                Markup.button.callback('🔄 Refresh', 'admin_orphan_review')
+            ],
+            [
+                Markup.button.callback('📋 Export CSV', 'admin_orphan_export'),
+                Markup.button.callback('🔍 Search Number', 'admin_orphan_search')
+            ],
+            [
+                Markup.button.callback('⬅️ Back to Admin', 'admin_dashboard')
+            ]
+        ]);
+
+        await this._safeEditMessage(ctx, message, keyboard);
+
+    } catch (error) {
+        logger.error('Orphan review error', { error: error.message, userId: ctx.from?.id });
+        await this.replyError(ctx, '❌ Failed to load orphan SMS review.');
+    }
+}
+
+/**
+ * Mark all orphan SMS as reviewed
+ */
+async handleOrphanMarkAll(ctx) {
+    try {
+        const { OrphanSMS } = await import('../../models/index.js');
+
+        const result = await OrphanSMS.updateMany(
+            { reviewed: false },
+            { 
+                $set: { 
+                    reviewed: true, 
+                    reviewedAt: new Date(),
+                    reviewedBy: ctx.from.id.toString()
+                } 
+            }
+        );
+
+        await ctx.answerCbQuery?.(`Marked ${result.modifiedCount} as reviewed`).catch(() => {});
+
+        // Refresh the view
+        return this.handleOrphanReview(ctx);
+
+    } catch (error) {
+        logger.error('Orphan mark all error', { error: error.message });
+        await this.replyError(ctx, '❌ Failed to mark orphans as reviewed.');
+    }
+}
+
+/**
+ * Export orphan SMS to CSV
+ */
+async handleOrphanExport(ctx) {
+    try {
+        const { OrphanSMS } = await import('../../models/index.js');
+
+        const orphans = await OrphanSMS.find()
+            .sort({ receivedAt: -1 })
+            .limit(1000)
+            .lean();
+
+        if (orphans.length === 0) {
+            return this.replyError(ctx, 'No orphan SMS to export.');
+        }
+
+        // Build CSV
+        const headers = ['Received At', 'Provider', 'To', 'From', 'Body', 'Extracted OTP', 'Reviewed', 'Reviewed At'];
+        const rows = orphans.map(o => [
+            o.receivedAt?.toISOString() || '',
+            o.provider,
+            o.to,
+            o.from || '',
+            `"${(o.body || '').replace(/"/g, '""')}"`,
+            o.extractedOtp || '',
+            o.reviewed ? 'Yes' : 'No',
+            o.reviewedAt?.toISOString() || ''
+        ]);
+
+        const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+
+        // Send as document
+        await ctx.replyWithDocument({
+            source: Buffer.from(csv),
+            filename: `orphan_sms_${new Date().toISOString().split('T')[0]}.csv`
+        }, {
+            caption: `📊 Orphan SMS Export\nTotal: ${orphans.length} records`
+        });
+
+    } catch (error) {
+        logger.error('Orphan export error', { error: error.message });
+        await this.replyError(ctx, '❌ Failed to export orphan SMS.');
+    }
+}
+
+/**
+ * Search orphan SMS by phone number
+ */
+async handleOrphanSearch(ctx) {
+    // Set admin state to wait for phone number input
+    ctx.session = ctx.session || {};
+    ctx.session.adminState = {
+        state: 'ORPHAN_SEARCH',
+        timestamp: Date.now()
+    };
+
+    await this.replySuccess(ctx, 
+        '🔍 <b>Search Orphan SMS</b>\n\n' +
+        'Please send the phone number to search for (with or without +):',
+        { reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('❌ Cancel', 'admin_orphan_review')]
+        ]).reply_markup }
+    );
+}
+
+/**
+ * Process orphan search text input
+ */
+async processOrphanSearch(ctx, phoneNumber) {
+    try {
+        const cleanPhone = phoneNumber.replace(/\D/g, '');
+        
+        const { OrphanSMS } = await import('../../models/index.js');
+
+        const matches = await OrphanSMS.find({
+            $or: [
+                { to: { $regex: cleanPhone } },
+                { from: { $regex: cleanPhone } }
+            ]
+        }).sort({ receivedAt: -1 }).limit(20).lean();
+
+        if (matches.length === 0) {
+            return this.replyError(ctx, `No orphan SMS found for <code>${phoneNumber}</code>.`);
+        }
+
+        const lines = matches.map((o, i) => 
+            `${i + 1}. <code>${this._maskPhone(o.to)}</code> → <code>${this._maskPhone(o.from)}</code>\n` +
+            `   🕐 ${this._formatTimeAgo(o.receivedAt)}\n` +
+            `   💬 ${o.body?.slice(0, 50) || 'N/A'}\n` +
+            `   🔢 <code>${o.extractedOtp || 'None'}</code>`
+        );
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔍 New Search', 'admin_orphan_search')],
+            [Markup.button.callback('⬅️ Back to Review', 'admin_orphan_review')]
+        ]);
+
+        await this.replySuccess(ctx,
+            `🔍 <b>Search Results for ${phoneNumber}</b>\n\n` +
+            `Found: <code>${matches.length}</code>\n\n` +
+            lines.join('\n\n'),
+            { reply_markup: keyboard.reply_markup }
+        );
+
+    } catch (error) {
+        logger.error('Orphan search error', { error: error.message, phone: phoneNumber });
+        await this.replyError(ctx, '❌ Search failed.');
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  HELPER METHODS
+// ═══════════════════════════════════════════════════════════════════════
+
+_formatTimeAgo(date) {
+    const seconds = Math.floor((Date.now() - new Date(date).getTime()) / 1000);
+    if (seconds < 60) return `${seconds}s ago`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    return `${Math.floor(hours / 24)}d ago`;
+}
+
+_maskPhone(phone) {
+    if (!phone) return '****';
+    const str = phone.toString().replace(/\D/g, '');
+    if (str.length < 4) return '****';
+    return '+' + str.slice(0, -4).replace(/./g, '*') + str.slice(-4);
+}
+
+/**
+ * Safe message edit — handles both text and photo messages
+ */
+async _safeEditMessage(ctx, text, keyboard) {
+    try {
+        if (ctx.callbackQuery?.message?.photo) {
+            // Edit caption for photo messages
+            await ctx.editMessageCaption(text, {
+                parse_mode: 'HTML',
+                reply_markup: keyboard.reply_markup
+            });
+        } else {
+            // Edit text message
+            await ctx.editMessageText(text, {
+                parse_mode: 'HTML',
+                reply_markup: keyboard.reply_markup
+            });
+        }
+    } catch (err) {
+        // If edit fails, send new message
+        if (err.message?.includes('not modified')) return;
+        await ctx.reply(text, {
+            parse_mode: 'HTML',
+            reply_markup: keyboard.reply_markup
+        });
+    }
+    }
+                                     
         // ═══════════════════════════════════════════════════════════════════════
     //  ADMIN POOL PURCHASE — FULL REWRITE
     //  Flow: Provider → Available Countries+Prices → Pick Country → 
