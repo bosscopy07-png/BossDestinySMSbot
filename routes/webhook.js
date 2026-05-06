@@ -1,71 +1,565 @@
-//  — Ad network postback routes
+// ═══════════════════════════════════════════════════════════════════════════════
+// routes/webhooks.js — Production Webhook Handlers
+// SMS (Twilio/Telnyx) + Ad Network Postbacks
+// ═══════════════════════════════════════════════════════════════════════════════
 
 import express from 'express';
-import { SMSProviderManager } from '../services/sms/index.js';
+import crypto from 'crypto';
+import twilio from 'twilio';
+import { Session, User } from '../models/index.js';
+import logger from '../utils/logger.js';
+import config from '../config/env.js';
 
 const router = express.Router();
 
-// Generic ad postback — used by most networks
-// Format: GET /webhook/ad/ogads?subId=xxx&status=approved&payout=0.5
-router.get('/ad/:network', async (req, res) => {
-    try {
-        const { network } = req.params;
-        const providerManager = SMSProviderManager.getInstance(); // Or however you access it
+// ═══════════════════════════════════════════════════════════════════════
+//  TWILIO SMS WEBHOOK
+// ═══════════════════════════════════════════════════════════════════════
 
-        // Get FreeProvider's AdCreditSystem
-        const freeProvider = providerManager.getProvider('FREE_PUBLIC');
-        if (!freeProvider || !freeProvider.adSystem) {
-            return res.status(500).send('ERROR');
+/**
+ * Validates Twilio request signature to prevent spoofing
+ */
+function validateTwilioRequest(req) {
+    const authToken = config.twilio?.authToken;
+    const webhookUrl = `${config.baseUrl}/webhooks/twilio`;
+    
+    if (!authToken) {
+        logger.warn('Twilio auth token not configured — skipping signature validation');
+        return true; // Allow in dev, block in production
+    }
+
+    const signature = req.headers['x-twilio-signature'];
+    if (!signature) {
+        logger.warn('Missing Twilio signature header');
+        return false;
+    }
+
+    return twilio.validateRequest(
+        authToken,
+        signature,
+        webhookUrl,
+        req.body
+    );
+}
+
+router.post('/twilio', 
+    express.urlencoded({ extended: false }),
+    async (req, res) => {
+        // Always respond immediately — Twilio retries on timeout
+        res.type('text/xml').send('<Response/>');
+
+        try {
+            // Validate signature in production
+            if (process.env.NODE_ENV === 'production' && !validateTwilioRequest(req)) {
+                logger.error('Invalid Twilio signature — possible spoofing attempt', {
+                    ip: req.ip,
+                    headers: req.headers
+                });
+                return;
+            }
+
+            const { From, To, Body, MessageSid, NumMedia } = req.body;
+
+            if (!To || !Body) {
+                logger.warn('Twilio webhook missing required fields', { body: req.body });
+                return;
+            }
+
+            logger.info('Twilio SMS received', {
+                from: maskPhone(From),
+                to: maskPhone(To),
+                messageSid: MessageSid,
+                bodyLength: Body.length,
+                hasMedia: NumMedia > 0
+            });
+
+            // Find active session for this number
+            const session = await Session.findOneAndUpdate(
+                {
+                    phoneNumber: normalizePhone(To),
+                    status: { $in: ['WAITING', 'ACTIVE'] },
+                    provider: { $in: ['TWILIO', 'NUMBER_POOL'] }
+                },
+                {
+                    $set: {
+                        lastActivityAt: new Date()
+                    }
+                },
+                { sort: { createdAt: -1 }, new: true }
+            );
+
+            if (!session) {
+                logger.warn('No active session for Twilio number', { 
+                    to: maskPhone(To),
+                    from: maskPhone(From) 
+                });
+                
+                // Store orphan SMS for manual review
+                await storeOrphanSMS({
+                    provider: 'TWILIO',
+                    from: From,
+                    to: To,
+                    body: Body,
+                    messageSid: MessageSid,
+                    receivedAt: new Date()
+                });
+                return;
+            }
+
+            // Extract OTP with multiple strategies
+            const otp = extractOTP(Body);
+            
+            // Atomic update — prevent race conditions
+            const updateResult = await Session.updateOne(
+                {
+                    _id: session._id,
+                    status: { $in: ['WAITING', 'ACTIVE'] } // Only if still active
+                },
+                {
+                    $set: {
+                        otp: otp || null,
+                        smsText: Body,
+                        smsFrom: From,
+                        messageSid: MessageSid,
+                        otpReceivedAt: new Date(),
+                        status: otp ? 'RECEIVED' : 'SMS_RECEIVED_NO_OTP',
+                        lastActivityAt: new Date()
+                    }
+                }
+            );
+
+            if (updateResult.matchedCount === 0) {
+                logger.warn('Session was already completed when SMS arrived', {
+                    sessionId: session.sessionId,
+                    messageSid
+                });
+                return;
+            }
+
+            logger.info('Session updated with SMS', {
+                sessionId: session.sessionId,
+                userId: session.userId,
+                hasOtp: !!otp,
+                otpPreview: otp ? otp.slice(0, 2) + '****' : null
+            });
+
+            // Notify user via bot
+            if (session.userId) {
+                await notifyUser(session.userId, {
+                    type: otp ? 'OTP_RECEIVED' : 'SMS_RECEIVED_NO_OTP',
+                    otp: otp || null,
+                    sessionId: session.sessionId,
+                    service: session.service,
+                    expiresIn: session.timeoutAt ? Math.floor((session.timeoutAt - Date.now()) / 1000) : null
+                });
+            }
+
+            // Release number if pool-managed
+            if (session.provider === 'NUMBER_POOL' && session.poolNumberId) {
+                await releasePoolNumber(session.poolNumberId, session.sessionId);
+            }
+
+        } catch (error) {
+            logger.error('Twilio webhook processing error', {
+                error: error.message,
+                stack: error.stack,
+                body: req.body
+            });
+        }
+    }
+);
+
+// ═══════════════════════════════════════════════════════════════════════
+//  TELNYX SMS WEBHOOK
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Validates Telnyx webhook signature using public key
+ */
+function validateTelnyxRequest(req) {
+    const publicKey = config.telnyx?.webhookPublicKey;
+    
+    if (!publicKey) {
+        logger.warn('Telnyx webhook public key not configured');
+        return process.env.NODE_ENV !== 'production';
+    }
+
+    try {
+        const signature = req.headers['telnyx-signature-ed25519'];
+        const timestamp = req.headers['telnyx-timestamp'];
+        const body = JSON.stringify(req.body);
+
+        if (!signature || !timestamp) return false;
+
+        // Verify timestamp is within 5 minutes
+        const now = Math.floor(Date.now() / 1000);
+        if (Math.abs(now - parseInt(timestamp)) > 300) {
+            logger.warn('Telnyx webhook timestamp too old');
+            return false;
         }
 
-        const result = await freeProvider.adSystem.handlePostback(network, req.body, req.query);
+        const payload = `${timestamp}|${body}`;
+        const verifier = crypto.createVerify('RSA-SHA256');
+        verifier.update(payload);
+        
+        return verifier.verify(publicKey, signature, 'base64');
+    } catch (error) {
+        logger.error('Telnyx signature validation error', { error: error.message });
+        return false;
+    }
+}
 
-        // Always return 200 to ad network, even on error (they retry otherwise)
-        if (result.success) {
-            return res.status(200).send('OK');
+router.post('/telnyx',
+    express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }),
+    async (req, res) => {
+        // Respond immediately
+        res.status(200).send('OK');
+
+        try {
+            // Validate in production
+            if (process.env.NODE_ENV === 'production' && !validateTelnyxRequest(req)) {
+                logger.error('Invalid Telnyx signature', { ip: req.ip });
+                return;
+            }
+
+            const event = req.body?.data;
+            
+            // Handle different event types
+            const eventType = event?.event_type;
+            
+            if (eventType !== 'message.received') {
+                logger.debug('Ignoring non-SMS Telnyx event', { eventType });
+                return;
+            }
+
+            const payload = event.payload;
+            const from = payload.from?.phone_number || payload.from;
+            const to = payload.to?.[0]?.phone_number || payload.to?.phone_number || payload.to;
+            const text = payload.text;
+
+            if (!to || !text) {
+                logger.warn('Telnyx webhook missing fields', { payload });
+                return;
+            }
+
+            logger.info('Telnyx SMS received', {
+                from: maskPhone(from),
+                to: maskPhone(to),
+                textLength: text.length
+            });
+
+            // Find and update session (same logic as Twilio)
+            const session = await Session.findOneAndUpdate(
+                {
+                    phoneNumber: normalizePhone(to),
+                    status: { $in: ['WAITING', 'ACTIVE'] },
+                    provider: { $in: ['TELNYX', 'NUMBER_POOL'] }
+                },
+                { $set: { lastActivityAt: new Date() } },
+                { sort: { createdAt: -1 }, new: true }
+            );
+
+            if (!session) {
+                await storeOrphanSMS({
+                    provider: 'TELNYX',
+                    from,
+                    to,
+                    body: text,
+                    receivedAt: new Date()
+                });
+                return;
+            }
+
+            const otp = extractOTP(text);
+
+            await Session.updateOne(
+                { _id: session._id, status: { $in: ['WAITING', 'ACTIVE'] } },
+                {
+                    $set: {
+                        otp: otp || null,
+                        smsText: text,
+                        smsFrom: from,
+                        otpReceivedAt: new Date(),
+                        status: otp ? 'RECEIVED' : 'SMS_RECEIVED_NO_OTP',
+                        lastActivityAt: new Date()
+                    }
+                }
+            );
+
+            if (session.userId) {
+                await notifyUser(session.userId, {
+                    type: otp ? 'OTP_RECEIVED' : 'SMS_RECEIVED_NO_OTP',
+                    otp: otp || null,
+                    sessionId: session.sessionId,
+                    service: session.service
+                });
+            }
+
+            if (session.provider === 'NUMBER_POOL' && session.poolNumberId) {
+                await releasePoolNumber(session.poolNumberId, session.sessionId);
+            }
+
+        } catch (error) {
+            logger.error('Telnyx webhook error', {
+                error: error.message,
+                body: req.body
+            });
+        }
+    }
+);
+
+// ═══════════════════════════════════════════════════════════════════════
+//  AD NETWORK POSTBACKS
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Rate limiter for postback endpoints
+ */
+const postbackLimits = new Map();
+const POSTBACK_WINDOW_MS = 60000;
+const MAX_POSTBACKS_PER_WINDOW = 100;
+
+function checkPostbackRateLimit(key) {
+    const now = Date.now();
+    const entry = postbackLimits.get(key);
+    
+    if (!entry || now - entry.windowStart > POSTBACK_WINDOW_MS) {
+        postbackLimits.set(key, { windowStart: now, count: 1 });
+        return true;
+    }
+    
+    if (entry.count >= MAX_POSTBACKS_PER_WINDOW) {
+        return false;
+    }
+    
+    entry.count++;
+    return true;
+}
+
+// Generic ad network postback
+router.get('/ad/:network', async (req, res) => {
+    // Always 200 to stop ad network retries
+    res.status(200).send('OK');
+
+    const { network } = req.params;
+    const clientIp = req.ip || req.connection.remoteAddress;
+
+    // Rate limit
+    if (!checkPostbackRateLimit(`${network}:${clientIp}`)) {
+        logger.warn('Ad postback rate limited', { network, ip: clientIp });
+        return;
+    }
+
+    try {
+        // Validate required params
+        const { subId, status, payout, verify } = req.query;
+        
+        if (!subId && !verify) {
+            logger.warn('Ad postback missing identifier', { network, query: req.query });
+            return;
+        }
+
+        const identifier = subId || verify;
+
+        logger.info('Ad postback received', {
+            network,
+            identifier: identifier.slice(0, 20),
+            status,
+            payout,
+            ip: clientIp
+        });
+
+        // Get FreeProvider
+        const { SMSProviderManager } = await import('../services/sms/index.js');
+        const providerManager = SMSProviderManager.getInstance?.() || global.smsProviderManager;
+        
+        if (!providerManager) {
+            logger.error('SMSProviderManager not available');
+            return;
+        }
+
+        const freeProvider = providerManager.getProvider('FREE_PUBLIC');
+        if (!freeProvider || !freeProvider.adSystem) {
+            logger.warn('FreeProvider or adSystem not available');
+            return;
+        }
+
+        // Process postback
+        const result = await freeProvider.adSystem.handlePostback(
+            network,
+            req.body,
+            req.query
+        );
+
+        if (!result.success) {
+            logger.warn('Ad postback processing failed', {
+                network,
+                identifier,
+                error: result.error
+            });
         } else {
-            logger.warn('Ad postback processing failed', { error: result.error });
-            return res.status(200).send('OK'); // Still 200 to stop retries
+            logger.info('Ad postback processed', {
+                network,
+                identifier,
+                creditsAdded: result.creditsAdded,
+                userId: result.userId
+            });
         }
 
     } catch (error) {
-        logger.error('Ad postback route error', { error: error.message });
-        res.status(200).send('OK'); // Always 200 for ad networks
+        logger.error('Ad postback error', {
+            network: req.params.network,
+            error: error.message,
+            stack: error.stack
+        });
     }
 });
 
-// Shorte.st / generic verification callback
-// Format: GET /webhook/ad/:verificationId?status=completed
-router.get('/ad/:verificationId', async (req, res) => {
+// ═══════════════════════════════════════════════════════════════════════
+//  HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Extract OTP from SMS text using multiple strategies
+ */
+function extractOTP(text) {
+    if (!text || typeof text !== 'string') return null;
+
+    const cleaned = text.replace(/[\s\-_\.]/g, '');
+
+    // Strategy 1: Explicit code/OTP keywords
+    const keywordPatterns = [
+        /(?:code|otp|pin|verification|verify|code:|otp:)\s*[:=\-]?\s*(\d{4,8})/i,
+        /(?:your|the)\s+(?:code|otp|pin|verification\s+code)\s+(?:is|:\s*=)\s*(\d{4,8})/i,
+        /(?:код|пин|верификация)\s*[:=\-]?\s*(\d{4,8})/i,
+        /(?:验证码|验证码为|代码)\s*[:：]?\s*(\d{4,8})/i
+    ];
+
+    for (const pattern of keywordPatterns) {
+        const match = text.match(pattern);
+        if (match?.[1]) {
+            const code = match[1].replace(/\D/g, '');
+            if (/^\d{4,8}$/.test(code)) return code;
+        }
+    }
+
+    // Strategy 2: Standalone 4-8 digit codes
+    const standaloneMatches = cleaned.match(/\b\d{4,8}\b/g);
+    if (standaloneMatches?.length > 0) {
+        // Prefer longer codes (more likely to be OTP than random numbers)
+        const sorted = standaloneMatches.sort((a, b) => b.length - a.length);
+        return sorted[0];
+    }
+
+    // Strategy 3: Numbers in context (WhatsApp, Telegram format)
+    const contextMatches = text.match(/(?:code|login|verify|sign\s*in)[^\d]*(\d{4,8})/i);
+    if (contextMatches?.[1]) {
+        const code = contextMatches[1].replace(/\D/g, '');
+        if (/^\d{4,8}$/.test(code)) return code;
+    }
+
+    return null;
+}
+
+/**
+ * Normalize phone number for matching
+ */
+function normalizePhone(phone) {
+    if (!phone) return '';
+    // Remove all non-digits except leading +
+    return phone.toString().replace(/[^\d+]/g, '').replace(/^\+?1?/, '');
+}
+
+/**
+ * Mask phone for logging
+ */
+function maskPhone(phone) {
+    if (!phone) return '****';
+    const str = phone.toString().replace(/\D/g, '');
+    if (str.length < 4) return '****';
+    return '+' + str.slice(0, -4).replace(/./g, '*') + str.slice(-4);
+}
+
+/**
+ * Store orphan SMS for manual review
+ */
+async function storeOrphanSMS(data) {
     try {
-        const { verificationId } = req.params;
-        const { status, payout } = req.query;
+        const { OrphanSMS } = await import('../models/index.js');
+        await OrphanSMS.create({
+            ...data,
+            reviewed: false
+        });
+        logger.info('Orphan SMS stored', { to: maskPhone(data.to) });
+    } catch (error) {
+        logger.error('Failed to store orphan SMS', { error: error.message });
+    }
+}
 
-        const providerManager = SMSProviderManager.getInstance();
-        const freeProvider = providerManager.getProvider('FREE_PUBLIC');
-
-        if (!freeProvider || !freeProvider.adSystem) {
-            return res.redirect('/error?msg=system_not_ready');
+/**
+ * Notify user via bot
+ */
+async function notifyUser(userId, data) {
+    try {
+        // Get bot instance — adjust based on your architecture
+        const bot = global.telegramBot || global.bot;
+        if (!bot) {
+            logger.warn('Bot instance not available for notification');
+            return;
         }
 
-        // Process the verification
-        const result = await freeProvider.adSystem.handlePostback('generic', null, {
-            verify: verificationId,
-            status,
-            payout
+        const message = data.type === 'OTP_RECEIVED'
+            ? `🔐 <b>OTP Received!</b>\n\n` +
+              `Service: <code>${data.service || 'Unknown'}</code>\n` +
+              `Code: <code>${data.otp}</code>\n\n` +
+              `⏰ Expires in ${data.expiresIn ? Math.floor(data.expiresIn / 60) + 'm' : 'soon'}`
+            : `📩 <b>SMS Received</b>\n\n` +
+              `Service: <code>${data.service || 'Unknown'}</code>\n` +
+              `Status: No OTP detected in message\n` +
+              `Check manually if needed.`;
+
+        await bot.telegram.sendMessage(userId, message, {
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [[
+                    { text: '📋 Copy OTP', callback_data: `copy_otp_${data.otp}` }
+                ]]
+            }
         });
 
-        // Redirect user back to bot with success/failure
-        if (result.success) {
-            return res.redirect(`/success?credits=${result.creditsAdded}`);
-        } else {
-            return res.redirect(`/error?msg=${encodeURIComponent(result.error)}`);
-        }
-
     } catch (error) {
-        logger.error('Verification callback error', { error: error.message });
-        res.redirect('/error?msg=verification_failed');
+        logger.error('Failed to notify user', { userId, error: error.message });
     }
+}
+
+/**
+ * Release number back to pool
+ */
+async function releasePoolNumber(poolNumberId, sessionId) {
+    try {
+        const { SMSProviderManager } = await import('../services/sms/index.js');
+        const manager = SMSProviderManager.getInstance?.() || global.smsProviderManager;
+        
+        if (manager?.numberPool) {
+            await manager.numberPool.releaseNumber(poolNumberId, sessionId);
+            logger.info('Pool number released', { poolNumberId, sessionId });
+        }
+    } catch (error) {
+        logger.error('Failed to release pool number', { poolNumberId, error: error.message });
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  HEALTH CHECK
+// ═══════════════════════════════════════════════════════════════════════
+
+router.get('/health', (req, res) => {
+    res.json({
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime()
+    });
 });
 
 export default router;
+    
