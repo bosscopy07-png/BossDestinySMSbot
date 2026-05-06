@@ -526,127 +526,147 @@ _freeRemaining(user) {
         }).sort({ createdAt: -1 });
     }
 
-          async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
+    /**
+     * FIXED: Timeout properly cancels on provider, stops session, and NEVER retries.
+     * Uses atomic lock to prevent double-firing.
+     */
+    async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
         try {
             const delayMs = new Date(timeoutAt) - new Date();
-            if (delayMs <= 0) return;
-
-            // CRITICAL: Store timer reference so we can clear it on manual cancel
-            if (!this._timeoutTimers) this._timeoutTimers = new Map();
-            
-            // Clear any existing timer for this session (prevents doubles)
-            if (this._timeoutTimers.has(sessionId)) {
-                clearTimeout(this._timeoutTimers.get(sessionId));
+            if (delayMs <= 0) {
+                // Already expired — handle immediately
+                return this._executeTimeout(userId, sessionId);
             }
 
-            const timer = setTimeout(async () => {
-                try {
-                    // ========== GUARD 1: Session still exists and not already handled ==========
-                    const currentSession = await Session.findOne({ sessionId }).lean();
-                    if (!currentSession) {
-                        logger.info('Timeout: session already deleted', { sessionId });
-                        return;
-                    }
+            // Store timer so handleCancel can clear it
+            if (!this._timeoutTimers) this._timeoutTimers = new Map();
+            
+            // CRITICAL: Clear any existing timer for this session (prevents duplicates)
+            if (this._timeoutTimers.has(sessionId)) {
+                clearTimeout(this._timeoutTimers.get(sessionId));
+                logger.warn('Duplicate timeout timer cleared', { sessionId });
+            }
 
-                    // ALREADY TIMEOUT/CANCELLED/DONE? EXIT IMMEDIATELY
-                    if (!['WAITING', 'CHECKING'].includes(currentSession.status)) {
-                        logger.info('Timeout: session already handled', { sessionId, status: currentSession.status });
-                        return;
-                    }
-
-                    // ========== GUARD 2: Mark as TIMING_OUT to prevent race conditions ==========
-                    const updated = await Session.updateOne(
-                        { sessionId, status: { $in: ['WAITING', 'CHECKING'] } },
-                        { $set: { status: 'TIMING_OUT' } }
-                    );
-                    
-                    // If update failed (another process got there first), abort
-                    if (updated.modifiedCount === 0) {
-                        logger.info('Timeout: another process already handling', { sessionId });
-                        return;
-                    }
-
-                    // ========== STEP 1: Cancel on provider (5SIM, etc.) ==========
-                    let providerCancelled = false;
-                    if (currentSession.mode === 'CHEAP' && currentSession.providerNumberId) {
-                        try {
-                            await this.smsProviderManager.cancelCheapNumber(currentSession.providerNumberId);
-                            providerCancelled = true;
-                            logger.info('5SIM cancelled on timeout', { sessionId, activationId: currentSession.providerNumberId });
-                        } catch (err) {
-                            // "order not found" means already cancelled — that's OK
-                            if (err.response?.data === 'order not found') {
-                                providerCancelled = true;
-                                logger.info('5SIM already cancelled (order not found)', { sessionId });
-                            } else {
-                                logger.warn('5SIM cancel on timeout failed', { sessionId, error: err.message });
-                            }
-                        }
-                    }
-
-                    if (currentSession.mode === 'FREE' && currentSession.providerNumberId && this.smsProviderManager) {
-                        try {
-                            await this.smsProviderManager.cancelNumber('FREE_PUBLIC', currentSession.providerNumberId);
-                            providerCancelled = true;
-                        } catch (err) {
-                            logger.warn('Free provider cancel on timeout failed', { sessionId, error: err.message });
-                        }
-                    }
-
-                    // ========== STEP 2: Cancel session (handles refunds) ==========
-                    // Use a NEW sessionId reference or pass providerCancelled status
-                    try {
-                        await sessionManager.cancelSession(sessionId, userId);
-                        logger.info('Session cancelled on timeout', { sessionId, userId, providerCancelled });
-                    } catch (cancelErr) {
-                        logger.error('cancelSession failed on timeout', { sessionId, error: cancelErr.message });
-                        // Force mark as timeout
-                        await Session.updateOne(
-                            { sessionId },
-                            { $set: { status: 'TIMEOUT', endTime: new Date(), providerReleased: providerCancelled } }
-                        );
-                    }
-
-                    // ========== STEP 3: Notify user ==========
-                    if (currentSession.mode === 'FREE') return;
-
-                    const refundText = {
-                        BUNDLE: 'Bundle credit restored',
-                        VIP: 'VIP daily quota restored',
-                        CHEAP: 'Funds returned to balance',
-                        FREE: 'Free quota restored'
-                    }[currentSession.mode] || 'Funds handled';
-
-                    const timeoutMessage =
-                        `⏰ <b>OTP Request Timed Out</b>\n\n` +
-                        `📱 Number: <code>${currentSession.number || 'unknown'}</code>\n` +
-                        `🎯 Service: ${currentSession.service || 'Unknown'}\n` +
-                        `⏱ Status: <b>Expired</b>\n\n` +
-                        `💰 ${refundText}\n\n` +
-                        `You can request a new OTP with /otp`;
-
-                    await this.bot.telegram.sendMessage(userId, timeoutMessage, {
-                        parse_mode: 'HTML',
-                        reply_markup: Markup.inlineKeyboard([
-                            [Markup.button.callback('🔄 Request New OTP', 'menu')],
-                            [Markup.button.callback('📞 Contact Support', 'contact_support')]
-                        ]).reply_markup
-                    });
-
-                } catch (notifyError) {
-                    logger.error('Timeout notification failed', { userId, sessionId, error: notifyError.message });
-                } finally {
-                    // Clean up timer reference
-                    this._timeoutTimers?.delete(sessionId);
-                }
+            const timer = setTimeout(() => {
+                // Delete from map BEFORE executing (so handleCancel won't try to clear it)
+                this._timeoutTimers?.delete(sessionId);
+                this._executeTimeout(userId, sessionId);
             }, Math.min(delayMs, 2147483647));
 
             this._timeoutTimers.set(sessionId, timer);
+            logger.info('Timeout scheduled', { sessionId, delayMs, timeoutAt });
 
         } catch (error) {
             logger.error('Failed to schedule timeout', { userId, sessionId, error: error.message });
         }
-          }
+    }
+
+    /**
+     * SEPARATED: Actual timeout execution logic
+     */
+    async _executeTimeout(userId, sessionId) {
+        try {
+            // ========== ATOMIC LOCK: Try to grab session ==========
+            const currentSession = await Session.findOneAndUpdate(
+                { 
+                    sessionId, 
+                    status: { $in: ['WAITING', 'CHECKING'] }  // Only grab if still active
+                },
+                { 
+                    $set: { status: 'TIMEOUT', endTime: new Date() } 
+                },
+                { new: true }  // Return updated doc
+            );
+
+            // If findOneAndUpdate returned null, session was already handled
+            if (!currentSession) {
+                logger.info('Timeout: session already handled or not found', { sessionId });
+                return;
+            }
+
+            logger.info('Timeout executing', { sessionId, mode: currentSession.mode, status: currentSession.status });
+
+            // ========== STEP 1: Cancel on provider ==========
+            let providerCancelled = false;
+            
+            if (currentSession.mode === 'CHEAP' && currentSession.providerNumberId) {
+                try {
+                    await this.smsProviderManager.cancelCheapNumber(currentSession.providerNumberId);
+                    providerCancelled = true;
+                    logger.info('5SIM cancelled on timeout', { 
+                        sessionId, 
+                        activationId: currentSession.providerNumberId 
+                    });
+                } catch (err) {
+                    // Already cancelled = success
+                    if (err.response?.data === 'order not found' || err.message?.includes('order not found')) {
+                        providerCancelled = true;
+                        logger.info('5SIM already cancelled (order not found)', { sessionId });
+                    } else {
+                        logger.warn('5SIM cancel on timeout failed', { sessionId, error: err.message });
+                    }
+                }
+            }
+
+            if (currentSession.mode === 'FREE' && currentSession.providerNumberId && this.smsProviderManager) {
+                try {
+                    await this.smsProviderManager.cancelNumber('FREE_PUBLIC', currentSession.providerNumberId);
+                    providerCancelled = true;
+                } catch (err) {
+                    logger.warn('Free provider cancel on timeout failed', { sessionId, error: err.message });
+                }
+            }
+
+            // ========== STEP 2: Release funds via sessionManager ==========
+            try {
+                // Use handleTimeout instead of cancelSession — it's designed for timeouts
+                await sessionManager.handleTimeout(sessionId, userId);
+                logger.info('Session timeout handled by SessionManager', { sessionId });
+            } catch (err) {
+                logger.error('sessionManager.handleTimeout failed', { sessionId, error: err.message });
+                // Fallback: manual fund release
+                try {
+                    await walletManager.releaseLockedFunds(
+                        userId, 
+                        currentSession.lockTxId, 
+                        'OTP_TIMEOUT'
+                    );
+                } catch (releaseErr) {
+                    logger.error('Manual fund release failed', { sessionId, error: releaseErr.message });
+                }
+            }
+
+            // ========== STEP 3: Notify user ==========
+            if (currentSession.mode === 'FREE') return; // FreeProvider handles UX
+
+            const refundText = {
+                BUNDLE: 'Bundle credit restored',
+                VIP: 'VIP daily quota restored',
+                CHEAP: 'Funds returned to balance',
+                FREE: 'Free quota restored'
+            }[currentSession.mode] || 'Funds handled';
+
+            const timeoutMessage =
+                `⏰ <b>OTP Request Timed Out</b>\n\n` +
+                `📱 Number: <code>${currentSession.number || 'unknown'}</code>\n` +
+                `🎯 Service: ${currentSession.service || 'Unknown'}\n` +
+                `⏱ Status: <b>Expired</b>\n\n` +
+                `💰 ${refundText}\n\n` +
+                `You can request a new OTP with /otp`;
+
+            await this.bot.telegram.sendMessage(userId, timeoutMessage, {
+                parse_mode: 'HTML',
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Request New OTP', 'menu')],
+                    [Markup.button.callback('📞 Contact Support', 'contact_support')]
+                ]).reply_markup
+            });
+
+        } catch (error) {
+            logger.error('Timeout execution failed', { userId, sessionId, error: error.message });
+        }
+    }
+    
     
     
     
@@ -2426,7 +2446,13 @@ _freeRemaining(user) {
                 this._timeoutTimers.delete(sessionId);
                 logger.info('Cleared timeout timer for manual cancel', { sessionId, userId });
             }
-
+// In handleCancel, right after finding activeSession:
+if (this._timeoutTimers?.has(activeSession.sessionId)) {
+    clearTimeout(this._timeoutTimers.get(activeSession.sessionId));
+    this._timeoutTimers.delete(activeSession.sessionId);
+    logger.info('Cleared timeout timer for manual cancel', { sessionId: activeSession.sessionId });
+        }
+            
             // ========== STEP 1: Mark session as CANCELLING (atomic lock) ==========
             const lockResult = await Session.updateOne(
                 { sessionId, status: { $in: ['WAITING', 'CHECKING'] } },
