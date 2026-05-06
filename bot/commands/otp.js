@@ -526,35 +526,43 @@ _freeRemaining(user) {
         }).sort({ createdAt: -1 });
     }
 
-    /**
-     * FIXED: Timeout properly cancels on provider, stops session, and NEVER retries.
-     * Uses atomic lock to prevent double-firing.
+        /**
+     * Schedule timeout notification.
+     * When timeout fires, it simply calls handleCancel() programmatically.
+     * Manual cancel already works — timeout uses the same code path.
      */
     async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
         try {
             const delayMs = new Date(timeoutAt) - new Date();
-            if (delayMs <= 0) {
-                // Already expired — handle immediately
-                return this._executeTimeout(userId, sessionId);
-            }
+            if (delayMs <= 0) return;
 
             // Store timer so handleCancel can clear it
             if (!this._timeoutTimers) this._timeoutTimers = new Map();
             
-            // CRITICAL: Clear any existing timer for this session (prevents duplicates)
+            // Prevent duplicate timers
             if (this._timeoutTimers.has(sessionId)) {
                 clearTimeout(this._timeoutTimers.get(sessionId));
-                logger.warn('Duplicate timeout timer cleared', { sessionId });
             }
 
-            const timer = setTimeout(() => {
-                // Delete from map BEFORE executing (so handleCancel won't try to clear it)
+            const timer = setTimeout(async () => {
+                // Remove from map immediately so handleCancel won't try to clear a fired timer
                 this._timeoutTimers?.delete(sessionId);
-                this._executeTimeout(userId, sessionId);
+
+                logger.info('Timeout fired, triggering cancel', { sessionId, userId });
+
+                // Build minimal fake ctx — handleCancel only needs ctx.from.id
+                const fakeCtx = {
+                    from: { id: parseInt(userId) }
+                };
+
+                try {
+                    await this.handleCancel(fakeCtx, true); // true = isTimeout
+                } catch (err) {
+                    logger.error('Timeout cancel failed', { sessionId, error: err.message });
+                }
             }, Math.min(delayMs, 2147483647));
 
             this._timeoutTimers.set(sessionId, timer);
-            logger.info('Timeout scheduled', { sessionId, delayMs, timeoutAt });
 
         } catch (error) {
             logger.error('Failed to schedule timeout', { userId, sessionId, error: error.message });
@@ -562,114 +570,140 @@ _freeRemaining(user) {
     }
 
     /**
-     * SEPARATED: Actual timeout execution logic
+     * Handle session cancellation.
+     * Works for both manual cancel (user taps button) and timeout (programmatic).
+     * 
+     * @param {Object} ctx - Telegram context or fake ctx with ctx.from.id
+     * @param {boolean} isTimeout - true when called from timeout, false for manual cancel
      */
-    async _executeTimeout(userId, sessionId) {
-        try {
-            // ========== ATOMIC LOCK: Try to grab session ==========
-            const currentSession = await Session.findOneAndUpdate(
-                { 
-                    sessionId, 
-                    status: { $in: ['WAITING', 'CHECKING'] }  // Only grab if still active
-                },
-                { 
-                    $set: { status: 'TIMEOUT', endTime: new Date() } 
-                },
-                { new: true }  // Return updated doc
-            );
+    async handleCancel(ctx, isTimeout = false) {
+        const userId = ctx.from.id.toString();
 
-            // If findOneAndUpdate returned null, session was already handled
-            if (!currentSession) {
-                logger.info('Timeout: session already handled or not found', { sessionId });
-                return;
+        try {
+            const activeSession = await Session.findOne({ 
+                userId, 
+                status: { $in: ['WAITING', 'CHECKING'] } 
+            });
+            
+            if (!activeSession) {
+                if (isTimeout) {
+                    logger.info('Timeout: no active session to cancel', { userId });
+                    return;
+                }
+                return this.sendPhotoWithCaption(ctx, IMAGES.default, 
+                    '❌ No active session to cancel.',
+                    KEYBOARDS.backToMenu(), 'HTML'
+                );
             }
 
-            logger.info('Timeout executing', { sessionId, mode: currentSession.mode, status: currentSession.status });
+            const sessionId = activeSession.sessionId;
 
-            // ========== STEP 1: Cancel on provider ==========
+            // Clear timeout timer if it exists (prevents double-fire)
+            if (this._timeoutTimers?.has(sessionId)) {
+                clearTimeout(this._timeoutTimers.get(sessionId));
+                this._timeoutTimers.delete(sessionId);
+            }
+
+            // ========== Step 1: Cancel on 5SIM (CHEAP mode) ==========
             let providerCancelled = false;
-            
-            if (currentSession.mode === 'CHEAP' && currentSession.providerNumberId) {
+            if (activeSession.mode === 'CHEAP' && activeSession.providerNumberId) {
                 try {
-                    await this.smsProviderManager.cancelCheapNumber(currentSession.providerNumberId);
+                    await this.smsProviderManager.cancelCheapNumber(activeSession.providerNumberId);
                     providerCancelled = true;
-                    logger.info('5SIM cancelled on timeout', { 
-                        sessionId, 
-                        activationId: currentSession.providerNumberId 
-                    });
+                    logger.info('5SIM cancelled', { sessionId, activationId: activeSession.providerNumberId });
                 } catch (err) {
-                    // Already cancelled = success
-                    if (err.response?.data === 'order not found' || err.message?.includes('order not found')) {
+                    if (err.response?.data === 'order not found') {
                         providerCancelled = true;
-                        logger.info('5SIM already cancelled (order not found)', { sessionId });
+                        logger.info('5SIM already cancelled', { sessionId });
                     } else {
-                        logger.warn('5SIM cancel on timeout failed', { sessionId, error: err.message });
+                        logger.warn('5SIM cancel failed', { sessionId, error: err.message });
                     }
                 }
             }
 
-            if (currentSession.mode === 'FREE' && currentSession.providerNumberId && this.smsProviderManager) {
+            // ========== Step 2: Cancel on free provider (FREE mode) ==========
+            if (activeSession.mode === 'FREE' && activeSession.providerNumberId && this.smsProviderManager) {
                 try {
-                    await this.smsProviderManager.cancelNumber('FREE_PUBLIC', currentSession.providerNumberId);
+                    await this.smsProviderManager.cancelNumber('FREE_PUBLIC', activeSession.providerNumberId);
                     providerCancelled = true;
                 } catch (err) {
-                    logger.warn('Free provider cancel on timeout failed', { sessionId, error: err.message });
+                    logger.warn('Free provider cancel failed', { sessionId, error: err.message });
                 }
             }
 
-            // ========== STEP 2: Release funds via sessionManager ==========
+            // ========== Step 3: Cancel session (handles all refunds) ==========
+            let cancelResult;
             try {
-                // Use handleTimeout instead of cancelSession — it's designed for timeouts
-                await sessionManager.handleTimeout(sessionId, userId);
-                logger.info('Session timeout handled by SessionManager', { sessionId });
+                cancelResult = await sessionManager.cancelSession(sessionId, userId);
+                logger.info('Session cancelled', { sessionId, releasedAmount: cancelResult?.releasedAmount || 0 });
             } catch (err) {
-                logger.error('sessionManager.handleTimeout failed', { sessionId, error: err.message });
-                // Fallback: manual fund release
-                try {
-                    await walletManager.releaseLockedFunds(
-                        userId, 
-                        currentSession.lockTxId, 
-                        'OTP_TIMEOUT'
-                    );
-                } catch (releaseErr) {
-                    logger.error('Manual fund release failed', { sessionId, error: releaseErr.message });
-                }
+                logger.error('cancelSession failed, forcing cleanup', { sessionId, error: err.message });
+                await Session.updateOne(
+                    { sessionId },
+                    { $set: { status: 'CANCELLED', endTime: new Date(), providerReleased: providerCancelled } }
+                );
+                cancelResult = { releasedAmount: 0 };
             }
 
-            // ========== STEP 3: Notify user ==========
-            if (currentSession.mode === 'FREE') return; // FreeProvider handles UX
+            // ========== Step 4: Notify user ==========
+            const refundLine = cancelResult?.releasedAmount > 0
+                ? `💰 Refunded: ${formatCurrency(cancelResult.releasedAmount)}\n`
+                : (activeSession.mode === 'CHEAP' && providerCancelled)
+                    ? `💰 Funds returned to balance\n`
+                    : '';
 
-            const refundText = {
-                BUNDLE: 'Bundle credit restored',
-                VIP: 'VIP daily quota restored',
-                CHEAP: 'Funds returned to balance',
-                FREE: 'Free quota restored'
-            }[currentSession.mode] || 'Funds handled';
+            let message, keyboard;
 
-            const timeoutMessage =
-                `⏰ <b>OTP Request Timed Out</b>\n\n` +
-                `📱 Number: <code>${currentSession.number || 'unknown'}</code>\n` +
-                `🎯 Service: ${currentSession.service || 'Unknown'}\n` +
-                `⏱ Status: <b>Expired</b>\n\n` +
-                `💰 ${refundText}\n\n` +
-                `You can request a new OTP with /otp`;
+            if (isTimeout) {
+                message =
+                    `⏰ <b>OTP Request Timed Out</b>\n\n` +
+                    `📱 Number: <code>${activeSession.number}</code>\n` +
+                    `🎯 Service: ${activeSession.service}\n` +
+                    `⏱ Status: <b>Expired</b>\n\n` +
+                    `${refundLine || '💰 Funds handled'}\n\n` +
+                    `You can request a new OTP with /otp`;
 
-            await this.bot.telegram.sendMessage(userId, timeoutMessage, {
-                parse_mode: 'HTML',
-                reply_markup: Markup.inlineKeyboard([
+                keyboard = Markup.inlineKeyboard([
                     [Markup.button.callback('🔄 Request New OTP', 'menu')],
                     [Markup.button.callback('📞 Contact Support', 'contact_support')]
-                ]).reply_markup
-            });
+                ]);
+            } else {
+                message =
+                    `✅ <b>Session Cancelled</b>\n\n` +
+                    `📱 Number: <code>${activeSession.number}</code>\n` +
+                    `🎯 Service: ${activeSession.service}\n` +
+                    refundLine +
+                    `\nAny used credits have been restored.\n` +
+                    `You can start a new request now.`;
+
+                keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 New OTP Request', 'menu')],
+                    [Markup.button.callback('🔙 Main Menu', 'menu')]
+                ]);
+            }
+
+            // Send: direct message for timeout, photo+caption for manual
+            if (isTimeout) {
+                await this.bot.telegram.sendMessage(userId, message, {
+                    parse_mode: 'HTML',
+                    reply_markup: keyboard.reply_markup
+                });
+            } else {
+                await this.sendPhotoWithCaption(ctx, IMAGES.default, message, keyboard, 'HTML');
+            }
 
         } catch (error) {
-            logger.error('Timeout execution failed', { userId, sessionId, error: error.message });
+            logger.error('Cancel failed', { userId, error: error.message });
+            if (!isTimeout) {
+                await this.sendPhotoWithCaption(ctx, IMAGES.default, 
+                    '❌ Failed to cancel session. Please try again.',
+                    KEYBOARDS.backToMenu(), 'HTML'
+                );
+            }
         }
     }
     
-    
-    
-    
+                     
                     // ═══════════════════════════════════════════════════════════════════════════════
 //  OTPCommands.js — Part 2: Main Menu, My Number, Mode Handlers, Selection
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2403,169 +2437,6 @@ _freeRemaining(user) {
     //  CANCEL HANDLER
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Handle session cancellation
-     * FIXED:
-     * - Cancels on 5SIM first (for CHEAP mode)
-     * - Calls sessionManager.cancelSession which handles ALL refunds
-     * - NO duplicate _refundSession call
-     * - Shows actual refunded amount from cancel result
-     */
-        /**
-     * Handle session cancellation
-     * FIXED:
-     * - Clears timeout timer to prevent double-processing
-     * - Cancels on 5SIM first (for CHEAP mode)
-     * - Cancels on free provider (for FREE mode)
-     * - Calls sessionManager.cancelSession which handles ALL refunds
-     * - NO duplicate _refundSession call
-     * - Shows actual refunded amount from cancel result
-     * - Prevents race conditions with timeout handler
-     */
-    async handleCancel(ctx) {
-        const userId = ctx.from.id.toString();
-
-        try {
-            const activeSession = await Session.findOne({ 
-                userId, 
-                status: { $in: ['WAITING', 'CHECKING'] } 
-            });
-            
-            if (!activeSession) {
-                return this.sendPhotoWithCaption(ctx, IMAGES.default, 
-                    '❌ No active session to cancel.',
-                    KEYBOARDS.backToMenu(), 'HTML'
-                );
-            }
-
-            const sessionId = activeSession.sessionId;
-
-            // ========== STEP 0: Clear timeout timer to prevent race ==========
-            if (this._timeoutTimers?.has(sessionId)) {
-                clearTimeout(this._timeoutTimers.get(sessionId));
-                this._timeoutTimers.delete(sessionId);
-                logger.info('Cleared timeout timer for manual cancel', { sessionId, userId });
-            }
-// In handleCancel, right after finding activeSession:
-if (this._timeoutTimers?.has(activeSession.sessionId)) {
-    clearTimeout(this._timeoutTimers.get(activeSession.sessionId));
-    this._timeoutTimers.delete(activeSession.sessionId);
-    logger.info('Cleared timeout timer for manual cancel', { sessionId: activeSession.sessionId });
-        }
-            
-            // ========== STEP 1: Mark session as CANCELLING (atomic lock) ==========
-            const lockResult = await Session.updateOne(
-                { sessionId, status: { $in: ['WAITING', 'CHECKING'] } },
-                { $set: { status: 'CANCELLING' } }
-            );
-
-            if (lockResult.modifiedCount === 0) {
-                logger.warn('Session already being cancelled by another process', { sessionId, userId });
-                return this.sendPhotoWithCaption(ctx, IMAGES.default,
-                    '⏳ Session is already being cancelled. Please wait.',
-                    KEYBOARDS.backToMenu(), 'HTML'
-                );
-            }
-
-            // ========== STEP 2: Cancel on 5SIM FIRST (for CHEAP mode) ==========
-            let providerCancelled = false;
-            if (activeSession.mode === 'CHEAP' && activeSession.providerNumberId) {
-                try {
-                    const cancelResult = await this.smsProviderManager.cancelCheapNumber(
-                        activeSession.providerNumberId
-                    );
-                    providerCancelled = true;
-                    logger.info('5SIM cancel result', { 
-                        sessionId,
-                        activationId: activeSession.providerNumberId,
-                        result: cancelResult 
-                    });
-                } catch (cancelError) {
-                    // "order not found" means already cancelled — that's fine
-                    if (cancelError.response?.data === 'order not found') {
-                        providerCancelled = true;
-                        logger.info('5SIM already cancelled (order not found)', { sessionId });
-                    } else {
-                        logger.error('5SIM cancel failed during user cancel', {
-                            sessionId,
-                            activationId: activeSession.providerNumberId,
-                            error: cancelError.message
-                        });
-                    }
-                    // Continue — 5SIM cancel is best-effort
-                }
-            }
-
-            // ========== STEP 3: Cancel on free provider (for FREE mode) ==========
-            if (activeSession.mode === 'FREE' && activeSession.providerNumberId && this.smsProviderManager) {
-                try {
-                    await this.smsProviderManager.cancelNumber('FREE_PUBLIC', activeSession.providerNumberId);
-                    providerCancelled = true;
-                } catch (err) {
-                    logger.warn('Free provider cancel failed during user cancel', { sessionId, error: err.message });
-                }
-            }
-
-            // ========== STEP 4: Cancel session — handles ALL refunds internally ==========
-            let cancelResult;
-            try {
-                cancelResult = await sessionManager.cancelSession(sessionId, userId);
-                logger.info('Session cancelled by user', { 
-                    sessionId, 
-                    userId,
-                    mode: activeSession.mode,
-                    releasedAmount: cancelResult?.releasedAmount || 0
-                });
-            } catch (cancelErr) {
-                logger.error('sessionManager.cancelSession failed, forcing cleanup', { 
-                    sessionId, 
-                    error: cancelErr.message 
-                });
-                // Force cleanup if sessionManager fails
-                await Session.updateOne(
-                    { sessionId },
-                    { 
-                        $set: { 
-                            status: 'CANCELLED', 
-                            endTime: new Date(),
-                            providerReleased: providerCancelled,
-                            cancelReason: 'USER_CANCELLED_FALLBACK'
-                        } 
-                    }
-                );
-                cancelResult = { releasedAmount: 0 };
-            }
-
-            // ========== STEP 5: Show result to user ==========
-            const refundedText = cancelResult?.releasedAmount > 0 
-                ? `💰 Refunded: ${formatCurrency(cancelResult.releasedAmount)}\n`
-                : (activeSession.mode === 'CHEAP' && providerCancelled)
-                    ? `💰 Funds will be returned to your balance shortly.\n`
-                    : '';
-
-            const message = 
-                `✅ <b>Session Cancelled</b>\n\n` +
-                `📱 Number: <code>${activeSession.number}</code>\n` +
-                `🎯 Service: ${activeSession.service}\n` +
-                refundedText +
-                `\nAny used credits have been restored.\n` +
-                `You can start a new request now.`;
-            
-            await this.sendPhotoWithCaption(ctx, IMAGES.default, message, 
-                Markup.inlineKeyboard([
-                    [Markup.button.callback('📱 New OTP Request', 'menu')],
-                    [Markup.button.callback('🔙 Main Menu', 'menu')]
-                ]), 'HTML'
-            );
-            
-        } catch (error) {
-            logger.error('Cancel failed', { userId, error: error.message });
-            await this.sendPhotoWithCaption(ctx, IMAGES.default, 
-                '❌ Failed to cancel session. Please try again.',
-                KEYBOARDS.backToMenu(), 'HTML'
-            );
-        }
-    }
     
     
     // ═══════════════════════════════════════════════════════════════════════
