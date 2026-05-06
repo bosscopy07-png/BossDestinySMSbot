@@ -4,19 +4,24 @@ import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
 
 class ReferralService {
-    constructor(walletService) {
+    constructor(walletService = null) {
         this.walletService = walletService;
     }
 
-    // Create referral record when user joins with referral code
+    // ═══════════════════════════════════════════════════════════
+    //  TRACK REFERRAL — Called when user joins with referral code
+    // ═══════════════════════════════════════════════════════════
+
     async trackReferral(referredId, referralCode) {
         try {
             if (!referralCode) return null;
 
+            const cleanCode = referralCode.toUpperCase().trim();
+
             // Find referrer
-            const referrer = await User.findOne({ referralCode: referralCode.toUpperCase() });
+            const referrer = await User.findOne({ referralCode: cleanCode });
             if (!referrer) {
-                logger.warn('Invalid referral code used', { code: referralCode, referredId });
+                logger.warn('Invalid referral code used', { code: cleanCode, referredId });
                 return null;
             }
 
@@ -29,7 +34,7 @@ class ReferralService {
             // Check if already referred
             const existing = await Referral.findOne({ referredId });
             if (existing) {
-                logger.info('User already has referral record', { referredId });
+                logger.info('User already has referral record', { referredId, status: existing.status });
                 return existing;
             }
 
@@ -39,17 +44,24 @@ class ReferralService {
                 referrerId: referrer.userId,
                 referredId,
                 status: 'PENDING',
-                rewardPercentage: config.referral.percentage,
+                rewardPercentage: config.referral?.percentage ?? 0.05,
                 metadata: {
-                    referrerCode: referralCode,
+                    referrerCode: cleanCode,
                     joinedAt: new Date()
                 }
             });
 
+            // Increment referrer's referral count
+            await User.updateOne(
+                { userId: referrer.userId },
+                { $inc: { referralCount: 1 } }
+            );
+
             logger.info('Referral tracked', {
                 referralId: referral.referralId,
                 referrerId: referrer.userId,
-                referredId
+                referredId,
+                code: cleanCode
             });
 
             return referral;
@@ -60,29 +72,59 @@ class ReferralService {
         }
     }
 
-    // Process deposit and check for referral reward
+    // ═══════════════════════════════════════════════════════════
+    //  PROCESS DEPOSIT — Called by WalletService when deposit detected
+    // ═══════════════════════════════════════════════════════════
+
     async processDeposit(userId, depositAmount) {
         try {
-            // Find referral record
+            // Find pending referral record for this user
             const referral = await Referral.findOne({
                 referredId: userId,
                 status: 'PENDING'
             });
 
-            if (!referral) return null;
+            if (!referral) {
+                // Check if already processed
+                const existing = await Referral.findOne({
+                    referredId: userId,
+                    status: { $in: ['DEPOSITED', 'REWARDED'] }
+                });
+                if (existing) {
+                    logger.debug('Referral already processed', { userId, status: existing.status });
+                } else {
+                    logger.debug('No referral record found for user', { userId });
+                }
+                return null;
+            }
 
             // Check minimum deposit
-            if (depositAmount < config.referral.minDeposit) {
+            const minDeposit = config.referral?.minDeposit ?? 5;
+            if (depositAmount < minDeposit) {
                 logger.info('Deposit below referral minimum', {
                     userId,
                     amount: depositAmount,
-                    minimum: config.referral.minDeposit
+                    minimum: minDeposit,
+                    referralId: referral.referralId
                 });
                 return null;
             }
 
-            // Calculate reward
-            const rewardAmount = depositAmount * referral.rewardPercentage;
+            // Prevent duplicate reward
+            const existingReward = await Transaction.findOne({
+                'metadata.referralId': referral.referralId,
+                type: 'REFERRAL_REWARD'
+            });
+            
+            if (existingReward) {
+                logger.warn('Referral reward already exists', { 
+                    referralId: referral.referralId,
+                    existingTxId: existingReward.txId 
+                });
+                return null;
+            }
+
+            const rewardAmount = depositAmount * (referral.rewardPercentage || config.referral?.percentage || 0.05);
 
             // Update referral record
             await Referral.updateOne(
@@ -93,12 +135,12 @@ class ReferralService {
                         firstDepositAmount: depositAmount,
                         firstDepositDate: new Date(),
                         rewardAmount,
-                        rewardPercentage: referral.rewardPercentage
+                        rewardPercentage: referral.rewardPercentage || config.referral?.percentage || 0.05
                     }
                 }
             );
 
-            // Create pending reward transaction (requires admin approval)
+            // Create pending reward transaction
             const rewardTx = await Transaction.create({
                 txId: generateId(),
                 userId: referral.referrerId,
@@ -110,7 +152,7 @@ class ReferralService {
                     referralId: referral.referralId,
                     referredUserId: userId,
                     depositAmount,
-                    percentage: referral.rewardPercentage,
+                    percentage: referral.rewardPercentage || config.referral?.percentage || 0.05,
                     requiresApproval: true,
                     createdAt: new Date()
                 }
@@ -127,7 +169,9 @@ class ReferralService {
             logger.info('Referral reward pending approval', {
                 referralId: referral.referralId,
                 referrerId: referral.referrerId,
-                amount: rewardAmount,
+                referredId: userId,
+                depositAmount,
+                rewardAmount,
                 rewardTxId: rewardTx.txId
             });
 
@@ -139,12 +183,15 @@ class ReferralService {
             };
 
         } catch (error) {
-            logger.error('Referral deposit processing failed', { userId, error: error.message });
+            logger.error('Referral deposit processing failed', { userId, depositAmount, error: error.message });
             throw error;
         }
     }
 
-    // Admin: Approve referral reward
+    // ═══════════════════════════════════════════════════════════
+    //  ADMIN: APPROVE REWARD
+    // ═══════════════════════════════════════════════════════════
+
     async approveReward(txId, adminId) {
         try {
             const tx = await Transaction.findOne({
@@ -157,7 +204,7 @@ class ReferralService {
                 throw new Error('TRANSACTION_NOT_FOUND_OR_ALREADY_PROCESSED');
             }
 
-            const { referralId, referredUserId } = tx.metadata;
+            const { referralId } = tx.metadata;
 
             // Credit referrer balance
             await User.updateOne(
@@ -216,7 +263,10 @@ class ReferralService {
         }
     }
 
-    // Admin: Reject referral reward
+    // ═══════════════════════════════════════════════════════════
+    //  ADMIN: REJECT REWARD
+    // ═══════════════════════════════════════════════════════════
+
     async rejectReward(txId, adminId, reason) {
         try {
             const tx = await Transaction.findOne({
@@ -278,7 +328,10 @@ class ReferralService {
         }
     }
 
-    // Get pending rewards for admin review
+    // ═══════════════════════════════════════════════════════════
+    //  ADMIN: GET PENDING REWARDS
+    // ═══════════════════════════════════════════════════════════
+
     async getPendingRewards(page = 1, limit = 20) {
         try {
             const skip = (page - 1) * limit;
@@ -304,7 +357,7 @@ class ReferralService {
                 rewards.map(async (tx) => {
                     const [referrer, referred] = await Promise.all([
                         User.findOne({ userId: tx.userId }).select('username firstName'),
-                        User.findOne({ userId: tx.metadata.referredUserId }).select('username firstName')
+                        User.findOne({ userId: tx.metadata?.referredUserId }).select('username firstName')
                     ]);
 
                     return {
@@ -315,7 +368,7 @@ class ReferralService {
                             name: referrer?.firstName
                         },
                         referred: {
-                            userId: tx.metadata.referredUserId,
+                            userId: tx.metadata?.referredUserId,
                             username: referred?.username,
                             name: referred?.firstName
                         }
@@ -339,28 +392,35 @@ class ReferralService {
         }
     }
 
-    // Get user's referral stats
+    // ═══════════════════════════════════════════════════════════
+    //  GET USER REFERRAL STATS
+    // ═══════════════════════════════════════════════════════════
+
     async getUserReferralStats(userId) {
         try {
             const [referrer, referrals, earnings] = await Promise.all([
                 User.findOne({ userId }).select('referralCode referralCount referralEarnings referralRewardsPending'),
-                Referral.find({ referrerId: userId }).sort({ createdAt: -1 }),
+                Referral.find({ referrerId: userId }).sort({ createdAt: -1 }).lean(),
                 Transaction.find({
                     userId,
                     type: 'REFERRAL_REWARD',
                     status: 'COMPLETED'
-                })
+                }).lean()
             ]);
 
-            const totalEarned = earnings.reduce((sum, tx) => sum + tx.amount, 0);
+            if (!referrer) {
+                throw new Error('USER_NOT_FOUND');
+            }
+
+            const totalEarned = earnings.reduce((sum, tx) => sum + (tx.amount || 0), 0);
 
             return {
                 referralCode: referrer.referralCode,
-                totalReferrals: referrer.referralCount,
+                totalReferrals: referrer.referralCount || 0,
                 successfulReferrals: referrals.filter(r => r.status === 'REWARDED').length,
                 pendingReferrals: referrals.filter(r => r.status === 'DEPOSITED').length,
                 totalEarned,
-                pendingApproval: referrer.referralRewardsPending,
+                pendingApproval: referrer.referralRewardsPending || 0,
                 recentReferrals: referrals.slice(0, 10).map(r => ({
                     referredId: r.referredId,
                     status: r.status,
@@ -376,12 +436,17 @@ class ReferralService {
         }
     }
 
-    // Generate referral link
+    // ═══════════════════════════════════════════════════════════
+    //  GENERATE REFERRAL LINK
+    // ═══════════════════════════════════════════════════════════
+
     generateReferralLink(botUsername, referralCode) {
+        if (!botUsername || !referralCode) {
+            throw new Error('BOT_USERNAME_AND_REFERRAL_CODE_REQUIRED');
+        }
         return `https://t.me/${botUsername}?start=${referralCode}`;
     }
 }
 
 export default ReferralService;
-
- 
+                
