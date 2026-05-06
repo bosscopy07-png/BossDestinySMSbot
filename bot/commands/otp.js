@@ -526,61 +526,89 @@ _freeRemaining(user) {
         }).sort({ createdAt: -1 });
     }
 
-        /**
-     * FIXED: Timeout now PROPERLY cancels on provider AND stops session.
-     * SessionManager.handleTimeout() handles credit restoration.
-     * This method handles: provider cancel → session stop → notification.
-     */
-    async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
+          async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
         try {
             const delayMs = new Date(timeoutAt) - new Date();
             if (delayMs <= 0) return;
 
-            setTimeout(async () => {
+            // CRITICAL: Store timer reference so we can clear it on manual cancel
+            if (!this._timeoutTimers) this._timeoutTimers = new Map();
+            
+            // Clear any existing timer for this session (prevents doubles)
+            if (this._timeoutTimers.has(sessionId)) {
+                clearTimeout(this._timeoutTimers.get(sessionId));
+            }
+
+            const timer = setTimeout(async () => {
                 try {
+                    // ========== GUARD 1: Session still exists and not already handled ==========
                     const currentSession = await Session.findOne({ sessionId }).lean();
-                    if (!currentSession) return;
+                    if (!currentSession) {
+                        logger.info('Timeout: session already deleted', { sessionId });
+                        return;
+                    }
 
-                    // Already handled? Don't double-process
-                    if (!['WAITING', 'CHECKING'].includes(currentSession.status)) return;
+                    // ALREADY TIMEOUT/CANCELLED/DONE? EXIT IMMEDIATELY
+                    if (!['WAITING', 'CHECKING'].includes(currentSession.status)) {
+                        logger.info('Timeout: session already handled', { sessionId, status: currentSession.status });
+                        return;
+                    }
 
-                    // ========== STEP 1: CANCEL ON PROVIDER ==========
-                    // Same logic as handleCancel — cancel on external provider FIRST
+                    // ========== GUARD 2: Mark as TIMING_OUT to prevent race conditions ==========
+                    const updated = await Session.updateOne(
+                        { sessionId, status: { $in: ['WAITING', 'CHECKING'] } },
+                        { $set: { status: 'TIMING_OUT' } }
+                    );
+                    
+                    // If update failed (another process got there first), abort
+                    if (updated.modifiedCount === 0) {
+                        logger.info('Timeout: another process already handling', { sessionId });
+                        return;
+                    }
+
+                    // ========== STEP 1: Cancel on provider (5SIM, etc.) ==========
+                    let providerCancelled = false;
                     if (currentSession.mode === 'CHEAP' && currentSession.providerNumberId) {
                         try {
-                            await this.smsProviderManager.cancelCheapNumber(
-                                currentSession.providerNumberId
-                            );
-                            logger.info('5SIM cancel on timeout', { sessionId, activationId: currentSession.providerNumberId });
+                            await this.smsProviderManager.cancelCheapNumber(currentSession.providerNumberId);
+                            providerCancelled = true;
+                            logger.info('5SIM cancelled on timeout', { sessionId, activationId: currentSession.providerNumberId });
                         } catch (err) {
-                            logger.warn('5SIM cancel on timeout failed (best-effort)', { sessionId, error: err.message });
+                            // "order not found" means already cancelled — that's OK
+                            if (err.response?.data === 'order not found') {
+                                providerCancelled = true;
+                                logger.info('5SIM already cancelled (order not found)', { sessionId });
+                            } else {
+                                logger.warn('5SIM cancel on timeout failed', { sessionId, error: err.message });
+                            }
                         }
                     }
 
                     if (currentSession.mode === 'FREE' && currentSession.providerNumberId && this.smsProviderManager) {
                         try {
                             await this.smsProviderManager.cancelNumber('FREE_PUBLIC', currentSession.providerNumberId);
+                            providerCancelled = true;
                         } catch (err) {
-                            logger.warn('Free provider cancel on timeout failed (best-effort)', { sessionId });
+                            logger.warn('Free provider cancel on timeout failed', { sessionId, error: err.message });
                         }
                     }
 
-                    // ========== STEP 2: STOP/CANCEL SESSION (handles refunds) ==========
-                    // Use cancelSession instead of just updating status — this triggers ALL cleanup
+                    // ========== STEP 2: Cancel session (handles refunds) ==========
+                    // Use a NEW sessionId reference or pass providerCancelled status
                     try {
                         await sessionManager.cancelSession(sessionId, userId);
-                        logger.info('Session cancelled on timeout', { sessionId, userId });
+                        logger.info('Session cancelled on timeout', { sessionId, userId, providerCancelled });
                     } catch (cancelErr) {
-                        // Fallback: if cancelSession fails, at least mark timeout
-                        logger.error('cancelSession failed on timeout, marking TIMEOUT manually', { sessionId, error: cancelErr.message });
+                        logger.error('cancelSession failed on timeout', { sessionId, error: cancelErr.message });
+                        // Force mark as timeout
                         await Session.updateOne(
                             { sessionId },
-                            { $set: { status: 'TIMEOUT', endTime: new Date() } }
+                            { $set: { status: 'TIMEOUT', endTime: new Date(), providerReleased: providerCancelled } }
                         );
                     }
 
-                    // ========== STEP 3: NOTIFY USER ==========
-                    if (currentSession.mode === 'FREE') return; // FreeProvider handles UX
+                    // ========== STEP 3: Notify user ==========
+                    if (currentSession.mode === 'FREE') return;
 
                     const refundText = {
                         BUNDLE: 'Bundle credit restored',
@@ -607,13 +635,19 @@ _freeRemaining(user) {
 
                 } catch (notifyError) {
                     logger.error('Timeout notification failed', { userId, sessionId, error: notifyError.message });
+                } finally {
+                    // Clean up timer reference
+                    this._timeoutTimers?.delete(sessionId);
                 }
             }, Math.min(delayMs, 2147483647));
+
+            this._timeoutTimers.set(sessionId, timer);
 
         } catch (error) {
             logger.error('Failed to schedule timeout', { userId, sessionId, error: error.message });
         }
-    }
+          }
+    
     
     
                     // ═══════════════════════════════════════════════════════════════════════════════
@@ -2357,6 +2391,17 @@ _freeRemaining(user) {
      * - NO duplicate _refundSession call
      * - Shows actual refunded amount from cancel result
      */
+        /**
+     * Handle session cancellation
+     * FIXED:
+     * - Clears timeout timer to prevent double-processing
+     * - Cancels on 5SIM first (for CHEAP mode)
+     * - Cancels on free provider (for FREE mode)
+     * - Calls sessionManager.cancelSession which handles ALL refunds
+     * - NO duplicate _refundSession call
+     * - Shows actual refunded amount from cancel result
+     * - Prevents race conditions with timeout handler
+     */
     async handleCancel(ctx) {
         const userId = ctx.from.id.toString();
 
@@ -2373,41 +2418,104 @@ _freeRemaining(user) {
                 );
             }
 
-            // Step 1: Cancel on 5SIM FIRST (for CHEAP mode)
+            const sessionId = activeSession.sessionId;
+
+            // ========== STEP 0: Clear timeout timer to prevent race ==========
+            if (this._timeoutTimers?.has(sessionId)) {
+                clearTimeout(this._timeoutTimers.get(sessionId));
+                this._timeoutTimers.delete(sessionId);
+                logger.info('Cleared timeout timer for manual cancel', { sessionId, userId });
+            }
+
+            // ========== STEP 1: Mark session as CANCELLING (atomic lock) ==========
+            const lockResult = await Session.updateOne(
+                { sessionId, status: { $in: ['WAITING', 'CHECKING'] } },
+                { $set: { status: 'CANCELLING' } }
+            );
+
+            if (lockResult.modifiedCount === 0) {
+                logger.warn('Session already being cancelled by another process', { sessionId, userId });
+                return this.sendPhotoWithCaption(ctx, IMAGES.default,
+                    '⏳ Session is already being cancelled. Please wait.',
+                    KEYBOARDS.backToMenu(), 'HTML'
+                );
+            }
+
+            // ========== STEP 2: Cancel on 5SIM FIRST (for CHEAP mode) ==========
+            let providerCancelled = false;
             if (activeSession.mode === 'CHEAP' && activeSession.providerNumberId) {
                 try {
                     const cancelResult = await this.smsProviderManager.cancelCheapNumber(
                         activeSession.providerNumberId
                     );
+                    providerCancelled = true;
                     logger.info('5SIM cancel result', { 
-                        sessionId: activeSession.sessionId,
+                        sessionId,
                         activationId: activeSession.providerNumberId,
                         result: cancelResult 
                     });
                 } catch (cancelError) {
-                    logger.error('5SIM cancel failed during user cancel', {
-                        sessionId: activeSession.sessionId,
-                        activationId: activeSession.providerNumberId,
-                        error: cancelError.message
-                    });
+                    // "order not found" means already cancelled — that's fine
+                    if (cancelError.response?.data === 'order not found') {
+                        providerCancelled = true;
+                        logger.info('5SIM already cancelled (order not found)', { sessionId });
+                    } else {
+                        logger.error('5SIM cancel failed during user cancel', {
+                            sessionId,
+                            activationId: activeSession.providerNumberId,
+                            error: cancelError.message
+                        });
+                    }
                     // Continue — 5SIM cancel is best-effort
                 }
             }
 
-            // Step 2: Cancel on free provider (for FREE mode)
+            // ========== STEP 3: Cancel on free provider (for FREE mode) ==========
             if (activeSession.mode === 'FREE' && activeSession.providerNumberId && this.smsProviderManager) {
-                await this.smsProviderManager.cancelNumber('FREE_PUBLIC', activeSession.providerNumberId)
-                    .catch(() => {});
+                try {
+                    await this.smsProviderManager.cancelNumber('FREE_PUBLIC', activeSession.providerNumberId);
+                    providerCancelled = true;
+                } catch (err) {
+                    logger.warn('Free provider cancel failed during user cancel', { sessionId, error: err.message });
+                }
             }
 
-            // Step 3: Cancel session — handles ALL refunds internally
-            // FIXED: No duplicate _refundSession! cancelSession does everything.
-            const cancelResult = await sessionManager.cancelSession(activeSession.sessionId, userId);
+            // ========== STEP 4: Cancel session — handles ALL refunds internally ==========
+            let cancelResult;
+            try {
+                cancelResult = await sessionManager.cancelSession(sessionId, userId);
+                logger.info('Session cancelled by user', { 
+                    sessionId, 
+                    userId,
+                    mode: activeSession.mode,
+                    releasedAmount: cancelResult?.releasedAmount || 0
+                });
+            } catch (cancelErr) {
+                logger.error('sessionManager.cancelSession failed, forcing cleanup', { 
+                    sessionId, 
+                    error: cancelErr.message 
+                });
+                // Force cleanup if sessionManager fails
+                await Session.updateOne(
+                    { sessionId },
+                    { 
+                        $set: { 
+                            status: 'CANCELLED', 
+                            endTime: new Date(),
+                            providerReleased: providerCancelled,
+                            cancelReason: 'USER_CANCELLED_FALLBACK'
+                        } 
+                    }
+                );
+                cancelResult = { releasedAmount: 0 };
+            }
 
-            // Step 4: Show result to user
-            const refundedText = cancelResult.releasedAmount > 0 
+            // ========== STEP 5: Show result to user ==========
+            const refundedText = cancelResult?.releasedAmount > 0 
                 ? `💰 Refunded: ${formatCurrency(cancelResult.releasedAmount)}\n`
-                : '';
+                : (activeSession.mode === 'CHEAP' && providerCancelled)
+                    ? `💰 Funds will be returned to your balance shortly.\n`
+                    : '';
 
             const message = 
                 `✅ <b>Session Cancelled</b>\n\n` +
@@ -2431,8 +2539,9 @@ _freeRemaining(user) {
                 KEYBOARDS.backToMenu(), 'HTML'
             );
         }
-                }
-                        
+    }
+    
+    
     // ═══════════════════════════════════════════════════════════════════════
     //  BUNDLE PURCHASES
     // ═══════════════════════════════════════════════════════════════════════
