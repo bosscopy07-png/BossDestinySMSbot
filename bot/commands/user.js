@@ -278,54 +278,118 @@ class UserCommands {
     // ═══════════════════════════════════════════════════════
 
     async handleStart(ctx) {
-        const userId = ctx.from.id.toString();
-        let user = await this._ensureUserFresh(ctx);
+    const userId = ctx.from.id.toString();
+    let user = await this._ensureUserFresh(ctx);
 
-        const startPayload = ctx.startPayload;
-        if (startPayload && !user.referredBy) {
-            const referrerCode = startPayload.toUpperCase();
-            const referrer = await User.findOne({ referralCode: referrerCode });
+    const startPayload = ctx.startPayload;
+    let referralNotice = '';
+    let isNewReferral = false;
 
-            if (referrer && referrer.userId !== userId) {
-                await User.updateOne({ userId }, { $set: { referredBy: referrerCode } });
-                await User.updateOne(
-                    { userId: referrer.userId },
-                    { $inc: { referralCount: 1 } }
-                );
+    // ═══════════════════════════════════════════════════════════
+    //  REFERRAL PROCESSING — Track and build notice
+    // ═══════════════════════════════════════════════════════════
 
-                await this.sendPhotoWithCaption(
-                    ctx,
-                    IMAGES.referral,
-                    '🎉 <b>You were referred!</b>\n\nYou were invited by ' + (referrer.username || 'a friend') + '!\n\nYou will receive a <b>bonus</b> on your first deposit.'
-                );
-                user = await User.findOne({ userId }).lean();
+    if (startPayload && !user.referredBy) {
+        const referrerCode = startPayload.toUpperCase().trim();
+        const referrer = await User.findOne({ referralCode: referrerCode });
+
+        if (referrer && referrer.userId !== userId) {
+            // Update user with referrer
+            await User.updateOne(
+                { userId },
+                { $set: { referredBy: referrerCode } }
+            );
+
+            // Increment referrer count
+            await User.updateOne(
+                { userId: referrer.userId },
+                { $inc: { referralCount: 1 } }
+            );
+
+            // Track in ReferralService if available
+            if (this.referralService) {
+                try {
+                    await this.referralService.trackReferral(userId, referrerCode);
+                } catch (err) {
+                    logger.error('ReferralService tracking failed', { userId, error: err.message });
+                }
             }
-        }
 
-        const freeRemaining = this._freeRemaining(user);
-        const isVip = this._isVipActive(user);
-        const vipRemaining = isVip ? this._vipRemaining(user) : 0;
-
-        const welcomeMessage =
-            '👋 <b>Welcome to SwiftSMS</b>, ' + (ctx.from.first_name || 'there') + '!\n\n' +
-            '🔐 Get verification codes instantly for any service.\n\n' +
-            (isVip ? '👑 <b>VIP Active</b> — ' + vipRemaining + ' left today\n' : '') +
-            '💰 Balance: <code>' + formatCurrency(user.balance || 0) + '</code>\n' +
-            '📦 Bundle: <code>' + (user.bundleRemaining || 0) + '</code> OTPs\n' +
-            '🆓 Free Today: <code>' + (3 - freeRemaining) + '/3</code> used\n\n' +
+            // Build referral notice for welcome message
+            const referrerName = referrer.username 
+                ? '@' + referrer.username 
+                : (referrer.firstName || 'a friend');
             
-            'Choose your mode or deposit to get started:';
+            referralNotice = 
+                '🎉 <b>You were referred by ' + referrerName + '!</b>\n' +
+                '💰 You will receive a <b>bonus</b> on your first deposit.\n\n';
 
-        const keyboard = Markup.inlineKeyboard([
-            [Markup.button.callback('🆓 FREE OTP', 'mode_free'), Markup.button.callback('💵 CHEAP OTP', 'mode_cheap')],
-            [Markup.button.callback('📦 Buy Bundle', 'mode_bundle'), Markup.button.callback('👑 Upgrade VIP', 'mode_vip')],
-            [Markup.button.callback('💳 Deposit', 'deposit'), Markup.button.callback('📊 My Stats', 'stats')],
-            [Markup.button.callback('🎁 Referral', 'referral'), Markup.button.callback('⚙️ Settings', 'settings')],
-            [Markup.button.callback('💰 Check Balance', 'balance'), Markup.button.callback('🎧 Customer Service', 'support')]
-        ]);
-
-        await this.sendPhotoWithCaption(ctx, IMAGES.welcome, welcomeMessage, keyboard, 'HTML');
+            isNewReferral = true;
+            
+            // Refresh user data after update
+            user = await User.findOne({ userId }).lean();
+        }
     }
+
+    // ═══════════════════════════════════════════════════════════
+    //  BUILD WELCOME MESSAGE WITH INLINE REFERRAL NOTICE
+    // ═══════════════════════════════════════════════════════════
+
+    const freeRemaining = this._freeRemaining(user);
+    const isVip = this._isVipActive(user);
+    const vipRemaining = isVip ? this._vipRemaining(user) : 0;
+
+    const welcomeMessage =
+        '👋 <b>Welcome to SwiftSMS</b>, ' + (ctx.from.first_name || 'there') + '!\n\n' +
+        (isNewReferral ? referralNotice : '') +
+        '🔐 Get verification codes instantly for any service.\n\n' +
+        (isVip ? '👑 <b>VIP Active</b> — ' + vipRemaining + ' left today\n' : '') +
+        '💰 Balance: <code>' + formatCurrency(user.balance || 0) + '</code>\n' +
+        '📦 Bundle: <code>' + (user.bundleRemaining || 0) + '</code> OTPs\n' +
+        '🆓 Free Today: <code>' + (3 - freeRemaining) + '/3</code> used\n\n' +
+        'Choose your mode or deposit to get started:';
+
+    const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('🆓 FREE OTP', 'mode_free'), Markup.button.callback('💵 CHEAP OTP', 'mode_cheap')],
+        [Markup.button.callback('📦 Buy Bundle', 'mode_bundle'), Markup.button.callback('👑 Upgrade VIP', 'mode_vip')],
+        [Markup.button.callback('💳 Deposit', 'deposit'), Markup.button.callback('📊 My Stats', 'stats')],
+        [Markup.button.callback('🎁 Referral', 'referral'), Markup.button.callback('⚙️ Settings', 'settings')],
+        [Markup.button.callback('💰 Check Balance', 'balance'), Markup.button.callback('🎧 Customer Service', 'support')]
+    ]);
+
+    // ═══════════════════════════════════════════════════════════
+    //  SEND WELCOME — Single message with referral notice inline
+    // ═══════════════════════════════════════════════════════════
+
+    try {
+        await this.sendPhotoWithCaption(ctx, IMAGES.welcome, welcomeMessage, keyboard, 'HTML');
+    } catch (err) {
+        logger.error('Failed to send welcome photo, falling back to text', { error: err.message });
+        await ctx.reply(welcomeMessage, { 
+            parse_mode: 'HTML',
+            reply_markup: keyboard.reply_markup 
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  OPTIONAL: Send separate referral confirmation if needed
+    // ═══════════════════════════════════════════════════════════
+    
+    if (isNewReferral && IMAGES.referral) {
+        try {
+            // Send as a follow-up message (not photo) to avoid clutter
+            await ctx.reply(
+                '✅ <b>Referral Confirmed</b>\n\n' +
+                'Your referrer will be rewarded when you make your first deposit of at least ' +
+                formatCurrency(config.referral?.minDeposit || 5) + '.',
+                { parse_mode: 'HTML' }
+            );
+        } catch (err) {
+            logger.error('Failed to send referral confirmation', { userId, error: err.message });
+        }
+    }
+    }
+    
 
     async handleMenu(ctx) {
         const user = await this._ensureUserFresh(ctx);
