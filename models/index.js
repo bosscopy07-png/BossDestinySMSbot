@@ -14,6 +14,7 @@ import Referral from './Referral.js';
 import ApiKey from './ApiKey.js';
 import AdminLog from './AdminLog.js';
 import Settings from './Settings.js';
+import { OrphanSMS } from './OrphanSMS.js';
 
 const modelRegistry = {
     User,
@@ -24,7 +25,8 @@ const modelRegistry = {
     Referral,
     ApiKey,
     AdminLog,
-    Settings
+    Settings,
+    OrphanSMS
 };
 
 function validateModels() {
@@ -112,8 +114,9 @@ export {
     Referral,
     ApiKey,
     AdminLog,
-    Settings
+    Settings,
+    OrphanSMS
 };
 
 export default modelRegistry;
-    
+        
