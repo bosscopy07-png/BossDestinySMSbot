@@ -454,10 +454,12 @@ class SessionManager {
 // SessionManager.js — Part 2/3
 // Timeout Handling, Provider Failure, Queries, Internal Session Creation & Finances
 // ═══════════════════════════════════════════════════════════════════════════════
-
     /**
      * Handle session timeout
-     * FIXED: Now properly cancels on 5SIM using activation ID before refund
+     * FIXED: 
+     * - Cancels on 5SIM using activation ID directly
+     * - NO auto-retry — user must request manually after timeout
+     * - Single source of truth for refunds
      */
     async handleTimeout(session) {
         const sessionId = session.sessionId || session;
@@ -467,47 +469,61 @@ class SessionManager {
             if (!session) return null;
         }
 
-        // Idempotency check
+        // Idempotency check — already handled?
         if (!['WAITING', 'CHECKING'].includes(session.status)) {
+            logger.info('Timeout: session already handled', { sessionId, status: session.status });
             return null;
         }
 
-        // FIXED: Cancel on 5SIM FIRST before releasing funds
-        // This prevents 5SIM from keeping the number reserved for 10min
-        if (session.mode === 'CHEAP' && session.providerNumberId && this.providerManager) {
+        // FIXED: Cancel on 5SIM FIRST using activation ID
+        if (session.mode === 'CHEAP' && session.providerNumberId) {
             try {
+                // Use cancelCheapNumber (activation ID) not cancelNumber
                 await this.providerManager.cancelCheapNumber(session.providerNumberId);
                 logger.info('5SIM cancelled on timeout', {
                     sessionId,
                     activationId: session.providerNumberId
                 });
             } catch (cancelError) {
-                logger.warn('5SIM cancel on timeout failed (non-critical)', {
-                    sessionId,
-                    activationId: session.providerNumberId,
-                    error: cancelError.message
-                });
+                // Already cancelled = OK
+                if (cancelError.response?.data === 'order not found' || 
+                    cancelError.message?.includes('order not found')) {
+                    logger.info('5SIM already cancelled (order not found)', { sessionId });
+                } else {
+                    logger.warn('5SIM cancel on timeout failed', {
+                        sessionId,
+                        activationId: session.providerNumberId,
+                        error: cancelError.message
+                    });
+                }
             }
         }
 
-        // Release provider number
+        // Release provider number (for other modes)
         await this._releaseProviderNumber(session, 'TIMEOUT');
 
-        // Restore credits
+        // Restore credits (bundle/vip/free)
         await this._restoreCredits(session);
 
-        // Release locked funds — SINGLE SOURCE OF TRUTH for CHEAP refunds
+        // Release locked funds for CHEAP mode
         if (session.lockTxId) {
-            await this.walletService.releaseFunds(
-                session.lockTxId,
-                session.userId,
-                'OTP_TIMEOUT'
-            );
+            try {
+                await this.walletService.releaseFunds(
+                    session.lockTxId,
+                    session.userId,
+                    'OTP_TIMEOUT'
+                );
+                logger.info('Funds released on timeout', { sessionId, lockTxId: session.lockTxId });
+            } catch (releaseError) {
+                logger.error('Fund release failed on timeout', { sessionId, error: releaseError.message });
+            }
         }
 
+        // Mark session as timeout
         await Session.markTimeout(sessionId);
         this._cleanupSession(sessionId);
 
+        // Notify user
         if (this.notificationService) {
             try {
                 await this.notificationService.notifyTimeout(session.userId, {
@@ -522,26 +538,9 @@ class SessionManager {
             }
         }
 
-        // Retry logic for CHEAP mode
-        if (session.mode === 'CHEAP' && session.retryCount < session.maxRetries) {
-            logger.info('Retrying CHEAP session', {
-                sessionId,
-                retryCount: session.retryCount + 1,
-                maxRetries: session.maxRetries
-            });
-
-            try {
-                const newSession = await this.createSession(
-                    session.userId,
-                    session.mode,
-                    session.service,
-                    session.country
-                );
-                return { retried: true, newSessionId: newSession.sessionId };
-            } catch (retryError) {
-                logger.error('Retry failed', { sessionId, error: retryError.message });
-            }
-        }
+        // ========== NO AUTO-RETRY ==========
+        // User must manually request a new OTP after timeout
+        // The _scheduleTimeoutNotification in your controller sends the timeout message to user
 
         logger.info('Session timed out', {
             sessionId,
@@ -552,6 +551,7 @@ class SessionManager {
 
         return { retried: false };
     }
+    
 
     /**
      * Handle provider-side failure
@@ -922,7 +922,6 @@ class SessionManager {
     // ═══════════════════════════════════════════════════════════
     //  INTERNAL - Monitoring
     // ═══════════════════════════════════════════════════════════
-
     _startMonitoring(session, providerInstance) {
         const sessionId = session.sessionId;
 
@@ -935,26 +934,15 @@ class SessionManager {
             pollCount: 0
         });
 
-        // Schedule timeout
-        const timeoutMs = new Date(session.timeoutAt) - Date.now();
-        const timeoutTimer = setTimeout(async () => {
-            try {
-                const current = await Session.findOne({ sessionId }).lean();
-                if (current && ['WAITING', 'CHECKING'].includes(current.status)) {
-                    await this.handleTimeout(current);
-                }
-            } catch (error) {
-                logger.error('Timeout handler error', { sessionId, error: error.message });
-            }
-        }, Math.max(timeoutMs, 0));
-
-        this.sessionTimeouts.set(sessionId, timeoutTimer);
+        // ========== NO TIMEOUT SCHEDULED HERE ==========
+        // The controller's _scheduleTimeoutNotification handles timeout
+        // SessionManager only handles polling
 
         // Start polling
         const pollInterval = this.config.pollIntervals[session.mode] || 5000;
         this._schedulePoll(sessionId, pollInterval);
     }
-
+    
     _schedulePoll(sessionId, interval) {
         const timer = setTimeout(async () => {
             await this._pollProvider(sessionId, interval);
