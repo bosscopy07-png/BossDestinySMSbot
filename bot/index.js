@@ -3,6 +3,7 @@
 // Part 1/3 — Imports, Constructor, Admin Utilities & Error Handling
 // ═══════════════════════════════════════════════════════════════════════════════
 
+
 import { Telegraf, session as telegrafSession } from 'telegraf';
 import { message } from 'telegraf/filters';
 import config from '../config/env.js';
@@ -14,6 +15,7 @@ import UserCommands from './commands/user.js';
 import OTPCommands from './commands/otp.js';
 import AdminCommands from './commands/admin.js';
 import Admin from './commands/extra.js';
+import ReferralService from '../services/referral/index.js';
 import WalletService from '../services/wallet/index.js';
 import SMSProviderManager from '../services/sms/index.js';
 import FreeNumberController from '../services/sms/FreeNumberController.js';
@@ -38,10 +40,9 @@ class TelegramBot {
             },
             handlerTimeout: 90000
         });
-
-        this.walletService = new WalletService();
+        this.walletService = new WalletService(this.referralService);
         this.smsProviderManager = null;
-        this.referralService = null;
+        this.referralService = new ReferralService(this.walletService);
         this.freeNumberController = null;
 
         this.metrics = {
