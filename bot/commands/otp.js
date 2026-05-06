@@ -526,12 +526,8 @@ _freeRemaining(user) {
         }).sort({ createdAt: -1 });
     }
 
-        /**
-     * Schedule timeout notification.
-     * When timeout fires, it simply calls handleCancel() programmatically.
-     * Manual cancel already works — timeout uses the same code path.
-     */
-    async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
+        
+                async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
         try {
             const delayMs = new Date(timeoutAt) - new Date();
             if (delayMs <= 0) return;
@@ -545,20 +541,37 @@ _freeRemaining(user) {
             }
 
             const timer = setTimeout(async () => {
-                // Remove from map immediately so handleCancel won't try to clear a fired timer
                 this._timeoutTimers?.delete(sessionId);
 
-                logger.info('Timeout fired, triggering cancel', { sessionId, userId });
-
-                // Build minimal fake ctx — handleCancel only needs ctx.from.id
-                const fakeCtx = {
-                    from: { id: parseInt(userId) }
-                };
+                logger.info('Timeout fired, calling SessionManager.handleTimeout', { sessionId, userId });
 
                 try {
-                    await this.handleCancel(fakeCtx, true); // true = isTimeout
+                    // SessionManager handles EVERYTHING: 5SIM cancel, refund, cleanup
+                    const result = await sessionManager.handleTimeout(sessionId);
+
+                    // If session was already handled, result is null
+                    if (!result) {
+                        logger.info('Timeout: session already handled by SessionManager', { sessionId });
+                        return;
+                    }
+
+                    // Notify user of timeout
+                    const timeoutMessage =
+                        `⏰ <b>OTP Request Timed Out</b>\n\n` +
+                        `⏱ Your OTP request has expired.\n\n` +
+                        `💰 Any locked funds have been returned to your balance.\n\n` +
+                        `You can request a new OTP with /otp`;
+
+                    await this.bot.telegram.sendMessage(userId, timeoutMessage, {
+                        parse_mode: 'HTML',
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('🔄 Request New OTP', 'menu')],
+                            [Markup.button.callback('📞 Contact Support', 'contact_support')]
+                        ]).reply_markup
+                    });
+
                 } catch (err) {
-                    logger.error('Timeout cancel failed', { sessionId, error: err.message });
+                    logger.error('Timeout handling failed', { sessionId, error: err.message });
                 }
             }, Math.min(delayMs, 2147483647));
 
@@ -567,16 +580,8 @@ _freeRemaining(user) {
         } catch (error) {
             logger.error('Failed to schedule timeout', { userId, sessionId, error: error.message });
         }
-    }
-
-    /**
-     * Handle session cancellation.
-     * Works for both manual cancel (user taps button) and timeout (programmatic).
-     * 
-     * @param {Object} ctx - Telegram context or fake ctx with ctx.from.id
-     * @param {boolean} isTimeout - true when called from timeout, false for manual cancel
-     */
-    async handleCancel(ctx, isTimeout = false) {
+                }
+        async handleCancel(ctx, isTimeout = false) {
         const userId = ctx.from.id.toString();
 
         try {
@@ -587,7 +592,7 @@ _freeRemaining(user) {
             
             if (!activeSession) {
                 if (isTimeout) {
-                    logger.info('Timeout: no active session to cancel', { userId });
+                    logger.info('Timeout cancel: no active session', { userId });
                     return;
                 }
                 return this.sendPhotoWithCaption(ctx, IMAGES.default, 
@@ -598,10 +603,19 @@ _freeRemaining(user) {
 
             const sessionId = activeSession.sessionId;
 
-            // Clear timeout timer if it exists (prevents double-fire)
+            // Clear controller's timeout timer
             if (this._timeoutTimers?.has(sessionId)) {
                 clearTimeout(this._timeoutTimers.get(sessionId));
                 this._timeoutTimers.delete(sessionId);
+            }
+
+            // ========== FIXED: Clear SessionManager's poll timer too ==========
+            if (sessionManager && sessionManager.pollTimers?.has(sessionId)) {
+                clearTimeout(sessionManager.pollTimers.get(sessionId));
+                sessionManager.pollTimers.delete(sessionId);
+            }
+            if (sessionManager && sessionManager.activeSessions?.has(sessionId)) {
+                sessionManager.activeSessions.delete(sessionId);
             }
 
             // ========== Step 1: Cancel on 5SIM (CHEAP mode) ==========
@@ -610,9 +624,9 @@ _freeRemaining(user) {
                 try {
                     await this.smsProviderManager.cancelCheapNumber(activeSession.providerNumberId);
                     providerCancelled = true;
-                    logger.info('5SIM cancelled', { sessionId, activationId: activeSession.providerNumberId });
+                    logger.info('5SIM cancelled on manual cancel', { sessionId, activationId: activeSession.providerNumberId });
                 } catch (err) {
-                    if (err.response?.data === 'order not found') {
+                    if (err.response?.data === 'order not found' || err.message?.includes('order not found')) {
                         providerCancelled = true;
                         logger.info('5SIM already cancelled', { sessionId });
                     } else {
@@ -621,17 +635,17 @@ _freeRemaining(user) {
                 }
             }
 
-            // ========== Step 2: Cancel on free provider (FREE mode) ==========
+            // ========== Step 2: Cancel on free provider ==========
             if (activeSession.mode === 'FREE' && activeSession.providerNumberId && this.smsProviderManager) {
                 try {
                     await this.smsProviderManager.cancelNumber('FREE_PUBLIC', activeSession.providerNumberId);
                     providerCancelled = true;
                 } catch (err) {
-                    logger.warn('Free provider cancel failed', { sessionId, error: err.message });
+                    logger.warn('Free provider cancel failed', { sessionId });
                 }
             }
 
-            // ========== Step 3: Cancel session (handles all refunds) ==========
+            // ========== Step 3: Cancel session (refunds handled inside) ==========
             let cancelResult;
             try {
                 cancelResult = await sessionManager.cancelSession(sessionId, userId);
@@ -682,7 +696,6 @@ _freeRemaining(user) {
                 ]);
             }
 
-            // Send: direct message for timeout, photo+caption for manual
             if (isTimeout) {
                 await this.bot.telegram.sendMessage(userId, message, {
                     parse_mode: 'HTML',
@@ -701,10 +714,9 @@ _freeRemaining(user) {
                 );
             }
         }
-    }
+        }
     
-                     
-                    // ═══════════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════════
 //  OTPCommands.js — Part 2: Main Menu, My Number, Mode Handlers, Selection
 // ═══════════════════════════════════════════════════════════════════════════════
 
