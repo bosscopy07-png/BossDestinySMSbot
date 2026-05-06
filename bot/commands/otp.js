@@ -526,15 +526,10 @@ _freeRemaining(user) {
         }).sort({ createdAt: -1 });
     }
 
-    /**
-     * FIXED: Removed ALL refund logic from timeout notification.
-     * SessionManager.handleTimeout() is the SINGLE SOURCE OF TRUTH for:
-     * - FREE mode: _restoreCredits() handles freeUsedToday
-     * - VIP mode: _restoreCredits() handles vipDailyUsed  
-     * - BUNDLE mode: _restoreCredits() handles bundleRemaining
-     * - CHEAP mode: releaseFunds() handles wallet refund
-     * 
-     * This method now ONLY sends the timeout message. It NEVER touches user credits/balance.
+        /**
+     * FIXED: Timeout now PROPERLY cancels on provider AND stops session.
+     * SessionManager.handleTimeout() handles credit restoration.
+     * This method handles: provider cancel → session stop → notification.
      */
     async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
         try {
@@ -543,33 +538,61 @@ _freeRemaining(user) {
 
             setTimeout(async () => {
                 try {
-                    // Just check if session still in waiting state (SessionManager may have already handled it)
                     const currentSession = await Session.findOne({ sessionId }).lean();
-                    
-                    // If session was already handled by SessionManager, just send notification
-                    // If not (edge case), mark it timed out here but DO NOT refund
-                    if (currentSession && ['WAITING', 'CHECKING'].includes(currentSession.status)) {
+                    if (!currentSession) return;
+
+                    // Already handled? Don't double-process
+                    if (!['WAITING', 'CHECKING'].includes(currentSession.status)) return;
+
+                    // ========== STEP 1: CANCEL ON PROVIDER ==========
+                    // Same logic as handleCancel — cancel on external provider FIRST
+                    if (currentSession.mode === 'CHEAP' && currentSession.providerNumberId) {
+                        try {
+                            await this.smsProviderManager.cancelCheapNumber(
+                                currentSession.providerNumberId
+                            );
+                            logger.info('5SIM cancel on timeout', { sessionId, activationId: currentSession.providerNumberId });
+                        } catch (err) {
+                            logger.warn('5SIM cancel on timeout failed (best-effort)', { sessionId, error: err.message });
+                        }
+                    }
+
+                    if (currentSession.mode === 'FREE' && currentSession.providerNumberId && this.smsProviderManager) {
+                        try {
+                            await this.smsProviderManager.cancelNumber('FREE_PUBLIC', currentSession.providerNumberId);
+                        } catch (err) {
+                            logger.warn('Free provider cancel on timeout failed (best-effort)', { sessionId });
+                        }
+                    }
+
+                    // ========== STEP 2: STOP/CANCEL SESSION (handles refunds) ==========
+                    // Use cancelSession instead of just updating status — this triggers ALL cleanup
+                    try {
+                        await sessionManager.cancelSession(sessionId, userId);
+                        logger.info('Session cancelled on timeout', { sessionId, userId });
+                    } catch (cancelErr) {
+                        // Fallback: if cancelSession fails, at least mark timeout
+                        logger.error('cancelSession failed on timeout, marking TIMEOUT manually', { sessionId, error: cancelErr.message });
                         await Session.updateOne(
                             { sessionId },
                             { $set: { status: 'TIMEOUT', endTime: new Date() } }
                         );
                     }
 
-                    // Skip notification for FREE mode — FreeProvider/FreeNumberController polling handles UX
-                    if (currentSession?.mode === 'FREE') return;
+                    // ========== STEP 3: NOTIFY USER ==========
+                    if (currentSession.mode === 'FREE') return; // FreeProvider handles UX
 
-                    // Send timeout message ONLY — no refund logic here
                     const refundText = {
                         BUNDLE: 'Bundle credit restored',
                         VIP: 'VIP daily quota restored',
                         CHEAP: 'Funds returned to balance',
                         FREE: 'Free quota restored'
-                    }[currentSession?.mode] || 'Funds handled';
+                    }[currentSession.mode] || 'Funds handled';
 
                     const timeoutMessage =
                         `⏰ <b>OTP Request Timed Out</b>\n\n` +
-                        `📱 Number: <code>${currentSession?.number || 'unknown'}</code>\n` +
-                        `🎯 Service: ${currentSession?.service || 'Unknown'}\n` +
+                        `📱 Number: <code>${currentSession.number || 'unknown'}</code>\n` +
+                        `🎯 Service: ${currentSession.service || 'Unknown'}\n` +
                         `⏱ Status: <b>Expired</b>\n\n` +
                         `💰 ${refundText}\n\n` +
                         `You can request a new OTP with /otp`;
