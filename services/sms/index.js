@@ -546,14 +546,12 @@ class SMSProviderManager {
 // SMSProviderManager.js — Part 2/3
 // SMS Checking, Free Tier Polling & Number Release/Cancellation
 // ═══════════════════════════════════════════════════════════════════════════════
-
     // ═══════════════════════════════════════════════════════════════════════
-    //  SMS CHECKING — Each provider uses its own correct method
+    //  SMS CHECKING — Complete tier coverage
     // ═══════════════════════════════════════════════════════════════════════
 
     /**
      * Check SMS for a CHEAP tier number (5SIM).
-     * 5SIM uses: checkSMS(activationId)
      */
     async checkCheapSMS(orderId) {
         if (!this.isInitialized) await this.initialize();
@@ -567,13 +565,11 @@ class SMSProviderManager {
             return provider.checkSMS(orderId);
         }
 
-        throw new Error('CHEAP_PROVIDER_NO_CHECK_METHOD: Provider missing checkSMS');
+        throw new Error('CHEAP_PROVIDER_NO_CHECK_METHOD');
     }
 
     /**
      * Check SMS for a FREE tier number.
-     * FreeProvider uses: pollForSMS(sessionId, onStatusUpdate) for live polling
-     * OR checkSMS(sessionId) for one-shot check
      */
     async checkFreeSMS(sessionId, onStatusUpdate = null) {
         if (!this.isInitialized) await this.initialize();
@@ -583,27 +579,68 @@ class SMSProviderManager {
             throw new Error('FREE_PROVIDER_NOT_FOUND');
         }
 
-        // If live polling requested and provider supports it
         if (onStatusUpdate && typeof provider.pollForSMS === 'function') {
             return provider.pollForSMS(sessionId, onStatusUpdate);
         }
 
-        // One-shot check
         if (typeof provider.checkSMS === 'function') {
             return provider.checkSMS(sessionId);
         }
 
-        // Fallback: try getSMS
         if (typeof provider.getSMS === 'function') {
             return provider.getSMS(sessionId);
         }
 
-        throw new Error('FREE_PROVIDER_NO_CHECK_METHOD: FreeProvider missing checkSMS/pollForSMS/getSMS');
+        throw new Error('FREE_PROVIDER_NO_CHECK_METHOD');
     }
 
     /**
-     * Check SMS for POOL number (VIP/BUNDLE).
-     * Pool numbers use webhooks — check database/session status.
+     * Check SMS for VIP direct number (Twilio/Telnyx NOT in pool).
+     * FIXED: Added missing VIP direct checker
+     */
+    async checkVipSMS(providerName, messageIdOrSid) {
+        if (!this.isInitialized) await this.initialize();
+
+        const provider = this.providers.get(providerName);
+        if (!provider) {
+            throw new Error(`VIP_PROVIDER_NOT_FOUND: ${providerName}`);
+        }
+
+        // Twilio: check status by message SID
+        if (providerName === 'TWILIO' && typeof provider.checkStatus === 'function') {
+            return provider.checkStatus(messageIdOrSid);
+        }
+
+        // Telnyx: fetch message by ID
+        if (providerName === 'TELNYX') {
+            try {
+                const response = await axios.get(
+                    `${provider.baseUrl}/messages/${messageIdOrSid}`,
+                    { headers: provider.getHeaders(), timeout: 15000 }
+                );
+                const msg = response.data?.data;
+                return {
+                    success: true,
+                    status: msg?.state,
+                    to: msg?.to,
+                    from: msg?.from,
+                    text: msg?.text,
+                    direction: msg?.direction
+                };
+            } catch (error) {
+                return {
+                    success: false,
+                    error: error.response?.data?.errors?.[0]?.detail || error.message
+                };
+            }
+        }
+
+        throw new Error(`VIP_CHECK_NOT_SUPPORTED: ${providerName}`);
+    }
+
+    /**
+     * Check SMS for POOL number (VIP/BUNDLE via NumberPool).
+     * Pool numbers use webhooks — check session/database.
      */
     async checkPoolSMS(sessionId) {
         if (!this.isInitialized) await this.initialize();
@@ -612,32 +649,66 @@ class SMSProviderManager {
             throw new Error('POOL_NOT_AVAILABLE');
         }
 
-        // Pool numbers are webhook-driven — return waiting status
+        // Pool numbers are webhook-driven — return session from database
         // Actual SMS is stored in Session model by webhook handler
+        const Session = (await import('../../models/index.js')).Session;
+        const session = await Session.findOne({ sessionId });
+
+        if (!session) {
+            return {
+                success: false,
+                status: 'NOT_FOUND',
+                message: 'Session not found'
+            };
+        }
+
+        if (session.otp) {
+            return {
+                success: true,
+                otp: session.otp,
+                status: 'RECEIVED',
+                receivedAt: session.otpReceivedAt,
+                fullText: session.smsText
+            };
+        }
+
+        if (session.status === 'EXPIRED' || session.status === 'CANCELLED') {
+            return {
+                success: false,
+                status: session.status,
+                message: `Session ${session.status.toLowerCase()}`
+            };
+        }
+
         return {
             success: false,
             status: 'WAITING',
-            message: 'Pool numbers use webhooks. Check session status in database.',
-            provider: 'NUMBER_POOL'
+            message: 'Waiting for SMS via webhook',
+            provider: 'NUMBER_POOL',
+            sessionStatus: session.status
         };
     }
 
     /**
-     * LEGACY checkSMS — DEPRECATED.
-     * Routes to correct tier-specific checker.
+     * UNIFIED checkSMS — routes to correct tier checker.
      */
     async checkSMS(providerName, identifier, options = {}) {
-        logger.warn('LEGACY checkSMS() called — use tier-specific checkers', { providerName });
+        // Normalize provider name
+        const normalized = providerName.toUpperCase();
 
-        if (providerName === 'FREE_PUBLIC' || providerName === 'FREE') {
+        if (normalized === 'FREE_PUBLIC' || normalized === 'FREE') {
             return this.checkFreeSMS(identifier, options.onStatusUpdate);
         }
 
-        if (providerName === 'CHEAP_PANEL' || providerName === 'CHEAP') {
+        if (normalized === 'CHEAP_PANEL' || normalized === 'CHEAP') {
             return this.checkCheapSMS(identifier);
         }
 
-        if (providerName === 'NUMBER_POOL' || providerName === 'TWILIO' || providerName === 'TELNYX') {
+        if (normalized === 'TWILIO' || normalized === 'TELNYX') {
+            return this.checkVipSMS(normalized, identifier);
+        }
+
+        if (normalized === 'NUMBER_POOL' || normalized === 'POOL') {
             return this.checkPoolSMS(identifier);
         }
 
@@ -647,7 +718,7 @@ class SMSProviderManager {
             throw new Error(`PROVIDER_NOT_FOUND: ${providerName}`);
         }
 
-        const checkMethod = provider.checkSMS || provider.getSMS || provider.getCode;
+        const checkMethod = provider.checkSMS || provider.getSMS || provider.getCode || provider.checkStatus;
         if (typeof checkMethod !== 'function') {
             return {
                 success: false,
@@ -657,8 +728,9 @@ class SMSProviderManager {
         }
 
         return checkMethod.call(provider, identifier);
-    }
-
+                    }
+            
+     
     // ═══════════════════════════════════════════════════════════════════════
     //  FREE TIER POLLING (For OTPCommands.startFreePolling)
     // ═══════════════════════════════════════════════════════════════════════
