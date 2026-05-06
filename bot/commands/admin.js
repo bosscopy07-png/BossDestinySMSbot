@@ -1138,7 +1138,7 @@ if (ctx.session?.adminState?.state === 'ORPHAN_SEARCH') {
     // ═══════════════════════════════════════════════════
     [
     Markup.button.callback('📨 Orphan SMS', 'admin_orphan_review'),
-    Markup.button.callback('🛠️ Advanced Tools', 'open_admin_dashboard')
+    Markup.button.callback('⛓️ RPC Mode', 'admin_rpc_control')
 ]
                                                
 ]);
