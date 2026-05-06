@@ -750,6 +750,12 @@ this.bot.action(/numpool_country_(.+)/, (ctx) => {
                 this._clearAdminState(ctx);
                 return this.executeBroadcast(ctx, filter, label, ctx.message.text);
             }
+            // In handleTextInput() or setupTextHandler():
+if (ctx.session?.adminState?.state === 'ORPHAN_SEARCH') {
+    delete ctx.session.adminState;
+    return this.processOrphanSearch(ctx, ctx.message.text);
+}
+            
 
             // ─── Awaiting add balance amount ───
             if (ctx.session.awaitingAddBalance) {
