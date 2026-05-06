@@ -486,15 +486,37 @@ function maskPhone(phone) {
 async function storeOrphanSMS(data) {
     try {
         const { OrphanSMS } = await import('../models/index.js');
+        
+        // Extract OTP before storing
+        const extractedOtp = extractOTP(data.body);
+
         await OrphanSMS.create({
-            ...data,
+            provider: data.provider || 'UNKNOWN',
+            from: data.from || null,
+            to: data.to,
+            body: data.body || null,
+            messageSid: data.messageSid || null,
+            extractedOtp: extractedOtp,
+            receivedAt: data.receivedAt || new Date(),
+            rawPayload: data.rawPayload || null,
+            sourceIp: data.sourceIp || null,
             reviewed: false
         });
-        logger.info('Orphan SMS stored', { to: maskPhone(data.to) });
+
+        logger.info('Orphan SMS stored for review', { 
+            to: maskPhone(data.to),
+            provider: data.provider,
+            hasOtp: !!extractedOtp
+        });
+
     } catch (error) {
-        logger.error('Failed to store orphan SMS', { error: error.message });
+        logger.error('Failed to store orphan SMS', { 
+            error: error.message,
+            to: maskPhone(data.to) 
+        });
     }
 }
+
 
 /**
  * Notify user via bot
