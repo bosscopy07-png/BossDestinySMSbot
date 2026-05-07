@@ -643,7 +643,6 @@ class CheapPanelProvider {
     // ═══════════════════════════════════════════════════════════
     //  SMS CHECKING — CRITICAL FIX FOR text.match CRASH
     // ═══════════════════════════════════════════════════════════
-
     async checkSMS(activationId) {
         try {
             if (!this.isActive) {
@@ -672,22 +671,32 @@ class CheapPanelProvider {
                 hasCode: !!data?.code,
                 hasSms: !!data?.sms,
                 smsType: typeof data?.sms,
+                isArray: Array.isArray(data?.sms),
                 codeType: typeof data?.code
             });
 
             const status = (data?.status || '').toUpperCase();
 
             if (status === 'RECEIVED' || status === 'FINISHED') {
-                // CRITICAL FIX: 5SIM returns SMS text in "sms" field, NOT "text"
-                // The "code" field may be string, number, or null
+                // CRITICAL FIX: 5SIM returns SMS text in "sms" field, which can be string OR array of objects
                 const otp = this.extractOTP(data.code, data.sms);
                 
                 if (otp) {
+                    // FIX: Handle array format for fullText storage
+                    let fullText = null;
+                    if (Array.isArray(data.sms)) {
+                        fullText = data.sms[0]?.text || data.sms[0]?.sms || JSON.stringify(data.sms);
+                    } else if (typeof data.sms === 'string') {
+                        fullText = data.sms;
+                    } else if (typeof data.sms === 'object' && data.sms !== null) {
+                        fullText = data.sms.text || data.sms.sms || JSON.stringify(data.sms);
+                    }
+
                     return {
                         success: true,
                         otp,
                         status: 'RECEIVED',
-                        fullText: data.sms || null,
+                        fullText: fullText,
                         receivedAt: new Date()
                     };
                 }
@@ -695,7 +704,7 @@ class CheapPanelProvider {
                 return {
                     success: false,
                     status: 'CHECKING',
-                    rawText: data.sms,
+                    rawText: Array.isArray(data.sms) ? JSON.stringify(data.sms) : data.sms,
                     message: 'SMS received but OTP extraction failed'
                 };
             }
@@ -714,40 +723,62 @@ class CheapPanelProvider {
             logger.error('5SMS check failed', { activationId, error: error.message });
             return { success: false, error: error.message, status: 'ERROR' };
         }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  OTP EXTRACTION — CRITICAL FIX FOR TYPE SAFETY
-    // ═══════════════════════════════════════════════════════════
-
-    extractOTP(code, text) {
+                }
+                            extractOTP(code, text) {
         // PRIORITY 1: Handle 5SIM "code" field (can be string, number, or null)
         if (code !== null && code !== undefined) {
             const codeStr = code.toString().trim();
-            // Remove spaces and dashes that 5SIM sometimes includes
             const cleanCode = codeStr.replace(/[\s\-]/g, '');
             if (/^\d{4,8}$/.test(cleanCode)) {
                 return cleanCode;
             }
-            // If code exists but doesn't match pattern, log it but continue to text parsing
             logger.debug('5SIM code field present but invalid format', { code, cleanCode });
         }
 
         // PRIORITY 2: Parse "sms" text field
-        // CRITICAL FIX: Must verify text is actually a string before calling .match()
         if (text === null || text === undefined) {
             logger.debug('No SMS text provided', { text });
             return null;
         }
 
-        // Type guard: ensure text is a string
+        // ========== FIX: Handle Array format from 5SIM ==========
         let textStr;
-        if (typeof text === 'string') {
+        
+        if (Array.isArray(text)) {
+            const firstMessage = text[0];
+            if (firstMessage && typeof firstMessage === 'object') {
+                if (firstMessage.text && typeof firstMessage.text === 'string') {
+                    textStr = firstMessage.text;
+                } else if (firstMessage.sms && typeof firstMessage.sms === 'string') {
+                    textStr = firstMessage.sms;
+                } else {
+                    const values = Object.values(firstMessage).filter(v => typeof v === 'string');
+                    if (values.length > 0) {
+                        textStr = values.join(' ');
+                    } else {
+                        logger.warn('SMS array element has no recognizable text field', { firstMessage });
+                        return null;
+                    }
+                }
+                
+                // Also try to get code from array element if main code param failed
+                if (firstMessage.code && (!code || code === null)) {
+                    const arrayCode = firstMessage.code.toString().trim().replace(/[\s\-]/g, '');
+                    if (/^\d{4,8}$/.test(arrayCode)) {
+                        return arrayCode;
+                    }
+                }
+            } else if (typeof firstMessage === 'string') {
+                textStr = firstMessage;
+            } else {
+                logger.warn('SMS array first element is not object or string', { firstMessage });
+                return null;
+            }
+        } else if (typeof text === 'string') {
             textStr = text;
         } else if (typeof text === 'number') {
             textStr = text.toString();
         } else if (typeof text === 'object') {
-            // 5SIM sometimes returns { text: "...", code: "..." } instead of flat string
             if (text.text && typeof text.text === 'string') {
                 textStr = text.text;
             } else if (text.sms && typeof text.sms === 'string') {
@@ -794,7 +825,10 @@ class CheapPanelProvider {
         if (digits?.length > 0) return digits[digits.length - 1];
 
         return null;
-    }
+                            }
+    
+ 
+   
 
     // ═══════════════════════════════════════════════════════════
     //  NUMBER MANAGEMENT
