@@ -323,7 +323,7 @@ _freeRemaining(user) {
         // OTP actions
         this.bot.action(/reveal_(.+)/, this.handleRevealOTP);
         this.bot.action('check_deposit', this.handleCheckDeposit);
-        this.bot.action('cancel_otp', this.handleCancel);
+        this.bot.action('cancel_otp', (ctx) => this.handleCancel(ctx));
         this.bot.action('deposit', this.handleDepositInfo);
         this.bot.action('menu', this.handleMenu);
         this.bot.action('contact_support', this.handleContactSupport);
@@ -581,20 +581,42 @@ _freeRemaining(user) {
             logger.error('Failed to schedule timeout', { userId, sessionId, error: error.message });
         }
                 }
-        async handleCancel(ctx, isTimeout = false) {
+    async handleCancel(ctx, isTimeout = false) {
         const userId = ctx.from.id.toString();
 
         try {
+            // ========== FIX: Find session regardless of status ==========
+            // Manual cancel might find WAITING/CHECKING
+            // Timeout might find TIMEOUT (already handled)
             const activeSession = await Session.findOne({ 
                 userId, 
                 status: { $in: ['WAITING', 'CHECKING'] } 
             });
             
-            if (!activeSession) {
-                if (isTimeout) {
-                    logger.info('Timeout cancel: no active session', { userId });
-                    return;
+            // If no active session and this is timeout, just log and exit
+            if (!activeSession && isTimeout) {
+                logger.info('Timeout: no active session to cancel', { userId });
+                return;
+            }
+
+            // If no active session and manual cancel, check if it was already timed out
+            if (!activeSession && !isTimeout) {
+                const timedOutSession = await Session.findOne({
+                    userId,
+                    status: 'TIMEOUT'
+                }).sort({ endTime: -1 });
+
+                if (timedOutSession) {
+                    // Session already timed out, tell user
+                    return this.sendPhotoWithCaption(ctx, IMAGES.default,
+                        '⏰ This session has already expired.\n\nYou can request a new OTP with /otp',
+                        Markup.inlineKeyboard([
+                            [Markup.button.callback('🔄 Request New OTP', 'menu')],
+                            [Markup.button.callback('📞 Contact Support', 'contact_support')]
+                        ]), 'HTML'
+                    );
                 }
+
                 return this.sendPhotoWithCaption(ctx, IMAGES.default, 
                     '❌ No active session to cancel.',
                     KEYBOARDS.backToMenu(), 'HTML'
@@ -609,7 +631,7 @@ _freeRemaining(user) {
                 this._timeoutTimers.delete(sessionId);
             }
 
-            // ========== FIXED: Clear SessionManager's poll timer too ==========
+            // Clear SessionManager's poll timer
             if (sessionManager && sessionManager.pollTimers?.has(sessionId)) {
                 clearTimeout(sessionManager.pollTimers.get(sessionId));
                 sessionManager.pollTimers.delete(sessionId);
@@ -624,7 +646,7 @@ _freeRemaining(user) {
                 try {
                     await this.smsProviderManager.cancelCheapNumber(activeSession.providerNumberId);
                     providerCancelled = true;
-                    logger.info('5SIM cancelled on manual cancel', { sessionId, activationId: activeSession.providerNumberId });
+                    logger.info('5SIM cancelled', { sessionId, activationId: activeSession.providerNumberId });
                 } catch (err) {
                     if (err.response?.data === 'order not found' || err.message?.includes('order not found')) {
                         providerCancelled = true;
@@ -668,7 +690,12 @@ _freeRemaining(user) {
 
             let message, keyboard;
 
+            // ========== KEY FIX: Use isTimeout parameter correctly ==========
+            // isTimeout = true only when called from _scheduleTimeoutNotification
+            // isTimeout = false (default) when called from manual button tap
+
             if (isTimeout) {
+                // TIMEOUT MESSAGE
                 message =
                     `⏰ <b>OTP Request Timed Out</b>\n\n` +
                     `📱 Number: <code>${activeSession.number}</code>\n` +
@@ -682,6 +709,7 @@ _freeRemaining(user) {
                     [Markup.button.callback('📞 Contact Support', 'contact_support')]
                 ]);
             } else {
+                // MANUAL CANCEL MESSAGE
                 message =
                     `✅ <b>Session Cancelled</b>\n\n` +
                     `📱 Number: <code>${activeSession.number}</code>\n` +
@@ -714,7 +742,8 @@ _freeRemaining(user) {
                 );
             }
         }
-        }
+    }
+    
     
     // ═══════════════════════════════════════════════════════════════════════════════
 //  OTPCommands.js — Part 2: Main Menu, My Number, Mode Handlers, Selection
