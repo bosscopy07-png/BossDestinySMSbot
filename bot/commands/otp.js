@@ -1235,16 +1235,27 @@ class OTPCommands {
     // ═══════════════════════════════════════════════════════════════════════
     //  FREE SERVICE SELECTED — User picks service after credits pass
     // ═══════════════════════════════════════════════════════════════════════
-
-    async handleFreeServiceSelected(ctx, serviceCode) {
+async handleFreeCountrySelected(ctx, countryCode) {
         const userId = ctx.from?.id?.toString();
 
         try {
             ctx.session = ctx.session || {};
-            ctx.session.selectedService = serviceCode;
+            const serviceCode = ctx.session.selectedService;
+
+            if (!serviceCode) {
+                return ctx.editMessageText(
+                    '❌ Session expired. Please start over.',
+                    {
+                        parse_mode: 'HTML',
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('🔙 Main Menu', 'menu')]
+                        ]).reply_markup
+                    }
+                );
+            }
 
             await ctx.editMessageText(
-                `⏳ <b>Loading countries for ${serviceCode}...</b>`,
+                '⏳ <b>Requesting free number...</b>',
                 { parse_mode: 'HTML' }
             );
 
@@ -1261,63 +1272,264 @@ class OTPCommands {
                 );
             }
 
-            const countries = await freeProvider.getCountries(serviceCode);
-            
-            if (!countries || countries.length === 0) {
+            const result = await freeProvider.requestNumber(userId, serviceCode, countryCode);
+
+            if (!result.success) {
                 return ctx.editMessageText(
-                    '❌ No countries available for this service.',
+                    `❌ <b>Failed to get number</b>\n\n${result.message || 'Please try again.'}`,
                     {
                         parse_mode: 'HTML',
                         reply_markup: Markup.inlineKeyboard([
-                            [Markup.button.callback('🔙 Back', 'mode_free')]
+                            [Markup.button.callback('🔄 Try Again', `free_country_${countryCode}`)],
+                            [Markup.button.callback('🔙 Back', `free_service_${serviceCode}`)],
+                            [Markup.button.callback('🔙 Menu', 'menu')]
                         ]).reply_markup
                     }
                 );
             }
 
-            const buttons = countries.slice(0,       
-                         
+            const dbSession = await Session.create({
+                sessionId: result.sessionId || `free_${Date.now()}_${userId}`,
+                userId,
+                mode: 'FREE',
+                service: serviceCode,
+                country: countryCode,
+                number: result.number,
+                providerNumberId: result.providerNumberId,
+                status: 'CHECKING',
+                startTime: new Date()
+            });
 
-           
-        // ═══════════════════════════════════════════════════════════════════════
-    //  FREE SESSION CANCEL — Cancel active free OTP polling
-    // ═══════════════════════════════════════════════════════════════════════
+            ctx.session.freeSessionId = result.sessionId;
+            ctx.session.providerNumberId = result.providerNumberId;
+            ctx.session.number = result.number;
+            ctx.session.service = serviceCode;
+            ctx.session.dbSessionId = dbSession._id.toString();
 
-    async handleCancelFree(ctx, sessionId) {
-        const userId = ctx.from?.id?.toString();
-
-        try {
-            // Cancel via provider manager
-            await this.providerManager.cancelNumber('FREE_PUBLIC', sessionId);
-            
-            // Credits are auto-restored by SessionManager.cancelSession() or handleTimeout()
-            
-            await ctx.answerCbQuery('✅ Session cancelled');
             await ctx.editMessageText(
-                '❌ <b>Free Session Cancelled</b>\n\n' +
-                'Your credit has been restored.',
+                `📱 <b>Free OTP Requested</b>\n\n` +
+                `Number: <code>${result.number}</code>\n` +
+                `Service: ${serviceCode}\n` +
+                `Country: ${countryCode}\n\n` +
+                `⏳ Waiting for SMS...\n\n` +
+                `<i>Number will be cancelled automatically if no SMS received within 10 minutes.</i>`,
                 {
                     parse_mode: 'HTML',
                     reply_markup: Markup.inlineKeyboard([
-                        [Markup.button.callback('📱 New Free Request', 'mode_free')],
-                        [Markup.button.callback('🔙 Menu', 'menu')]
+                        [Markup.button.callback('🔄 Check Now', `check_free_${result.sessionId}`)],
+                        [Markup.button.callback('❌ Cancel', `cancel_free_${result.sessionId}`)]
                     ]).reply_markup
                 }
             );
 
+            this.startFreePolling(ctx, userId, result.sessionId, dbSession.sessionId);
+
         } catch (error) {
-            logger.error('handleCancelFree error', { userId, sessionId, error: error.message });
-            ctx.answerCbQuery('❌ Cancel failed').catch(() => {});
+            logger.error('handleFreeCountrySelected error', { userId, countryCode, error: error.message });
+            ctx.answerCbQuery('❌ Error requesting number').catch(() => {});
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  FREE CHECK NOW — Manual poll for SMS
+    // ═══════════════════════════════════════════════════════════════════════
 
+    async handleCheckFree(ctx, sessionId) {
+        try {
+            const freeProvider = this.smsProviderManager?.getProvider('FREE_PUBLIC');
+            if (!freeProvider) {
+                return ctx.answerCbQuery('❌ Service unavailable').catch(() => {});
+            }
 
-    
+            const result = await freeProvider.checkFreeSMS(sessionId);
 
+            if (result.success && result.otp) {
+                await ctx.answerCbQuery('✅ OTP received! Updating...');
+            } else if (result.status === 'EXPIRED' || result.status === 'CANCELLED') {
+                await ctx.answerCbQuery('❌ Session expired', { show_alert: true });
+            } else {
+                await ctx.answerCbQuery(`⏳ ${result.message || 'Still waiting...'}`);
+            }
 
-        // ═══════════════════════════════════════════════════════════════════════
-    //  OTP HUB — Central OTP services screen (called from your existing /menu)
+        } catch (error) {
+            logger.error('handleCheckFree error', { sessionId, error: error.message });
+            ctx.answerCbQuery('❌ Check failed').catch(() => {});
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  CHEAP MODE — NEW TIER-BASED FLOW
+    //  Steps: Service Selection → Tier Selection → Country Selection → Auto Purchase
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleCheapMode(ctx) {
+        const user = ctx.state.user;
+        
+        try {
+            if (!this.tierSelector || !this.countryCatalog) {
+                logger.warn('Tier system not available, falling back to legacy CHEAP flow');
+                return this._handleCheapModeLegacy(ctx);
+            }
+
+            const minEntryPrice = TIER_CONFIG.budget.priceMultiplier * 0.05;
+            if (this._getAvailableBalance(user) < minEntryPrice) {
+                const message = 
+                    `💰 <b>Insufficient Balance</b>\n\n` +
+                    `CHEAP mode requires at least ${formatCurrency(minEntryPrice)}.\n` +
+                    `Available: ${formatCurrency(this._getAvailableBalance(user))}\n\n` +
+                    `Please deposit first.`;
+                    
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('💳 Deposit', 'deposit')],
+                    [Markup.button.callback('🔙 Back', 'menu')]
+                ]);
+                
+                return this.sendPhotoWithCaption(ctx, IMAGES.cheapMode, message, keyboard, 'HTML');
+            }
+
+            ctx.session = ctx.session || {};
+            ctx.session.otpMode = 'CHEAP';
+
+            await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
+            
+        } catch (error) {
+            logger.error('handleCheapMode failed', { userId: user.userId, error: error.message });
+            return this._handleCheapModeLegacy(ctx);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  LEGACY CHEAP MODE (Fallback)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async _handleCheapModeLegacy(ctx) {
+        const user = ctx.state.user;
+        
+        try {
+            let displayPrice = config.prices?.cheapOtp || 0.05;
+
+            if (this.smsProviderManager) {
+                try {
+                    const priceInfo = await this.smsProviderManager.getCheapPrice('US', 'Any');
+                    if (priceInfo && priceInfo.displayPrice) {
+                        displayPrice = priceInfo.displayPrice;
+                    }
+                } catch (priceError) {
+                    logger.warn('Failed to get dynamic CHEAP price, using fallback', { 
+                        error: priceError.message 
+                    });
+                }
+            }
+
+            if (this._getAvailableBalance(user) < displayPrice) {
+                const message = 
+                    `💰 <b>Insufficient Balance</b>\n\n` +
+                    `Required: ${formatCurrency(displayPrice)}\n` +
+                    `Available: ${formatCurrency(this._getAvailableBalance(user))}\n\n` +
+                    `Please deposit first.`;
+                    
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('💳 Deposit', 'deposit')],
+                    [Markup.button.callback('🔙 Back', 'menu')]
+                ]);
+                
+                return this.sendPhotoWithCaption(ctx, IMAGES.cheapMode, message, keyboard, 'HTML');
+            }
+
+            ctx.session = ctx.session || {};
+            ctx.session.otpMode = 'CHEAP';
+            ctx.session.cheapDisplayPrice = displayPrice;
+
+            await this._showLegacyServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode, displayPrice);
+            
+        } catch (error) {
+            logger.error('Legacy cheap mode failed', { userId: user.userId, error: error.message });
+            ctx.session = ctx.session || {};
+            ctx.session.otpMode = 'CHEAP';
+            await this._showLegacyServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
+        }
+    }
+
+    async handleBundleMode(ctx) {
+        const user = ctx.state.user;
+        
+        if (!user.bundleRemaining || user.bundleRemaining <= 0) {
+            return this.handleBuyBundle(ctx);
+        }
+
+        if (this._isVipActive(user) && user.vipPhoneNumber) {
+            ctx.session = ctx.session || {};
+            ctx.session.otpMode = 'BUNDLE';
+            ctx.session.useVipNumber = true;
+            return this._showLegacyServiceSelection(ctx, 'BUNDLE (VIP Number)', IMAGES.bundleOther);
+        }
+
+        ctx.session = ctx.session || {};
+        ctx.session.otpMode = 'BUNDLE';
+        ctx.session.useVipNumber = false;
+        await this._showLegacyServiceSelection(ctx, 'BUNDLE', IMAGES.bundleOther);
+    }
+
+    async handleVIPMode(ctx) {
+        const user = ctx.state.user;
+        
+        if (!this._isVipActive(user)) {
+            const message = 
+                `👑 <b>VIP Required</b>\n\n` +
+                `You need an active VIP subscription.\n\n` +
+                `Price: ${formatCurrency(config.prices?.vipSubscription || 5.00)}/month\n` +
+                `✅ 50 OTPs per day\n` +
+                `⚡ Dedicated number\n` +
+                `🚀 Priority routing\n\n` +
+                `Upgrade now?`;
+                
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('👑 Upgrade VIP', 'buy_vip')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]);
+            
+            return this.sendPhotoWithCaption(ctx, IMAGES.vipFirst, message, keyboard, 'HTML');
+        }
+        
+        if (!this._canUseVip(user)) {
+            const message = 
+                '⚠️ <b>VIP Daily Limit Reached</b>\n\n' +
+                `You've used ${config.limits?.vipDaily || 50}/${config.limits?.vipDaily || 50} VIP OTPs today.\n` +
+                'Resets at midnight UTC.\n\n' +
+                'Buy bundle OTPs to continue:';
+            
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('📦 Buy Bundle OTPs', 'buy_bundle_otp')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]);
+            
+            return this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message, keyboard, 'HTML');
+        }
+        
+        if (!user.vipPhoneNumber) {
+            const assignment = await this.assignVipNumber(user.userId, 'US');
+            if (!assignment) {
+                return this.sendPhotoWithCaption(
+                    ctx, IMAGES.vipOther,
+                    '⚠️ <b>Number Assignment Pending</b>\n\nWe\'re setting up your VIP number. Please try again shortly.',
+                    Markup.inlineKeyboard([
+                        [Markup.button.callback('🔄 Retry', 'mode_vip')],
+                        [Markup.button.callback('🔙 Back', 'menu')]
+                    ]),
+                    'HTML'
+                );
+            }
+            user.vipPhoneNumber = assignment.phoneNumber;
+        }
+
+        ctx.session = ctx.session || {};
+        ctx.session.otpMode = 'VIP';
+        ctx.session.useVipNumber = true;
+        await this._showLegacyServiceSelection(ctx, 'VIP', IMAGES.vipOther);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  OTP HUB — Central OTP services screen
     // ═══════════════════════════════════════════════════════════════════════
 
     async handleOTPHub(ctx) {
@@ -1341,12 +1553,10 @@ class OTPCommands {
         
         message += `\nChoose an option:`;
 
-        // Primary OTP actions
         const buttons = [
             [Markup.button.callback('🆓 FREE OTP', 'mode_free'), Markup.button.callback('💰 CHEAP OTP', 'mode_cheap')]
         ];
 
-        // VIP/BUNDLE or Buy options
         if (hasBundle || isVip) {
             buttons.push([
                 Markup.button.callback('📦 Bundle', 'mode_bundle'),
@@ -1359,55 +1569,82 @@ class OTPCommands {
             ]);
         }
 
-        // VIP number quick access
         if (isVip && user.vipPhoneNumber) {
             buttons.push([Markup.button.callback('📱 My VIP Number', 'view_my_number')]);
         }
 
-        // Feature buttons row 1
         buttons.push([
             Markup.button.callback('⚡ Quick Buy', 'quick_buy'),
             Markup.button.callback('📊 My Stats', 'stats')
         ]);
 
-        // Feature buttons row 2
         buttons.push([
             Markup.button.callback('📜 History', 'history'),
             Markup.button.callback('👥 Referral', 'referral')
         ]);
 
-        // Feature buttons row 3
         buttons.push([
             Markup.button.callback('⚙️ Settings', 'settings'),
             Markup.button.callback('❓ FAQ', 'faq')
         ]);
 
-        // Bottom row
         buttons.push([
             Markup.button.callback('🔌 Status', 'provider_status'),
             Markup.button.callback('📞 Support', 'contact_support')
         ]);
 
-        // Back to YOUR existing menu
         buttons.push([Markup.button.callback('🔙 Back to Main Menu', 'menu')]);
 
         const keyboard = Markup.inlineKeyboard(buttons);
         await this.sendPhotoWithCaption(ctx, IMAGES.otpMenu, message, keyboard, 'HTML');
-                }
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  SERVICE & COUNTRY SELECTION
+    //  NEW: Service Selection with Search, Popular, Categories, Pagination
     // ═══════════════════════════════════════════════════════════════════════
-    
-        /**
-     * Show service selection (unchanged)
-     */
+
     async showServiceSelection(ctx, mode, imageUrl, displayPrice = null) {
+        if (!this.serviceCatalog || mode !== 'CHEAP') {
+            return this._showLegacyServiceSelection(ctx, mode, imageUrl, displayPrice);
+        }
+
+        const priceText = displayPrice ? `\n💰 Starting from ${formatCurrency(displayPrice)}` : '';
+        let message = `📱 <b>${mode} Mode</b>${priceText}\n\n`;
+        
+        const popular = this.serviceCatalog.getPopularServices();
+        message += `🔥 <b>Popular Services</b>\n`;
+        message += popular.slice(0, 10).map(s => `• ${s.name}`).join('\n');
+        message += `\n\n🔍 <i>Use search below or browse all services</i>`;
+
+        const buttons = [];
+
+        const popularRow = popular.slice(0, 5).map(s => 
+            Markup.button.callback('📱', `service_${s.name}`)
+        );
+        if (popularRow.length > 0) buttons.push(popularRow);
+
+        buttons.push([Markup.button.callback('🔍 Search Service...', 'service_search_prompt')]);
+
+        const categories = this.serviceCatalog.getCategories();
+        for (const cat of categories.slice(0, 3)) {
+            buttons.push([Markup.button.callback(`📂 ${cat.name} (${cat.count})`, `service_cat_${cat.name}`)]);
+        }
+
+        buttons.push([Markup.button.callback('📋 Browse All Services', 'service_page_1')]);
+        buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
+
+        await this.sendPhotoWithCaption(ctx, imageUrl, message, Markup.inlineKeyboard(buttons), 'HTML');
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  LEGACY: Old service selection (all services at once)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async _showLegacyServiceSelection(ctx, mode, imageUrl, displayPrice = null) {
         const priceText = displayPrice ? `\n💰 Starting from ${formatCurrency(displayPrice)}` : '';
         const message = `📱 <b>${mode} Mode</b>${priceText}\n\nChoose the service you need OTP for:`;
         const buttons = [];
         
-        // Group services in rows of 3
         for (let i = 0; i < SERVICES.length; i += 3) {
             const row = SERVICES.slice(i, i + 3).map(s => 
                 Markup.button.callback(s, `service_${s}`)
@@ -1419,34 +1656,368 @@ class OTPCommands {
         await this.sendPhotoWithCaption(ctx, imageUrl, message, Markup.inlineKeyboard(buttons), 'HTML');
     }
 
-    /**
-     * FIXED: Service selection now fetches dynamic countries from 5SIM for CHEAP mode
-     * For other modes, uses static COUNTRIES list
-     */
+    // ═══════════════════════════════════════════════════════════════════════
+    //  NEW: Tier Selection (Step 2 of CHEAP flow)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async showTierSelection(ctx, service) {
+        const tierInfos = this.tierSelector.getAllTierInfos();
+        
+        let message = 
+            `📱 <b>${service}</b>\n\n` +
+            `Choose Number Quality:\n\n`;
+
+        const buttons = [];
+
+        for (const tier of tierInfos) {
+            const emoji = tier.emoji;
+            const label = tier.label;
+            const badge = tier.badge;
+            
+            let priceText = '';
+            try {
+                const baseline = await this.tierSelector.selectOperator(
+                    tier.key, 'US', service, { timeoutMs: 5000 }
+                ).catch(() => null);
+                
+                if (baseline?.displayPrice) {
+                    priceText = ` — from ${formatCurrency(baseline.displayPrice)}`;
+                }
+            } catch (e) {
+                // Ignore price fetch errors
+            }
+
+            const badgeText = badge ? ` [${badge.toUpperCase()}]` : '';
+            
+            message += `${emoji} <b>${label}</b>${badgeText}\n`;
+            message += `   ${tier.description}${priceText}\n\n`;
+
+            buttons.push([Markup.button.callback(
+                `${emoji} ${label}${badgeText}${priceText}`,
+                `tier_${tier.key}`
+            )]);
+        }
+
+        buttons.push([Markup.button.callback('🔙 Back to Services', 'tier_back_service')]);
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.cheapMode, message, Markup.inlineKeyboard(buttons), 'HTML');
+    }
+
+    async handleTierSelect(ctx, tierKey) {
+        const service = ctx.session?.otpService;
+        
+        if (!service) {
+            return ctx.answerCbQuery('❌ Session expired. Start over.', { show_alert: true });
+        }
+
+        const tierInfo = this.tierSelector.getTierInfo(tierKey);
+        if (!tierInfo) {
+            return ctx.answerCbQuery('❌ Invalid tier selected');
+        }
+
+        ctx.session = ctx.session || {};
+        ctx.session.selectedTier = tierKey;
+
+        await ctx.answerCbQuery(`✅ ${tierInfo.label} selected`);
+
+        await this.showTierCountrySelection(ctx, service, tierKey, 1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  NEW: Country Selection with Tier-Aware Live Pricing (Step 3)
+    // ══════
+
+
+
+    async handleTierCountrySelect(ctx, countryCode) {
+        const userId = ctx.from.id.toString();
+        const service = ctx.session?.otpService;
+        const tierKey = ctx.session?.selectedTier;
+
+        if (!service || !tierKey) {
+            return ctx.answerCbQuery('❌ Session expired. Start over.', { show_alert: true });
+        }
+
+        await ctx.answerCbQuery('⏳ Purchasing number...');
+
+        let loadingMsg = null;
+        let selection = null;
+        
+        try {
+            loadingMsg = await ctx.reply('⏳ Finding best operator and purchasing number...');
+
+            selection = await this.tierSelector.selectOperator(tierKey, countryCode, service, {
+                timeoutMs: 15000
+            });
+
+            logger.info('Tier operator selected', {
+                userId,
+                tier: tierKey,
+                service,
+                country: countryCode,
+                operator: selection.operator,
+                price: selection.price,
+                displayPrice: selection.displayPrice,
+                stock: selection.stock,
+                score: selection.score
+            });
+
+            const user = ctx.state.user;
+            if (this._getAvailableBalance(user) < selection.displayPrice) {
+                try {
+                    if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
+                } catch (delErr) {}
+
+                const message = 
+                    `💰 <b>Insufficient Balance</b>\n\n` +
+                    `Required: ${formatCurrency(selection.displayPrice)}\n` +
+                    `Available: ${formatCurrency(this._getAvailableBalance(user))}\n\n` +
+                    `Price varies by operator quality. Please deposit more.`;
+                    
+                return this.sendPhotoWithCaption(
+                    ctx, IMAGES.cheapMode, message,
+                    Markup.inlineKeyboard([
+                        [Markup.button.callback('💳 Deposit', 'deposit')],
+                        [Markup.button.callback('🔙 Back', `tier_${tierKey}`)]
+                    ]), 'HTML'
+                );
+            }
+
+            const cheapProvider = this.smsProviderManager?.getProvider('CHEAP_PANEL');
+            if (!cheapProvider) {
+                throw new Error('CHEAP_PROVIDER_NOT_AVAILABLE');
+            }
+
+            const cheapResult = await cheapProvider.getNumber(countryCode, service, selection.operator);
+
+            try {
+                if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
+            } catch (delErr) {
+                logger.debug('Failed to delete loading message', { error: delErr.message });
+            }
+
+            const session = await sessionManager.createSessionWithNumber(
+                userId, 
+                'CHEAP', 
+                service, 
+                countryCode,
+                cheapResult.phoneNumber,
+                cheapResult.provider,
+                cheapResult.providerNumberId,
+                cheapResult.displayCost || selection.displayPrice
+            );
+
+            ctx.session.tierOperator = selection.operator;
+            ctx.session.tierKey = tierKey;
+            ctx.session.selectedCountry = countryCode;
+
+            const message = 
+                `📱 <b>OTP Request Started</b>\n\n` +
+                `🌍 Mode: CHEAP (${tierKey.toUpperCase()})\n` +
+                `📱 Number: <code>${session.number}</code>\n` +
+                `🎯 Service: ${service}\n` +
+                `🏢 Operator: <code>${selection.operator}</code>\n` +
+                `⏳ Status: Waiting for OTP...\n` +
+                `💰 Cost: ${formatCurrency(session.cost)}\n` +
+                `⭐ Quality Score: ${selection.score.toFixed(2)}\n` +
+                `⏱ Timeout: ${Math.floor((session.timeoutAt - new Date()) / 1000)}s\n\n` +
+                `⚠️ Funds locked. Will be deducted on delivery.\n` +
+                `Cancel anytime to get full refund.`;
+
+            const keyboard = KEYBOARDS.otpActions(session.sessionId);
+            const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
+
+            if (sentMessage?.message_id) {
+                await this._scheduleTimeoutNotification(
+                    userId, session.sessionId, sentMessage.message_id, session.timeoutAt
+                );
+            }
+
+        } catch (error) {
+            try {
+                if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
+            } catch (delErr) {}
+
+            logger.error('Tier country purchase failed', {
+                userId, tierKey, countryCode, service, error: error.message
+            });
+
+            if (error.message?.includes('NO_NUMBERS') || error.message?.includes('NOT_AVAILABLE')) {
+                try {
+                    const fallbackOps = await this.tierSelector.getFallbackOperators(
+                        tierKey, countryCode, service, selection?.operator
+                    );
+                    
+                    if (fallbackOps && fallbackOps.length > 0) {
+                        const message = 
+                            `⚠️ <b>Primary Operator Unavailable</b>\n\n` +
+                            `Operator <code>${selection?.operator}</code> ran out of stock.\n\n` +
+                            `Available alternatives in ${tierKey} tier:`;
+
+                        const buttons = fallbackOps.slice(0, 3).map(op => [
+                            Markup.button.callback(
+                                `🏢 ${op.operator} — ${formatCurrency(op.displayPrice || op.price)}`,
+                                `tier_fallback_${op.operator}`
+                            )
+                        ]);
+
+                        buttons.push([Markup.button.callback('🔙 Back to Countries', `tier_${tierKey}`)]);
+                        
+                        return this.sendPhotoWithCaption(ctx, IMAGES.otpFailed, message, Markup.inlineKeyboard(buttons), 'HTML');
+                    }
+                } catch (fallbackError) {
+                    // Ignore fallback errors
+                }
+            }
+
+            const errorMessages = {
+                NO_NUMBERS: '❌ No numbers available for this operator. Try another country or tier.',
+                NO_BALANCE: '💰 Provider balance insufficient. Contact support.',
+                NOT_AVAILABLE: '❌ Service not available in this country for selected tier.',
+                TIMEOUT: '⏱ Operator selection timed out. Please try again.',
+                INSUFFICIENT_BALANCE: '💰 Your balance is too low for this selection.'
+            };
+
+            const errorKey = Object.keys(errorMessages).find(key => error.message?.includes(key));
+            const displayMessage = errorMessages[errorKey] || `❌ Error: ${error.message}`;
+
+            await this.sendPhotoWithCaption(
+                ctx, IMAGES.otpFailed, 
+                displayMessage,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Retry', `tier_country_${countryCode}`)],
+                    [Markup.button.callback('🔙 Back to Countries', `tier_${tierKey}`)],
+                    [Markup.button.callback('📞 Support', 'contact_support')]
+                ]), 'HTML'
+            );
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  NEW: Pagination Handlers
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleTierServicePage(ctx, page) {
+        const service = ctx.session?.otpService;
+        const tierKey = ctx.session?.selectedTier;
+        
+        if (!tierKey) {
+            return this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
+        }
+
+        if (service) {
+            return this.showTierCountrySelection(ctx, service, tierKey, page);
+        }
+
+        await ctx.answerCbQuery(`Page ${page}`);
+    }
+
+    async handleTierCountryPage(ctx, page) {
+        const service = ctx.session?.otpService;
+        const tierKey = ctx.session?.selectedTier;
+
+        if (!service || !tierKey) {
+            return ctx.answerCbQuery('❌ Session expired', { show_alert: true });
+        }
+
+        await this.showTierCountrySelection(ctx, service, tierKey, page);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  NEW: Search Handlers
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleTierSearchService(ctx, query) {
+        if (!query || query.trim().length < 2) {
+            return ctx.reply('❌ Please enter at least 2 characters to search.');
+        }
+
+        const results = this.serviceCatalog.searchServices(query);
+        
+        if (results.length === 0) {
+            return ctx.reply(
+                `❌ No services found for "${query}"\n\nTry another search term.`,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('🔍 Search Again', 'service_search_prompt')],
+                    [Markup.button.callback('🔙 Back', 'menu')]
+                ])
+            );
+        }
+
+        let message = `🔍 <b>Search Results for "${query}"</b>\n\nFound ${results.length} services:\n\n`;
+        const buttons = [];
+
+        for (const r of results.slice(0, 10)) {
+            const popularMark = r.isPopular ? ' 🔥' : '';
+            message += `• ${r.name}${popularMark} — ${r.category}\n`;
+            buttons.push([Markup.button.callback(
+                `${r.name}${popularMark}`,
+                `service_${r.name}`
+            )]);
+        }
+
+        buttons.push([Markup.button.callback('🔍 New Search', 'service_search_prompt')]);
+        buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
+
+        await ctx.reply(message, {
+            parse_mode: 'HTML',
+            reply_markup: Markup.inlineKeyboard(buttons).reply_markup
+        });
+    }
+
+    async handleTierSearchCountry(ctx, query) {
+        const service = ctx.session?.otpService;
+        const tierKey = ctx.session?.selectedTier;
+
+        if (!service || !tierKey) {
+            return ctx.reply('❌ Session expired. Please start over with /otp');
+        }
+
+        const matches = this.countryCatalog.searchCountries(query);
+        
+        if (matches.length === 0) {
+            return ctx.reply(
+                `❌ No countries found for "${query}"\n\nTry country name or ISO code (e.g., US, UK).`,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('🔍 Search Again', 'country_search_prompt')],
+                    [Markup.button.callback('🔙 Back', `tier_${tierKey}`)]
+                ])
+            );
+        }
+
+        await this.showTierCountrySelection(ctx, service, tierKey, 1, query);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SERVICE & COUNTRY SELECTION
+    // ═══════════════════════════════════════════════════════════════════════
+
     async handleServiceSelect(ctx) {
         const service = ctx.match[1];
         
         const validServices = SERVICES.map(s => s.toLowerCase());
         if (!validServices.includes(service.toLowerCase())) {
-            logger.warn('Invalid service selected', { service, validServices });
-            return ctx.answerCbQuery('❌ Invalid service');
+            if (this.serviceCatalog && this.serviceCatalog.hasService(service)) {
+                // Valid via catalog, proceed
+            } else {
+                logger.warn('Invalid service selected', { service });
+                return ctx.answerCbQuery('❌ Invalid service');
+            }
         }
         
         ctx.session = ctx.session || {};
         ctx.session.otpService = service;
         
         const mode = ctx.session?.otpMode;
-        
-        // ═════════════════════════════════════════════════════════════════
-        //  CHEAP mode: Fetch available countries from 5SIM dynamically
-        // ═════════════════════════════════════════════════════════════════
+
+        if (mode === 'CHEAP' && this.tierSelector) {
+            return this.showTierSelection(ctx, service);
+        }
+
         if (mode === 'CHEAP') {
-            return this._showCheapCountrySelection(ctx, service);
+            return this._showCheapCountrySelectionLegacy(ctx, service);
         }
         
-        // ═════════════════════════════════════════════════════════════════
-        //  Other modes: Use static COUNTRIES list
-        // ═════════════════════════════════════════════════════════════════
         const message = `🌍 <b>Select Country</b>\n\nChoose number country for <b>${service}</b>:`;
         const buttons = COUNTRIES.map(c => [
             Markup.button.callback(
@@ -1460,10 +2031,9 @@ class OTPCommands {
     }
 
     /**
-     * NEW: Show country selection for CHEAP mode using 5SIM's available countries
-     * Fetches real-time stock from 5SIM API
+     * LEGACY: Show country selection for CHEAP mode using 5SIM's available countries
      */
-    async _showCheapCountrySelection(ctx, service) {
+    async _showCheapCountrySelectionLegacy(ctx, service) {
         const userId = ctx.from.id.toString();
         let loadingMsg = null;
         
@@ -1474,7 +2044,6 @@ class OTPCommands {
                 throw new Error('SMS_PROVIDER_NOT_AVAILABLE');
             }
 
-            // Fetch available countries from 5SIM for this service
             const countriesResult = await this.smsProviderManager.getCheapCountries(service);
             
             if (!countriesResult || countriesResult.length === 0) {
@@ -1493,9 +2062,8 @@ class OTPCommands {
                 );
             }
 
-            // Fetch prices for top countries to show accurate pricing
             const countriesWithPrices = [];
-            for (const country of countriesResult.slice(0, 20)) { // Limit to 20 to avoid rate limits
+            for (const country of countriesResult.slice(0, 20)) {
                 try {
                     const priceInfo = await this.smsProviderManager.getCheapPrice(country.code, service);
                     countriesWithPrices.push({
@@ -1505,7 +2073,6 @@ class OTPCommands {
                         stock: priceInfo.stock
                     });
                 } catch (priceErr) {
-                    // If price fetch fails, still show country with unknown price
                     countriesWithPrices.push({
                         ...country,
                         simPrice: null,
@@ -1515,7 +2082,6 @@ class OTPCommands {
                 }
             }
 
-            // Sort by price (cheapest first)
             countriesWithPrices.sort((a, b) => (a.displayPrice || Infinity) - (b.displayPrice || Infinity));
 
             try {
@@ -1527,7 +2093,6 @@ class OTPCommands {
             const message = `🌍 <b>Select Country for ${service}</b>\n\nPrices include service fee. Cheapest shown first:`;
             const buttons = [];
             
-            // Group in rows of 2
             for (let i = 0; i < countriesWithPrices.length; i += 2) {
                 const row = countriesWithPrices.slice(i, i + 2).map(c => {
                     const priceText = c.displayPrice 
@@ -1557,7 +2122,6 @@ class OTPCommands {
 
             logger.error('Failed to fetch CHEAP countries', { userId, service, error: error.message });
             
-            // Fallback to static list with warning
             const message = `🌍 <b>Select Country</b>\n\n⚠️ Live prices unavailable. Showing default list for <b>${service}</b>:`;
             const buttons = COUNTRIES.map(c => [
                 Markup.button.callback(
@@ -1571,10 +2135,6 @@ class OTPCommands {
         }
     }
 
-    /**
-     * Helper: Get flag emoji from country code
-     */
-    
     _getFlag(code) {
         const flags = {
             'US': '🇺🇸', 'UK': '🇬🇧', 'CA': '🇨🇦', 'RU': '🇷🇺', 'CN': '🇨🇳',
@@ -1593,7 +2153,11 @@ class OTPCommands {
             'XK': '🇽🇰'
         };
         return flags[code] || '🌍';
-    }
+        }
+
+
+
+                    
     
     // ═══════════════════════════════════════════════════════════════════════
     //  COUNTRY SELECTED — ACQUIRE NUMBER (CORE LOGIC)
