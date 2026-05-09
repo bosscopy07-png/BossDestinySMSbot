@@ -1,4 +1,3 @@
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // AdCreditSystem.js — Server-side anti-abuse with correct enum values
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -9,8 +8,15 @@ import config from '../../config/env.js';
 
 class AdCreditSystem {
     constructor() {
-        this.PRIMARY_URL = config.adSystem?.primaryUrl || process.env.AD_PRIMARY_URL || 'https://omg10.com/4/10967769';
-        this.FALLBACK_URL = config.adSystem?.fallbackUrl || process.env.AD_FALLBACK_URL || 'https://www.profitablecpmratenetwork.com/zs5wg1ki?key=cb472c48fad6246f544094483b9f9bcc';
+        // FIXED: Validate URLs on init — reject known dead endpoints
+        this.PRIMARY_URL = this._validateAdUrl(
+            config.adSystem?.primaryUrl || process.env.AD_PRIMARY_URL,
+            null
+        );
+        this.FALLBACK_URL = this._validateAdUrl(
+            config.adSystem?.fallbackUrl || process.env.AD_FALLBACK_URL,
+            null
+        );
 
         this.COSTS = {
             NUMBER_REQUEST: config.adSystem?.creditsPerRequest || 2,
@@ -24,15 +30,42 @@ class AdCreditSystem {
 
         this.activeVerifications = new Map();
         this.userClaimHistory = new Map();
+        this._processedPostbacks = new Set(); // NEW: Idempotency guard
 
         this._startCleanupInterval();
 
         logger.info('AdCreditSystem initialized', {
-            primaryUrl: this.PRIMARY_URL.substring(0, 30) + '...',
+            primaryUrl: this.PRIMARY_URL ? this.PRIMARY_URL.substring(0, 30) + '...' : 'NOT_CONFIGURED',
+            fallbackUrl: this.FALLBACK_URL ? this.FALLBACK_URL.substring(0, 30) + '...' : 'NOT_CONFIGURED',
             minWatchTime: `${this.MIN_WATCH_TIME}ms`,
             claimCooldown: `${this.CLAIM_COOLDOWN}ms`,
             maxClaimsPerHour: this.MAX_CLAIMS_PER_HOUR
         });
+    }
+
+    /**
+     * Validates ad URL format and warns if using known dead endpoints
+     */
+    _validateAdUrl(url, defaultUrl) {
+        if (!url || typeof url !== 'string') {
+            logger.warn('Ad URL not configured');
+            return defaultUrl;
+        }
+
+        // Block known dead/problematic domains
+        const blockedDomains = ['omg10.com', 'profitablecpmratenetwork.com'];
+        try {
+            const urlObj = new URL(url);
+            if (blockedDomains.some(domain => urlObj.hostname.includes(domain))) {
+                logger.error(`Blocked dead ad domain: ${urlObj.hostname}`);
+                return defaultUrl;
+            }
+        } catch {
+            logger.warn('Invalid ad URL format', { url });
+            return defaultUrl;
+        }
+
+        return url;
     }
 
     async getCredits(userId) {
@@ -132,14 +165,39 @@ class AdCreditSystem {
     }
 
     async generateAdView(userId, networkType = 'primary') {
+        // FIXED: Check if URLs are configured
+        if (!this.PRIMARY_URL && !this.FALLBACK_URL) {
+            logger.error('No ad URLs configured');
+            return {
+                success: false,
+                error: 'AD_NETWORK_NOT_CONFIGURED',
+                message: 'Ad system is temporarily unavailable. Please try again later.'
+            };
+        }
+
         const verificationId = `ad_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
         const isPrimary = networkType === 'primary';
-        const baseUrl = isPrimary ? this.PRIMARY_URL : this.FALLBACK_URL;
+        
+        // FIXED: Fallback to available URL if primary is not configured
+        let baseUrl = isPrimary ? this.PRIMARY_URL : this.FALLBACK_URL;
+        if (!baseUrl) {
+            baseUrl = this.PRIMARY_URL || this.FALLBACK_URL;
+            logger.warn('Requested network not available, using fallback', { requested: networkType });
+        }
 
-        const separator = baseUrl.includes('?') ? '&' : '?';
-        const adUrl = `${baseUrl}${separator}subId=${verificationId}&userId=${userId}`;
+        // FIXED: Use URL constructor for safe parameter appending
+        let adUrl;
+        try {
+            const urlObj = new URL(baseUrl);
+            urlObj.searchParams.set('subId', verificationId);
+            urlObj.searchParams.set('userId', userId);
+            adUrl = urlObj.toString();
+        } catch {
+            // Fallback to string concatenation if URL parsing fails
+            const separator = baseUrl.includes('?') ? '&' : '?';
+            adUrl = `${baseUrl}${separator}subId=${verificationId}&userId=${userId}`;
+        }
 
-        // FIXED: Use enum-safe network values
         const networkEnum = isPrimary ? 'omg10' : 'profitablecpm';
 
         this.activeVerifications.set(verificationId, {
@@ -148,15 +206,16 @@ class AdCreditSystem {
             startTime: null,
             createdAt: Date.now(),
             status: 'PENDING',
-            urlType: networkEnum  // ← FIXED: 'omg10' or 'profitablecpm'
+            urlType: networkEnum
         });
 
         logger.info('Ad view generated', { userId, verificationId, network: networkEnum });
 
         return {
+            success: true,
             verificationId,
             adUrl,
-            network: networkEnum,  // ← FIXED: Enum-safe
+            network: networkEnum,
             type: 'redirect',
             estimatedTime: '30 sec',
             creditValue: 2,
@@ -271,7 +330,7 @@ class AdCreditSystem {
             await AdView.create({
                 viewId: verificationId,
                 userId,
-                network: urlType,  // ← 'omg10' or 'profitablecpm' — now enum-safe
+                network: urlType,
                 creditsEarned: credits,
                 status: 'COMPLETED',
                 completedAt: new Date(),
@@ -279,7 +338,7 @@ class AdCreditSystem {
                 metadata: {
                     ...metadata,
                     userAgent: metadata.userMetadata?.userAgent,
-                    source: 'time_based_claim'
+                    source: metadata.source || 'time_based_claim'
                 }
             });
 
@@ -349,7 +408,8 @@ class AdCreditSystem {
         return Math.max(0, oldestInWindow + 3600000 - Date.now());
     }
 
-    async handlePostback(query = {}) {
+    // FIXED: Corrected signature to accept (network, query) matching webhook call
+    async handlePostback(network, query = {}) {
         const { verify, subId, status } = query;
         const verificationId = verify || subId;
 
@@ -357,45 +417,79 @@ class AdCreditSystem {
             return { success: false, error: 'MISSING_VERIFICATION_ID' };
         }
 
+        // NEW: Idempotency check — prevent double-credit
+        if (this._processedPostbacks.has(verificationId)) {
+            logger.warn('Duplicate postback ignored', { verificationId, network });
+            return { success: false, error: 'ALREADY_PROCESSED' };
+        }
+
+        const verification = this.activeVerifications.get(verificationId);
+        if (!verification) {
+            return { success: false, error: 'VERIFICATION_NOT_FOUND' };
+        }
+
+        // NEW: Validate network matches verification
+        const expectedNetwork = verification.urlType;
+        const incomingNetwork = network === 'primary' ? 'omg10' : 
+                               network === 'fallback' ? 'profitablecpm' : network;
+        
+        if (incomingNetwork !== expectedNetwork) {
+            logger.warn('Network mismatch in postback', {
+                verificationId,
+                expected: expectedNetwork,
+                received: incomingNetwork
+            });
+            return { success: false, error: 'NETWORK_MISMATCH' };
+        }
+
         if (status === 'completed' || status === 'approved') {
-            const verification = this.activeVerifications.get(verificationId);
-            if (!verification) {
-                return { success: false, error: 'VERIFICATION_NOT_FOUND' };
-            }
             if (verification.status === 'COMPLETED') {
                 return { success: false, error: 'ALREADY_COMPLETED' };
             }
-            return this._awardCredits(verificationId, verification, { source: 'postback' });
+
+            this._processedPostbacks.add(verificationId);
+            return this._awardCredits(verificationId, verification, { 
+                source: 'postback',
+                network: incomingNetwork 
+            });
         }
 
         return { success: false, error: 'STATUS_NOT_COMPLETED' };
     }
 
     getAvailableNetworks() {
-        return [
-            {
+        const networks = [];
+        
+        if (this.PRIMARY_URL) {
+            networks.push({
                 id: 'primary',
                 name: 'Watch Ad',
                 creditValue: 2,
-                configured: !!this.PRIMARY_URL,
+                configured: true,
                 minWatchTime: Math.floor(this.MIN_WATCH_TIME / 1000)
-            },
-            {
+            });
+        }
+        
+        if (this.FALLBACK_URL) {
+            networks.push({
                 id: 'fallback',
                 name: 'Watch Ad (Alt)',
                 creditValue: 2,
-                configured: !!this.FALLBACK_URL,
+                configured: true,
                 minWatchTime: Math.floor(this.MIN_WATCH_TIME / 1000)
-            }
-        ].filter(n => n.configured);
+            });
+        }
+        
+        return networks;
     }
 
     _startCleanupInterval() {
         setInterval(() => {
             const verCleaned = this.cleanupOldVerifications();
             const claimCleaned = this._cleanupOldClaims();
-            if (verCleaned > 0 || claimCleaned > 0) {
-                logger.debug('Cleanup completed', { verCleaned, claimCleaned });
+            const postbackCleaned = this._cleanupOldPostbacks();
+            if (verCleaned > 0 || claimCleaned > 0 || postbackCleaned > 0) {
+                logger.debug('Cleanup completed', { verCleaned, claimCleaned, postbackCleaned });
             }
         }, 300000);
     }
@@ -429,6 +523,21 @@ class AdCreditSystem {
             cleaned += history.length - filtered.length;
         }
         return cleaned;
+    }
+
+    // NEW: Clean up old processed postback IDs to prevent memory leak
+    _cleanupOldPostbacks() {
+        const maxSize = 10000;
+        if (this._processedPostbacks.size > maxSize) {
+            const toDelete = this._processedPostbacks.size - maxSize;
+            const iter = this._processedPostbacks.values();
+            for (let i = 0; i < toDelete; i++) {
+                const val = iter.next().value;
+                this._processedPostbacks.delete(val);
+            }
+            return toDelete;
+        }
+        return 0;
     }
 
     getPendingVerifications() {
