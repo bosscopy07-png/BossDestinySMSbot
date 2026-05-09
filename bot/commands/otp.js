@@ -1,10 +1,6 @@
-
-
-    
-
-
 // ═══════════════════════════════════════════════════════════════════════════════
 //  OTPCommands.js — Part 1: Imports, Setup, User Helpers, VIP & Deposit
+//  INTEGRATED: Tier-based operator selection system for CHEAP mode
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { Markup } from 'telegraf';
@@ -14,9 +10,13 @@ import { formatCurrency, maskOTP } from '../../utils/helpers.js';
 import sessionManager from '../../services/otp/index.js';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  NEW TIER SYSTEM IMPORTS
+// ═══════════════════════════════════════════════════════════════════════════════
+import TierOperatorSelector from '../../services/TierOperatorSelector.js';
 import ServiceCatalog from '../../services/ServiceCatalog.js';
 import CountryCatalog from '../../services/CountryCatalog.js';
-import TierOperatorSelector from '../../services/TierOperatorSelector.js';
 import { TIER_CONFIG, POPULAR_SERVICES } from '../../config/tierConfig.js';
 
 // ─── Image Assets ─────────────────────────────────────────────────────────────
@@ -38,10 +38,7 @@ const IMAGES = {
     banned: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231497/file_0000000034547246812a74392b500be0_gelms4.png',
     history: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231497/file_0000000034547246812a74392b500be0_gelms4.png',
     referral: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231496/file_00000000970071f4a9405256d1d028af_hjzc8o.png',
-    stats: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231495/file_00000000800071f48dbbef2fbcc543fe_qgr5ch.png',
-    // NEW: Tier system images
-    serviceSelect: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231497/file_0000000034547246812a74392b500be0_gelms4.png',
-    tierSelect: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231495/file_00000000800071f48dbbef2fbcc543fe_qgr5ch.png'
+    stats: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231495/file_00000000800071f48dbbef2fbcc543fe_qgr5ch.png'
 };
 
 // ─── Inline Keyboards (Reusable) ──────────────────────────────────────────────
@@ -70,6 +67,7 @@ const KEYBOARDS = {
 //  OTPCommands Class
 // ═══════════════════════════════════════════════════════════════════════════════
 
+class OTPCommands {
     constructor(bot, walletService, smsProviderManager = null) {
         this.bot = bot;
         this.walletService = walletService;
@@ -90,15 +88,10 @@ const KEYBOARDS = {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  NEW: Tier System Initialization
-    // ═══════════════════════════════════════════════════════════════════════
-
+    // ─── NEW: Tier System Initialization ─────────────────────────────────
     _initTierSystem() {
-        // Initialize catalogs
         this.serviceCatalog = new ServiceCatalog();
         
-        // CountryCatalog needs the cheap provider and tier selector
         const cheapProvider = this.smsProviderManager?.getProvider('CHEAP_PANEL');
         if (cheapProvider) {
             this.tierSelector = new TierOperatorSelector(cheapProvider);
@@ -116,8 +109,7 @@ const KEYBOARDS = {
 
     // ─── Auto-bind all handler methods ─────────────────────────────────────
     _bindAllHandlers() {
-                const handlerNames = [
-            // ... existing handlers ...
+        const handlerNames = [
             'handleOTPCommand', 'handleMyNumberCommand', 'handleCancel',
             'handleFreeMode', 'handleCheapMode', 'handleVIPMode', 'handleBundleMode',
             'handleViewMyNumber', 'handleRequestOtpVip', 'handleBuyBundleOtp',
@@ -132,15 +124,10 @@ const KEYBOARDS = {
             'handleFaq', 'handleTerms', 'handleOTPHub',
             'handleWatchAd', 'handleCheckCredits', 'handleFreeServiceSelected',
             'handleFreeCountrySelected', 'handleCheckFree',
-            // ═════════════════════════════════════════════════════════════════
-            //  NEW: Tier system handlers
-            // ═════════════════════════════════════════════════════════════════
-            'handleTierSelect',           // Tier selection after service
-            'handleTierCountrySelect',    // Country selection with tier pricing
-            'handleTierSearchService',    // Service search
-            'handleTierSearchCountry',    // Country search
-            'handleTierServicePage',      // Service pagination
-            'handleTierCountryPage'       // Country pagination
+            // NEW: Tier system handlers
+            'handleTierSelect', 'handleTierCountrySelect',
+            'handleTierSearchService', 'handleTierSearchCountry',
+            'handleTierServicePage', 'handleTierCountryPage'
         ];
         
         for (const name of handlerNames) {
@@ -151,92 +138,26 @@ const KEYBOARDS = {
             }
         }
     }
-    
-    // ═══════════════════════════════════════════════════════════════════════
-    //  NEW: Utility Methods for Tier System
-    // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Check if tier system is available
-     */
-    _isTierSystemAvailable() {
-        return !!(this.tierSelector && this.countryCatalog && this.serviceCatalog);
-    }
-
-    /**
-     * Get cheap provider from manager
-     */
-    _getCheapProvider() {
-        return this.smsProviderManager?.getProvider('CHEAP_PANEL');
-    }
-
-    /**
-     * Format price display with currency
-     */
-    _formatPrice(price) {
-        if (price === null || price === undefined) return 'N/A';
-        return `$${parseFloat(price).toFixed(2)}`;
-    }
-
-    /**
-     * Create pagination buttons
-     */
-    _createPaginationButtons(currentPage, totalPages, actionPrefix, extraData = '') {
-        const buttons = [];
-        const row = [];
-
-        if (currentPage > 1) {
-            row.push(Markup.button.callback('⬅️ Prev', `${actionPrefix}_page_${currentPage - 1}${extraData}`));
-        }
-
-        row.push(Markup.button.callback(`📄 ${currentPage}/${totalPages}`, 'noop'));
-
-        if (currentPage < totalPages) {
-            row.push(Markup.button.callback('Next ➡️', `${actionPrefix}_page_${currentPage + 1}${extraData}`));
-        }
-
-        if (row.length > 0) buttons.push(row);
-        return buttons;
-    }
-    
     // ═══════════════════════════════════════════════════════════════════════
     //  USER HELPERS
     // ═══════════════════════════════════════════════════════════════════════
     
     _canUseFree(user) {
-    // DEFENSIVE: Missing user = deny
-    if (!user || typeof user !== 'object') {
-        return false;
+        if (!user || typeof user !== 'object') return false;
+        if (user.isAdmin === true) return true;
+        const limit = config.limits?.freeDaily || 3;
+        const used = Number.isFinite(user.freeUsedToday) ? user.freeUsedToday : 0;
+        return used < limit;
     }
 
-    // Admin bypass: unlimited free
-    if (user.isAdmin === true) {
-        return true;
+    _freeRemaining(user) {
+        if (!user || typeof user !== 'object') return 0;
+        if (user.isAdmin === true) return '∞';
+        const limit = config.limits?.freeDaily || 3;
+        const used = Number.isFinite(user.freeUsedToday) ? user.freeUsedToday : 0;
+        return Math.max(0, limit - used);
     }
-
-    const limit = config.limits?.freeDaily || 3;
-    const used = Number.isFinite(user.freeUsedToday) ? user.freeUsedToday : 0;
-
-    return used < limit;
-}
-
-_freeRemaining(user) {
-    // DEFENSIVE: Missing user = zero remaining
-    if (!user || typeof user !== 'object') {
-        return 0;
-    }
-
-    // Admin bypass: show unlimited
-    if (user.isAdmin === true) {
-        return '∞';
-    }
-
-    const limit = config.limits?.freeDaily || 3;
-    const used = Number.isFinite(user.freeUsedToday) ? user.freeUsedToday : 0;
-
-    return Math.max(0, limit - used);
-}
-    
     
     _canUseVip(user) {
         if (!this._isVipActive(user)) return false;
@@ -251,8 +172,6 @@ _freeRemaining(user) {
     _getAvailableBalance(user) {
         return (user.balance || 0) - (user.lockedBalance || 0);
     }
-
-    
 
     _vipRemaining(user) {
         const limit = config.limits?.vipDaily || 50;
@@ -372,6 +291,144 @@ _freeRemaining(user) {
 
     registerCommands() {
         // Slash commands
+        this.bot.command('otp', this.handleOTPCommand);
+        this.bot.command('mynumber', this.handleMyNumberCommand);
+        this.bot.command('cancel', this.handleCancel);
+        this.bot.command('history', this.handleHistory);
+        this.bot.command('referral', this.handleReferral);
+        this.bot.command('stats', this.handleStats);
+        this.bot.command('status', this.handleProviderStatus);
+        this.bot.command('settings', this.handleSettings);
+        this.bot.command('faq', this.handleFaq);
+        
+        // Mode selection actions
+        this.bot.action('mode_free', this.handleFreeMode);
+        this.bot.action('mode_cheap', this.handleCheapMode);
+        this.bot.action('mode_vip', this.handleVIPMode);
+        this.bot.action('mode_bundle', this.handleBundleMode);
+        
+        // My Number & VIP actions
+        this.bot.action('view_my_number', this.handleViewMyNumber);
+        this.bot.action('request_otp_vip', this.handleRequestOtpVip);
+        this.bot.action('buy_bundle_otp', this.handleBuyBundleOtp);
+        
+        // Bundle quantity actions
+        this.bot.action('bundle_qty_5', (ctx) => this.handleBundleQuantity(ctx, 5));
+        this.bot.action('bundle_qty_10', (ctx) => this.handleBundleQuantity(ctx, 10));
+        this.bot.action('bundle_qty_25', (ctx) => this.handleBundleQuantity(ctx, 25));
+        this.bot.action('bundle_qty_50', (ctx) => this.handleBundleQuantity(ctx, 50));
+        this.bot.action('bundle_qty_custom', this.handleBundleQuantityCustom);
+        this.bot.action('confirm_bundle_purchase', this.handleConfirmBundlePurchase);
+        
+        // Service & Country selection
+        this.bot.action(/service_(.+)/, this.handleServiceSelect);
+        this.bot.action(/country_(.+)/, this.handleCountrySelect);
+        
+        // Purchase confirmations
+        this.bot.action('buy_bundle', this.handleBuyBundle);
+        this.bot.action('confirm_free_mode', this.handleConfirmFreeMode);
+        this.bot.action('buy_vip', this.handleBuyVIP);
+        this.bot.action('confirm_bundle', this.handleConfirmBundle);
+        this.bot.action('confirm_vip', this.handleConfirmVIP);
+        
+        // OTP Hub
+        this.bot.action('otp_hub', this.handleOTPHub);
+        
+        // OTP actions
+        this.bot.action(/reveal_(.+)/, this.handleRevealOTP);
+        this.bot.action('check_deposit', this.handleCheckDeposit);
+        this.bot.action('cancel_otp', (ctx) => this.handleCancel(ctx));
+        this.bot.action('deposit', this.handleDepositInfo);
+        this.bot.action('menu', this.handleMenu);
+        this.bot.action('contact_support', this.handleContactSupport);
+        this.bot.action('cancel_vip_subscription', this.handleCancelVipSubscription);
+        this.bot.action('confirm_vip_cancel', this.handleConfirmVipCancel);
+        
+        // New feature actions
+        this.bot.action('history', this.handleHistory);
+        this.bot.action('referral', this.handleReferral);
+        this.bot.action('stats', this.handleStats);
+        this.bot.action('quick_buy', this.handleQuickBuy);
+        this.bot.action('provider_status', this.handleProviderStatus);
+        this.bot.action('settings', this.handleSettings);
+        this.bot.action('toggle_notifications', this.handleToggleNotifications);
+        this.bot.action('faq', this.handleFaq);
+        this.bot.action('terms', this.handleTerms);
+        
+        // OTP check with pattern
+        this.bot.action(/check_otp_(.+)/, this.handleCheckOTP);
+
+        // ═════════════════════════════════════════════════════════════════
+        //  AD CREDIT SYSTEM ACTIONS
+        // ═════════════════════════════════════════════════════════════════
+        this.bot.action(/watch_ad_(.+)/, async (ctx) => {
+            try {
+                await this.handleWatchAd(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('watch_ad action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error loading ad').catch(() => {});
+            }
+        });
+
+        this.bot.action('check_credits', async (ctx) => {
+            try {
+                await this.handleCheckCredits(ctx);
+            } catch (error) {
+                logger.error('check_credits action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error checking credits').catch(() => {});
+            }
+        });
+
+        this.bot.action(/free_service_(.+)/, async (ctx) => {
+            try {
+                await this.handleFreeServiceSelected(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('free_service action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error').catch(() => {});
+            }
+        });
+
+        this.bot.action(/free_country_(.+)/, async (ctx) => {
+            try {
+                await this.handleFreeCountrySelected(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('free_country action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error').catch(() => {});
+            }
+        });
+
+        this.bot.action(/cancel_free_(.+)/, async (ctx) => {
+            try {
+                await this.handleCancel(ctx);
+            } catch (error) {
+                logger.error('cancel_free action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Cancel failed').catch(() => {});
+            }
+        });
+
+        this.bot.action(/check_free_(.+)/, async (ctx) => {
+            try {
+                await this.handleCheckFree(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('check_free action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Check failed').catch(() => {});
+            }
+        });
+
+        // ═════════════════════════════════════════════════════════════════
+        //  NEW: TIER SYSTEM ACTION HANDLERS
+        // ═════════════════════════════════════════════════════════════════
+        this.bot.action(/tier_(budget|standard|premium)/, async (ctx) => {
+            try {
+                await this.handleTierSelect(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('tier_select action error', { error: error.message, userId: ctx.from?.id });
+      
+
+    
+
+
+     commands
         this.bot.command('otp', this.handleOTPCommand);
         this.bot.command('mynumber', this.handleMyNumberCommand);
         this.bot.command('cancel', this.handleCancel);
