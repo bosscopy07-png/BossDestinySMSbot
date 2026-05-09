@@ -2261,21 +2261,15 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
         return flags[code] || '🌍';
         }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  OTPCommands.js — Part 3: Core Purchase Logic, Polling, Check OTP, Cancel
+//  INTEGRATED: Tier-based operator selection for CHEAP mode
+// ═══════════════════════════════════════════════════════════════════════════════
 
-
-                    
-    
     // ═══════════════════════════════════════════════════════════════════════
     //  COUNTRY SELECTED — ACQUIRE NUMBER (CORE LOGIC)
     // ═══════════════════════════════════════════════════════════════════════
-    /**
-     * Handle country selection for OTP request
-     * FIXED:
-     * - Passes providerNumberId and displayCost to createSessionWithNumber
-     * - Dynamic price re-check for specific country/service
-     * - Proper error handling for message deletion
-     * - Correct cost display in confirmation message
-     */
+
     async handleCountrySelect(ctx) {
         const country = ctx.match[1];
         const userId = ctx.from.id.toString();
@@ -2283,7 +2277,6 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
         const service = ctx.session?.otpService;
         const useVipNumber = ctx.session?.useVipNumber;
 
-        // Validate session state
         if (!mode || !service) {
             return this.sendPhotoWithCaption(ctx, IMAGES.default, 
                 '❌ Session expired. Please start over with /otp',
@@ -2291,7 +2284,6 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
             );
         }
 
-        // Check for existing active session
         const existingSession = await this._getActiveSession(userId);
         if (existingSession && existingSession.status !== 'RECEIVED') {
             return this.sendPhotoWithCaption(
@@ -2323,7 +2315,6 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
                     await User.updateOne({ userId }, { $inc: { bundleRemaining: -1 } });
                 }
 
-                // Safe message deletion
                 try {
                     if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
                 } catch (delErr) {
@@ -2477,7 +2468,8 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
             }
 
             // ═════════════════════════════════════════════════════════════════
-            //  CHEAP tier — uses CheapPanelProvider (5SIM) ONLY (FIXED)
+            //  CHEAP tier — LEGACY PATH (when tier system NOT used)
+            //  New tier flow bypasses this via handleTierCountrySelect
             // ═════════════════════════════════════════════════════════════════
             if (mode === 'CHEAP') {
                 if (!this.smsProviderManager) {
@@ -2487,7 +2479,6 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
                     throw new Error('SMS_PROVIDER_NOT_AVAILABLE');
                 }
 
-                // FIXED: Get dynamic price for this specific country/service before purchase
                 let priceInfo = null;
                 let displayPrice = ctx.session?.cheapDisplayPrice || config.prices?.cheapOtp || 0.05;
                 
@@ -2505,7 +2496,6 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
                     });
                 }
 
-                // Re-check balance with actual price for this country
                 const user = ctx.state.user;
                 if (this._getAvailableBalance(user) < displayPrice) {
                     try {
@@ -2527,7 +2517,6 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
                     );
                 }
 
-                // Get number from 5SIM
                 const cheapResult = await this.smsProviderManager.getCheapNumber(country, service);
 
                 try {
@@ -2536,20 +2525,17 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
                     logger.debug('Failed to delete loading message', { error: delErr.message });
                 }
 
-                // FIXED: Pass all required params to createSessionWithNumber
-                // Arguments: (userId, mode, service, country, phoneNumber, provider, providerNumberId, cost)
                 const session = await sessionManager.createSessionWithNumber(
                     userId, 
                     mode, 
                     service, 
                     country,
-                    cheapResult.phoneNumber,      // 5th arg: phone number
-                    cheapResult.provider,        // 6th arg: provider name
-                    cheapResult.providerNumberId, // 7th arg: 5SIM activation ID (e.g. "1001025384")
-                    cheapResult.displayCost || cheapResult.cost // 8th arg: what user pays
+                    cheapResult.phoneNumber,
+                    cheapResult.provider,
+                    cheapResult.providerNumberId,
+                    cheapResult.displayCost || cheapResult.cost
                 );
 
-                // FIXED: Use session.cost (which is now correctly set from displayCost)
                 const message = 
                     `📱 <b>OTP Request Started</b>\n\n` +
                     `🌍 Mode: CHEAP\n` +
@@ -2623,21 +2609,18 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
                 return;
             }
 
-            // Unknown mode
             try {
                 if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
             } catch (delErr) {}
             throw new Error(`UNKNOWN_MODE: ${mode}`);
 
         } catch (error) {
-            // Safe cleanup of loading message on error
             try {
                 if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
             } catch (delErr) {}
 
             logger.error('OTP session creation failed', { userId, mode, service, country, error: error.message });
 
-            // Rollback on error
             if (mode === 'BUNDLE') {
                 await User.updateOne({ userId }, { $inc: { bundleRemaining: 1 } }).catch(() => {});
             } else if (mode === 'VIP' && useVipNumber) {
@@ -2670,8 +2653,6 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
                 TIMEOUT: '⏱ Request timed out. Please try again.'
             };
 
-            
-            
             const errorKey = Object.keys(errorMessages).find(key => error.message?.includes(key));
             const displayMessage = errorMessages[errorKey] || `❌ Error: ${error.message}`;
 
@@ -2682,76 +2663,16 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
             );
         }
     }
-    
-    // ═══════════════════════════════════════════════════════════════════════════════
-//  OTPCommands.js — Part 3: Polling, Check OTP, Cancel, Bundle & VIP Purchases
-// ═══════════════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  FREE POLLING — Unified free OTP polling
+    // ═══════════════════════════════════════════════════════════════════════
+
     async startFreePolling(ctx, userId, freeSessionId, dbSessionId) {
-        if (!this.smsProviderManager) return;
+        if (!this.smsProviderManager) {
+            logger.error('startFreePolling: smsP
 
-        let pollMessageId = null;
-
-        try {
-            const smsResult = await this.smsProviderManager.pollFreeSMS(
-                freeSessionId,
-                async (status) => {
-                    const message = this.formatPollStatus(status);
-                    
-                    try {
-                        if (pollMessageId) {
-                            await ctx.telegram.editMessageText(
-                                ctx.chat.id,
-                                pollMessageId,
-                                undefined,
-                                message,
-                                { parse_mode: 'Markdown' }
-                            );
-                            return;
-                        }
-                        
-                        const sent = await ctx.reply(message, { parse_mode: 'Markdown' });
-                        if (sent?.message_id) pollMessageId = sent.message_id;
-                    } catch (err) {
-                        // Edit failed or message too old — silently ignore
-                    }
-                }
-            );
-
-            // Delete the poll message before sending final result
-            if (pollMessageId) {
-                try {
-                    await ctx.telegram.deleteMessage(ctx.chat.id, pollMessageId);
-                } catch (err) {
-                    // Message already gone or too old — ignore
-                }
-            }
-
-            if (smsResult.success) {
-                await Session.updateOne(
-                    { sessionId: dbSessionId },
-                    {
-                        $set: {
-                            status: 'RECEIVED',
-                            otpCode: smsResult.otp,
-                            endTime: new Date(),
-                            fullText: smsResult.fullText
-                        }
-                    }
-                );
-
-                await User.updateOne({ userId }, { $inc: { totalOtps: 1, freeUsedToday: 1 } });
-
-                const message = 
-                    `🔓 <b>OTP Received!</b>\n\n` +
-                    `📱 Number: <code>${smsResult.number}</code>\n` +
-                    `🎯 Service: ${smsResult.service || 'N/A'}\n` +
-                    `🔢 OTP: <code>${smsResult.otp}</code>\n` +
-                    `⏱ Delivery: ${smsResult.deliveryTime || '~'}ms\n\n` +
-                    `⚠️ Do not share this code with anyone.`;
-
-                await this.bot.telegram.sendMessage(userId, message, {
-                    parse_mode: 'HTML',
-                    reply_markup: Markup.inlineKeyboard([
+reply_markup: Markup.inlineKeyboard([
                         [Markup.button.callback('🔙 Back to Menu', 'menu')],
                         [Markup.button.callback('📱 Request Another', 'mode_free')]
                     ]).reply_markup
