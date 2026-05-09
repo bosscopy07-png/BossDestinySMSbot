@@ -1726,9 +1726,115 @@ async handleFreeCountrySelected(ctx, countryCode) {
     // ═══════════════════════════════════════════════════════════════════════
     //  NEW: Country Selection with Tier-Aware Live Pricing (Step 3)
     // ══════
+async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = null) {
+        const tierInfo = this.tierSelector.getTierInfo(tierKey);
+        
+        try {
+            await ctx.editMessageCaption(
+                `🌍 <b>Loading countries for ${tierInfo.emoji} ${tierInfo.label}...</b>`,
+                { parse_mode: 'HTML' }
+            );
+        } catch (e) {
+            // Message might be text, not photo
+        }
 
+        try {
+            const result = await this.countryCatalog.getCountriesForService(
+                service, 
+                tierKey, 
+                { page, perPage: 10, searchQuery, topOnly: !searchQuery && page === 1 }
+            );
 
+            if (!result.countries || result.countries.length === 0) {
+                const noStockMessage = 
+                    `⚠️ <b>No ${tierInfo.label} Numbers Available</b>\n\n` +
+                    `No ${tierInfo.label.toLowerCase()} numbers available for <b>${service}</b> currently.\n\n` +
+                    `Try:\n` +
+                    `• Another tier\n` +
+                    `• Another service\n` +
+                    `• Search for a specific country`;
 
+                const fallbackButtons = [];
+                
+                const otherTiers = this.tierSelector.getAllTierInfos().filter(t => t.key !== tierKey);
+                for (const t of otherTiers) {
+                    fallbackButtons.push([Markup.button.callback(
+                        `${t.emoji} Try ${t.label}`,
+                        `tier_${t.key}`
+                    )]);
+                }
+                
+                fallbackButtons.push([Markup.button.callback('🔙 Back to Tiers', 'tier_back_tier')]);
+                fallbackButtons.push([Markup.button.callback('🔙 Main Menu', 'menu')]);
+
+                return this.sendPhotoWithCaption(
+                    ctx, IMAGES.otpFailed, noStockMessage, 
+                    Markup.inlineKeyboard(fallbackButtons), 'HTML'
+                );
+            }
+
+            let message = 
+                `🌍 <b>Select Country for ${service}</b>\n` +
+                `${tierInfo.emoji} <b>${tierInfo.label} Tier</b>\n\n`;
+
+            if (searchQuery) {
+                message += `🔍 Search: "${searchQuery}"\n`;
+            }
+
+            message += `Showing ${result.countries.length} countries (sorted by price):\n\n`;
+
+            const buttons = [];
+
+            for (const country of result.countries) {
+                const flag = country.flag || this._getFlag(country.code);
+                const priceText = country.displayPrice 
+                    ? ` ${formatCurrency(country.displayPrice)}`
+                    : (country.price ? ` ~${formatCurrency(country.price)}` : '');
+                const stockText = country.stock > 0 ? ` (${country.stock} avail)` : ' (no stock)';
+                const unavailable = country.unavailable ? ' ❌' : '';
+
+                buttons.push([Markup.button.callback(
+                    `${flag} ${country.name}${priceText}${stockText}${unavailable}`,
+                    `tier_country_${country.code}`
+                )]);
+            }
+
+            const paginationButtons = [];
+            if (result.pagination.hasPrev) {
+                paginationButtons.push(Markup.button.callback('◀️ Prev', `country_page_${page - 1}`));
+            }
+            if (result.pagination.hasNext) {
+                paginationButtons.push(Markup.button.callback('Next ▶️', `country_page_${page + 1}`));
+            }
+            if (paginationButtons.length > 0) buttons.push(paginationButtons);
+
+            buttons.push([Markup.button.callback('🔍 Search Country...', 'country_search_prompt')]);
+            buttons.push([Markup.button.callback('🔙 Back to Tiers', 'tier_back_tier')]);
+            buttons.push([Markup.button.callback('🔙 Main Menu', 'menu')]);
+
+            await this.sendPhotoWithCaption(
+                ctx, IMAGES.countrySelect, message, 
+                Markup.inlineKeyboard(buttons), 'HTML'
+            );
+
+        } catch (error) {
+            logger.error('Tier country selection failed', { 
+                service, tierKey, page, error: error.message 
+            });
+            
+            return this.sendPhotoWithCaption(
+                ctx, IMAGES.otpFailed,
+                `❌ <b>Error Loading Countries</b>\n\n${error.message}\n\nPlease try again.`,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Retry', `tier_${tierKey}`)],
+                    [Markup.button.callback('🔙 Back', 'tier_back_tier')]
+                ]),
+                'HTML'
+            );
+        }
+    }
+
+    
     async handleTierCountrySelect(ctx, countryCode) {
         const userId = ctx.from.id.toString();
         const service = ctx.session?.otpService;
