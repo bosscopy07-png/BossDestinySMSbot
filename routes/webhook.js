@@ -25,7 +25,7 @@ function validateTwilioRequest(req) {
     
     if (!authToken) {
         logger.warn('Twilio auth token not configured — skipping signature validation');
-        return true; // Allow in dev, block in production
+        return process.env.NODE_ENV !== 'production';
     }
 
     const signature = req.headers['x-twilio-signature'];
@@ -43,13 +43,12 @@ function validateTwilioRequest(req) {
 }
 
 router.post('/twilio', 
-    express.urlencoded({ extended: false }),
+    express.urlencoded({ extended: false, verify: (req, res, buf) => { req.rawBody = buf; } }),
     async (req, res) => {
         // Always respond immediately — Twilio retries on timeout
         res.type('text/xml').send('<Response/>');
 
         try {
-            // Validate signature in production
             if (process.env.NODE_ENV === 'production' && !validateTwilioRequest(req)) {
                 logger.error('Invalid Twilio signature — possible spoofing attempt', {
                     ip: req.ip,
@@ -73,18 +72,13 @@ router.post('/twilio',
                 hasMedia: NumMedia > 0
             });
 
-            // Find active session for this number
             const session = await Session.findOneAndUpdate(
                 {
                     phoneNumber: normalizePhone(To),
                     status: { $in: ['WAITING', 'ACTIVE'] },
                     provider: { $in: ['TWILIO', 'NUMBER_POOL'] }
                 },
-                {
-                    $set: {
-                        lastActivityAt: new Date()
-                    }
-                },
+                { $set: { lastActivityAt: new Date() } },
                 { sort: { createdAt: -1 }, new: true }
             );
 
@@ -94,7 +88,6 @@ router.post('/twilio',
                     from: maskPhone(From) 
                 });
                 
-                // Store orphan SMS for manual review
                 await storeOrphanSMS({
                     provider: 'TWILIO',
                     from: From,
@@ -106,15 +99,10 @@ router.post('/twilio',
                 return;
             }
 
-            // Extract OTP with multiple strategies
             const otp = extractOTP(Body);
             
-            // Atomic update — prevent race conditions
             const updateResult = await Session.updateOne(
-                {
-                    _id: session._id,
-                    status: { $in: ['WAITING', 'ACTIVE'] } // Only if still active
-                },
+                { _id: session._id, status: { $in: ['WAITING', 'ACTIVE'] } },
                 {
                     $set: {
                         otp: otp || null,
@@ -143,7 +131,6 @@ router.post('/twilio',
                 otpPreview: otp ? otp.slice(0, 2) + '****' : null
             });
 
-            // Notify user via bot
             if (session.userId) {
                 await notifyUser(session.userId, {
                     type: otp ? 'OTP_RECEIVED' : 'SMS_RECEIVED_NO_OTP',
@@ -154,7 +141,6 @@ router.post('/twilio',
                 });
             }
 
-            // Release number if pool-managed
             if (session.provider === 'NUMBER_POOL' && session.poolNumberId) {
                 await releasePoolNumber(session.poolNumberId, session.sessionId);
             }
@@ -174,7 +160,8 @@ router.post('/twilio',
 // ═══════════════════════════════════════════════════════════════════════
 
 /**
- * Validates Telnyx webhook signature using public key
+ * Validates Telnyx webhook signature using Ed25519
+ * FIXED: Corrected from RSA-SHA256 to Ed25519 verification
  */
 function validateTelnyxRequest(req) {
     const publicKey = config.telnyx?.webhookPublicKey;
@@ -187,22 +174,31 @@ function validateTelnyxRequest(req) {
     try {
         const signature = req.headers['telnyx-signature-ed25519'];
         const timestamp = req.headers['telnyx-timestamp'];
-        const body = JSON.stringify(req.body);
+        
+        if (!signature || !timestamp) {
+            logger.warn('Missing Telnyx signature headers');
+            return false;
+        }
 
-        if (!signature || !timestamp) return false;
-
-        // Verify timestamp is within 5 minutes
         const now = Math.floor(Date.now() / 1000);
-        if (Math.abs(now - parseInt(timestamp)) > 300) {
+        if (Math.abs(now - parseInt(timestamp, 10)) > 300) {
             logger.warn('Telnyx webhook timestamp too old');
             return false;
         }
 
-        const payload = `${timestamp}|${body}`;
-        const verifier = crypto.createVerify('RSA-SHA256');
-        verifier.update(payload);
+        const payload = `${timestamp}|${req.rawBody}`;
         
-        return verifier.verify(publicKey, signature, 'base64');
+        // FIXED: Use crypto.verify for Ed25519 instead of createVerify(RSA-SHA256)
+        return crypto.verify(
+            null,
+            Buffer.from(payload),
+            {
+                key: Buffer.from(publicKey, 'base64'),
+                format: 'der',
+                type: 'spki'
+            },
+            Buffer.from(signature, 'base64')
+        );
     } catch (error) {
         logger.error('Telnyx signature validation error', { error: error.message });
         return false;
@@ -212,19 +208,15 @@ function validateTelnyxRequest(req) {
 router.post('/telnyx',
     express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }),
     async (req, res) => {
-        // Respond immediately
         res.status(200).send('OK');
 
         try {
-            // Validate in production
             if (process.env.NODE_ENV === 'production' && !validateTelnyxRequest(req)) {
                 logger.error('Invalid Telnyx signature', { ip: req.ip });
                 return;
             }
 
             const event = req.body?.data;
-            
-            // Handle different event types
             const eventType = event?.event_type;
             
             if (eventType !== 'message.received') {
@@ -248,7 +240,6 @@ router.post('/telnyx',
                 textLength: text.length
             });
 
-            // Find and update session (same logic as Twilio)
             const session = await Session.findOneAndUpdate(
                 {
                     phoneNumber: normalizePhone(to),
@@ -312,9 +303,6 @@ router.post('/telnyx',
 //  AD NETWORK POSTBACKS
 // ═══════════════════════════════════════════════════════════════════════
 
-/**
- * Rate limiter for postback endpoints
- */
 const postbackLimits = new Map();
 const POSTBACK_WINDOW_MS = 60000;
 const MAX_POSTBACKS_PER_WINDOW = 100;
@@ -336,22 +324,19 @@ function checkPostbackRateLimit(key) {
     return true;
 }
 
-// Generic ad network postback
+// FIXED: Corrected postback handler to match AdCreditSystem.handlePostback signature
 router.get('/ad/:network', async (req, res) => {
-    // Always 200 to stop ad network retries
     res.status(200).send('OK');
 
     const { network } = req.params;
     const clientIp = req.ip || req.connection.remoteAddress;
 
-    // Rate limit
     if (!checkPostbackRateLimit(`${network}:${clientIp}`)) {
         logger.warn('Ad postback rate limited', { network, ip: clientIp });
         return;
     }
 
     try {
-        // Validate required params
         const { subId, status, payout, verify } = req.query;
         
         if (!subId && !verify) {
@@ -369,7 +354,7 @@ router.get('/ad/:network', async (req, res) => {
             ip: clientIp
         });
 
-        // Get FreeProvider
+        // FIXED: Properly resolve adSystem with fallback checks
         const { SMSProviderManager } = await import('../services/sms/index.js');
         const providerManager = SMSProviderManager.getInstance?.() || global.smsProviderManager;
         
@@ -379,17 +364,19 @@ router.get('/ad/:network', async (req, res) => {
         }
 
         const freeProvider = providerManager.getProvider('FREE_PUBLIC');
-        if (!freeProvider || !freeProvider.adSystem) {
-            logger.warn('FreeProvider or adSystem not available');
+        const adSystem = freeProvider?.adSystem || freeProvider?.adCreditSystem;
+        
+        if (!adSystem || typeof adSystem.handlePostback !== 'function') {
+            logger.warn('AdCreditSystem not available on FreeProvider', {
+                hasFreeProvider: !!freeProvider,
+                hasAdSystem: !!(freeProvider?.adSystem || freeProvider?.adCreditSystem),
+                hasHandlePostback: typeof adSystem?.handlePostback === 'function'
+            });
             return;
         }
 
-        // Process postback
-        const result = await freeProvider.adSystem.handlePostback(
-            network,
-            req.body,
-            req.query
-        );
+        // FIXED: Pass (network, req.query) to match corrected handlePostback signature
+        const result = await adSystem.handlePostback(network, req.query);
 
         if (!result.success) {
             logger.warn('Ad postback processing failed', {
@@ -419,15 +406,9 @@ router.get('/ad/:network', async (req, res) => {
 //  HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════
 
-/**
- * Extract OTP from SMS text using multiple strategies
- */
 function extractOTP(text) {
     if (!text || typeof text !== 'string') return null;
 
-    const cleaned = text.replace(/[\s\-_\.]/g, '');
-
-    // Strategy 1: Explicit code/OTP keywords
     const keywordPatterns = [
         /(?:code|otp|pin|verification|verify|code:|otp:)\s*[:=\-]?\s*(\d{4,8})/i,
         /(?:your|the)\s+(?:code|otp|pin|verification\s+code)\s+(?:is|:\s*=)\s*(\d{4,8})/i,
@@ -443,15 +424,12 @@ function extractOTP(text) {
         }
     }
 
-    // Strategy 2: Standalone 4-8 digit codes
-    const standaloneMatches = cleaned.match(/\b\d{4,8}\b/g);
+    const standaloneMatches = text.replace(/[\s\-_\.]/g, '').match(/\b\d{4,8}\b/g);
     if (standaloneMatches?.length > 0) {
-        // Prefer longer codes (more likely to be OTP than random numbers)
         const sorted = standaloneMatches.sort((a, b) => b.length - a.length);
         return sorted[0];
     }
 
-    // Strategy 3: Numbers in context (WhatsApp, Telegram format)
     const contextMatches = text.match(/(?:code|login|verify|sign\s*in)[^\d]*(\d{4,8})/i);
     if (contextMatches?.[1]) {
         const code = contextMatches[1].replace(/\D/g, '');
@@ -461,18 +439,11 @@ function extractOTP(text) {
     return null;
 }
 
-/**
- * Normalize phone number for matching
- */
 function normalizePhone(phone) {
     if (!phone) return '';
-    // Remove all non-digits except leading +
     return phone.toString().replace(/[^\d+]/g, '').replace(/^\+?1?/, '');
 }
 
-/**
- * Mask phone for logging
- */
 function maskPhone(phone) {
     if (!phone) return '****';
     const str = phone.toString().replace(/\D/g, '');
@@ -480,14 +451,9 @@ function maskPhone(phone) {
     return '+' + str.slice(0, -4).replace(/./g, '*') + str.slice(-4);
 }
 
-/**
- * Store orphan SMS for manual review
- */
 async function storeOrphanSMS(data) {
     try {
         const { OrphanSMS } = await import('../models/index.js');
-        
-        // Extract OTP before storing
         const extractedOtp = extractOTP(data.body);
 
         await OrphanSMS.create({
@@ -517,20 +483,18 @@ async function storeOrphanSMS(data) {
     }
 }
 
-
-/**
- * Notify user via bot
- */
+// FIXED: Guard against null OTP in callback_data
 async function notifyUser(userId, data) {
     try {
-        // Get bot instance — adjust based on your architecture
         const bot = global.telegramBot || global.bot;
         if (!bot) {
             logger.warn('Bot instance not available for notification');
             return;
         }
 
-        const message = data.type === 'OTP_RECEIVED'
+        const hasOtp = !!data.otp && data.otp !== 'null' && data.otp !== 'undefined';
+
+        const message = hasOtp
             ? `🔐 <b>OTP Received!</b>\n\n` +
               `Service: <code>${data.service || 'Unknown'}</code>\n` +
               `Code: <code>${data.otp}</code>\n\n` +
@@ -540,13 +504,15 @@ async function notifyUser(userId, data) {
               `Status: No OTP detected in message\n` +
               `Check manually if needed.`;
 
+        const replyMarkup = hasOtp ? {
+            inline_keyboard: [[
+                { text: '📋 Copy OTP', callback_data: `copy_otp_${data.otp}` }
+            ]]
+        } : undefined;
+
         await bot.telegram.sendMessage(userId, message, {
             parse_mode: 'HTML',
-            reply_markup: {
-                inline_keyboard: [[
-                    { text: '📋 Copy OTP', callback_data: `copy_otp_${data.otp}` }
-                ]]
-            }
+            reply_markup: replyMarkup
         });
 
     } catch (error) {
@@ -554,9 +520,6 @@ async function notifyUser(userId, data) {
     }
 }
 
-/**
- * Release number back to pool
- */
 async function releasePoolNumber(poolNumberId, sessionId) {
     try {
         const { SMSProviderManager } = await import('../services/sms/index.js');
@@ -584,4 +547,4 @@ router.get('/health', (req, res) => {
 });
 
 export default router;
-    
+                        
