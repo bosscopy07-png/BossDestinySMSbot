@@ -1,3 +1,8 @@
+
+
+    
+
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  OTPCommands.js — Part 1: Imports, Setup, User Helpers, VIP & Deposit
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -9,6 +14,10 @@ import { formatCurrency, maskOTP } from '../../utils/helpers.js';
 import sessionManager from '../../services/otp/index.js';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
+import ServiceCatalog from '../../services/ServiceCatalog.js';
+import CountryCatalog from '../../services/CountryCatalog.js';
+import TierOperatorSelector from '../../services/TierOperatorSelector.js';
+import { TIER_CONFIG, POPULAR_SERVICES } from '../../config/tierConfig.js';
 
 // ─── Image Assets ─────────────────────────────────────────────────────────────
 const IMAGES = {
@@ -29,7 +38,10 @@ const IMAGES = {
     banned: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231497/file_0000000034547246812a74392b500be0_gelms4.png',
     history: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231497/file_0000000034547246812a74392b500be0_gelms4.png',
     referral: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231496/file_00000000970071f4a9405256d1d028af_hjzc8o.png',
-    stats: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231495/file_00000000800071f48dbbef2fbcc543fe_qgr5ch.png'
+    stats: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231495/file_00000000800071f48dbbef2fbcc543fe_qgr5ch.png',
+    // NEW: Tier system images
+    serviceSelect: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231497/file_0000000034547246812a74392b500be0_gelms4.png',
+    tierSelect: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231495/file_00000000800071f48dbbef2fbcc543fe_qgr5ch.png'
 };
 
 // ─── Inline Keyboards (Reusable) ──────────────────────────────────────────────
@@ -67,6 +79,8 @@ class OTPCommands {
         // Bind all handler methods to ensure `this` context
         this._bindAllHandlers();
         
+        this._initTierSystem();
+        
         this.registerCommands();
         
         if (this.walletService?.onDepositNotification) {
@@ -74,6 +88,32 @@ class OTPCommands {
         }
     }
 
+        // ═══════════════════════════════════════════════════════════════════════
+    //  NEW: Tier System Initialization
+    // ═══════════════════════════════════════════════════════════════════════
+    _initTierSystem() {
+        try {
+            // Initialize catalogs
+            this.serviceCatalog = new ServiceCatalog();
+            
+            // Initialize tier selector if cheap panel provider exists
+            const cheapProvider = this.smsProviderManager?.getProvider('CHEAP_PANEL');
+            if (cheapProvider) {
+                this.tierSelector = new TierOperatorSelector(cheapProvider);
+                this.countryCatalog = new CountryCatalog(cheapProvider, this.tierSelector);
+                logger.info('Tier system initialized with CHEAP_PANEL provider');
+            } else {
+                logger.warn('CHEAP_PANEL provider not available, tier system operating in degraded mode');
+                this.tierSelector = null;
+                this.countryCatalog = null;
+            }
+        } catch (error) {
+            logger.error('Tier system initialization failed', { error: error.message });
+            this.tierSelector = null;
+            this.countryCatalog = null;
+        }
+    }
+    
     // ─── Auto-bind all handler methods ─────────────────────────────────────
     _bindAllHandlers() {
         const handlerNames = [
@@ -92,7 +132,7 @@ class OTPCommands {
             // NEW: Ad system handlers
             'handleWatchAd', 'handleCheckCredits', 'handleFreeServiceSelected',
             'handleFreeCountrySelected', 'handleCheckFree'
-        ];
+               ];
         
         for (const name of handlerNames) {
             if (typeof this[name] === 'function') {
@@ -103,7 +143,53 @@ class OTPCommands {
         }
     }
     
+    // ═══════════════════════════════════════════════════════════════════════
+    //  NEW: Utility Methods for Tier System
+    // ═══════════════════════════════════════════════════════════════════════
 
+    /**
+     * Check if tier system is available
+     */
+    _isTierSystemAvailable() {
+        return !!(this.tierSelector && this.countryCatalog && this.serviceCatalog);
+    }
+
+    /**
+     * Get cheap provider from manager
+     */
+    _getCheapProvider() {
+        return this.smsProviderManager?.getProvider('CHEAP_PANEL');
+    }
+
+    /**
+     * Format price display with currency
+     */
+    _formatPrice(price) {
+        if (price === null || price === undefined) return 'N/A';
+        return `$${parseFloat(price).toFixed(2)}`;
+    }
+
+    /**
+     * Create pagination buttons
+     */
+    _createPaginationButtons(currentPage, totalPages, actionPrefix, extraData = '') {
+        const buttons = [];
+        const row = [];
+
+        if (currentPage > 1) {
+            row.push(Markup.button.callback('⬅️ Prev', `${actionPrefix}_page_${currentPage - 1}${extraData}`));
+        }
+
+        row.push(Markup.button.callback(`📄 ${currentPage}/${totalPages}`, 'noop'));
+
+        if (currentPage < totalPages) {
+            row.push(Markup.button.callback('Next ➡️', `${actionPrefix}_page_${currentPage + 1}${extraData}`));
+        }
+
+        if (row.length > 0) buttons.push(row);
+        return buttons;
+    }
+    
     // ═══════════════════════════════════════════════════════════════════════
     //  USER HELPERS
     // ═══════════════════════════════════════════════════════════════════════
@@ -448,7 +534,7 @@ _freeRemaining(user) {
         }
         return this.sendPhotoWithCaption(ctx, imageUrl, caption, keyboard, parseMode);
     }
-
+ 
     escapeTelegramText(text) {
         if (!text) return '';
         return text
