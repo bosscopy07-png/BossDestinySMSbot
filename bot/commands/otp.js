@@ -423,97 +423,10 @@ class OTPCommands {
                 await this.handleTierSelect(ctx, ctx.match[1]);
             } catch (error) {
                 logger.error('tier_select action error', { error: error.message, userId: ctx.from?.id });
-      
-
-    
-
-
-     commands
-        this.bot.command('otp', this.handleOTPCommand);
-        this.bot.command('mynumber', this.handleMyNumberCommand);
-        this.bot.command('cancel', this.handleCancel);
-        this.bot.command('history', this.handleHistory);
-        this.bot.command('referral', this.handleReferral);
-        this.bot.command('stats', this.handleStats);
-        this.bot.command('status', this.handleProviderStatus);
-        this.bot.command('settings', this.handleSettings);
-        this.bot.command('faq', this.handleFaq);
-        
-        // Mode selection actions
-        this.bot.action('mode_free', this.handleFreeMode);
-        this.bot.action('mode_cheap', this.handleCheapMode);
-        this.bot.action('mode_vip', this.handleVIPMode);
-        this.bot.action('mode_bundle', this.handleBundleMode);
-        
-        // My Number & VIP actions
-        this.bot.action('view_my_number', this.handleViewMyNumber);
-        this.bot.action('request_otp_vip', this.handleRequestOtpVip);
-        this.bot.action('buy_bundle_otp', this.handleBuyBundleOtp);
-        
-        // Bundle quantity actions
-        this.bot.action('bundle_qty_5', (ctx) => this.handleBundleQuantity(ctx, 5));
-        this.bot.action('bundle_qty_10', (ctx) => this.handleBundleQuantity(ctx, 10));
-        this.bot.action('bundle_qty_25', (ctx) => this.handleBundleQuantity(ctx, 25));
-        this.bot.action('bundle_qty_50', (ctx) => this.handleBundleQuantity(ctx, 50));
-        this.bot.action('bundle_qty_custom', this.handleBundleQuantityCustom);
-        this.bot.action('confirm_bundle_purchase', this.handleConfirmBundlePurchase);
-        
-        // Service & Country selection
-        this.bot.action(/service_(.+)/, this.handleServiceSelect);
-        this.bot.action(/country_(.+)/, this.handleCountrySelect);
-        
-        // Purchase confirmations
-        this.bot.action('buy_bundle', this.handleBuyBundle);
-        this.bot.action('confirm_free_mode', this.handleConfirmFreeMode);
-        this.bot.action('buy_vip', this.handleBuyVIP);
-        this.bot.action('confirm_bundle', this.handleConfirmBundle);
-        this.bot.action('confirm_vip', this.handleConfirmVIP);
-        
-        // OTP Hub
-        this.bot.action('otp_hub', this.handleOTPHub);
-        
-        // OTP actions
-        this.bot.action(/reveal_(.+)/, this.handleRevealOTP);
-        this.bot.action('check_deposit', this.handleCheckDeposit);
-        this.bot.action('cancel_otp', (ctx) => this.handleCancel(ctx));
-        this.bot.action('deposit', this.handleDepositInfo);
-        this.bot.action('menu', this.handleMenu);
-        this.bot.action('contact_support', this.handleContactSupport);
-        this.bot.action('cancel_vip_subscription', this.handleCancelVipSubscription);
-        this.bot.action('confirm_vip_cancel', this.handleConfirmVipCancel);
-        
-        // New feature actions
-        this.bot.action('history', this.handleHistory);
-        this.bot.action('referral', this.handleReferral);
-        this.bot.action('stats', this.handleStats);
-        this.bot.action('quick_buy', this.handleQuickBuy);
-        this.bot.action('provider_status', this.handleProviderStatus);
-        this.bot.action('settings', this.handleSettings);
-        this.bot.action('toggle_notifications', this.handleToggleNotifications);
-        this.bot.action('faq', this.handleFaq);
-        this.bot.action('terms', this.handleTerms);
-        
-        // OTP check with pattern
-        this.bot.action(/check_otp_(.+)/, this.handleCheckOTP);
-
-        // ═════════════════════════════════════════════════════════════════
-        //  AD CREDIT SYSTEM ACTIONS (NEW)
-        // ═════════════════════════════════════════════════════════════════
-                // ═════════════════════════════════════════════════════════════════
-        //  NEW: Tier System Action Handlers
-        // ═════════════════════════════════════════════════════════════════
-
-        // Tier selection: tier_budget, tier_standard, tier_premium
-        this.bot.action(/tier_(budget|standard|premium)/, async (ctx) => {
-            try {
-                await this.handleTierSelect(ctx, ctx.match[1]);
-            } catch (error) {
-                logger.error('tier_select action error', { error: error.message, userId: ctx.from?.id });
                 ctx.answerCbQuery('❌ Error selecting tier').catch(() => {});
             }
         });
 
-        // Country selection with tier: tier_country_US, tier_country_UK, etc.
         this.bot.action(/tier_country_(.+)/, async (ctx) => {
             try {
                 await this.handleTierCountrySelect(ctx, ctx.match[1]);
@@ -523,8 +436,22 @@ class OTPCommands {
             }
         });
 
-        // Service search: user types in search field (handled via text listener, not action)
-        // Pagination: service_page_2, country_page_3
+        this.bot.action(/tier_fallback_(.+)/, async (ctx) => {
+            try {
+                const operator = ctx.match[1];
+                const country = ctx.session?.selectedCountry;
+                const service = ctx.session?.otpService;
+                const tierKey = ctx.session?.selectedTier;
+                if (!country || !service || !tierKey) {
+                    return ctx.answerCbQuery('❌ Session expired', { show_alert: true });
+                }
+                await this.handleTierCountrySelect(ctx, country);
+            } catch (error) {
+                logger.error('tier_fallback action error', { error: error.message });
+                ctx.answerCbQuery('❌ Error').catch(() => {});
+            }
+        });
+
         this.bot.action(/service_page_(\d+)/, async (ctx) => {
             try {
                 await this.handleTierServicePage(ctx, parseInt(ctx.match[1]));
@@ -543,7 +470,6 @@ class OTPCommands {
             }
         });
 
-        // Back navigation for tier flow
         this.bot.action('tier_back_service', async (ctx) => {
             try {
                 await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
@@ -564,68 +490,24 @@ class OTPCommands {
                 logger.error('tier_back_tier error', { error: error.message });
             }
         });
-                
-        // Watch ad button — user selects an ad network
-        this.bot.action(/watch_ad_(.+)/, async (ctx) => {
-            try {
-                await this.handleWatchAd(ctx, ctx.match[1]);
-            } catch (error) {
-                logger.error('watch_ad action error', { error: error.message, userId: ctx.from?.id });
-                ctx.answerCbQuery('❌ Error loading ad').catch(() => {});
-            }
+
+        // Search prompts
+        this.bot.action('service_search_prompt', async (ctx) => {
+            ctx.session.awaitingServiceSearch = true;
+            await ctx.reply('🔍 <b>Search for a service:</b>\n\nType the service name (e.g., "WhatsApp", "Telegram", "Netflix"):', {
+                parse_mode: 'HTML',
+                reply_markup: Markup.forceReply().reply_markup
+            });
         });
 
-        // Check credits button — user checks if ad completion awarded credits
-        this.bot.action('check_credits', async (ctx) => {
-            try {
-                await this.handleCheckCredits(ctx);
-            } catch (error) {
-                logger.error('check_credits action error', { error: error.message, userId: ctx.from?.id });
-                ctx.answerCbQuery('❌ Error checking credits').catch(() => {});
-            }
-        });
-
-        // Free service selection — user picks service after credits pass
-        this.bot.action(/free_service_(.+)/, async (ctx) => {
-            try {
-                await this.handleFreeServiceSelected(ctx, ctx.match[1]);
-            } catch (error) {
-                logger.error('free_service action error', { error: error.message, userId: ctx.from?.id });
-                ctx.answerCbQuery('❌ Error').catch(() => {});
-            }
-        });
-
-        // Free country selection — user picks country after service
-        this.bot.action(/free_country_(.+)/, async (ctx) => {
-            try {
-                await this.handleFreeCountrySelected(ctx, ctx.match[1]);
-            } catch (error) {
-                logger.error('free_country action error', { error: error.message, userId: ctx.from?.id });
-                ctx.answerCbQuery('❌ Error').catch(() => {});
-            }
-        });
-
-        // Free session cancel — route to unified handleCancel
-        this.bot.action(/cancel_free_(.+)/, async (ctx) => {
-            try {
-                await this.handleCancel(ctx);
-            } catch (error) {
-                logger.error('cancel_free action error', { error: error.message, userId: ctx.from?.id });
-                ctx.answerCbQuery('❌ Cancel failed').catch(() => {});
-            }
-        });
-
-        // Free check now — manual poll for SMS
-        this.bot.action(/check_free_(.+)/, async (ctx) => {
-            try {
-                await this.handleCheckFree(ctx, ctx.match[1]);
-            } catch (error) {
-                logger.error('check_free action error', { error: error.message, userId: ctx.from?.id });
-                ctx.answerCbQuery('❌ Check failed').catch(() => {});
-            }
+        this.bot.action('country_search_prompt', async (ctx) => {
+            ctx.session.awaitingCountrySearch = true;
+            await ctx.reply('🔍 <b>Search for a country:</b>\n\nType country name or ISO code (e.g., "USA", "United Kingdom", "Germany"):', {
+                parse_mode: 'HTML',
+                reply_markup: Markup.forceReply().reply_markup
+            });
         });
     }
-    
     
     // ═══════════════════════════════════════════════════════════════════════
     //  UTILITY METHODS
@@ -665,7 +547,7 @@ class OTPCommands {
         }
         return this.sendPhotoWithCaption(ctx, imageUrl, caption, keyboard, parseMode);
     }
- 
+
     escapeTelegramText(text) {
         if (!text) return '';
         return text
@@ -693,12 +575,9 @@ class OTPCommands {
         return `⚠️ ${this.escapeTelegramText(status.message || status.error || '...')}`;
     }
 
-        async sendPollUpdate(ctx, status) {
-        // Don't send new message every poll — update existing or skip if no change
+    async sendPollUpdate(ctx, status) {
         const message = this.formatPollStatus(status);
-        
         try {
-            // If we have a poll message ID stored, try to edit it
             if (ctx.session?.pollMessageId) {
                 try {
                     await ctx.telegram.editMessageText(
@@ -708,13 +587,11 @@ class OTPCommands {
                         message,
                         { parse_mode: 'Markdown' }
                     );
-                    return; // Successfully edited, don't send new
+                    return;
                 } catch (editError) {
-                    // Message too old or can't edit, fall through to send new
+                    // Message too old or can't edit, fall through
                 }
             }
-            
-            // Send new message and store ID for future edits
             const sent = await ctx.reply(message, { parse_mode: 'Markdown' });
             if (sent?.message_id) {
                 ctx.session = ctx.session || {};
@@ -723,7 +600,7 @@ class OTPCommands {
         } catch (error) {
             logger.debug('Poll update failed', { error: error.message });
         }
-        }
+    }
     
     maskPhone(phone) {
         if (!phone) return '****';
@@ -743,16 +620,13 @@ class OTPCommands {
         }).sort({ createdAt: -1 });
     }
 
-        
-                async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
+    async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
         try {
             const delayMs = new Date(timeoutAt) - new Date();
             if (delayMs <= 0) return;
 
-            // Store timer so handleCancel can clear it
             if (!this._timeoutTimers) this._timeoutTimers = new Map();
             
-            // Prevent duplicate timers
             if (this._timeoutTimers.has(sessionId)) {
                 clearTimeout(this._timeoutTimers.get(sessionId));
             }
@@ -763,16 +637,13 @@ class OTPCommands {
                 logger.info('Timeout fired, calling SessionManager.handleTimeout', { sessionId, userId });
 
                 try {
-                    // SessionManager handles EVERYTHING: 5SIM cancel, refund, cleanup
                     const result = await sessionManager.handleTimeout(sessionId);
 
-                    // If session was already handled, result is null
                     if (!result) {
                         logger.info('Timeout: session already handled by SessionManager', { sessionId });
                         return;
                     }
 
-                    // Notify user of timeout
                     const timeoutMessage =
                         `⏰ <b>OTP Request Timed Out</b>\n\n` +
                         `⏱ Your OTP request has expired.\n\n` +
@@ -797,26 +668,22 @@ class OTPCommands {
         } catch (error) {
             logger.error('Failed to schedule timeout', { userId, sessionId, error: error.message });
         }
-                }
+    }
+
     async handleCancel(ctx, isTimeout = false) {
         const userId = ctx.from.id.toString();
 
         try {
-            // ========== FIX: Find session regardless of status ==========
-            // Manual cancel might find WAITING/CHECKING
-            // Timeout might find TIMEOUT (already handled)
             const activeSession = await Session.findOne({ 
                 userId, 
                 status: { $in: ['WAITING', 'CHECKING'] } 
             });
             
-            // If no active session and this is timeout, just log and exit
             if (!activeSession && isTimeout) {
                 logger.info('Timeout: no active session to cancel', { userId });
                 return;
             }
 
-            // If no active session and manual cancel, check if it was already timed out
             if (!activeSession && !isTimeout) {
                 const timedOutSession = await Session.findOne({
                     userId,
@@ -824,7 +691,6 @@ class OTPCommands {
                 }).sort({ endTime: -1 });
 
                 if (timedOutSession) {
-                    // Session already timed out, tell user
                     return this.sendPhotoWithCaption(ctx, IMAGES.default,
                         '⏰ This session has already expired.\n\nYou can request a new OTP with /otp',
                         Markup.inlineKeyboard([
@@ -842,13 +708,11 @@ class OTPCommands {
 
             const sessionId = activeSession.sessionId;
 
-            // Clear controller's timeout timer
             if (this._timeoutTimers?.has(sessionId)) {
                 clearTimeout(this._timeoutTimers.get(sessionId));
                 this._timeoutTimers.delete(sessionId);
             }
 
-            // Clear SessionManager's poll timer
             if (sessionManager && sessionManager.pollTimers?.has(sessionId)) {
                 clearTimeout(sessionManager.pollTimers.get(sessionId));
                 sessionManager.pollTimers.delete(sessionId);
@@ -857,7 +721,6 @@ class OTPCommands {
                 sessionManager.activeSessions.delete(sessionId);
             }
 
-            // ========== Step 1: Cancel on 5SIM (CHEAP mode) ==========
             let providerCancelled = false;
             if (activeSession.mode === 'CHEAP' && activeSession.providerNumberId) {
                 try {
@@ -874,7 +737,6 @@ class OTPCommands {
                 }
             }
 
-            // ========== Step 2: Cancel on free provider ==========
             if (activeSession.mode === 'FREE' && activeSession.providerNumberId && this.smsProviderManager) {
                 try {
                     await this.smsProviderManager.cancelNumber('FREE_PUBLIC', activeSession.providerNumberId);
@@ -884,7 +746,6 @@ class OTPCommands {
                 }
             }
 
-            // ========== Step 3: Cancel session (refunds handled inside) ==========
             let cancelResult;
             try {
                 cancelResult = await sessionManager.cancelSession(sessionId, userId);
@@ -898,7 +759,6 @@ class OTPCommands {
                 cancelResult = { releasedAmount: 0 };
             }
 
-            // ========== Step 4: Notify user ==========
             const refundLine = cancelResult?.releasedAmount > 0
                 ? `💰 Refunded: ${formatCurrency(cancelResult.releasedAmount)}\n`
                 : (activeSession.mode === 'CHEAP' && providerCancelled)
@@ -907,12 +767,7 @@ class OTPCommands {
 
             let message, keyboard;
 
-            // ========== KEY FIX: Use isTimeout parameter correctly ==========
-            // isTimeout = true only when called from _scheduleTimeoutNotification
-            // isTimeout = false (default) when called from manual button tap
-
             if (isTimeout) {
-                // TIMEOUT MESSAGE
                 message =
                     `⏰ <b>OTP Request Timed Out</b>\n\n` +
                     `📱 Number: <code>${activeSession.number}</code>\n` +
@@ -926,7 +781,6 @@ class OTPCommands {
                     [Markup.button.callback('📞 Contact Support', 'contact_support')]
                 ]);
             } else {
-                // MANUAL CANCEL MESSAGE
                 message =
                     `✅ <b>Session Cancelled</b>\n\n` +
                     `📱 Number: <code>${activeSession.number}</code>\n` +
@@ -960,8 +814,8 @@ class OTPCommands {
             }
         }
     }
-    
-    
+}
+                             
     // ═══════════════════════════════════════════════════════════════════════════════
 //  OTPCommands.js — Part 2: Main Menu, My Number, Mode Handlers, Selection
 // ═══════════════════════════════════════════════════════════════════════════════
