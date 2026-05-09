@@ -2668,49 +2668,221 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
     //  FREE POLLING — Unified free OTP polling
     // ═══════════════════════════════════════════════════════════════════════
 
+    
+
     async startFreePolling(ctx, userId, freeSessionId, dbSessionId) {
         if (!this.smsProviderManager) {
-            logger.error('startFreePolling: smsP
+            logger.error('startFreePolling: smsProviderManager not available', { userId, dbSessionId });
+            return;
+        }
 
-reply_markup: Markup.inlineKeyboard([
-                        [Markup.button.callback('🔙 Back to Menu', 'menu')],
-                        [Markup.button.callback('📱 Request Another', 'mode_free')]
-                    ]).reply_markup
-                });
+        let pollMessageId = null;
+        const startTime = Date.now();
+        const maxDuration = 600000;
+        const pollInterval = 5000;
 
-                return;
-
-            } else if (smsResult.status === 'TIMEOUT') {
-                logger.info('Free tier timeout', { userId, sessionId: dbSessionId });
-
-                const message = 
-                    `⏰ <b>Free OTP Timed Out</b>\n\n` +
-                    `No SMS received within the time limit.\n\n` +
-                    `💡 Try again or use paid options for better reliability:`;
-
-                await this.bot.telegram.sendMessage(userId, message, {
-                    parse_mode: 'HTML',
-                    reply_markup: Markup.inlineKeyboard([
-                        [Markup.button.callback('🔄 Retry Free', 'mode_free')],
-                        [Markup.button.callback('💰 Try CHEAP', 'mode_cheap')],
-                        [Markup.button.callback('👑 Try VIP', 'buy_vip')],
-                        [Markup.button.callback('🔙 Menu', 'menu')]
-                    ]).reply_markup
-                });
+        const updatePollMessage = async (text) => {
+            try {
+                if (pollMessageId) {
+                    await ctx.telegram.editMessageText(
+                        ctx.chat.id,
+                        pollMessageId,
+                        undefined,
+                        text,
+                        { parse_mode: 'HTML' }
+                    );
+                    return;
+                }
+                
+                const sent = await ctx.reply(text, { parse_mode: 'HTML' });
+                if (sent?.message_id) pollMessageId = sent.message_id;
+            } catch (err) {
+                // Silently ignore
             }
+        };
 
-        } catch (error) {
-            logger.error('Free polling failed', { userId, error: error.message });
-            
-            // Cleanup poll message on error
+        const deletePollMessage = async () => {
             if (pollMessageId) {
                 try {
                     await ctx.telegram.deleteMessage(ctx.chat.id, pollMessageId);
-                } catch (err) {}
+                    pollMessageId = null;
+                } catch (err) {
+                    // Ignore
+                }
             }
-        }
+        };
+
+        const formatElapsed = (ms) => {
+            const secs = Math.floor(ms / 1000);
+            if (secs < 60) return `${secs}s`;
+            const mins = Math.floor(secs / 60);
+            const rem = secs % 60;
+            return `${mins}m ${rem}s`;
+        };
+
+        try {
+            await updatePollMessage(
+                `⏳ <b>Waiting for SMS...</b>\n\n` +
+                `Session: <code>${dbSessionId.slice(-8)}</code>\n` +
+                `Elapsed: 0s\n` +
+                `Timeout: 10m\n\n` +
+                `<i>Checking every 5 seconds...</i>`
+            );
+
+            while (Date.now() - startTime < maxDuration) {
+                await new Promise(resolve => setTimeout(resolve, pollInterval));
+
+                try {
+                    const result = await this.smsProviderManager.checkFreeSMS(freeSessionId);
+
+                    if (result.success && result.otp) {
+                        await deletePollMessage();
+
+                        await Session.updateOne(
+                            { sessionId: dbSessionId },
+                            {
+                                $set: {
+                                    status: 'RECEIVED',
+                                    otpCode: result.otp,
+                                    endTime: new Date(),
+                                    fullText: result.fullText || null
                                 }
-                
+                            }
+                        );
+
+                        await User.updateOne(
+                            { userId },
+                            { $inc: { totalOtps: 1, freeUsedToday: 1 } }
+                        );
+
+                        const message = 
+                            `🔓 <b>OTP Received!</b>\n\n` +
+                            `📱 Number: <code>${result.number || ctx.session?.number || 'N/A'}</code>\n` +
+                            `🎯 Service: ${result.service || ctx.session?.service || 'N/A'}\n` +
+                            `🔢 OTP: <code>${result.otp}</code>\n` +
+                            `⏱ Delivery: ${formatElapsed(Date.now() - startTime)}\n\n` +
+                            `⚠️ Do not share this code with anyone.`;
+
+                        await this.bot.telegram.sendMessage(userId, message, {
+                            parse_mode: 'HTML',
+                            reply_markup: Markup.inlineKeyboard([
+                                [Markup.button.callback('🔙 Back to Menu', 'menu')],
+                                [Markup.button.callback('📱 Request Another', 'mode_free')]
+                            ]).reply_markup
+                        });
+
+                        if (ctx.session) {
+                            delete ctx.session.freeSessionId;
+                            delete ctx.session.providerNumberId;
+                            delete ctx.session.number;
+                            delete ctx.session.service;
+                            delete ctx.session.selectedService;
+                            delete ctx.session.selectedCountry;
+                            delete ctx.session.freeCreditsDeducted;
+                        }
+
+                        return;
+                    }
+
+                    if (result.status === 'EXPIRED' || result.status === 'CANCELLED') {
+                        await deletePollMessage();
+
+                        await Session.updateOne(
+                            { sessionId: dbSessionId },
+                            { $set: { status: result.status, endTime: new Date() } }
+                        );
+
+                        const message = 
+                            `❌ <b>Session ${result.status}</b>\n\n` +
+                            `The number is no longer active.\n\n` +
+                            `You can request a new free OTP or try paid options:`;
+
+                        await this.bot.telegram.sendMessage(userId, message, {
+                            parse_mode: 'HTML',
+                            reply_markup: Markup.inlineKeyboard([
+                                [Markup.button.callback('🔄 Retry Free', 'mode_free')],
+                                [Markup.button.callback('💰 Try CHEAP', 'mode_cheap')],
+                                [Markup.button.callback('👑 Try VIP', 'buy_vip')],
+                                [Markup.button.callback('🔙 Menu', 'menu')]
+                            ]).reply_markup
+                        });
+
+                        if (ctx.session) {
+                            delete ctx.session.freeSessionId;
+                            delete ctx.session.providerNumberId;
+                            delete ctx.session.number;
+                            delete ctx.session.service;
+                            delete ctx.session.selectedService;
+                            delete ctx.session.selectedCountry;
+                            delete ctx.session.freeCreditsDeducted;
+                        }
+
+                        return;
+                    }
+
+                    const elapsed = Date.now() - startTime;
+                    const remaining = Math.max(0, maxDuration - elapsed);
+                    
+                    await updatePollMessage(
+                        `⏳ <b>Waiting for SMS...</b>\n\n` +
+                        `Session: <code>${dbSessionId.slice(-8)}</code>\n` +
+                        `Elapsed: ${formatElapsed(elapsed)}\n` +
+                        `Remaining: ${formatElapsed(remaining)}\n\n` +
+                        `<i>Checking every 5 seconds...</i>`
+                    );
+
+                } catch (pollError) {
+                    logger.error('Free poll iteration error', { 
+                        userId, 
+                        freeSessionId, 
+                        error: pollError.message 
+                    });
+                }
+            }
+
+            await deletePollMessage();
+
+            logger.info('Free tier timeout', { userId, sessionId: dbSessionId });
+
+            try {
+                await this.smsProviderManager.cancelNumber('FREE_PUBLIC', freeSessionId);
+            } catch (e) {}
+
+            await Session.updateOne(
+                { sessionId: dbSessionId },
+                { $set: { status: 'TIMEOUT', endTime: new Date() } }
+            );
+
+            const message = 
+                `⏰ <b>Free OTP Timed Out</b>\n\n` +
+                `No SMS received within 10 minutes.\n\n` +
+                `💡 Try again or use paid options for better reliability:`;
+
+            await this.bot.telegram.sendMessage(userId, message, {
+                parse_mode: 'HTML',
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Retry Free', 'mode_free')],
+                    [Markup.button.callback('💰 Try CHEAP', 'mode_cheap')],
+                    [Markup.button.callback('👑 Try VIP', 'buy_vip')],
+                    [Markup.button.callback('🔙 Menu', 'menu')]
+                ]).reply_markup
+            });
+
+            if (ctx.session) {
+                delete ctx.session.freeSessionId;
+                delete ctx.session.providerNumberId;
+                delete ctx.session.number;
+                delete ctx.session.service;
+                delete ctx.session.selectedService;
+                delete ctx.session.selectedCountry;
+                delete ctx.session.freeCreditsDeducted;
+            }
+
+        } catch (error) {
+            logger.error('Free polling failed', { userId, dbSessionId, error: error.message });
+            await deletePollMessage();
+        }
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  CHECK OTP
@@ -2721,13 +2893,11 @@ reply_markup: Markup.inlineKeyboard([
         const matchId = ctx.match[1];
         
         try {
-            // Handle VIP check pattern: vip_userId_timestamp
             let query = { 
                 userId, 
                 status: { $in: ['WAITING', 'CHECKING', 'RECEIVED'] } 
             };
             
-            // If matchId looks like a session ID, query by that
             if (!matchId.startsWith('vip_')) {
                 query = { sessionId: matchId, userId };
             }
@@ -2768,7 +2938,6 @@ reply_markup: Markup.inlineKeyboard([
                     { $set: { status: 'RECEIVED', otpCode: status.otpCode, endTime: new Date() } }
                 );
 
-                // Update user stats
                 await User.updateOne({ userId }, { $inc: { totalOtps: 1 } });
 
                 await ctx.answerCbQuery('✅ OTP received!');
@@ -2828,12 +2997,6 @@ reply_markup: Markup.inlineKeyboard([
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  CANCEL HANDLER
-    // ═══════════════════════════════════════════════════════════════════════
-
-    
-    
     // ═══════════════════════════════════════════════════════════════════════
     //  BUNDLE PURCHASES
     // ═══════════════════════════════════════════════════════════════════════
@@ -2967,7 +3130,6 @@ reply_markup: Markup.inlineKeyboard([
         }
         
         const expiryDate = new Date();
-        // If already VIP, extend from current expiry
         if (this._isVipActive(user) && user.vipExpiry) {
             expiryDate.setTime(new Date(user.vipExpiry).getTime());
         }
@@ -2988,45 +3150,10 @@ reply_markup: Markup.inlineKeyboard([
             );
 
             await Transaction.create({
-                txId: `VIP_${Date.now()}_${user.userId}`,
-                userId: user.userId,
-                type: 'VIP_SUBSCRIPTION',
-                amount: -vipPrice,
-                status: 'COMPLETED',
-                metadata: { expiryDate, source: 'VIP_MENU' },
-                createdAt: new Date()
-            });
+                txId: `VIP_${Date.now()}_${user.userI
 
-            const assignment = await this.assignVipNumber(user.userId, 'US');
+
             
-            let numberText = '';
-            if (assignment) {
-                numberText = `\n\n📱 <b>Your VIP Number:</b> <code>${assignment.phoneNumber}</code>\n🏢 Provider: ${assignment.provider}`;
-            } else {
-                numberText = '\n\n⚠️ Your VIP number is being assigned. Use /mynumber to check.';
-            }
-
-            const message = 
-                `👑 <b>VIP Activated!</b>\n\n` +
-                `⏰ Valid until: ${expiryDate.toLocaleDateString()}\n` +
-                `✅ 50 OTPs per day\n` +
-                `⚡ Priority delivery enabled${numberText}\n\n` +
-                `Enjoy premium service!`;
-                
-            await this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message, 
-                Markup.inlineKeyboard([
-                    [Markup.button.callback('📱 My Number', 'view_my_number')],
-                    [Markup.button.callback('🔙 Main Menu', 'menu')]
-                ]), 'HTML'
-            );
-        } catch (error) {
-            logger.error('VIP purchase failed', { userId: user.userId, error: error.message });
-            await this.sendPhotoWithCaption(ctx, IMAGES.otpFailed, 
-                '❌ VIP upgrade failed. Please try again.',
-                KEYBOARDS.supportOrRetry(), 'HTML'
-            );
-        }
-    }
 
     async handleCancelVipSubscription(ctx) {
         const user = ctx.state.user;
@@ -3089,246 +3216,7 @@ reply_markup: Markup.inlineKeyboard([
 
 
 
-                    // ═══════════════════════════════════════════════════════════════════════════════
-//  OTPCommands.js — Part 4: Bundle Qty, VIP Request, Support, Reveal, Deposit
-// ═══════════════════════════════════════════════════════════════════════════════
-    // ═══════════════════════════════════════════════════════════════════════
-    //  UNIFIED FREE POLLING — Handles all free OTP sessions
-    //  Merged: DB updates, user stats, timeout handling, message management
-    // ═══════════════════════════════════════════════════════════════════════
-
-    async startFreePolling(ctx, userId, freeSessionId, dbSessionId) {
-        if (!this.smsProviderManager) {
-            logger.error('startFreePolling: smsProviderManager not available', { userId, dbSessionId });
-            return;
-        }
-
-        let pollMessageId = null;
-        const startTime = Date.now();
-        const maxDuration = 600000; // 10 minutes
-        const pollInterval = 5000; // 5 seconds
-
-        // Helper: Send or update poll status message
-        const updatePollMessage = async (text) => {
-            try {
-                if (pollMessageId) {
-                    await ctx.telegram.editMessageText(
-                        ctx.chat.id,
-                        pollMessageId,
-                        undefined,
-                        text,
-                        { parse_mode: 'HTML' }
-                    );
-                    return;
-                }
-                
-                const sent = await ctx.reply(text, { parse_mode: 'HTML' });
-                if (sent?.message_id) pollMessageId = sent.message_id;
-            } catch (err) {
-                // Edit failed or message too old — silently ignore
-            }
-        };
-
-        // Helper: Delete poll message
-        const deletePollMessage = async () => {
-            if (pollMessageId) {
-                try {
-                    await ctx.telegram.deleteMessage(ctx.chat.id, pollMessageId);
-                    pollMessageId = null;
-                } catch (err) {
-                    // Message already gone or too old — ignore
-                }
-            }
-        };
-
-        // Helper: Format elapsed time
-        const formatElapsed = (ms) => {
-            const secs = Math.floor(ms / 1000);
-            if (secs < 60) return `${secs}s`;
-            const mins = Math.floor(secs / 60);
-            const rem = secs % 60;
-            return `${mins}m ${rem}s`;
-        };
-
-        try {
-            // Show initial polling message
-            await updatePollMessage(
-                `⏳ <b>Waiting for SMS...</b>\n\n` +
-                `Session: <code>${dbSessionId.slice(-8)}</code>\n` +
-                `Elapsed: 0s\n` +
-                `Timeout: 10m\n\n` +
-                `<i>Checking every 5 seconds...</i>`
-            );
-
-            // Polling loop
-            while (Date.now() - startTime < maxDuration) {
-                await new Promise(resolve => setTimeout(resolve, pollInterval));
-
-                try {
-                    const result = await this.smsProviderManager.checkFreeSMS(freeSessionId);
-
-                    // ─── OTP RECEIVED ──────────────────────────────────────
-                    if (result.success && result.otp) {
-                        await deletePollMessage();
-
-                        // Update database session
-                        await Session.updateOne(
-                            { sessionId: dbSessionId },
-                            {
-                                $set: {
-                                    status: 'RECEIVED',
-                                    otpCode: result.otp,
-                                    endTime: new Date(),
-                                    fullText: result.fullText || null
-                                }
-                            }
-                        );
-
-                        // Update user stats
-                        await User.updateOne(
-                            { userId },
-                            { $inc: { totalOtps: 1, freeUsedToday: 1 } }
-                        );
-
-                        // Send success message
-                        const message = 
-                            `🔓 <b>OTP Received!</b>\n\n` +
-                            `📱 Number: <code>${result.number || ctx.session?.number || 'N/A'}</code>\n` +
-                            `🎯 Service: ${result.service || ctx.session?.service || 'N/A'}\n` +
-                            `🔢 OTP: <code>${result.otp}</code>\n` +
-                            `⏱ Delivery: ${formatElapsed(Date.now() - startTime)}\n\n` +
-                            `⚠️ Do not share this code with anyone.`;
-
-                        await this.bot.telegram.sendMessage(userId, message, {
-                            parse_mode: 'HTML',
-                            reply_markup: Markup.inlineKeyboard([
-                                [Markup.button.callback('🔙 Back to Menu', 'menu')],
-                                [Markup.button.callback('📱 Request Another', 'mode_free')]
-                            ]).reply_markup
-                        });
-
-                        // Clean up session state
-                        if (ctx.session) {
-                            delete ctx.session.freeSessionId;
-                            delete ctx.session.providerNumberId;
-                            delete ctx.session.number;
-                            delete ctx.session.service;
-                            delete ctx.session.selectedService;
-                            delete ctx.session.selectedCountry;
-                            delete ctx.session.freeCreditsDeducted;
-                        }
-
-                        return;
-                    }
-
-                    // ─── SESSION EXPIRED / CANCELLED ───────────────────────
-                    if (result.status === 'EXPIRED' || result.status === 'CANCELLED') {
-                        await deletePollMessage();
-
-                        await Session.updateOne(
-                            { sessionId: dbSessionId },
-                            { $set: { status: result.status, endTime: new Date() } }
-                        );
-
-                        const message = 
-                            `❌ <b>Session ${result.status}</b>\n\n` +
-                            `The number is no longer active.\n\n` +
-                            `You can request a new free OTP or try paid options:`;
-
-                        await this.bot.telegram.sendMessage(userId, message, {
-                            parse_mode: 'HTML',
-                            reply_markup: Markup.inlineKeyboard([
-                                [Markup.button.callback('🔄 Retry Free', 'mode_free')],
-                                [Markup.button.callback('💰 Try CHEAP', 'mode_cheap')],
-                                [Markup.button.callback('👑 Try VIP', 'buy_vip')],
-                                [Markup.button.callback('🔙 Menu', 'menu')]
-                            ]).reply_markup
-                        });
-
-                        // Clean up session state
-                        if (ctx.session) {
-                            delete ctx.session.freeSessionId;
-                            delete ctx.session.providerNumberId;
-                            delete ctx.session.number;
-                            delete ctx.session.service;
-                            delete ctx.session.selectedService;
-                            delete ctx.session.selectedCountry;
-                            delete ctx.session.freeCreditsDeducted;
-                        }
-
-                        return;
-                    }
-
-                    // ─── STILL WAITING — Update poll message ─────────────────
-                    const elapsed = Date.now() - startTime;
-                    const remaining = Math.max(0, maxDuration - elapsed);
-                    
-                    await updatePollMessage(
-                        `⏳ <b>Waiting for SMS...</b>\n\n` +
-                        `Session: <code>${dbSessionId.slice(-8)}</code>\n` +
-                        `Elapsed: ${formatElapsed(elapsed)}\n` +
-                        `Remaining: ${formatElapsed(remaining)}\n\n` +
-                        `<i>Checking every 5 seconds...</i>`
-                    );
-
-                } catch (pollError) {
-                    logger.error('Free poll iteration error', { 
-                        userId, 
-                        freeSessionId, 
-                        error: pollError.message 
-                    });
-                    // Continue polling despite error
-                }
-            }
-
-            // ─── TIMEOUT ─────────────────────────────────────────────────
-            await deletePollMessage();
-
-            logger.info('Free tier timeout', { userId, sessionId: dbSessionId });
-
-            // Cancel on provider if possible
-            try {
-                await this.smsProviderManager.cancelNumber('FREE_PUBLIC', freeSessionId);
-            } catch (e) {}
-
-            // Update database
-            await Session.updateOne(
-                { sessionId: dbSessionId },
-                { $set: { status: 'TIMEOUT', endTime: new Date() } }
-            );
-
-            const message = 
-                `⏰ <b>Free OTP Timed Out</b>\n\n` +
-                `No SMS received within 10 minutes.\n\n` +
-                `💡 Try again or use paid options for better reliability:`;
-
-            await this.bot.telegram.sendMessage(userId, message, {
-                parse_mode: 'HTML',
-                reply_markup: Markup.inlineKeyboard([
-                    [Markup.button.callback('🔄 Retry Free', 'mode_free')],
-                    [Markup.button.callback('💰 Try CHEAP', 'mode_cheap')],
-                    [Markup.button.callback('👑 Try VIP', 'buy_vip')],
-                    [Markup.button.callback('🔙 Menu', 'menu')]
-                ]).reply_markup
-            });
-
-            // Clean up session state
-            if (ctx.session) {
-                delete ctx.session.freeSessionId;
-                delete ctx.session.providerNumberId;
-                delete ctx.session.number;
-                delete ctx.session.service;
-                delete ctx.session.selectedService;
-                delete ctx.session.selectedCountry;
-                delete ctx.session.freeCreditsDeducted;
-            }
-
-        } catch (error) {
-            logger.error('Free polling failed', { userId, dbSessionId, error: error.message });
-            await deletePollMessage();
-        }
-    }
-    
+ 
     // ═══════════════════════════════════════════════════════════════════════
     //  BUNDLE QUANTITY HANDLERS
     // ═══════════════════════════════════════════════════════════════════════
