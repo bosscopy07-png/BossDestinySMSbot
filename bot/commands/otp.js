@@ -3150,10 +3150,45 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
             );
 
             await Transaction.create({
-                txId: `VIP_${Date.now()}_${user.userI
+                txId: `VIP_${Date.now()}_${user.userId}`,
+                userId: user.userId,
+                type: 'VIP_SUBSCRIPTION',
+                amount: -vipPrice,
+                status: 'COMPLETED',
+                metadata: { expiryDate, source: 'VIP_MENU' },
+                createdAt: new Date()
+            });
 
-
+            const assignment = await this.assignVipNumber(user.userId, 'US');
             
+            let numberText = '';
+            if (assignment) {
+                numberText = `\n\n📱 <b>Your VIP Number:</b> <code>${assignment.phoneNumber}</code>\n🏢 Provider: ${assignment.provider}`;
+            } else {
+                numberText = '\n\n⚠️ Your VIP number is being assigned. Use /mynumber to check.';
+            }
+
+            const message = 
+                `👑 <b>VIP Activated!</b>\n\n` +
+                `⏰ Valid until: ${expiryDate.toLocaleDateString()}\n` +
+                `✅ 50 OTPs per day\n` +
+                `⚡ Priority delivery enabled${numberText}\n\n` +
+                `Enjoy premium service!`;
+                
+            await this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message, 
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 My Number', 'view_my_number')],
+                    [Markup.button.callback('🔙 Main Menu', 'menu')]
+                ]), 'HTML'
+            );
+        } catch (error) {
+            logger.error('VIP purchase failed', { userId: user.userId, error: error.message });
+            await this.sendPhotoWithCaption(ctx, IMAGES.otpFailed, 
+                '❌ VIP upgrade failed. Please try again.',
+                KEYBOARDS.supportOrRetry(), 'HTML'
+            );
+        }
+    }
 
     async handleCancelVipSubscription(ctx) {
         const user = ctx.state.user;
@@ -3177,7 +3212,7 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
         await this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message, keyboard, 'HTML');
     }
 
-        async handleConfirmVipCancel(ctx) {
+    async handleConfirmVipCancel(ctx) {
         const userId = ctx.from.id.toString();
         const user = ctx.state.user;
         
@@ -3211,12 +3246,7 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
             logger.error('VIP cancel failed', { userId, error: error.message });
             await ctx.answerCbQuery('❌ Failed to cancel VIP');
         }
-        }
-
-
-
-
- 
+    }
     // ═══════════════════════════════════════════════════════════════════════
     //  BUNDLE QUANTITY HANDLERS
     // ═══════════════════════════════════════════════════════════════════════
