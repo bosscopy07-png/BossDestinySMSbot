@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// AdCreditSystem.js — Server-side anti-abuse with direct ad URLs
+// AdCreditSystem.js — Server-side anti-abuse with correct enum values
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { User, AdView } from '../../models/index.js';
@@ -135,30 +135,27 @@ class AdCreditSystem {
         const isPrimary = networkType === 'primary';
         const baseUrl = isPrimary ? this.PRIMARY_URL : this.FALLBACK_URL;
 
-        if (!baseUrl) {
-            throw new Error(`No URL configured for network type: ${networkType}`);
-        }
+        const separator = baseUrl.includes('?') ? '&' : '?';
+        const adUrl = `${baseUrl}${separator}subId=${verificationId}&userId=${userId}`;
 
         // FIXED: Use enum-safe network values
         const networkEnum = isPrimary ? 'omg10' : 'profitablecpm';
 
-        // Store verification tracking internally — DON'T modify the ad URL
         this.activeVerifications.set(verificationId, {
             userId,
             credits: 2,
             startTime: null,
             createdAt: Date.now(),
             status: 'PENDING',
-            urlType: networkEnum
+            urlType: networkEnum  // ← FIXED: 'omg10' or 'profitablecpm'
         });
 
         logger.info('Ad view generated', { userId, verificationId, network: networkEnum });
 
-        // Return the CLEAN, unmodified ad URL
         return {
-            verificationId,        // For internal tracking only
-            adUrl: baseUrl,       // ← FIXED: Direct link, no query injection
-            network: networkEnum,
+            verificationId,
+            adUrl,
+            network: networkEnum,  // ← FIXED: Enum-safe
             type: 'redirect',
             estimatedTime: '30 sec',
             creditValue: 2,
@@ -273,7 +270,7 @@ class AdCreditSystem {
             await AdView.create({
                 viewId: verificationId,
                 userId,
-                network: urlType,
+                network: urlType,  // ← 'omg10' or 'profitablecpm' — now enum-safe
                 creditsEarned: credits,
                 status: 'COMPLETED',
                 completedAt: new Date(),
@@ -452,4 +449,3 @@ class AdCreditSystem {
 }
 
 export default AdCreditSystem;
-                    
