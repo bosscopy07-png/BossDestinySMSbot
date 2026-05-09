@@ -70,16 +70,18 @@ const KEYBOARDS = {
 //  OTPCommands Class
 // ═══════════════════════════════════════════════════════════════════════════════
 
-class OTPCommands {
     constructor(bot, walletService, smsProviderManager = null) {
         this.bot = bot;
         this.walletService = walletService;
         this.smsProviderManager = smsProviderManager;
         
+        // ═════════════════════════════════════════════════════════════════
+        //  NEW: Initialize tier system components
+        // ═════════════════════════════════════════════════════════════════
+        this._initTierSystem();
+        
         // Bind all handler methods to ensure `this` context
         this._bindAllHandlers();
-        
-        this._initTierSystem();
         
         this.registerCommands();
         
@@ -88,35 +90,34 @@ class OTPCommands {
         }
     }
 
-        // ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
     //  NEW: Tier System Initialization
     // ═══════════════════════════════════════════════════════════════════════
+
     _initTierSystem() {
-        try {
-            // Initialize catalogs
-            this.serviceCatalog = new ServiceCatalog();
-            
-            // Initialize tier selector if cheap panel provider exists
-            const cheapProvider = this.smsProviderManager?.getProvider('CHEAP_PANEL');
-            if (cheapProvider) {
-                this.tierSelector = new TierOperatorSelector(cheapProvider);
-                this.countryCatalog = new CountryCatalog(cheapProvider, this.tierSelector);
-                logger.info('Tier system initialized with CHEAP_PANEL provider');
-            } else {
-                logger.warn('CHEAP_PANEL provider not available, tier system operating in degraded mode');
-                this.tierSelector = null;
-                this.countryCatalog = null;
-            }
-        } catch (error) {
-            logger.error('Tier system initialization failed', { error: error.message });
+        // Initialize catalogs
+        this.serviceCatalog = new ServiceCatalog();
+        
+        // CountryCatalog needs the cheap provider and tier selector
+        const cheapProvider = this.smsProviderManager?.getProvider('CHEAP_PANEL');
+        if (cheapProvider) {
+            this.tierSelector = new TierOperatorSelector(cheapProvider);
+            this.countryCatalog = new CountryCatalog(cheapProvider, this.tierSelector);
+            logger.info('Tier system initialized', { 
+                hasProvider: true,
+                tiers: Object.keys(TIER_CONFIG)
+            });
+        } else {
+            logger.warn('Tier system initialized WITHOUT cheap provider — CHEAP mode will use legacy flow');
             this.tierSelector = null;
             this.countryCatalog = null;
         }
     }
-    
+
     // ─── Auto-bind all handler methods ─────────────────────────────────────
     _bindAllHandlers() {
-        const handlerNames = [
+                const handlerNames = [
+            // ... existing handlers ...
             'handleOTPCommand', 'handleMyNumberCommand', 'handleCancel',
             'handleFreeMode', 'handleCheapMode', 'handleVIPMode', 'handleBundleMode',
             'handleViewMyNumber', 'handleRequestOtpVip', 'handleBuyBundleOtp',
@@ -129,10 +130,18 @@ class OTPCommands {
             'handleHistory', 'handleReferral', 'handleStats', 'handleQuickBuy',
             'handleProviderStatus', 'handleSettings', 'handleToggleNotifications',
             'handleFaq', 'handleTerms', 'handleOTPHub',
-            // NEW: Ad system handlers
             'handleWatchAd', 'handleCheckCredits', 'handleFreeServiceSelected',
-            'handleFreeCountrySelected', 'handleCheckFree'
-               ];
+            'handleFreeCountrySelected', 'handleCheckFree',
+            // ═════════════════════════════════════════════════════════════════
+            //  NEW: Tier system handlers
+            // ═════════════════════════════════════════════════════════════════
+            'handleTierSelect',           // Tier selection after service
+            'handleTierCountrySelect',    // Country selection with tier pricing
+            'handleTierSearchService',    // Service search
+            'handleTierSearchCountry',    // Country search
+            'handleTierServicePage',      // Service pagination
+            'handleTierCountryPage'       // Country pagination
+        ];
         
         for (const name of handlerNames) {
             if (typeof this[name] === 'function') {
@@ -433,7 +442,72 @@ _freeRemaining(user) {
         // ═════════════════════════════════════════════════════════════════
         //  AD CREDIT SYSTEM ACTIONS (NEW)
         // ═════════════════════════════════════════════════════════════════
-        
+                // ═════════════════════════════════════════════════════════════════
+        //  NEW: Tier System Action Handlers
+        // ═════════════════════════════════════════════════════════════════
+
+        // Tier selection: tier_budget, tier_standard, tier_premium
+        this.bot.action(/tier_(budget|standard|premium)/, async (ctx) => {
+            try {
+                await this.handleTierSelect(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('tier_select action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error selecting tier').catch(() => {});
+            }
+        });
+
+        // Country selection with tier: tier_country_US, tier_country_UK, etc.
+        this.bot.action(/tier_country_(.+)/, async (ctx) => {
+            try {
+                await this.handleTierCountrySelect(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('tier_country action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error selecting country').catch(() => {});
+            }
+        });
+
+        // Service search: user types in search field (handled via text listener, not action)
+        // Pagination: service_page_2, country_page_3
+        this.bot.action(/service_page_(\d+)/, async (ctx) => {
+            try {
+                await this.handleTierServicePage(ctx, parseInt(ctx.match[1]));
+            } catch (error) {
+                logger.error('service_page action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error').catch(() => {});
+            }
+        });
+
+        this.bot.action(/country_page_(\d+)/, async (ctx) => {
+            try {
+                await this.handleTierCountryPage(ctx, parseInt(ctx.match[1]));
+            } catch (error) {
+                logger.error('country_page action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error').catch(() => {});
+            }
+        });
+
+        // Back navigation for tier flow
+        this.bot.action('tier_back_service', async (ctx) => {
+            try {
+                await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
+            } catch (error) {
+                logger.error('tier_back_service error', { error: error.message });
+            }
+        });
+
+        this.bot.action('tier_back_tier', async (ctx) => {
+            try {
+                const service = ctx.session?.otpService;
+                if (service) {
+                    await this.showTierSelection(ctx, service);
+                } else {
+                    await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
+                }
+            } catch (error) {
+                logger.error('tier_back_tier error', { error: error.message });
+            }
+        });
+                
         // Watch ad button — user selects an ad network
         this.bot.action(/watch_ad_(.+)/, async (ctx) => {
             try {
@@ -1470,63 +1544,105 @@ _freeRemaining(user) {
     
 
    
+        // ═══════════════════════════════════════════════════════════════════════
+    //  CHEAP MODE — NEW TIER-BASED FLOW
+    //  Steps: Service Selection → Tier Selection → Country Selection → Auto Purchase
+    // ═══════════════════════════════════════════════════════════════════════
+
     async handleCheapMode(ctx) {
-    const user = ctx.state.user;
-    
-    try {
-        // FIXED: Query actual 5SIM price for display
-        // Default to a sample country/service to show price range
-        let displayPrice = config.prices?.cheapOtp || 0.05;
-        let priceInfo = null;
-
-        if (this.smsProviderManager) {
-            try {
-                // Get price for US/Any as baseline (fastest query)
-                priceInfo = await this.smsProviderManager.getCheapPrice('US', 'Any');
-                if (priceInfo && priceInfo.displayPrice) {
-                    displayPrice = priceInfo.displayPrice;
-                }
-            } catch (priceError) {
-                logger.warn('Failed to get dynamic CHEAP price, using fallback', { 
-                    error: priceError.message 
-                });
-                displayPrice = config.prices?.cheapOtp || 0.05;
+        const user = ctx.state.user;
+        
+        try {
+            // Check if tier system is available
+            if (!this.tierSelector || !this.countryCatalog) {
+                logger.warn('Tier system not available, falling back to legacy CHEAP flow');
+                return this._handleCheapModeLegacy(ctx);
             }
-        }
 
-        // Check balance against dynamic price
-        if (this._getAvailableBalance(user) < displayPrice) {
-            const message = 
-                `💰 <b>Insufficient Balance</b>\n\n` +
-                `Required: ${formatCurrency(displayPrice)}\n` +
-                `Available: ${formatCurrency(this._getAvailableBalance(user))}\n\n` +
-                `Please deposit first.`;
+            // Check minimum balance to enter CHEAP mode (lowest tier threshold)
+            const minEntryPrice = TIER_CONFIG.budget.priceMultiplier * 0.05; // ~$0.05 minimum
+            if (this._getAvailableBalance(user) < minEntryPrice) {
+                const message = 
+                    `💰 <b>Insufficient Balance</b>\n\n` +
+                    `CHEAP mode requires at least ${formatCurrency(minEntryPrice)}.\n` +
+                    `Available: ${formatCurrency(this._getAvailableBalance(user))}\n\n` +
+                    `Please deposit first.`;
+                    
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('💳 Deposit', 'deposit')],
+                    [Markup.button.callback('🔙 Back', 'menu')]
+                ]);
                 
-            const keyboard = Markup.inlineKeyboard([
-                [Markup.button.callback('💳 Deposit', 'deposit')],
-                [Markup.button.callback('🔙 Back', 'menu')]
-            ]);
+                return this.sendPhotoWithCaption(ctx, IMAGES.cheapMode, message, keyboard, 'HTML');
+            }
+
+            // Store mode
+            ctx.session = ctx.session || {};
+            ctx.session.otpMode = 'CHEAP';
+
+            // Show new service selection with search + popular
+            await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
             
-            return this.sendPhotoWithCaption(ctx, IMAGES.cheapMode, message, keyboard, 'HTML');
+        } catch (error) {
+            logger.error('handleCheapMode failed', { userId: user.userId, error: error.message });
+            // Fallback to legacy
+            return this._handleCheapModeLegacy(ctx);
         }
-
-        // Store mode and price info in session
-        ctx.session = ctx.session || {};
-        ctx.session.otpMode = 'CHEAP';
-        ctx.session.cheapDisplayPrice = displayPrice;  // Store for later use
-
-        // Show service selection with dynamic price
-        await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode, displayPrice);
-        
-    } catch (error) {
-        logger.error('handleCheapMode failed', { userId: user.userId, error: error.message });
-        
-        // Fallback to old behavior
-        ctx.session = ctx.session || {};
-        ctx.session.otpMode = 'CHEAP';
-        await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  LEGACY CHEAP MODE (Fallback)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async _handleCheapModeLegacy(ctx) {
+        const user = ctx.state.user;
+        
+        try {
+            let displayPrice = config.prices?.cheapOtp || 0.05;
+
+            if (this.smsProviderManager) {
+                try {
+                    const priceInfo = await this.smsProviderManager.getCheapPrice('US', 'Any');
+                    if (priceInfo && priceInfo.displayPrice) {
+                        displayPrice = priceInfo.displayPrice;
+                    }
+                } catch (priceError) {
+                    logger.warn('Failed to get dynamic CHEAP price, using fallback', { 
+                        error: priceError.message 
+                    });
+                }
+            }
+
+            if (this._getAvailableBalance(user) < displayPrice) {
+                const message = 
+                    `💰 <b>Insufficient Balance</b>\n\n` +
+                    `Required: ${formatCurrency(displayPrice)}\n` +
+                    `Available: ${formatCurrency(this._getAvailableBalance(user))}\n\n` +
+                    `Please deposit first.`;
+                    
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('💳 Deposit', 'deposit')],
+                    [Markup.button.callback('🔙 Back', 'menu')]
+                ]);
+                
+                return this.sendPhotoWithCaption(ctx, IMAGES.cheapMode, message, keyboard, 'HTML');
+            }
+
+            ctx.session = ctx.session || {};
+            ctx.session.otpMode = 'CHEAP';
+            ctx.session.cheapDisplayPrice = displayPrice;
+
+            // Legacy: show ALL services at once
+            await this._showLegacyServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode, displayPrice);
+            
+        } catch (error) {
+            logger.error('Legacy cheap mode failed', { userId: user.userId, error: error.message });
+            ctx.session = ctx.session || {};
+            ctx.session.otpMode = 'CHEAP';
+            await this._showLegacyServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
+        }
     }
+
         // ═══════════════════════════════════════════════════════════════════════
     //  FREE SESSION CANCEL — Cancel active free OTP polling
     // ═══════════════════════════════════════════════════════════════════════
