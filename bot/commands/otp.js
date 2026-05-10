@@ -2,6 +2,11 @@
 //  OTPCommands.js — Part 1: Imports, Setup, User Helpers, VIP & Deposit
 //  INTEGRATED: Tier-based operator selection system for CHEAP mode
 // ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+//  OTPCommands.js — Constructor & Tier System Initialization (FIXED)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+
 import ServiceCatalog from '../../services/ServiceCatalog.js';
 import TierOperatorSelector from '../../services/TierOperatorSelector.js';
 import CountryCatalog from '../../services/CountryCatalog.js';
@@ -66,7 +71,8 @@ const KEYBOARDS = {
 // ═══════════════════════════════════════════════════════════════════════════════
 //  OTPCommands Class
 // ═══════════════════════════════════════════════════════════════════════════════
-class OTPCommands {
+
+    class OTPCommands {
     constructor(bot, walletService, smsProviderManager = null, tierIntegrationService = null) {
         this.bot = bot;
         this.walletService = walletService;
@@ -100,12 +106,13 @@ class OTPCommands {
         }
     }
 
-
     // ─── Legacy Tier System Initialization (fallback) ───────────────────────
     _initTierSystem() {
-        this.serviceCatalog = new ServiceCatalog();
-        
         const cheapProvider = this.smsProviderManager?.getProvider('CHEAP_PANEL');
+        
+        // FIXED: Pass cheapProvider to ServiceCatalog constructor
+        this.serviceCatalog = new ServiceCatalog(cheapProvider);
+        
         if (cheapProvider) {
             this.tierSelector = new TierOperatorSelector(cheapProvider);
             this.countryCatalog = new CountryCatalog(cheapProvider, this.tierSelector);
@@ -118,12 +125,13 @@ class OTPCommands {
             this.tierSelector = null;
             this.countryCatalog = null;
         }
-    }
+                }
+    
     
 
 
 
-    // ─── Auto-bind all handler methods ─────────────────────────────────────
+        // ─── Auto-bind all handler methods ─────────────────────────────────────
     _bindAllHandlers() {
         const handlerNames = [
             'handleOTPCommand', 'handleMyNumberCommand', 'handleCancel',
@@ -154,6 +162,7 @@ class OTPCommands {
             }
         }
     }
+    
 
     // ═══════════════════════════════════════════════════════════════════════
     //  USER HELPERS
