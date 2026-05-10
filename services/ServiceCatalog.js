@@ -1,112 +1,276 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-//  services/ServiceCatalog.js — Service Discovery, Search & Categorization
-//  Handles 1100+ services without loading all at once
+//  services/ServiceCatalog.js — Service Discovery with Dynamic 5SIM Catalog
+//  Handles 1100+ services from live API without loading all at once
+//  NO hardcoded SERVICES import. All data from CheapPanelProvider.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-import { POPULAR_SERVICES, SERVICE_CATEGORIES, PAGINATION } from '../config/tierConfig.js';
-import { SERVICES } from '../utils/constants.js';
+import { POPULAR_SERVICES, SERVICE_CATEGORIES, PAGINATION, CACHE_TTL } from '../config/tierConfig.js';
 import logger from '../utils/logger.js';
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  INTERNAL HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
 /**
- * ServiceCatalog — Manages service listing with search, categories, and pagination
- * 
- * Performance:
- *   - O(1) popular service lookup
- *   - O(n) search with early termination
- *   - Lazy loading via pagination
- *   - No full array loading into UI
+ * Reverse service map: 5SIM internal name -> display name
+ * Built dynamically from provider's serviceMap
  */
-class ServiceCatalog {
-    constructor() {
-        // Build search index
-        this._searchIndex = new Map();
-        this._serviceMap = new Map();
-        this._categoryMap = new Map(); // category -> Set of services
-        this._buildIndex();
+function buildReverseServiceMap(providerServiceMap) {
+    const reverse = new Map();
+    for (const [display, internal] of Object.entries(providerServiceMap)) {
+        // Handle duplicates: prefer shorter/cleaner display name
+        if (!reverse.has(internal) || display.length < reverse.get(internal).length) {
+            reverse.set(internal, display);
+        }
     }
+    return reverse;
+}
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  INDEX BUILDING
-    // ═══════════════════════════════════════════════════════════════════════
+/**
+ * Clean service display name from 5SIM raw key
+ */
+function cleanServiceName(rawName) {
+    return rawName
+        .replace(/[_-]/g, ' ')
+        .replace(/\b\w/g, c => c.toUpperCase())
+        .trim();
+}
 
-    _buildIndex() {
-        for (const service of SERVICES) {
-            const lowerName = service.toLowerCase();
-            this._serviceMap.set(lowerName, service);
-            
-            // Index by name parts
-            const words = lowerName.split(/[\s\-_]+/);
-            for (const word of words) {
-                if (word.length < 2) continue;
-                if (!this._searchIndex.has(word)) {
-                    this._searchIndex.set(word, new Set());
-                }
-                this._searchIndex.get(word).add(service);
-            }
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CLASS
+// ═══════════════════════════════════════════════════════════════════════════════
 
-            // Index by full name
-            if (!this._searchIndex.has(lowerName)) {
-                this._searchIndex.set(lowerName, new Set());
-            }
-            this._searchIndex.get(lowerName).add(service);
+class ServiceCatalog {
+    constructor(cheapPanelProvider) {
+        if (!cheapPanelProvider) {
+            throw new Error('ServiceCatalog requires cheapPanelProvider');
         }
 
-        // Build category reverse index
-        for (const [category, services] of Object.entries(SERVICE_CATEGORIES)) {
-            const validServices = services.filter(s => this._serviceMap.has(s.toLowerCase()));
-            this._categoryMap.set(category, new Set(validServices));
-        }
+        this.provider = cheapPanelProvider;
 
-        logger.info('Service catalog indexed', { 
-            totalServices: SERVICES.length,
-            indexEntries: this._searchIndex.size,
-            categories: this._categoryMap.size
+        // Dynamic indexes — populated from provider API
+        this._serviceMap = new Map();        // normalized name -> display name
+        this._searchIndex = new Map();       // word -> Set of display names
+        this._categoryMap = new Map();       // category -> Set of display names
+        this._allServices = new Set();       // All display names
+
+        // Reverse mapping: 5SIM internal -> display
+        this._reverseServiceMap = buildReverseServiceMap(cheapPanelProvider.serviceMap || {});
+
+        // Cache
+        this._servicesCache = null;
+        this._servicesCacheTime = 0;
+        this._cacheTtl = CACHE_TTL.tierPrices || 2 * 60 * 1000; // 2 minutes
+
+        // Build static category mapping (categories are config hints)
+        this._buildCategoryIndex();
+
+        logger.info('ServiceCatalog initialized', {
+            provider: cheapPanelProvider.name || 'unknown',
+            providerActive: cheapPanelProvider.isActive,
+            knownMappings: this._reverseServiceMap.size
         });
     }
 
+    _buildCategoryIndex() {
+        // SERVICE_CATEGORIES contains display names -> we validate against dynamic catalog later
+        for (const [category, services] of Object.entries(SERVICE_CATEGORIES)) {
+            this._categoryMap.set(category, new Set(services));
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
-    //  PUBLIC API — Popular Services
+    //  DYNAMIC CATALOG LOADING
     // ═══════════════════════════════════════════════════════════════════════
 
     /**
-     * Get popular services with their category info
+     * Load all services from 5SIM product catalog
+     * This is the SINGLE SOURCE OF TRUTH for service availability
      */
-    getPopularServices() {
-        return POPULAR_SERVICES
-            .filter(name => this._serviceMap.has(name.toLowerCase()))
-            .map(name => ({
-                name,
-                category: this._getServiceCategory(name),
-                isPopular: true
-            }));
+    async _loadServices() {
+        const now = Date.now();
+
+        // Return cached if fresh
+        if (this._servicesCache && (now - this._servicesCacheTime) < this._cacheTtl) {
+            logger.debug('Using cached service catalog', { count: this._allServices.size });
+            return;
+        }
+
+        try {
+            const products = await this.provider.getProducts();
+
+            if (!products || typeof products !== 'object') {
+                logger.error('Failed to load services: invalid products data');
+                return;
+            }
+
+            // Extract all unique services across all countries
+            const serviceSet = new Set();
+
+            for (const [countryCode, services] of Object.entries(products)) {
+                if (!services || typeof services !== 'object') continue;
+
+                for (const serviceKey of Object.keys(services)) {
+                    serviceSet.add(serviceKey);
+                }
+            }
+
+            // Build display names and indexes
+            this._serviceMap.clear();
+            this._searchIndex.clear();
+            this._allServices.clear();
+
+            for (const serviceKey of serviceSet) {
+                // Map to display name
+                const displayName = this._reverseServiceMap.get(serviceKey) || cleanServiceName(serviceKey);
+                const normalized = displayName.toLowerCase();
+
+                this._serviceMap.set(normalized, displayName);
+                this._allServices.add(displayName);
+
+                // Index by words
+                const words = normalized.split(/\s+/).filter(w => w.length >= 2);
+                for (const word of words) {
+                    if (!this._searchIndex.has(word)) {
+                        this._searchIndex.set(word, new Set());
+                    }
+                    this._searchIndex.get(word).add(displayName);
+                }
+
+                // Index full name
+                if (!this._searchIndex.has(normalized)) {
+                    this._searchIndex.set(normalized, new Set());
+                }
+                this._searchIndex.get(normalized).add(displayName);
+            }
+
+            // Update category mappings with validated services
+            for (const [category, services] of this._categoryMap) {
+                const valid = new Set();
+                for (const s of services) {
+                    if (this._serviceMap.has(s.toLowerCase())) {
+                        valid.add(this._serviceMap.get(s.toLowerCase()));
+                    }
+                }
+                this._categoryMap.set(category, valid);
+            }
+
+            this._servicesCache = true;
+            this._servicesCacheTime = now;
+
+            logger.info('Service catalog loaded from provider', {
+                totalServices: this._allServices.size,
+                indexEntries: this._searchIndex.size,
+                categories: this._categoryMap.size
+            });
+
+        } catch (error) {
+            logger.error('Failed to load services from provider', { error: error.message });
+            // If we have cached data, keep using it even if stale
+            if (!this._servicesCache) {
+                logger.warn('No cached services available, catalog is empty');
+            }
+        }
+    }
+
+    /**
+     * Ensure catalog is loaded before operations
+     */
+    async _ensureLoaded() {
+        if (!this._servicesCache) {
+            await this._loadServices();
+        }
+        }
+                // ═══════════════════════════════════════════════════════════════════════
+    //  PUBLIC API — Popular Services with Backfill
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Get popular services, backfilled to minCount (default 25) from dynamic catalog
+     */
+    async getPopularServices(minCount = 25) {
+        await this._ensureLoaded();
+
+        if (this._allServices.size === 0) {
+            return [];
+        }
+
+        // Start with configured popular services that exist in dynamic catalog
+        const result = [];
+        const added = new Set();
+
+        for (const name of POPULAR_SERVICES) {
+            const normalized = name.toLowerCase();
+            if (this._serviceMap.has(normalized)) {
+                const displayName = this._serviceMap.get(normalized);
+                if (!added.has(displayName)) {
+                    result.push({
+                        name: displayName,
+                        category: this._getServiceCategory(displayName),
+                        isPopular: true
+                    });
+                    added.add(displayName);
+                }
+            }
+        }
+
+        // Backfill: add more services from catalog until minCount reached
+        const needed = minCount - result.length;
+        if (needed > 0) {
+            // Get services not already added, sorted alphabetically for stability
+            const remaining = Array.from(this._allServices)
+                .filter(s => !added.has(s))
+                .sort();
+
+            for (const name of remaining.slice(0, needed)) {
+                result.push({
+                    name,
+                    category: this._getServiceCategory(name),
+                    isPopular: false
+                });
+                added.add(name);
+            }
+        }
+
+        logger.debug('Popular services with backfill', {
+            popularCount: result.filter(s => s.isPopular).length,
+            backfillCount: result.filter(s => !s.isPopular).length,
+            total: result.length
+        });
+
+        return result;
     }
 
     /**
      * Get services by category
      */
-    getServicesByCategory(categoryName) {
+    async getServicesByCategory(categoryName) {
+        await this._ensureLoaded();
+
         const services = this._categoryMap.get(categoryName) || new Set();
         return Array.from(services)
-            .filter(name => this._serviceMap.has(name.toLowerCase()))
+            .filter(name => this._allServices.has(name))
             .map(name => ({
                 name,
                 category: categoryName,
-                isPopular: POPULAR_SERVICES.includes(name)
+                isPopular: POPULAR_SERVICES.map(s => s.toLowerCase()).includes(name.toLowerCase())
             }));
     }
 
     /**
      * Get all categories with service counts
      */
-    getCategories() {
+    async getCategories() {
+        await this._ensureLoaded();
+
         return Array.from(this._categoryMap.entries())
             .map(([name, services]) => ({
                 name,
                 count: services.size,
-                services: Array.from(services).slice(0, 5) // Preview
+                services: Array.from(services).slice(0, 5)
             }))
             .filter(c => c.count > 0)
-            .sort((a, b) => b.count - a.count); // Most services first
+            .sort((a, b) => b.count - a.count);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -114,30 +278,33 @@ class ServiceCatalog {
     // ═══════════════════════════════════════════════════════════════════════
 
     /**
-     * Search services by query string
-     * @param {string} query - Search term
-     * @param {number} limit - Max results (default: 30)
-     * @returns {Array<{name: string, category: string, matchScore: number}>}
+     * Search services by query string against FULL dynamic catalog
      */
-    searchServices(query, limit = PAGINATION.searchResultsLimit) {
+    async searchServices(query, limit = PAGINATION.searchResultsLimit) {
+        await this._ensureLoaded();
+
         if (!query || query.trim().length < 1) {
+            return [];
+        }
+
+        if (this._allServices.size === 0) {
             return [];
         }
 
         const normalizedQuery = query.toLowerCase().trim();
         const queryWords = normalizedQuery.split(/\s+/).filter(w => w.length >= 2);
-        
-        const scores = new Map(); // service -> score
 
-        // Exact match gets highest score
+        const scores = new Map(); // displayName -> score
+
+        // Exact match = highest score
         if (this._serviceMap.has(normalizedQuery)) {
             scores.set(this._serviceMap.get(normalizedQuery), 100);
         }
 
-        // Prefix match (e.g., "whats" matches "WhatsApp")
-        for (const [key, service] of this._serviceMap) {
+        // Prefix match
+        for (const [key, displayName] of this._serviceMap) {
             if (key.startsWith(normalizedQuery)) {
-                scores.set(service, (scores.get(service) || 0) + 50);
+                scores.set(displayName, (scores.get(displayName) || 0) + 50);
             }
         }
 
@@ -154,25 +321,25 @@ class ServiceCatalog {
         }
 
         // Sort by score and return top results
-        const results = Array.from(scores.entries())
+        return Array.from(scores.entries())
             .map(([name, score]) => ({
                 name,
                 category: this._getServiceCategory(name),
                 matchScore: score,
-                isPopular: POPULAR_SERVICES.includes(name)
+                isPopular: POPULAR_SERVICES.map(s => s.toLowerCase()).includes(name.toLowerCase())
             }))
             .sort((a, b) => b.matchScore - a.matchScore)
             .slice(0, limit);
-
-        return results;
     }
 
     /**
-     * Get paginated service list
+     * Get paginated service list from FULL dynamic catalog
      */
-    getServicesPage(page = 1, perPage = PAGINATION.servicesPerPage, filter = null) {
-        let services = Array.from(this._serviceMap.values());
-        
+    async getServicesPage(page = 1, perPage = PAGINATION.servicesPerPage, filter = null) {
+        await this._ensureLoaded();
+
+        let services = Array.from(this._allServices).sort();
+
         if (filter) {
             const normalized = filter.toLowerCase();
             services = services.filter(s => s.toLowerCase().includes(normalized));
@@ -180,14 +347,14 @@ class ServiceCatalog {
 
         const total = services.length;
         const start = (page - 1) * perPage;
-        const end = start + perPage;
+        const end = Math.min(start + perPage, total);
         const pageServices = services.slice(start, end);
 
         return {
             services: pageServices.map(name => ({
                 name,
                 category: this._getServiceCategory(name),
-                isPopular: POPULAR_SERVICES.includes(name)
+                isPopular: POPULAR_SERVICES.map(s => s.toLowerCase()).includes(name.toLowerCase())
             })),
             pagination: {
                 page,
@@ -201,24 +368,26 @@ class ServiceCatalog {
     }
 
     /**
-     * Get services starting from a specific letter (A-Z browsing)
+     * Get services starting from a specific letter
      */
-    getServicesByLetter(letter, page = 1, perPage = PAGINATION.servicesPerPage) {
+    async getServicesByLetter(letter, page = 1, perPage = PAGINATION.servicesPerPage) {
+        await this._ensureLoaded();
+
         const normalizedLetter = letter.toUpperCase();
-        const services = Array.from(this._serviceMap.values())
+        const services = Array.from(this._allServices)
             .filter(s => s.toUpperCase().startsWith(normalizedLetter))
             .sort();
 
         const total = services.length;
         const start = (page - 1) * perPage;
-        const end = start + perPage;
+        const end = Math.min(start + perPage, total);
         const pageServices = services.slice(start, end);
 
         return {
             services: pageServices.map(name => ({
                 name,
                 category: this._getServiceCategory(name),
-                isPopular: POPULAR_SERVICES.includes(name)
+                isPopular: POPULAR_SERVICES.map(s => s.toLowerCase()).includes(name.toLowerCase())
             })),
             pagination: {
                 page,
@@ -229,26 +398,28 @@ class ServiceCatalog {
                 hasPrev: page > 1
             }
         };
-    }
-
-    /**
-     * Check if a service exists
+        }
+                            /**
+     * Check if a service exists in dynamic catalog
      */
-    hasService(serviceName) {
+    async hasService(serviceName) {
+        await this._ensureLoaded();
         return this._serviceMap.has(serviceName.toLowerCase());
     }
 
     /**
      * Get service display name (preserves original casing)
      */
-    getServiceName(serviceName) {
+    async getServiceName(serviceName) {
+        await this._ensureLoaded();
         return this._serviceMap.get(serviceName.toLowerCase()) || serviceName;
     }
 
     /**
      * Get service category
      */
-    getServiceCategory(serviceName) {
+    async getServiceCategory(serviceName) {
+        await this._ensureLoaded();
         return this._getServiceCategory(serviceName);
     }
 
@@ -259,12 +430,35 @@ class ServiceCatalog {
     _getServiceCategory(serviceName) {
         const lower = serviceName.toLowerCase();
         for (const [category, services] of this._categoryMap) {
-            if (services.has(serviceName)) {
-                return category;
+            for (const s of services) {
+                if (s.toLowerCase() === lower) return category;
             }
         }
         return 'Other';
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  CACHE MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════════════
+
+    clearCache() {
+        this._servicesCache = null;
+        this._servicesCacheTime = 0;
+        this._serviceMap.clear();
+        this._searchIndex.clear();
+        this._allServices.clear();
+        logger.info('ServiceCatalog cache cleared');
+    }
+
+    getCacheStats() {
+        return {
+            cached: !!this._servicesCache,
+            cacheAge: this._servicesCache ? Date.now() - this._servicesCacheTime : null,
+            totalServices: this._allServices.size,
+            indexEntries: this._searchIndex.size
+        };
+    }
 }
 
 export default ServiceCatalog;
+    
