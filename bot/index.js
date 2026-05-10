@@ -3,7 +3,6 @@
 // Part 1/3 — Imports, Constructor, Admin Utilities & Error Handling
 // ═══════════════════════════════════════════════════════════════════════════════
 
-
 import { Telegraf, session as telegrafSession } from 'telegraf';
 import { message } from 'telegraf/filters';
 import config from '../config/env.js';
@@ -20,6 +19,8 @@ import WalletService from '../services/wallet/index.js';
 import SMSProviderManager from '../services/sms/index.js';
 import FreeNumberController from '../services/sms/FreeNumberController.js';
 import StartVerification from './verification/StartVerification.js';
+import TierIntegrationService from '../services/TierIntegrationService.js';
+import TierFlowMiddleware from './middleware/tierFlowMiddleware.js';
 import { Worker } from 'worker_threads';
 import { cpus } from 'os';
 
@@ -44,6 +45,12 @@ class TelegramBot {
         this.smsProviderManager = null;
         this.referralService = new ReferralService(this.walletService);
         this.freeNumberController = null;
+
+        // ═════════════════════════════════════════════════════════════════
+        //  NEW: Tier System Integration
+        // ═════════════════════════════════════════════════════════════════
+        this.tierIntegrationService = null;
+        this.tierFlowMiddleware = null;
 
         this.metrics = {
             requestsHandled: 0,
@@ -316,7 +323,7 @@ class TelegramBot {
             }
                 // ═══════════════════════════════════════════════════════════════════════════════
 // bot/TelegramBot.js — Part 2/3
-// Middleware Stack, Command Setup & Free Tier Integration
+// Middleware Stack, Command Setup, Tier Integration & Free Tier Handlers
 // ═══════════════════════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -350,7 +357,20 @@ class TelegramBot {
                 captchaPassed: false,
                 captchaAnswer: null,
                 captchaAttempts: 0,
-                captchaBlockedUntil: null
+                captchaBlockedUntil: null,
+                // ═════════════════════════════════════════════════════════════════
+                //  NEW: Tier flow session state
+                // ═════════════════════════════════════════════════════════════════
+                otpMode: null,
+                otpService: null,
+                selectedTier: null,
+                selectedCountry: null,
+                tierOperator: null,
+                tierKey: null,
+                tierFlowStep: null,
+                searchType: null,
+                searchQuery: null,
+                cheapDisplayPrice: null
             })
         }));
 
@@ -547,9 +567,38 @@ class TelegramBot {
             });
         }
 
+        // ═════════════════════════════════════════════════════════════════
+        //  NEW: Initialize Tier Integration Service
+        // ═════════════════════════════════════════════════════════════════
+        try {
+            this.tierIntegrationService = new TierIntegrationService(this.smsProviderManager);
+            await this.tierIntegrationService.initialize();
+            logger.info('Tier Integration Service initialized', {
+                available: this.tierIntegrationService.isAvailable(),
+                metrics: this.tierIntegrationService.getMetrics()
+            });
+        } catch (error) {
+            logger.error('Failed to initialize Tier Integration Service', { error: error.message });
+            this.tierIntegrationService = null;
+            await this.alertAdmins(error, {
+                source: 'setup.setupCommands',
+                note: 'Tier Integration Service init failed — CHEAP mode will use legacy flow'
+            });
+        }
+
         // Initialize command modules
         const userCommands = new UserCommands(this.bot, this.walletService);
-        const otpCommands = new OTPCommands(this.bot, this.walletService, this.smsProviderManager);
+        
+        // ═════════════════════════════════════════════════════════════════
+        //  NEW: Pass tier integration to OTPCommands
+        // ═════════════════════════════════════════════════════════════════
+        const otpCommands = new OTPCommands(
+            this.bot, 
+            this.walletService, 
+            this.smsProviderManager,
+            this.tierIntegrationService
+        );
+        
         const adminCommands = new AdminCommands(this.bot, this.walletService, this.referralService, this.smsProviderManager);
         const advancedAdmin = new Admin(
             this.bot,
@@ -562,6 +611,17 @@ class TelegramBot {
         this.commandModules.set('otp', otpCommands);
         this.commandModules.set('admin', adminCommands);
         this.commandModules.set('advancedAdmin', advancedAdmin);
+
+        // ═════════════════════════════════════════════════════════════════
+        //  NEW: Register Tier Flow Middleware
+        // ═════════════════════════════════════════════════════════════════
+        if (this.tierIntegrationService && this.tierIntegrationService.isAvailable()) {
+            this.tierFlowMiddleware = new TierFlowMiddleware(this.tierIntegrationService, otpCommands);
+            this.tierFlowMiddleware.register(this.bot);
+            logger.info('Tier Flow Middleware registered');
+        } else {
+            logger.warn('Tier Flow Middleware NOT registered — tier system unavailable');
+        }
 
         // Initialize StartVerification
         this.startVerification = new StartVerification(
@@ -705,7 +765,7 @@ class TelegramBot {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  TEXT MESSAGE HANDLER — Admin inputs, broadcast, etc.
+    //  TEXT MESSAGE HANDLER — Admin inputs, broadcast, tier search, etc.
     // ═══════════════════════════════════════════════════════════════════════
 
     setupTextHandler() {
@@ -714,6 +774,18 @@ class TelegramBot {
                 if (!ctx.session) return next();
 
                 const isAdmin = this.isEffectiveAdmin(ctx);
+
+                // ═════════════════════════════════════════════════════════════════
+                //  NEW: Tier search input handler (non-admin users)
+                //  Must run BEFORE admin handlers to avoid conflicts
+                // ═════════════════════════════════════════════════════════════════
+                if (!isAdmin && ctx.session?.tierFlowStep?.startsWith('searching_')) {
+                    const otpCommands = this.commandModules.get('otp');
+                    if (otpCommands?.handleTierSearchInput) {
+                        const handled = await otpCommands.handleTierSearchInput(ctx);
+                        if (handled) return;
+                    }
+                }
 
                 if (isAdmin) {
                     const advancedAdmin = this.commandModules.get('advancedAdmin');
@@ -724,62 +796,18 @@ class TelegramBot {
 
                     if (ctx.session.awaitingBroadcast) {
                         const { target, filter, label } = ctx.session.awaitingBroadcast;
-                        delete ctx.session.awaitingBroadcast;
-                        return adminCommands.executeBroadcast(ctx, filter, label, ctx.message.text);
-                    }
+                        delete
 
-                    if (ctx.session.awaitingAddBalance) {
-                        const targetId = ctx.session.awaitingAddBalance;
-                        delete ctx.session.awaitingAddBalance;
-                        const amount = parseFloat(ctx.message.text);
-                        if (isNaN(amount) || amount <= 0) {
-                            return adminCommands.replyError(ctx, '❌ <b>Invalid amount.</b>');
-                        }
-                        return adminCommands.processAddBalance(ctx, targetId, amount, 'Admin credit via inline');
-                    }
 
-                    if (ctx.session.awaitingDeductBalance) {
-                        const targetId = ctx.session.awaitingDeductBalance;
-                        delete ctx.session.awaitingDeductBalance;
-                        const amount = parseFloat(ctx.message.text);
-                        if (isNaN(amount) || amount <= 0) {
-                            return adminCommands.replyError(ctx, '❌ <b>Invalid amount.</b>');
-                        }
-                        return adminCommands.processDeductBalance(ctx, targetId, amount, 'Admin deduction via inline');
-                    }
 
-                    if (ctx.session.awaitingBlacklistReason) {
-                        const targetId = ctx.session.awaitingBlacklistReason;
-                        delete ctx.session.awaitingBlacklistReason;
-                        const reason = ctx.message.text.trim().toLowerCase() === 'skip'
-                            ? 'Manual blacklist'
-                            : ctx.message.text.trim();
-                        return adminCommands.processBlacklist(ctx, targetId, reason);
-                    }
 
-                    if (ctx.session.awaitingMessageUser) {
-                        const targetId = ctx.session.awaitingMessageUser;
-                        delete ctx.session.awaitingMessageUser;
-                        return adminCommands.processMessageUser(ctx, targetId, ctx.message.text);
-                    }
-                }
 
-                return next();
-            } catch (err) {
-                logger.error('Text message handler error', { error: err.message, userId: ctx.from?.id });
-                await this.alertAdmins(err, {
-                    userId: ctx.from?.id,
-                    updateType: 'message',
-                    command: ctx.message?.text,
-                    source: 'handler.textMessage',
-                    note: 'Text handler crash'
-                });
-            }
-        });
-                                                                                      }
-            // ═══════════════════════════════════════════════════════════════════════════════
+
+
+
+                            // ═══════════════════════════════════════════════════════════════════════════════
 // bot/TelegramBot.js — Part 3/3
-// Launch Sequence, Deposit Scanner, Metrics & Graceful Shutdown
+// Launch Sequence, Deposit Scanner, Metrics, Health & Graceful Shutdown
 // ═══════════════════════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -876,6 +904,18 @@ class TelegramBot {
 
         this.stopDepositScanner();
 
+        // ═════════════════════════════════════════════════════════════════
+        //  NEW: Shutdown tier integration service
+        // ═════════════════════════════════════════════════════════════════
+        if (this.tierIntegrationService) {
+            try {
+                this.tierIntegrationService.clearCaches();
+                logger.info('Tier integration caches cleared');
+            } catch (e) {
+                logger.warn('Tier integration shutdown error', { error: e.message });
+            }
+        }
+
         if (this.smsProviderManager) {
             try {
                 await this.smsProviderManager.shutdown();
@@ -939,10 +979,15 @@ class TelegramBot {
             walletRpcType: this.walletService?.currentProviderType || 'none',
             smsProviderReady: !!this.smsProviderManager?.isInitialized,
             freeTierReady: !!this.freeNumberController?.provider?.isActive,
+            // ═════════════════════════════════════════════════════════════════
+            //  NEW: Tier system health
+            // ═════════════════════════════════════════════════════════════════
+            tierSystemReady: !!this.tierIntegrationService?.isAvailable(),
+            tierSystemHealth: this.tierIntegrationService?.getHealth() || null,
             timestamp: new Date().toISOString()
         };
     }
 }
 
 export default TelegramBot;
-            
+        
