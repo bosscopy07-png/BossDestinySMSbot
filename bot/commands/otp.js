@@ -98,10 +98,9 @@ class OTPCommands {
 
     // ─── Legacy Tier System Initialization (fallback) ───────────────────────
     _initTierSystem() {
-        const { default: ServiceCatalog } = require('../../services/ServiceCatalog.js');
-        const { default: TierOperatorSelector } = require('../../services/TierOperatorSelector.js');
-        const { default: CountryCatalog } = require('../../services/CountryCatalog.js');
-
+        const ServiceCatalog = (await import('../../services/ServiceCatalog.js')).default;
+      const TierOperatorSelector = (await import('../../services/TierOperatorSelector.js')).default;
+      const CountryCatalog = (await import('../../services/CountryCatalog.js')).default;
         this.serviceCatalog = new ServiceCatalog();
         
         const cheapProvider = this.smsProviderManager?.getProvider('CHEAP_PANEL');
@@ -117,7 +116,7 @@ class OTPCommands {
             this.tierSelector = null;
             this.countryCatalog = null;
         }
-    }
+            }
 
 
 
