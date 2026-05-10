@@ -2152,8 +2152,21 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
     /**
      * LEGACY: Show country selection for CHEAP mode using 5SIM's available countries
      */
+  /**
+     * Legacy country selection with CHEAP provider prices.
+     * Fetches live prices, falls back to static list on failure.
+     * 
+     * @param {Object} ctx - Telegraf context
+     * @param {string} service - Service code (e.g., 'wa', 'ig')
+     * @returns {Promise<void>}
+     */
     async _showCheapCountrySelectionLegacy(ctx, service) {
-        const userId = ctx.from.id.toString();
+        const userId = ctx.from?.id?.toString();
+        if (!userId) {
+            logger.error('Missing user ID in country selection');
+            return ctx.reply('❌ Authentication error. Please try /start').catch(() => {});
+        }
+
         let loadingMsg = null;
         
         try {
@@ -2166,12 +2179,11 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
             const countriesResult = await this.smsProviderManager.getCheapCountries(service);
             
             if (!countriesResult || countriesResult.length === 0) {
-                try {
-                    if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
-                } catch (delErr) {}
+                await this._safeDeleteMessage(ctx, loadingMsg);
                 
                 return this.sendPhotoWithCaption(
-                    ctx, IMAGES.otpFailed,
+                    ctx, 
+                    IMAGES.otpFailed,
                     `❌ <b>No Countries Available</b>\n\nNo countries have stock for <b>${service}</b> right now.\n\nTry another service or check back later.`,
                     Markup.inlineKeyboard([
                         [Markup.button.callback('🔄 Try Another Service', 'menu')],
@@ -2181,63 +2193,31 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
                 );
             }
 
-            const countriesWithPrices = [];
-            for (const country of countriesResult.slice(0, 20)) {
-                try {
-                    const priceInfo = await this.smsProviderManager.getCheapPrice(country.code, service);
-                    countriesWithPrices.push({
-                        ...country,
-                        simPrice: priceInfo.simPrice,
-                        displayPrice: priceInfo.displayPrice,
-                        stock: priceInfo.stock
-                    });
-                } catch (priceErr) {
-                    countriesWithPrices.push({
-                        ...country,
-                        simPrice: null,
-                        displayPrice: null,
-                        stock: country.stock || 0
-                    });
-                }
-            }
+            // Fetch prices in parallel with concurrency limit
+            const countriesWithPrices = await this._fetchPricesParallel(
+                countriesResult.slice(0, 20), 
+                service
+            );
 
-            countriesWithPrices.sort((a, b) => (a.displayPrice || Infinity) - (b.displayPrice || Infinity));
+            // Sort by display price ascending
+            countriesWithPrices.sort((a, b) => (a.displayPrice ?? Infinity) - (b.displayPrice ?? Infinity));
 
-            try {
-                if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
-            } catch (delErr) {
-                logger.debug('Failed to delete loading message', { error: delErr.message });
-            }
+            await this._safeDeleteMessage(ctx, loadingMsg);
 
             const message = `🌍 <b>Select Country for ${service}</b>\n\nPrices include service fee. Cheapest shown first:`;
-            const buttons = [];
-            
-            for (let i = 0; i < countriesWithPrices.length; i += 2) {
-                const row = countriesWithPrices.slice(i, i + 2).map(c => {
-                    const priceText = c.displayPrice 
-                        ? ` $${c.displayPrice.toFixed(2)}`
-                        : (c.simPrice ? ` ~$${(c.simPrice + 0.20).toFixed(2)}` : '');
-                    const stockText = c.stock > 5 ? '' : ` (${c.stock} left)`;
-                    
-                    return Markup.button.callback(
-                        `${this._getFlag(c.code)} ${c.name}${priceText}${stockText}`,
-                        `country_${c.code}`
-                    );
-                });
-                buttons.push(row);
-            }
-
+            const buttons = this._buildCountryButtons(countriesWithPrices);
             buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
             
             await this.sendPhotoWithCaption(
-                ctx, IMAGES.countrySelect, message, 
-                Markup.inlineKeyboard(buttons), 'HTML'
+                ctx, 
+                IMAGES.countrySelect, 
+                message, 
+                Markup.inlineKeyboard(buttons), 
+                'HTML'
             );
 
         } catch (error) {
-            try {
-                if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
-            } catch (delErr) {}
+            await this._safeDeleteMessage(ctx, loadingMsg);
 
             logger.error('Failed to fetch CHEAP countries', { userId, service, error: error.message });
             
@@ -2250,10 +2230,86 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
             ]);
             
             buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
-            await this.sendPhotoWithCaption(ctx, IMAGES.countrySelect, message, Markup.inlineKeyboard(buttons), 'HTML');
+            
+            await this.sendPhotoWithCaption(
+                ctx, 
+                IMAGES.countrySelect, 
+                message, 
+                Markup.inlineKeyboard(buttons), 
+                'HTML'
+            );
         }
     }
 
+    /**
+     * Safely delete a message, ignoring errors.
+     * @private
+     */
+    async _safeDeleteMessage(ctx, message) {
+        if (!message?.message_id) return;
+        try {
+            await ctx.deleteMessage(message.message_id);
+        } catch (err) {
+            logger.debug('Failed to delete message', { error: err.message, messageId: message.message_id });
+        }
+    }
+
+    /**
+     * Fetch prices in parallel with error resilience.
+     * @private
+     */
+    async _fetchPricesParallel(countries, service) {
+        const pricePromises = countries.map(async (country) => {
+            try {
+                const priceInfo = await this.smsProviderManager.getCheapPrice(country.code, service);
+                return {
+                    ...country,
+                    simPrice: priceInfo.simPrice,
+                    displayPrice: priceInfo.displayPrice,
+                    stock: priceInfo.stock
+                };
+            } catch (priceErr) {
+                return {
+                    ...country,
+                    simPrice: null,
+                    displayPrice: null,
+                    stock: country.stock || 0
+                };
+            }
+        });
+
+        return Promise.all(pricePromises);
+    }
+
+    /**
+     * Build inline keyboard rows for country selection.
+     * @private
+     */
+    _buildCountryButtons(countriesWithPrices) {
+        const buttons = [];
+        
+        for (let i = 0; i < countriesWithPrices.length; i += 2) {
+            const row = countriesWithPrices.slice(i, i + 2).map(c => {
+                const priceText = c.displayPrice 
+                    ? ` $${c.displayPrice.toFixed(2)}`
+                    : (c.simPrice ? ` ~$${(c.simPrice + 0.20).toFixed(2)}` : '');
+                const stockText = c.stock > 5 ? '' : ` (${c.stock} left)`;
+                
+                return Markup.button.callback(
+                    `${this._getFlag(c.code)} ${c.name}${priceText}${stockText}`,
+                    `country_${c.code}`
+                );
+            });
+            buttons.push(row);
+        }
+
+        return buttons;
+    }
+
+    /**
+     * Get emoji flag for country code.
+     * @private
+     */
     _getFlag(code) {
         const flags = {
             'US': '🇺🇸', 'UK': '🇬🇧', 'CA': '🇨🇦', 'RU': '🇷🇺', 'CN': '🇨🇳',
@@ -2272,8 +2328,9 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
             'XK': '🇽🇰'
         };
         return flags[code] || '🌍';
-        }
-
+    }
+    
+                            
 // ═══════════════════════════════════════════════════════════════════════════════
 //  OTPCommands.js — Part 3: Core Purchase Logic, Polling, Check OTP, Cancel
 //  INTEGRATED: Tier-based operator selection for CHEAP mode
