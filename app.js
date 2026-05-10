@@ -189,7 +189,7 @@ try {
     
     try {
         console.log('2️⃣  TierFlowMiddleware...');
-        const flowMod = await traceTierImport('../middleware/TierFlowMiddleware.js', 0);
+        const flowMod = await traceTierImport('./bot/middleware/TierFlowMiddleware.js', 0);
         TierFlowMiddleware = flowMod.default || flowMod.TierFlowMiddleware || flowMod;
         console.log('   ✅ TierFlowMiddleware loaded\n');
     } catch (flowErr) {
