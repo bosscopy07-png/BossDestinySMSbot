@@ -476,6 +476,52 @@ const KEYBOARDS = {
                 ctx.answerCbQuery('❌ Error').catch(() => {});
             }
         });
+        
+        
+
+// AFTER (fixed):
+// Handle service SELECTION
+this.bot.action(/service_select_(.+)/, async (ctx) => {
+    try {
+        await this.handleServiceSelect(ctx, ctx.match[1]);
+    } catch (error) {
+        logger.error('service_select action error', { error: error.message });
+        ctx.answerCbQuery('❌ Error').catch(() => {});
+    }
+});
+
+// Handle service PAGE navigation
+this.bot.action(/service_page_(\d+)/, async (ctx) => {
+    try {
+        await this.handleTierServicePage(ctx, parseInt(ctx.match[1]));
+    } catch (error) {
+        logger.error('service_page action error', { error: error.message });
+        ctx.answerCbQuery('❌ Error').catch(() => {});
+    }
+});
+
+// Handle search prompt
+this.bot.action('service_search_prompt', async (ctx) => {
+    try {
+        ctx.session.awaitingServiceSearch = true;
+        await ctx.reply('🔍 <b>Search for a service:</b>\n\nType the service name (e.g., "WhatsApp", "Telegram", "Netflix"):', {
+            parse_mode: 'HTML',
+            reply_markup: Markup.forceReply().reply_markup
+        });
+    } catch (error) {
+        logger.error('service_search_prompt error', { error: error.message });
+    }
+});
+
+// Handle browse all
+this.bot.action('service_browse_all', async (ctx) => {
+    try {
+        await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode, null, 1);
+    } catch (error) {
+        logger.error('service_browse_all error', { error: error.message });
+    }
+});
+            
 
         this.bot.action(/service_page_(\d+)/, async (ctx) => {
             try {
@@ -2162,15 +2208,19 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
     //  SERVICE & COUNTRY SELECTION
     //  FIXED: Uses dynamic catalog, no hardcoded SERVICES/COUNTRIES
     // ═══════════════════════════════════════════════════════════════════════
-
-    async handleServiceSelect(ctx) {
-        const service = ctx.match[1];
+    async handleServiceSelect(ctx, serviceName = null) {
+        // If called from action, serviceName is passed directly
+        // If called from text handler, extract from context
+        const service = serviceName || ctx.message?.text?.trim();
         
-        // FIXED: Use async hasService() from dynamic catalog instead of hardcoded SERVICES
+        if (!service) {
+            return ctx.answerCbQuery('❌ Invalid service').catch(() => {});
+        }
+        
         const isValid = await this.serviceCatalog.hasService(service);
         if (!isValid) {
             logger.warn('Invalid service selected', { service });
-            return ctx.answerCbQuery('❌ Invalid service');
+            return ctx.answerCbQuery('❌ Invalid service').catch(() => {});
         }
         
         ctx.session = ctx.session || {};
@@ -2186,10 +2236,9 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
             return this._showCheapCountrySelectionLegacy(ctx, service);
         }
         
-        // For non-CHEAP modes (VIP, BUNDLE, FREE) — use dynamic country catalog
+        // For non-CHEAP modes
         const message = `🌍 <b>Select Country</b>\n\nChoose number country for <b>${service}</b>:`;
         
-        // FIXED: Use countryCatalog instead of hardcoded COUNTRIES
         const availableCountries = await this.countryCatalog.getCountriesForService(service, 'standard', {
             topOnly: true,
             perPage: 20
@@ -2198,14 +2247,15 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
         const buttons = availableCountries.countries.map(c => [
             Markup.button.callback(
                 `${c.flag} ${c.name}${c.displayPrice ? ` (${formatCurrency(c.displayPrice)})` : ''}`, 
-                `country_${c.code}`
+                `country_select_${c.code}`  // FIXED: Different prefix
             )
         ]);
         
         buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
         await this.sendPhotoWithCaption(ctx, IMAGES.countrySelect, message, Markup.inlineKeyboard(buttons), 'HTML');
-                                                         }
-                                                                                                  
+            }
+        
+                                                                                                      
         /**
      * Legacy country selection with CHEAP provider prices.
      * FIXED: Uses dynamic country catalog as fallback instead of hardcoded COUNTRIES
