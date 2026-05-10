@@ -1822,7 +1822,7 @@ async handleFreeCountrySelected(ctx, countryCode) {
     // ═══════════════════════════════════════════════════════════════════════
     //  NEW: Country Selection with Tier-Aware Live Pricing (Step 3)
     // ══════
-async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = null) {
+            async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = null) {
         const tierInfo = this.tierSelector.getTierInfo(tierKey);
         
         try {
@@ -1830,18 +1830,25 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
                 `🌍 <b>Loading countries for ${tierInfo.emoji} ${tierInfo.label}...</b>`,
                 { parse_mode: 'HTML' }
             );
-        } catch (e) {
-            // Message might be text, not photo
-        }
+        } catch (e) {}
 
         try {
+            // FIXED: Remove topOnly, fetch ALL available countries sorted by price
+            // perPage 15 for 3×5 grid
             const result = await this.countryCatalog.getCountriesForService(
                 service, 
                 tierKey, 
-                { page, perPage: 10, searchQuery, topOnly: !searchQuery && page === 1 }
+                { 
+                    page, 
+                    perPage: 15,  // 15 per page = 3×5 grid
+                    searchQuery,
+                    topOnly: false,  // FIXED: Don't limit to TOP_COUNTRIES
+                    minAvailable: 15  // Ensure at least 15
+                }
             );
 
-            if (!result.countries || result.countries.length === 0) {
+            
+        if (!result.countries || result.countries.length === 0) {
                 const noStockMessage = 
                     `⚠️ <b>No ${tierInfo.label} Numbers Available</b>\n\n` +
                     `No ${tierInfo.label.toLowerCase()} numbers available for <b>${service}</b> currently.\n\n` +
@@ -2448,7 +2455,8 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
     // ═══════════════════════════════════════════════════════════════════════
     //  COUNTRY SELECTED — ACQUIRE NUMBER (CORE LOGIC)
     // ═══════════════════════════════════════════════════════════════════════
-
+    
+            
     async handleCountrySelect(ctx) {
         const country = ctx.match[1];
         const userId = ctx.from.id.toString();
