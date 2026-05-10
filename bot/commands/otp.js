@@ -2133,22 +2133,19 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
 
         await this.showTierCountrySelection(ctx, service, tierKey, 1, query);
     }
-
-    // ═══════════════════════════════════════════════════════════════════════
+            // ═══════════════════════════════════════════════════════════════════════
     //  SERVICE & COUNTRY SELECTION
+    //  FIXED: Uses dynamic catalog, no hardcoded SERVICES/COUNTRIES
     // ═══════════════════════════════════════════════════════════════════════
 
     async handleServiceSelect(ctx) {
         const service = ctx.match[1];
         
-        const validServices = SERVICES.map(s => s.toLowerCase());
-        if (!validServices.includes(service.toLowerCase())) {
-            if (this.serviceCatalog && this.serviceCatalog.hasService(service)) {
-                // Valid via catalog, proceed
-            } else {
-                logger.warn('Invalid service selected', { service });
-                return ctx.answerCbQuery('❌ Invalid service');
-            }
+        // FIXED: Use async hasService() from dynamic catalog instead of hardcoded SERVICES
+        const isValid = await this.serviceCatalog.hasService(service);
+        if (!isValid) {
+            logger.warn('Invalid service selected', { service });
+            return ctx.answerCbQuery('❌ Invalid service');
         }
         
         ctx.session = ctx.session || {};
@@ -2164,18 +2161,26 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
             return this._showCheapCountrySelectionLegacy(ctx, service);
         }
         
+        // For non-CHEAP modes (VIP, BUNDLE, FREE) — use dynamic country catalog
         const message = `🌍 <b>Select Country</b>\n\nChoose number country for <b>${service}</b>:`;
-        const buttons = COUNTRIES.map(c => [
+        
+        // FIXED: Use countryCatalog instead of hardcoded COUNTRIES
+        const availableCountries = await this.countryCatalog.getCountriesForService(service, 'standard', {
+            topOnly: true,
+            perPage: 20
+        });
+        
+        const buttons = availableCountries.countries.map(c => [
             Markup.button.callback(
-                `${c.flag} ${c.name}${c.priceModifier > 0 ? ` (+$${c.priceModifier})` : ''}`, 
+                `${c.flag} ${c.name}${c.displayPrice ? ` (${formatCurrency(c.displayPrice)})` : ''}`, 
                 `country_${c.code}`
             )
         ]);
         
         buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
         await this.sendPhotoWithCaption(ctx, IMAGES.countrySelect, message, Markup.inlineKeyboard(buttons), 'HTML');
-    }
-
+                                                         }
+                                                                                                  
     /**
      * LEGACY: Show country selection for CHEAP mode using 5SIM's available countries
      */
