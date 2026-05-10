@@ -1628,7 +1628,7 @@ async handleFreeCountrySelected(ctx, countryCode) {
     //  FIXED: Async calls, shows service names with emojis, no category groups
     // ═══════════════════════════════════════════════════════════════════════
 
-    async showServiceSelection(ctx, mode, imageUrl, displayPrice = null) {
+        async showServiceSelection(ctx, mode, imageUrl, displayPrice = null, page = 1) {
         if (!this.serviceCatalog || mode !== 'CHEAP') {
             return this._showLegacyServiceSelection(ctx, mode, imageUrl, displayPrice);
         }
@@ -1636,15 +1636,14 @@ async handleFreeCountrySelected(ctx, countryCode) {
         const priceText = displayPrice ? `\n💰 Starting from ${formatCurrency(displayPrice)}` : '';
         let message = `📱 <b>${mode} Mode</b>${priceText}\n\n`;
         
-        // FIXED: await async getPopularServices()
-        const popular = await this.serviceCatalog.getPopularServices();
-        message += `🔥 <b>Popular Services</b>\n`;
-        message += popular.slice(0, 10).map(s => `• ${s.name}`).join('\n');
-        message += `\n\n🔍 <i>Use search below or browse all services</i>`;
+        // Get ALL services from catalog, paginate here
+        const allServicesResult = await this.serviceCatalog.getServicesPage(page, 15);
+        const services = allServicesResult.services;
+        
+        message += `🔥 <b>Popular Services</b> (Page ${page}/${allServicesResult.pagination.totalPages})\n\n`;
+        message += `Select a service or use options below:`;
 
         const buttons = [];
-
-        // FIXED: Show service names with relevant emojis, not just 📱
         const serviceEmojis = {
             'WhatsApp': '💬', 'Telegram': '✈️', 'Facebook': '👤', 'Instagram': '📸',
             'Twitter': '🐦', 'TikTok': '🎵', 'Binance': '💰', 'Coinbase': '₿',
@@ -1652,29 +1651,40 @@ async handleFreeCountrySelected(ctx, countryCode) {
             'PayPal': '💳', 'Snapchat': '👻', 'Discord': '🎮', 'Spotify': '🎧',
             'Uber': '🚗', 'Airbnb': '🏠', 'WeChat': '💬', 'Signal': '🔒',
             'LinkedIn': '💼', 'Tinder': '🔥', 'Google': '🔍', 'Microsoft': '🪟',
-            'Apple': '🍎', 'Telegram': '✈️', 'Viber': '📞', 'Line': '📱',
-            'KakaoTalk': '💬', 'Imo': '📹', 'Zalo': '💬', 'Badoo': '❤️'
+            'Apple': '🍎', 'Viber': '📞', 'Line': '📱', 'KakaoTalk': '💬',
+            'Imo': '📹', 'Zalo': '💬', 'Badoo': '❤️'
         };
 
-        // Show first 8 popular services as individual buttons (your suggestion: no groups)
-        for (const s of popular.slice(0, 8)) {
-            const emoji = serviceEmojis[s.name] || '📱';
-            buttons.push([Markup.button.callback(
-                `${emoji} ${s.name}`,
-                `service_${s.name}`
-            )]);
+        // 3 columns × 5 rows = 15 services
+        for (let i = 0; i < services.length; i += 3) {
+            const row = services.slice(i, i + 3).map(s => {
+                const emoji = serviceEmojis[s.name] || '📱';
+                return Markup.button.callback(
+                    `${emoji} ${s.name}`,
+                    `service_select_${s.name}`  // FIXED: Different prefix to avoid collision
+                );
+            });
+            buttons.push(row);
         }
 
-        buttons.push([Markup.button.callback('🔍 Search Service...', 'service_search_prompt')]);
-        
+        // Bottom navigation row
+        const navButtons = [];
+        if (allServicesResult.pagination.hasPrev) {
+            navButtons.push(Markup.button.callback('◀️ Prev', `service_page_${page - 1}`));
+        }
+        navButtons.push(Markup.button.callback('🔍 Search', 'service_search_prompt'));
+        if (allServicesResult.pagination.hasNext) {
+            navButtons.push(Markup.button.callback('Next ▶️', `service_page_${page + 1}`));
+        }
+        buttons.push(navButtons);
+
         // Browse all button
-        buttons.push([Markup.button.callback('📋 Browse All Services', 'service_page_1')]);
+        buttons.push([Markup.button.callback('📋 Browse All Services', 'service_browse_all')]);
         buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
 
         await this.sendPhotoWithCaption(ctx, imageUrl, message, Markup.inlineKeyboard(buttons), 'HTML');
-    }
+        }
         
-
 
     // ═══════════════════════════════════════════════════════════════════════
     //  LEGACY: Old service selection (all services at once)
