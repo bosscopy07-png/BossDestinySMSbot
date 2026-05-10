@@ -1,27 +1,17 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 //  services/CountryCatalog.js — Country Discovery with Live Pricing & Search
 //  DYNAMIC: Uses CheapPanelProvider.getAvailableCountries() as single source of truth
-//  No hardcoded COUNTRIES import. Backfills top countries to reach minAvailable.
+//  NO hardcoded COUNTRIES import. Shows ALL available countries sorted by price.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { TOP_COUNTRIES, COUNTRY_ALIASES, PAGINATION, CACHE_TTL, TIER_CONFIG } from '../config/tierConfig.js';
 import logger from '../utils/logger.js';
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  INTERNAL HELPERS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Generate stable cache key
- */
 function makeCacheKey(tierKey, service, countryCodes) {
     const sorted = countryCodes.slice().sort();
     return `${tierKey}:${service}:${sorted.join(',')}`;
 }
 
-/**
- * Check if error indicates "service not offered" vs. "transient failure"
- */
 function isNoStockError(error) {
     if (!error || !error.message) return false;
     return (
@@ -33,26 +23,16 @@ function isNoStockError(error) {
     );
 }
 
-/**
- * Convert ISO code to emoji flag
- */
 function isoToFlag(code) {
     if (!code || typeof code !== 'string' || code.length !== 2) return '🌍';
     const cc = code.toUpperCase();
     const OFFSET = 127397;
     try {
-        return (
-            String.fromCodePoint(cc.charCodeAt(0) + OFFSET) +
-            String.fromCodePoint(cc.charCodeAt(1) + OFFSET)
-        );
+        return String.fromCodePoint(cc.charCodeAt(0) + OFFSET) + String.fromCodePoint(cc.charCodeAt(1) + OFFSET);
     } catch {
         return '🌍';
     }
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  CLASS
-// ═══════════════════════════════════════════════════════════════════════════════
 
 class CountryCatalog {
     constructor(cheapPanelProvider, tierSelector) {
@@ -63,20 +43,16 @@ class CountryCatalog {
         this.provider = cheapPanelProvider;
         this.tierSelector = tierSelector;
 
-        // Dynamic country index — populated from provider, NOT hardcoded
-        this._countryMap = new Map();      // iso -> { code, name, flag }
-        this._nameIndex = new Map();       // normalized name -> iso
-        this._aliasMap = new Map();        // alias -> iso
+        this._countryMap = new Map();
+        this._nameIndex = new Map();
+        this._aliasMap = new Map();
 
-        // Available countries cache per service: service -> { countries[], timestamp }
         this._availableCache = new Map();
-        this._availableCacheTtl = CACHE_TTL.tierPrices || 2 * 60 * 1000; // 2 minutes default
+        this._availableCacheTtl = CACHE_TTL.tierPrices || 2 * 60 * 1000;
 
-        // Price cache for specific country/service/tier combos
         this._priceCache = new Map();
         this._maxPriceCacheSize = 200;
 
-        // Build alias index from config (aliases are static)
         this._buildAliasIndex();
 
         logger.info('CountryCatalog initialized', {
@@ -95,22 +71,15 @@ class CountryCatalog {
     //  DYNAMIC CATALOG LOADING
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Fetch available countries for a service from 5SIM
-     * This is the SINGLE SOURCE OF TRUTH for country availability
-     */
     async _loadAvailableCountries(service) {
         const normalizedService = this._normalizeService(service);
         const cacheKey = normalizedService;
 
-        // Check cache
         const cached = this._availableCache.get(cacheKey);
         if (cached && (Date.now() - cached.timestamp) < this._availableCacheTtl) {
-            logger.debug('Using cached available countries', { service: normalizedService, count: cached.countries.length });
             return cached.countries;
         }
 
-        // Fetch from provider
         const result = await this.provider.getAvailableCountries(normalizedService);
 
         if (!result.success || !result.countries) {
@@ -118,7 +87,6 @@ class CountryCatalog {
             return [];
         }
 
-        // Update dynamic index
         const countries = result.countries.map(c => ({
             code: c.code.toUpperCase(),
             name: c.name,
@@ -126,14 +94,9 @@ class CountryCatalog {
             simCode: c.simCode
         }));
 
-        // Rebuild indexes with fresh data
         this._rebuildCountryIndex(countries);
 
-        // Cache
-        this._availableCache.set(cacheKey, {
-            countries,
-            timestamp: Date.now()
-        });
+        this._availableCache.set(cacheKey, { countries, timestamp: Date.now() });
 
         logger.info('Loaded available countries from provider', {
             service: normalizedService,
@@ -152,7 +115,6 @@ class CountryCatalog {
             this._countryMap.set(country.code, country);
             this._nameIndex.set(country.name.toLowerCase(), country.code);
 
-            // Also index aliases that point to this country
             for (const [alias, isoCode] of this._aliasMap.entries()) {
                 if (isoCode === country.code) {
                     this._nameIndex.set(alias, country.code);
@@ -170,18 +132,6 @@ class CountryCatalog {
     //  PUBLIC API
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Get countries for a service with availability backfill
-     * 
-     * @param {string} service - Service name (e.g., 'whatsapp', 'telegram')
-     * @param {string} tierKey - 'budget' | 'standard' | 'premium'
-     * @param {Object} options
-     *   @param {number} options.page - Page number
-     *   @param {number} options.perPage - Items per page
-     *   @param {string|null} options.searchQuery - Search by name/ISO/alias
-     *   @param {boolean} options.topOnly - Prefer top countries, backfill if sparse
-     *   @param {number} options.minAvailable - Minimum available countries (default: 20)
-     */
     async getCountriesForService(service, tierKey, options = {}) {
         const normalizedService = this._normalizeService(service);
 
@@ -194,18 +144,10 @@ class CountryCatalog {
         } = options;
 
         const tier = TIER_CONFIG[tierKey];
-        if (!tier) {
-            throw new Error(`INVALID_TIER: ${tierKey}`);
-        }
+        if (!tier) throw new Error(`INVALID_TIER: ${tierKey}`);
+        if (!Number.isInteger(page) || page < 1) throw new Error(`INVALID_PAGE: ${page}`);
+        if (!Number.isInteger(perPage) || perPage < 1 || perPage > 100) throw new Error(`INVALID_PER_PAGE: ${perPage}`);
 
-        if (!Number.isInteger(page) || page < 1) {
-            throw new Error(`INVALID_PAGE: page must be positive integer, got ${page}`);
-        }
-        if (!Number.isInteger(perPage) || perPage < 1 || perPage > 100) {
-            throw new Error(`INVALID_PER_PAGE: perPage must be 1-100, got ${perPage}`);
-        }
-
-        // ── Load dynamic catalog for this service ──
         const availableCountries = await this._loadAvailableCountries(normalizedService);
         const availableCodes = new Set(availableCountries.map(c => c.code));
 
@@ -219,7 +161,6 @@ class CountryCatalog {
             };
         }
 
-        // ── Determine which country codes to check ──
         let countryCodes;
         let isSearchMode = false;
 
@@ -227,21 +168,16 @@ class CountryCatalog {
             countryCodes = this._searchCountries(searchQuery, availableCodes);
             isSearchMode = true;
         } else if (topOnly) {
-            // Start with TOP_COUNTRIES that are available for this service
             countryCodes = TOP_COUNTRIES.filter(code => availableCodes.has(code));
         } else {
-            // All available countries
             countryCodes = Array.from(availableCodes);
         }
 
-        // ── Search mode: handle explicit unavailability ──
         if (isSearchMode) {
-            // Check if search matched countries NOT available for this service
-            const allMatches = this._searchAllMatches(searchQuery); // Includes unavailable
+            const allMatches = this._searchAllMatches(searchQuery);
             const unavailableMatches = allMatches.filter(code => !availableCodes.has(code));
 
             if (countryCodes.length === 0 && unavailableMatches.length > 0) {
-                // User searched a valid country, but it's not available for this service
                 const unavailableCountries = unavailableMatches.map(code => ({
                     code,
                     name: this._getCountryName(code),
@@ -282,21 +218,13 @@ class CountryCatalog {
             }
         }
 
-        // ── Backfill for topOnly mode ──
         if (topOnly && !isSearchMode) {
-            const backfillCodes = this._computeBackfill(countryCodes, availableCodes, minAvailable);
+            const backfillCodes = this._computeBackfill(countryCodes, availableCodes, minAvailable, normalizedService);
             countryCodes = backfillCodes;
         }
 
-        // ── Fetch live prices ──
-        const countriesWithPrices = await this._fetchCountryPrices(
-            countryCodes,
-            normalizedService,
-            tierKey,
-            tier
-        );
+        const countriesWithPrices = await this._fetchCountryPrices(countryCodes, normalizedService, tierKey, tier);
 
-        // Sort: available first (cheapest), then unavailable
         countriesWithPrices.sort((a, b) => {
             if (a.available && !b.available) return -1;
             if (!a.available && b.available) return 1;
@@ -308,7 +236,6 @@ class CountryCatalog {
             return (b.stock || 0) - (a.stock || 0);
         });
 
-        // Paginate
         const total = countriesWithPrices.length;
         const start = (page - 1) * perPage;
         const end = Math.min(start + perPage, total);
@@ -332,9 +259,6 @@ class CountryCatalog {
         };
     }
 
-    /**
-     * Get top countries with backfill guarantee
-     */
     async getTopCountries(service, tierKey, limit = 20) {
         return this.getCountriesForService(service, tierKey, {
             topOnly: true,
@@ -357,25 +281,18 @@ class CountryCatalog {
     hasCountry(code) {
         if (!code || typeof code !== 'string') return false;
         return this._countryMap.has(code.toUpperCase());
-        }
-                    // ═══════════════════════════════════════════════════════════════════════
+                }
+        // ═══════════════════════════════════════════════════════════════════════
     //  INTERNAL — Backfill Logic
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Compute backfill: if top countries < minAvailable, add more available countries
-     * Preserves top country priority order, appends backfill by catalog order
-     */
-    _computeBackfill(topCodes, availableCodes, minAvailable) {
-        if (topCodes.length >= minAvailable) {
-            return topCodes; // Sufficient top countries available
-        }
+    _computeBackfill(topCodes, availableCodes, minAvailable, service = 'unknown') {
+        if (topCodes.length >= minAvailable) return topCodes;
 
         const needed = minAvailable - topCodes.length;
         const result = [...topCodes];
         const added = new Set(topCodes);
 
-        // Add remaining available countries in provider catalog order
         for (const code of availableCodes) {
             if (added.has(code)) continue;
             result.push(code);
@@ -384,6 +301,7 @@ class CountryCatalog {
         }
 
         logger.info('Backfilled countries', {
+            service,
             topAvailable: topCodes.length,
             needed,
             backfilledTo: result.length,
@@ -420,9 +338,7 @@ class CountryCatalog {
                 }
 
                 try {
-                    const selection = await this.tierSelector.selectOperator(
-                        tierKey, code, service, { timeoutMs: 8000 }
-                    );
+                    const selection = await this.tierSelector.selectOperator(tierKey, code, service, { timeoutMs: 8000 });
 
                     return {
                         code,
@@ -496,68 +412,49 @@ class CountryCatalog {
         }
         this._priceCache.set(key, { data, timestamp: Date.now() });
     }
-        // ═══════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
     //  INTERNAL — Search
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Search countries available for the service
-     */
     _searchCountries(query, availableCodes = null) {
         const normalized = query.toLowerCase().trim();
         if (!normalized) return [];
 
         const matches = new Set();
 
-        // Direct ISO match
         const upperCode = normalized.toUpperCase();
         if (this._countryMap.has(upperCode)) {
-            if (!availableCodes || availableCodes.has(upperCode)) {
-                matches.add(upperCode);
-            }
+            if (!availableCodes || availableCodes.has(upperCode)) matches.add(upperCode);
         }
 
-        // Alias match
         if (this._aliasMap.has(normalized)) {
             const aliasCode = this._aliasMap.get(normalized);
-            if (!availableCodes || availableCodes.has(aliasCode)) {
-                matches.add(aliasCode);
-            }
+            if (!availableCodes || availableCodes.has(aliasCode)) matches.add(aliasCode);
         }
 
-        // Name prefix/substring match
         for (const [name, code] of this._nameIndex) {
             if (name.includes(normalized) || normalized.includes(name)) {
-                if (!availableCodes || availableCodes.has(code)) {
-                    matches.add(code);
-                }
+                if (!availableCodes || availableCodes.has(code)) matches.add(code);
             }
         }
 
         return Array.from(matches);
     }
 
-    /**
-     * Search ALL matches including unavailable (for unavailability messaging)
-     */
     _searchAllMatches(query) {
         const normalized = query.toLowerCase().trim();
         if (!normalized) return [];
 
         const matches = new Set();
 
-        // Direct ISO
         const upperCode = normalized.toUpperCase();
         if (this._countryMap.has(upperCode)) matches.add(upperCode);
 
-        // Alias
         if (this._aliasMap.has(normalized)) matches.add(this._aliasMap.get(normalized));
 
-        // Name match
         for (const [name, code] of this._nameIndex) {
-            if (name.includes(normalized) || normalized.includes(name)) {
-                matches.add(code);
-            }
+            if (name.includes(normalized) || normalized.includes(name)) matches.add(code);
         }
 
         return Array.from(matches);
@@ -580,9 +477,6 @@ class CountryCatalog {
         logger.info('CountryCatalog caches cleared', { priceEntries: priceSize, availableEntries: availableSize });
     }
 
-    /**
-     * Invalidate available countries cache for a specific service
-     */
     invalidateService(service) {
         const normalized = this._normalizeService(service);
         const removed = this._availableCache.delete(normalized);
