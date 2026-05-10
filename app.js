@@ -88,6 +88,188 @@ const parseStackTrace = (stack) => {
 };
 
 /**
+ * THE FIX: Find exactly where "Unexpected end of input" comes from
+ * This scans backwards from EOF to find the unclosed brace/paren/bracket
+ */
+const findUnexpectedEOF = (filePath) => {
+    try {
+        const content = readFileSync(filePath, 'utf-8');
+        const lines = content.split('\n');
+
+        console.log(`\n🔍 SCANNING ${filePath} for "Unexpected end of input"...`);
+        console.log(`   Total lines: ${lines.length}`);
+
+        // Stack tracks: { char, line, col, type }
+        const stack = [];
+        const problems = [];
+
+        let inString = false;
+        let stringChar = null;
+        let inTemplateExpr = false;
+        let inRegex = false;
+        let inLineComment = false;
+        let inBlockComment = false;
+
+        for (let i = 0; i < content.length; i++) {
+            const char = content[i];
+            const prev = content[i - 1];
+            const next = content[i + 1];
+            const lineNum = content.substring(0, i).split('\n').length;
+            const colNum = i - content.lastIndexOf('\n', i - 1);
+
+            // Block comments /* */
+            if (!inString && !inRegex && char === '/' && next === '*') {
+                inBlockComment = true;
+                i++;
+                continue;
+            }
+            if (inBlockComment && char === '*' && next === '/') {
+                inBlockComment = false;
+                i++;
+                continue;
+            }
+            if (inBlockComment) continue;
+
+            // Line comments //
+            if (!inString && !inRegex && char === '/' && next === '/') {
+                inLineComment = true;
+                continue;
+            }
+            if (inLineComment && char === '\n') {
+                inLineComment = false;
+                continue;
+            }
+            if (inLineComment) continue;
+
+            // Regex literals
+            if (!inString && !inRegex && char === '/' && prev !== '\\') {
+                // Rough check for regex context
+                const before = content.substring(Math.max(0, i - 20), i).trim();
+                if (/[\=\(\[,!&|:;\?\+~\*\/]$/.test(before) || before === '' || before.endsWith('return')) {
+                    inRegex = true;
+                    continue;
+                }
+            }
+            if (inRegex && char === '/' && prev !== '\\') {
+                inRegex = false;
+                while (/[gimuy]/.test(content[i + 1])) i++;
+                continue;
+            }
+            if (inRegex) continue;
+
+            // Strings and template literals
+            if (!inString && (char === '"' || char === "'" || char === '`')) {
+                inString = true;
+                stringChar = char;
+                continue;
+            }
+            if (inString && char === stringChar && prev !== '\\') {
+                if (stringChar === '`') inTemplateExpr = false;
+                inString = false;
+                stringChar = null;
+                continue;
+            }
+            if (inString && stringChar === '`' && char === '$' && next === '{') {
+                inTemplateExpr = true;
+                // Don't skip, let the { be processed below
+            }
+            if (inString && !inTemplateExpr) continue;
+
+            // Track brackets with line numbers
+            const opens = { '{': 'brace', '(': 'paren', '[': 'bracket' };
+            const closes = { '}': 'brace', ')': 'paren', ']': 'bracket' };
+
+            if (char in opens) {
+                stack.push({
+                    char,
+                    type: opens[char],
+                    line: lineNum,
+                    col: colNum,
+                    pos: i
+                });
+            } else if (char in closes) {
+                const last = stack[stack.length - 1];
+                if (last && last.type === closes[char]) {
+                    stack.pop();
+                } else {
+                    problems.push({
+                        type: 'MISMATCH',
+                        expected: last ? last.char : 'nothing',
+                        found: char,
+                        line: lineNum,
+                        col: colNum
+                    });
+                }
+            }
+        }
+
+        // RESULTS
+        console.log(`   Braces/Parens/Brackets still open at EOF: ${stack.length}`);
+
+        if (stack.length === 0 && problems.length === 0) {
+            console.log('   ✅ File syntax is balanced!');
+            return null;
+        }
+
+        if (problems.length > 0) {
+            console.log(`\n❌ MISMATCHED CLOSING TOKENS: ${problems.length}`);
+            problems.forEach(p => {
+                console.log(`   Line ${p.line}: found '${p.found}' but expected '${p.expected}'`);
+            });
+        }
+
+        if (stack.length > 0) {
+            console.log(`\n❌ UNCLOSED TOKENS AT EOF: ${stack.length}`);
+
+            // The LAST unclosed token is usually the real problem
+            const lastUnclosed = stack[stack.length - 1];
+
+            console.log(`\n🎯 ROOT CAUSE: Unclosed '${lastUnclosed.char}' opened at line ${lastUnclosed.line}, col ${lastUnclosed.col}`);
+            console.log(`   This means something was started but never finished before the file ended.`);
+            console.log(`   The "export default" at the bottom is fine — the parser just never got there properly.\n`);
+
+            // Show ALL unclosed tokens (most recent last = closest to EOF)
+            console.log('   All unclosed tokens (newest = closest to EOF):');
+            [...stack].reverse().forEach((item, idx) => {
+                const isLast = idx === 0;
+                console.log(`      ${isLast ? '>>>' : '   '} #${stack.length - idx}: '${item.char}' at line ${item.line} (${item.type})`);
+            });
+
+            // Show context around the LAST (most likely broken) one
+            console.log(`\n📄 CODE WHERE THE PROBLEM STARTED (line ${lastUnclosed.line}):`);
+            console.log('─'.repeat(70));
+
+            const ctxStart = Math.max(0, lastUnclosed.line - 6);
+            const ctxEnd = Math.min(lines.length, lastUnclosed.line + 5);
+
+            for (let i = ctxStart; i < ctxEnd; i++) {
+                const marker = (i === lastUnclosed.line - 1) ? '>>> ' : '    ';
+                console.log(`${marker}${String(i + 1).padStart(4)} | ${lines[i] || ''}`);
+            }
+            console.log('─'.repeat(70));
+
+            // Also show EOF context
+            console.log(`\n📄 EOF CONTEXT (last 10 lines):`);
+            console.log('─'.repeat(70));
+            const eofStart = Math.max(0, lines.length - 10);
+            for (let i = eofStart; i < lines.length; i++) {
+                const marker = (i === lines.length - 1) ? 'EOF> ' : '     ';
+                console.log(`${marker}${String(i + 1).padStart(4)} | ${lines[i] || ''}`);
+            }
+            console.log('─'.repeat(70));
+
+            return lastUnclosed;
+        }
+
+        return null;
+
+    } catch (e) {
+        console.error(`   Could not analyze file: ${e.message}`);
+        return null;
+    }
+};
+
+/**
  * Verify file syntax balance
  */
 const verifyFileComplete = (filePath) => {
@@ -105,7 +287,6 @@ const verifyFileComplete = (filePath) => {
             const char = content[i];
             const prev = content[i - 1];
 
-            // Ignore strings
             if (
                 !inString &&
                 (char === '"' || char === "'" || char === '`')
@@ -123,7 +304,6 @@ const verifyFileComplete = (filePath) => {
 
             if (inString) continue;
 
-            // Count syntax
             if (char === '{') braces++;
             if (char === '}') braces--;
             if (char === '(') parens++;
@@ -174,23 +354,8 @@ const verifyCriticalFiles = () => {
             );
 
             if (!check.complete) {
-                console.log(`      ⚠️ Syntax imbalance detected`);
-
-                try {
-                    const content = readFileSync(url.pathname, 'utf-8');
-                    const lines = content.split('\n');
-
-                    console.log('\n📄 LAST 25 LINES:\n');
-                    console.log('─'.repeat(70));
-
-                    const start = Math.max(0, lines.length - 25);
-
-                    for (let i = start; i < lines.length; i++) {
-                        console.log(`${String(i + 1).padStart(4)} | ${lines[i]}`);
-                    }
-
-                    console.log('─'.repeat(70));
-                } catch {}
+                console.log(`      ⚠️ Syntax imbalance detected — running deep scan...`);
+                findUnexpectedEOF(url.pathname);
             }
 
         } catch (e) {
@@ -233,6 +398,22 @@ const safeImport = async (modulePath) => {
                         getLineContext(primary.filePath, primary.lineNum, 3)
                     );
                 }
+            }
+
+            // THE KEY FIX: If "Unexpected end of input", run the deep scanner
+            if (error.message.includes('Unexpected end of input')) {
+                console.error('\n🚨 "Unexpected end of input" detected — scanning for unclosed tokens...');
+
+                // Try to resolve the actual file path
+                let targetFile = modulePath;
+                try {
+                    const resolved = new URL(modulePath, import.meta.url);
+                    targetFile = resolved.pathname;
+                } catch {
+                    // keep original
+                }
+
+                findUnexpectedEOF(targetFile);
             }
         }
 
@@ -284,22 +465,14 @@ const traceImportChain = async (modulePath, depth = 0, visited = new Set()) => {
                     getLineContext(primaryLoc.filePath, primaryLoc.lineNum, 3)
                 );
             } else {
+                // "Unexpected end of input" shows line 0 — run deep scanner
+                let targetFile = modulePath;
                 try {
-                    const resolvedPath = new URL(modulePath, import.meta.url).pathname;
-                    const content = readFileSync(resolvedPath, 'utf-8');
-                    const lines = content.split('\n');
-
-                    console.error('\n📄 LAST 25 LINES:\n');
-                    console.error('─'.repeat(70));
-
-                    const start = Math.max(0, lines.length - 25);
-
-                    for (let i = start; i < lines.length; i++) {
-                        console.error(`${String(i + 1).padStart(4)} | ${lines[i]}`);
-                    }
-
-                    console.error('─'.repeat(70));
+                    targetFile = new URL(modulePath, import.meta.url).pathname;
                 } catch {}
+
+                console.error(`${indent}\n🚨 Running deep token analysis...`);
+                findUnexpectedEOF(targetFile);
             }
 
             throw new Error(`SYNTAX ERROR in ${modulePath}: ${error.message}`);
@@ -316,92 +489,6 @@ const traceImportChain = async (modulePath, depth = 0, visited = new Set()) => {
     }
 };
 
-/**
- * Debug unclosed tokens in a file with full context
- */
-const debugUnclosedTokens = (filePath) => {
-    try {
-        const content = readFileSync(filePath, 'utf-8');
-        const lines = content.split('\n');
-        const openBraces = [];
-        const openParens = [];
-        const openBrackets = [];
-
-        for (let i = 0; i < content.length; i++) {
-            const char = content[i];
-            const lineNum = content.substring(0, i).split('\n').length;
-
-            if (char === '{') {
-                openBraces.push({ pos: i, line: lineNum });
-            }
-            if (char === '}') {
-                openBraces.pop();
-            }
-            if (char === '(') {
-                openParens.push({ pos: i, line: lineNum });
-            }
-            if (char === ')') {
-                openParens.pop();
-            }
-            if (char === '[') {
-                openBrackets.push({ pos: i, line: lineNum });
-            }
-            if (char === ']') {
-                openBrackets.pop();
-            }
-        }
-
-        console.log('\n🧠 UNCLOSED TOKENS:');
-
-        if (openBraces.length === 0 && openParens.length === 0 && openBrackets.length === 0) {
-            console.log('   ✅ All tokens are properly closed!');
-            return;
-        }
-
-        for (const item of openBraces.slice(-5)) {
-            const before = content.substring(Math.max(0, item.pos - 60), item.pos + 60);
-            console.log(`\n❌ UNCLOSED { at line ${item.line}:`);
-            console.log('─'.repeat(70));
-            const contextLines = before.split('\n');
-            contextLines.forEach((line, idx) => {
-                const actualLine = item.line - (contextLines.length - idx) + 1;
-                const marker = (actualLine === item.line) ? '>>>' : '   ';
-                console.log(`${marker} ${String(actualLine).padStart(4)} | ${line}`);
-            });
-            console.log('─'.repeat(70));
-        }
-
-        for (const item of openParens.slice(-5)) {
-            const before = content.substring(Math.max(0, item.pos - 60), item.pos + 60);
-            console.log(`\n❌ UNCLOSED ( at line ${item.line}:`);
-            console.log('─'.repeat(70));
-            const contextLines = before.split('\n');
-            contextLines.forEach((line, idx) => {
-                const actualLine = item.line - (contextLines.length - idx) + 1;
-                const marker = (actualLine === item.line) ? '>>>' : '   ';
-                console.log(`${marker} ${String(actualLine).padStart(4)} | ${line}`);
-            });
-            console.log('─'.repeat(70));
-        }
-
-        for (const item of openBrackets.slice(-5)) {
-            const before = content.substring(Math.max(0, item.pos - 60), item.pos + 60);
-            console.log(`\n❌ UNCLOSED [ at line ${item.line}:`);
-            console.log('─'.repeat(70));
-            const contextLines = before.split('\n');
-            contextLines.forEach((line, idx) => {
-                const actualLine = item.line - (contextLines.length - idx) + 1;
-                const marker = (actualLine === item.line) ? '>>>' : '   ';
-                console.log(`${marker} ${String(actualLine).padStart(4)} | ${line}`);
-            });
-            console.log('─'.repeat(70));
-        }
-
-    } catch (e) {
-        console.error(`Could not debug file: ${filePath} (${e.message})`);
-    }
-};
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // MAIN
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -411,14 +498,11 @@ try {
     console.log(`   Node: ${process.version}`);
     console.log(`   CWD: ${process.cwd()}`);
 
-    // ONLY VERIFY IMPORTANT FILES
     verifyCriticalFiles();
 
-    // IMPORTS
     const { config, connectDatabase } = await safeImport('./config/index.js');
     const { default: logger } = await safeImport('./utils/logger.js');
 
-    // TRACE BOT
     console.log('\n📂 Starting deep import trace...');
 
     const importedBot = await traceImportChain('./bot/index.js');
@@ -433,7 +517,6 @@ try {
     const { default: CronJobs } = await safeImport('./cron/index.js');
 
     let bot = null;
-
     const port = config?.server?.port || process.env.PORT || 3000;
 
     const startApp = async () => {
@@ -460,5 +543,5 @@ try {
     }
 
     process.exit(1);
-}
-    
+                }
+            
