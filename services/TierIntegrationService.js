@@ -5,7 +5,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { TIER_CONFIG, CACHE_TTL } from '../config/tierConfig.js';
-import { SERVICES } from '../utils/constants.js';
 import logger from '../utils/logger.js';
 
 /**
@@ -115,8 +114,9 @@ class TierIntegrationService {
                this._countryCatalog !== null &&
                this._cheapProvider !== null &&
                this._cheapProvider.isActive;
-                    }
-                    // ═══════════════════════════════════════════════════════════════════════
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     //  SERVICE SELECTION (Step 1)
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -167,16 +167,16 @@ class TierIntegrationService {
 
     /**
      * Validate service exists
-     * FIXED: Now async due to dynamic catalog loading
+     * FIXED: Removed hardcoded SERVICES fallback. Dynamic catalog is the only source of truth.
      */
     async isValidService(serviceName) {
         if (!this.isAvailable()) {
-            // Fallback to constants array
-            return SERVICES.map(s => s.toLowerCase()).includes(serviceName.toLowerCase());
+            // No fallback to hardcoded list — dynamic catalog is the only source of truth
+            return false;
         }
         return this._serviceCatalog.hasService(serviceName);
-    }
-        // ═══════════════════════════════════════════════════════════════════════
+}
+            // ═══════════════════════════════════════════════════════════════════════
     //  TIER SELECTION (Step 2)
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -595,4 +595,4 @@ class TierIntegrationService {
 }
 
 export default TierIntegrationService;
-                
+                        
