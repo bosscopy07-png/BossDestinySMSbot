@@ -175,7 +175,7 @@ try {
     
     try {
         console.log('1️⃣  TierIntegrationService...');
-        const tierMod = await traceTierImport('../services/TierIntegrationService.js', 0);
+        const tierMod = await traceTierImport('./services/TierIntegrationService.js', 0);
         TierIntegrationService = tierMod.default || tierMod.TierIntegrationService || tierMod;
         console.log('   ✅ TierIntegrationService loaded\n');
     } catch (tierErr) {
@@ -189,7 +189,7 @@ try {
     
     try {
         console.log('2️⃣  TierFlowMiddleware...');
-        const flowMod = await traceTierImport('./middleware/TierFlowMiddleware.js', 0);
+        const flowMod = await traceTierImport('../middleware/TierFlowMiddleware.js', 0);
         TierFlowMiddleware = flowMod.default || flowMod.TierFlowMiddleware || flowMod;
         console.log('   ✅ TierFlowMiddleware loaded\n');
     } catch (flowErr) {
