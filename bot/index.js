@@ -463,6 +463,7 @@ class TelegramBot {
         // ═══════════════════════════════════════════════════
         //  GLOBAL JOIN VERIFICATION + REVOCATION CHECK
         // ═══════════════════════════════════════════════════
+                    
         this.bot.use(async (ctx, next) => {
             try {
                 if (ctx.chat?.type !== 'private') {
@@ -504,4 +505,557 @@ class TelegramBot {
                     }
                 }
 
-                return await ne
+                return await next();
+
+            } catch (err) {
+                logger.error('Global verification middleware error', { error: err.message, userId: ctx.from?.id });
+                await this.alertAdmins(err, {
+                    userId: ctx.from?.id,
+                    updateType: ctx.updateType,
+                    command: ctx.message?.text || ctx.callbackQuery?.data,
+                    source: 'middleware.joinVerification',
+                    note: 'Global join verification middleware crash'
+                });
+            }
+        });
+
+        // Maintenance mode middleware
+        this.bot.use(async (ctx, next) => {
+            try {
+                if (this.isShuttingDown) {
+                    await ctx.reply('🔴 Bot is restarting. Please try again in a moment.').catch(() => {});
+                    return;
+                }
+
+                const isAdmin = this.isEffectiveAdmin(ctx);
+
+                if (config.maintenance && !isAdmin) {
+                    await ctx.reply(
+                        '🔧 <b>Maintenance Mode</b>\n\n' +
+                        'The bot is currently under maintenance. Please try again later.\n\n' +
+                        '<i>We apologize for any inconvenience.</i>',
+                        { parse_mode: 'HTML' }
+                    ).catch(() => {});
+                    return;
+                }
+
+                return await next();
+            } catch (err) {
+                logger.error('Maintenance middleware error', { error: err.message });
+                await this.alertAdmins(err, {
+                    userId: ctx.from?.id,
+                    updateType: ctx.updateType,
+                    source: 'middleware.maintenance',
+                    note: 'Maintenance middleware crash'
+                });
+            }
+        });
+
+        // Development logging
+        if (process.env.NODE_ENV === 'development') {
+            this.bot.use(async (ctx, next) => {
+                const start = Date.now();
+                await next();
+                logger.debug(`Handler took ${Date.now() - start}ms`, {
+                    updateType: ctx.updateType,
+                    userId: ctx.from?.id
+                });
+            });
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  COMMAND SETUP — Initialize all modules and wire handlers
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async setupCommands() {
+        // Initialize SMS Provider Manager
+        try {
+            this.smsProviderManager = new SMSProviderManager();
+            await this.smsProviderManager.initialize();
+            logger.info('SMS Provider Manager initialized in bot');
+        } catch (error) {
+            logger.error('Failed to initialize SMS Provider Manager', { error: error.message });
+            this.smsProviderManager = null;
+            await this.alertAdmins(error, {
+                source: 'setup.setupCommands',
+                note: 'SMS Provider Manager init failed'
+            });
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  TIER INTEGRATION — Proper initialization and dependency injection
+        // ═══════════════════════════════════════════════════════════════════════
+        try {
+            this.tierIntegrationService = new TierIntegrationService(this.smsProviderManager);
+            await this.tierIntegrationService.initialize();
+            logger.info('Tier Integration Service initialized');
+        } catch (error) {
+            logger.error('Failed to initialize Tier Integration Service', { error: error.message });
+            this.tierIntegrationService = null;
+            await this.alertAdmins(error, {
+                source: 'setup.tierIntegration',
+                note: 'Tier Integration Service init failed'
+            });
+        }
+
+        // Initialize command modules
+        const userCommands = new UserCommands(this.bot, this.walletService);
+        const otpCommands = new OTPCommands(this.bot, this.walletService, this.smsProviderManager);
+        const adminCommands = new AdminCommands(this.bot, this.walletService, this.referralService, this.smsProviderManager);
+        const advancedAdmin = new Admin(
+            this.bot,
+            this.walletService,
+            this.referralService,
+            this.smsProviderManager
+        );
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  TIER DEPENDENCY INJECTION — Safe property assignment
+        // ═══════════════════════════════════════════════════════════════════════
+        if (this.tierIntegrationService) {
+            otpCommands.tierService = this.tierIntegrationService;
+            otpCommands.tierSelector = this.tierIntegrationService._tierSelector;
+            otpCommands.serviceCatalog = this.tierIntegrationService._serviceCatalog;
+            otpCommands.countryCatalog = this.tierIntegrationService._countryCatalog;
+            logger.info('Tier services injected into OTPCommands');
+        }
+
+        this.commandModules.set('user', userCommands);
+        this.commandModules.set('otp', otpCommands);
+        this.commandModules.set('admin', adminCommands);
+        this.commandModules.set('advancedAdmin', advancedAdmin);
+
+        // Initialize StartVerification
+        this.startVerification = new StartVerification(
+            this.bot,
+            userCommands,
+            (userId) => this.isAdmin(userId),
+            (err, ctx) => this.alertAdmins(err, ctx)
+        );
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  TIER FLOW MIDDLEWARE — Register after commands, before free tier
+        // ═══════════════════════════════════════════════════════════════════════
+        if (this.tierIntegrationService && otpCommands) {
+            this.tierFlowMiddleware = new TierFlowMiddleware(this.tierIntegrationService, otpCommands);
+            this.tierFlowMiddleware.register(this.bot);
+            logger.info('Tier Flow Middleware registered');
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  FREE TIER CONTROLLER — Wire all free mode handlers
+        // ═══════════════════════════════════════════════════════════════════════
+        this.freeNumberController = new FreeNumberController(this.bot);
+
+        // Main free mode entry point
+        this.bot.action('mode_free', async (ctx) => {
+            try {
+                await ctx.answerCbQuery().catch(() => {});
+                await this.freeNumberController.handleFreeRequest(ctx);
+            } catch (error) {
+                logger.error('mode_free action error', { error: error.message, userId: ctx.from?.id });
+                await this.alertAdmins(error, {
+                    userId: ctx.from?.id,
+                    updateType: 'callback_query',
+                    command: 'mode_free',
+                    source: 'action.mode_free',
+                    note: 'Free mode entry crash'
+                });
+            }
+        });
+
+        // Ad watching handlers
+        this.bot.action(/watch_ad_(.+)/, async (ctx) => {
+            try {
+                await this.freeNumberController.handleWatchAd(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('watch_ad action error', { error: error.message, userId: ctx.from?.id });
+                await ctx.answerCbQuery('❌ Ad unavailable').catch(() => {});
+            }
+        });
+
+        // Ad verification handlers
+        this.bot.action(/verify_ad_(.+)/, async (ctx) => {
+            try {
+                await this.freeNumberController.handleVerifyAd(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('verify_ad action error', { error: error.message, userId: ctx.from?.id });
+                await ctx.answerCbQuery('❌ Verification failed').catch(() => {});
+            }
+        });
+
+        // Cancel free session
+        this.bot.action(/cancel_free_(.+)/, async (ctx) => {
+            try {
+                await this.freeNumberController.handleCancel(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('cancel_free action error', { error: error.message, userId: ctx.from?.id });
+                await ctx.answerCbQuery('❌ Cancel failed').catch(() => {});
+            }
+        });
+
+        // Manual check now
+        this.bot.action(/check_free_(.+)/, async (ctx) => {
+            try {
+                await this.freeNumberController.handleCheckNow(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('check_free action error', { error: error.message, userId: ctx.from?.id });
+                await ctx.answerCbQuery('❌ Check failed').catch(() => {});
+            }
+        });
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  GLOBAL ACTION HANDLERS
+        // ═══════════════════════════════════════════════════════════════════════
+        this.bot.action('help', async (ctx) => {
+            try {
+                await ctx.answerCbQuery().catch(() => {});
+                const helpMessage = [
+                    "<b>❓ Help & Commands</b>",
+                    "",
+                    "📱 <code>/otp</code> — Request OTP",
+                    "💰 <code>/balance</code> — Check balance",
+                    "💳 <code>/deposit</code> — Add funds",
+                    "📜 <code>/history</code> — Transaction history",
+                    "🎁 <code>/referral</code> — Referral program",
+                    "📊 <code>/stats</code> — Your statistics",
+                    "⚙️ <code>/settings</code> — Bot settings",
+                    "❌ <code>/cancel</code> — Cancel active session",
+                    "",
+                    "<b>Admin Only:</b>",
+                    "🔐 <code>/admin</code> — Admin dashboard"
+                ].join("\n");
+                await ctx.reply(helpMessage, { parse_mode: 'HTML' });
+            } catch (error) {
+                logger.error('Help action error', { error: error.message });
+                await this.alertAdmins(error, {
+                    userId: ctx.from?.id,
+                    updateType: 'callback_query',
+                    command: 'help',
+                    source: 'action.help',
+                    note: 'Help action crash'
+                });
+            }
+        });
+
+        this.bot.action('menu', async (ctx) => {
+            try {
+                await ctx.answerCbQuery().catch(() => {});
+                await userCommands.handleMenu(ctx);
+            } catch (error) {
+                logger.error('Menu action error', { error: error.message });
+                await this.alertAdmins(error, {
+                    userId: ctx.from?.id,
+                    updateType: 'callback_query',
+                    command: 'menu',
+                    source: 'action.menu',
+                    note: 'Menu action crash'
+                });
+            }
+        });
+
+        this.bot.action('open_admin_dashboard', async (ctx) => {
+            try {
+                if (!this.isEffectiveAdmin(ctx)) {
+                    return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
+                }
+                await advancedAdmin.showDashboard(ctx, true);
+            } catch (err) {
+                logger.error('Admin dashboard action error', { error: err.message });
+                await this.alertAdmins(err, {
+                    userId: ctx.from?.id,
+                    updateType: 'callback_query',
+                    command: 'open_admin_dashboard',
+                    source: 'action.openAdminDashboard',
+                    note: 'Admin dashboard action crash'
+                });
+            }
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  TEXT MESSAGE HANDLER — Admin inputs, broadcast, etc.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    setupTextHandler() {
+        this.bot.on(message('text'), async (ctx, next) => {
+            try {
+                const isAdmin = this.isEffectiveAdmin(ctx);
+
+                if (isAdmin) {
+                    const advancedAdmin = this.commandModules.get('advancedAdmin');
+                    const adminCommands = this.commandModules.get('admin');
+
+                    // Let advanced admin handle its text inputs first
+                    if (advancedAdmin) {
+                        const handled = await advancedAdmin.handleTextInput(ctx);
+                        if (handled) return;
+                    }
+
+                    // Handle broadcast
+                    if (ctx.session?.awaitingBroadcast) {
+                        const { target, filter, label } = ctx.session.awaitingBroadcast;
+                        delete ctx.session.awaitingBroadcast;
+                        if (adminCommands) {
+                            await adminCommands.executeBroadcast(ctx, filter, label, ctx.message.text);
+                        }
+                        return;
+                    }
+
+                    // Handle add balance
+                    if (ctx.session?.awaitingAddBalance) {
+                        const targetId = ctx.session.awaitingAddBalance;
+                        delete ctx.session.awaitingAddBalance;
+                        const amount = parseFloat(ctx.message.text);
+                        if (isNaN(amount) || amount <= 0) {
+                            if (adminCommands?.replyError) {
+                                await adminCommands.replyError(ctx, '❌ <b>Invalid amount.</b>');
+                            }
+                            return;
+                        }
+                        if (adminCommands) {
+                            await adminCommands.processAddBalance(ctx, targetId, amount, 'Admin credit via inline');
+                        }
+                        return;
+                    }
+
+                    // Handle deduct balance
+                    if (ctx.session?.awaitingDeductBalance) {
+                        const targetId = ctx.session.awaitingDeductBalance;
+                        delete ctx.session.awaitingDeductBalance;
+                        const amount = parseFloat(ctx.message.text);
+                        if (isNaN(amount) || amount <= 0) {
+                            if (adminCommands?.replyError) {
+                                await adminCommands.replyError(ctx, '❌ <b>Invalid amount.</b>');
+                            }
+                            return;
+                        }
+                        if (adminCommands) {
+                            await adminCommands.processDeductBalance(ctx, targetId, amount, 'Admin deduction via inline');
+                        }
+                        return;
+                    }
+
+                    // Handle blacklist reason
+                    if (ctx.session?.awaitingBlacklistReason) {
+                        const targetId = ctx.session.awaitingBlacklistReason;
+                        delete ctx.session.awaitingBlacklistReason;
+                        const reason = ctx.message.text.trim().toLowerCase() === 'skip'
+                            ? 'Manual blacklist'
+                            : ctx.message.text.trim();
+                        if (adminCommands) {
+                            await adminCommands.processBlacklist(ctx, targetId, reason);
+                        }
+                        return;
+                    }
+
+                    // Handle message user
+                    if (ctx.session?.awaitingMessageUser) {
+                        const targetId = ctx.session.awaitingMessageUser;
+                        delete ctx.session.awaitingMessageUser;
+                        if (adminCommands) {
+                            await adminCommands.processMessageUser(ctx, targetId, ctx.message.text);
+                        }
+                        return;
+                    }
+                }
+
+                // Pass to next handler if not handled
+                return await next();
+            } catch (err) {
+                logger.error('Text message handler error', { error: err.message, userId: ctx.from?.id });
+                await this.alertAdmins(err, {
+                    userId: ctx.from?.id,
+                    updateType: 'message',
+                    command: ctx.message?.text,
+                    source: 'handler.textMessage',
+                    note: 'Text handler crash'
+                });
+            }
+        });
+                }
+                        
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // bot/TelegramBot.js — Part 3/3
+    // Launch Sequence, Deposit Scanner, Metrics & Graceful Shutdown
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  DEPOSIT SCANNER
+    // ═══════════════════════════════════════════════════════════════════════
+
+    startDepositScanner() {
+        let retryDelay = 5000;
+        const maxRetryDelay = 60000;
+
+        const checkAndStart = async () => {
+            if (this.isShuttingDown) return;
+
+            try {
+                if (this.walletService?.isReady) {
+                    this.walletService.startDepositScanner(30000);
+                    logger.info('Deposit scanner started');
+                    retryDelay = 5000;
+                } else {
+                    logger.warn('Wallet not ready, retrying...');
+                    setTimeout(checkAndStart, retryDelay);
+                    retryDelay = Math.min(retryDelay * 2, maxRetryDelay);
+                }
+            } catch (error) {
+                logger.error('Deposit scanner error', { error: error.message });
+                await this.alertAdmins(error, {
+                    source: 'scanner.depositScanner',
+                    note: 'Deposit scanner retry loop error'
+                });
+                setTimeout(checkAndStart, retryDelay);
+                retryDelay = Math.min(retryDelay * 2, maxRetryDelay);
+            }
+        };
+
+        setTimeout(checkAndStart, 3000);
+    }
+
+    stopDepositScanner() {
+        try {
+            this.walletService?.stopDepositScanner?.();
+        } catch (error) {
+            logger.error('Error stopping scanner', { error: error.message });
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  LAUNCH SEQUENCE
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async launch() {
+        try {
+            logger.info('Initializing database...');
+            await initModels();
+
+            await this.setupCommands();
+            this.setupTextHandler();
+
+            this.startDepositScanner();
+
+            await this.bot.telegram.deleteWebhook({ drop_pending_updates: true });
+            await this.bot.launch();
+
+            this.isReady = true;
+            logger.info('Bot launched successfully');
+
+            process.once('SIGINT', () => this.gracefulShutdown('SIGINT'));
+            process.once('SIGTERM', () => this.gracefulShutdown('SIGTERM'));
+
+            setInterval(() => this.logMetrics(), 300000);
+
+        } catch (error) {
+            logger.error('Launch failed', { error: error.message });
+            await this.alertAdmins(error, {
+                source: 'launch.botLaunch',
+                note: 'Bot failed to launch — critical'
+            });
+            throw error;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  GRACEFUL SHUTDOWN
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async gracefulShutdown(signal) {
+        if (this.isShuttingDown) return;
+        this.isShuttingDown = true;
+
+        logger.info(`Shutting down (${signal})`);
+
+        try {
+            this.bot.stop(signal);
+        } catch (e) {
+            logger.warn('Error stopping bot', { error: e.message });
+        }
+
+        this.stopDepositScanner();
+
+        // Shutdown tier integration
+        if (this.tierIntegrationService) {
+            try {
+                await this.tierIntegrationService.shutdown?.();
+                logger.info('Tier Integration Service shut down');
+            } catch (e) {
+                logger.warn('Tier Integration Service shutdown failed', { error: e.message });
+            }
+        }
+
+        if (this.smsProviderManager) {
+            try {
+                await this.smsProviderManager.shutdown();
+            } catch (e) {
+                logger.warn('SMS Provider Manager shutdown failed', { error: e.message });
+            }
+        }
+
+        try {
+            await Promise.race([
+                this.walletService?.disconnect?.(),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+            ]);
+        } catch (e) {
+            logger.warn('Wallet disconnect timeout or error', { error: e.message });
+        }
+
+        // Exit with delay to allow final logs/alerts to flush
+        setTimeout(() => process.exit(0), 2000);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  METRICS & HEALTH
+    // ═══════════════════════════════════════════════════════════════════════
+
+    updateMetrics(duration) {
+        this.metrics.requestsHandled++;
+        this.metrics.avgResponseTime =
+            (this.metrics.avgResponseTime * (this.metrics.requestsHandled - 1) + duration)
+            / this.metrics.requestsHandled;
+    }
+
+    trackEvent(event, userId) {
+        setImmediate(() => {
+            logger.debug('Event tracked', { event, userId });
+        });
+    }
+
+    logMetrics() {
+        const uptime = (Date.now() - this.metrics.startTime) / 1000;
+        logger.info('Bot metrics', {
+            uptime: `${Math.floor(uptime / 60)}m`,
+            requestsHandled: this.metrics.requestsHandled,
+            requestsFailed: this.metrics.requestsFailed,
+            avgResponseTime: `${Math.round(this.metrics.avgResponseTime)}ms`,
+            activeUsers: this.metrics.activeUsers.size
+        });
+    }
+
+    getHealth() {
+        return {
+            status: this.isShuttingDown ? 'shutting_down' : this.isReady ? 'healthy' : 'starting',
+            uptime: process.uptime(),
+            memory: process.memoryUsage(),
+            metrics: {
+                requests: this.metrics.requestsHandled,
+                failed: this.metrics.requestsFailed,
+                avgResponseTime: Math.round(this.metrics.avgResponseTime),
+                activeUsers: this.metrics.activeUsers.size
+            },
+            walletReady: this.walletService?.isReady || false,
+            walletScanMode: this.walletService?.scanMode || 'unknown',
+            walletRpcType: this.walletService?.currentProviderType || 'none',
+            smsProviderReady: !!this.smsProviderManager?.isInitialized,
+            tierIntegrationReady: !!this.tierIntegrationService?.isInitialized,
+            freeTierReady: !!this.freeNumberController?.provider?.isActive,
+            timestamp: new Date().toISOString()
+        };
+    }
+}
+
+export default TelegramBot;
