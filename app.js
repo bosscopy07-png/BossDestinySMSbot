@@ -1,604 +1,270 @@
-import { pathToFileURL } from 'url';
 import { readFileSync } from 'fs';
+import path from 'path';
+
+/* ─────────────────────────────────────────────
+   GLOBAL ERROR HANDLERS (SINGLE SOURCE)
+───────────────────────────────────────────── */
 
 process.on('uncaughtException', (err) => {
-    console.error('💥 UNCAUGHT EXCEPTION:', err.message);
-    console.error('Stack:', err.stack);
+    console.error('\n💥 UNCAUGHT EXCEPTION');
+    console.error(err.stack || err.message);
     process.exit(1);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('💥 UNHANDLED REJECTION at:', promise);
-    console.error('Reason:', reason);
+process.on('unhandledRejection', (reason) => {
+    console.error('\n💥 UNHANDLED REJECTION');
+    console.error(reason?.stack || reason);
     process.exit(1);
 });
 
-/**
- * Extract line context from a file around a specific line number
- */
-const getLineContext = (filePath, lineNum, context = 3) => {
-    try {
-        const content = readFileSync(filePath, 'utf-8');
-        const lines = content.split('\n');
+/* ─────────────────────────────────────────────
+   STACK PARSER (ROBUST)
+───────────────────────────────────────────── */
 
-        const start = Math.max(0, lineNum - context - 1);
-        const end = Math.min(lines.length, lineNum + context);
-
-        let result = `\n📄 FILE: ${filePath}\n`;
-        result += '─'.repeat(70) + '\n';
-
-        for (let i = start; i < end; i++) {
-            const marker = i === lineNum - 1 ? '>>> ' : '    ';
-            const lineStr = String(i + 1).padStart(4, ' ');
-
-            result += `${marker}${lineStr} | ${lines[i]}\n`;
-        }
-
-        result += '─'.repeat(70);
-
-        return result;
-
-    } catch (e) {
-        return `Could not read file: ${filePath} (${e.message})`;
-    }
-};
-
-/**
- * Parse stack trace to find exact file locations
- */
-const parseStackTrace = (stack) => {
-
-    const lines = stack.split('\n');
-
+const parseStackTrace = (stack = '') => {
     const locations = [];
 
-    for (const line of lines) {
+    for (const line of stack.split('\n')) {
+        const match = line.match(/(file:\/\/[^\s)]+|\/.*\.js:\d+:\d+)/);
+        if (!match) continue;
 
-        const match = line.match(
-            /(?:at\s+)?(?:?)(file:\/\/[^\s)]+|[^\s(]+\.js:\d+:\d+)(?:?)/
-        );
+        let raw = match[1];
+        let lineNum = 0;
+        let colNum = 0;
 
-        if (match) {
+        const pos = raw.match(/:(\d+):(\d+)$/);
 
-            const rawPath = match[1];
-
-            let filePath = rawPath;
-            let lineNum = 0;
-            let colNum = 0;
-
-            const posMatch = rawPath.match(/:(\d+):(\d+)$/);
-
-            if (posMatch) {
-
-                lineNum = parseInt(posMatch[1], 10);
-                colNum = parseInt(posMatch[2], 10);
-
-                filePath = rawPath.slice(
-                    0,
-                    -posMatch[0].length
-                );
-            }
-
-            if (filePath.startsWith('file://')) {
-                try {
-                    filePath = new URL(filePath).pathname;
-                } catch {}
-            }
-
-            locations.push({
-                filePath,
-                lineNum,
-                colNum,
-                raw: rawPath
-            });
+        if (pos) {
+            lineNum = +pos[1];
+            colNum = +pos[2];
+            raw = raw.slice(0, -pos[0].length);
         }
+
+        if (raw.startsWith('file://')) {
+            raw = new URL(raw).pathname;
+        }
+
+        locations.push({ filePath: raw, lineNum, colNum });
     }
 
     return locations;
 };
 
-/**
- * Verify file syntax balance
- */
-const verifyFileComplete = (filePath) => {
+/* ─────────────────────────────────────────────
+   CONTEXT DEBUGGER
+───────────────────────────────────────────── */
 
+const getLineContext = (filePath, lineNum, context = 3) => {
     try {
+        const lines = readFileSync(filePath, 'utf8').split('\n');
 
-        const content = readFileSync(filePath, 'utf-8');
+        const start = Math.max(0, lineNum - context - 1);
+        const end = Math.min(lines.length, lineNum + context);
 
-        let braces = 0;
-        let parens = 0;
-        let brackets = 0;
+        let out = `\n📄 FILE: ${filePath}\n`;
+        out += '─'.repeat(70) + '\n';
 
-        let inString = false;
-        let stringChar = null;
-
-        for (let i = 0; i < content.length; i++) {
-
-            const char = content[i];
-            const prev = content[i - 1];
-
-            // Ignore strings
-            if (
-                !inString &&
-                (
-                    char === '"' ||
-                    char === "'" ||
-                    char === '`'
-                )
-            ) {
-                inString = true;
-                stringChar = char;
-                continue;
-            }
-
-            if (
-                inString &&
-                char === stringChar &&
-                prev !== '\\'
-            ) {
-                inString = false;
-                stringChar = null;
-                continue;
-            }
-
-            if (inString) continue;
-
-            // Count syntax
-            if (char === '{') braces++;
-            if (char === '}') braces--;
-
-            if (char === '(') parens++;
-            if (char === ')') parens--;
-
-            if (char === '[') brackets++;
-            if (char === ']') brackets--;
+        for (let i = start; i < end; i++) {
+            out += `${i + 1 === lineNum ? '>>' : '  '} ${String(i + 1).padStart(4)} | ${lines[i]}\n`;
         }
 
-        return {
-            complete:
-                braces === 0 &&
-                parens === 0 &&
-                brackets === 0,
-
-            braceBalance: braces,
-            parenBalance: parens,
-            bracketBalance: brackets,
-
-            totalChars: content.length
-        };
-
-    } catch (e) {
-
-        return {
-            complete: false,
-            error: e.message
-        };
+        return out + '─'.repeat(70);
+    } catch {
+        return `Cannot read ${filePath}`;
     }
 };
 
-/**
- * Verify only critical files
- */
+/* ─────────────────────────────────────────────
+   FILE INTEGRITY CHECK (IMPROVED)
+───────────────────────────────────────────── */
+
+const verifyFileBalance = (content) => {
+    let brace = 0;
+
+    for (const c of content) {
+        if (c === '{') brace++;
+        if (c === '}') brace--;
+    }
+
+    return brace;
+};
+
+const findUnclosedTokens = (content) => {
+
+    const stack = [];
+    const issues = [];
+
+    const openMap = { '{': '}', '(': ')', '[': ']' };
+    const closeMap = { '}': '{', ')': '(', ']': '[' };
+
+    for (let i = 0; i < content.length; i++) {
+        const c = content[i];
+
+        if (openMap[c]) {
+            stack.push({ char: c, index: i });
+        }
+
+        if (closeMap[c]) {
+            const last = stack[stack.length - 1];
+
+            if (last && last.char === closeMap[c]) {
+                stack.pop();
+            } else {
+                issues.push({ type: 'mismatch', char: c, index: i });
+            }
+        }
+    }
+
+    return { stack, issues };
+};
+
+/* ─────────────────────────────────────────────
+   CRITICAL FILE CHECK (CLEAN OUTPUT)
+───────────────────────────────────────────── */
+
 const verifyCriticalFiles = () => {
 
-    console.log('\n🔍 Verifying critical files...');
+    console.log('\n🔍 Checking critical files...\n');
 
-    const criticalFiles = [
+    const files = [
         './bot/commands/otp.js',
         './bot/index.js'
     ];
 
-    for (const file of criticalFiles) {
-
+    for (const file of files) {
         try {
+            const full = new URL(file, import.meta.url).pathname;
+            const content = readFileSync(full, 'utf8');
 
-            const url = new URL(file, import.meta.url);
+            const balance = verifyFileBalance(content);
 
-            const check = verifyFileComplete(url.pathname);
+            if (balance === 0) {
+                console.log(`✅ ${file}`);
+            } else {
+                console.log(`❌ ${file} (brace imbalance: ${balance})`);
 
-            const status =
-                check.complete ? '✅' : '❌';
+                const { stack, issues } = findUnclosedTokens(content);
 
-            console.log(
-                `   ${status} ${file} ` +
-                `(braces:${check.braceBalance}, ` +
-                `parens:${check.parenBalance}, ` +
-                `brackets:${check.bracketBalance}, ` +
-                `chars:${check.totalChars})`
-            );
+                if (stack.length || issues.length) {
+                    console.log('\n🧠 Detailed issues:');
 
-            if (!check.complete) {
-
-                console.log(
-                    `      ⚠️ Syntax imbalance detected`
-                );
-
-                try {
-
-                    const content = readFileSync(
-                        url.pathname,
-                        'utf-8'
-                    );
-
-                    const lines = content.split('\n');
-
-                    console.log('\n📄 LAST 25 LINES:\n');
-                    console.log('─'.repeat(70));
-
-                    const start = Math.max(
-                        0,
-                        lines.length - 25
-                    );
-
-                    for (
-                        let i = start;
-                        i < lines.length;
-                        i++
-                    ) {
-                        console.log(
-                            `${String(i + 1).padStart(4)} | ${lines[i]}`
-                        );
+                    for (const s of stack.slice(-5)) {
+                        console.log(`UNOPENED ${s.char}`);
                     }
 
-                    console.log('─'.repeat(70));
-
-                } catch {}
-            }
-
-        } catch (e) {
-
-            console.log(
-                `   ❌ ${file} (not found)`
-            );
-        }
-    }
-};
-
-/**
- * Safe import
- */
-const safeImport = async (modulePath) => {
-
-    console.log(`📦 Importing: ${modulePath}...`);
-
-    try {
-
-        const module = await import(modulePath);
-
-        console.log(`✅ Imported: ${modulePath}`);
-
-        return module;
-
-    } catch (error) {
-
-        console.error(
-            `\n❌ FAILED to import: ${modulePath}`
-        );
-
-        console.error(
-            `   Error Type: ${error.constructor.name}`
-        );
-
-        console.error(
-            `   Message: ${error.message}`
-        );
-
-        if (
-            error instanceof SyntaxError &&
-            error.stack
-        ) {
-
-            console.error(
-                '\n🔍 SYNTAX ERROR DETECTED'
-            );
-
-            const locations =
-                parseStackTrace(error.stack);
-
-            if (locations.length > 0) {
-
-                const primary = locations[0];
-
-                console.error(
-                    `\n🎯 PRIMARY LOCATION:`
-                );
-
-                console.error(
-                    `   File: ${primary.filePath}`
-                );
-
-                console.error(
-                    `   Line: ${primary.lineNum}`
-                );
-
-                console.error(
-                    `   Column: ${primary.colNum}`
-                );
-
-                if (primary.lineNum > 0) {
-
-                    console.error(
-                        getLineContext(
-                            primary.filePath,
-                            primary.lineNum,
-                            3
-                        )
-                    );
+                    for (const i of issues.slice(-5)) {
+                        console.log(`MISMATCH ${i.char}`);
+                    }
                 }
             }
-        }
 
-        throw error;
+        } catch {
+            console.log(`❌ ${file} (missing)`);
+        }
     }
 };
 
-/**
- * Deep import tracer
- */
-const traceImportChain = async (
-    modulePath,
-    depth = 0,
-    visited = new Set()
-) => {
+/* ─────────────────────────────────────────────
+   SAFE IMPORT (CLEAN + DEBUG READY)
+───────────────────────────────────────────── */
 
-    const indent = '  '.repeat(depth);
+const safeImport = async (p) => {
+    try {
+        console.log(`📦 ${p}`);
+        const mod = await import(p);
+        console.log(`✅ ${p}`);
+        return mod;
 
-    if (visited.has(modulePath)) {
+    } catch (e) {
+        console.error(`❌ ${p}`);
+        console.error(e.message);
 
-        console.log(
-            `${indent}♻️ Already visited: ${modulePath}`
-        );
+        if (e.stack) {
+            const loc = parseStackTrace(e.stack)[0];
+            if (loc) {
+                console.error(getLineContext(loc.filePath, loc.lineNum));
+            }
+        }
 
-        return null;
+        throw e;
     }
+};
 
-    visited.add(modulePath);
+/* ─────────────────────────────────────────────
+   IMPORT TRACE (DEBUG MODE)
+───────────────────────────────────────────── */
 
-    console.log(
-        `${indent}📂 Tracing: ${modulePath}`
-    );
+const traceImportChain = async (p, visited = new Set()) => {
+
+    if (visited.has(p)) return null;
+    visited.add(p);
+
+    console.log(`📂 ${p}`);
 
     try {
+        const mod = await import(p);
+        console.log(`✅ ${p}`);
+        return mod;
 
-        const module = await import(modulePath);
+    } catch (e) {
+        console.log(`❌ ${p}`);
 
-        console.log(
-            `${indent}✅ OK: ${modulePath}`
-        );
-
-        return module;
-
-    } catch (error) {
-
-        console.error(
-            `${indent}❌ BROKEN: ${modulePath}`
-        );
-
-        if (error instanceof SyntaxError) {
-
-            console.error(
-                `\n${indent}🎯 SYNTAX ERROR FOUND`
-            );
-
-            console.error(
-                `${indent}   File: ${modulePath}`
-            );
-
-            console.error(
-                `${indent}   Message: ${error.message}`
-            );
-
-            const locations =
-                parseStackTrace(error.stack);
-
-            const primaryLoc =
-                locations[0] || {
-                    filePath: modulePath,
-                    lineNum: 0,
-                    colNum: 0
-                };
-
-            console.error(
-                `${indent}   Location: ${primaryLoc.filePath}:${primaryLoc.lineNum}:${primaryLoc.colNum}`
-            );
-
-            if (primaryLoc.lineNum > 0) {
-
-                console.error(
-                    getLineContext(
-                        primaryLoc.filePath,
-                        primaryLoc.lineNum,
-                        3
-                    )
-                );
-
-            } else {
-
-                try {
-
-                    const resolvedPath =
-                        new URL(
-                            modulePath,
-                            import.meta.url
-                        ).pathname;
-
-                    const content =
-                        readFileSync(
-                            resolvedPath,
-                            'utf-8'
-                        );
-
-                    const lines =
-                        content.split('\n');
-
-                    console.error(
-                        '\n📄 LAST 25 LINES:\n'
-                    );
-
-                    console.error(
-                        '─'.repeat(70)
-                    );
-
-                    const start = Math.max(
-                        0,
-                        lines.length - 25
-                    );
-
-                    for (
-                        let i = start;
-                        i < lines.length;
-                        i++
-                    ) {
-
-                        console.error(
-                            `${String(i + 1).padStart(4)} | ${lines[i]}`
-                        );
-                    }
-
-                    console.error(
-                        '─'.repeat(70)
-                    );
-
-                } catch {}
+        if (e instanceof SyntaxError) {
+            const loc = parseStackTrace(e.stack)[0];
+            if (loc) {
+                console.error(getLineContext(loc.filePath, loc.lineNum));
             }
-
-            throw new Error(
-                `SYNTAX ERROR in ${modulePath}: ${error.message}`
-            );
         }
 
-        if (
-            error.code === 'ERR_MODULE_NOT_FOUND'
-        ) {
-
-            console.error(
-                `${indent}📦 MODULE NOT FOUND`
-            );
-
-            console.error(
-                `${indent}   ${error.message}`
-            );
-
-            throw error;
-        }
-
-        console.error(
-            `${indent}   Error: ${error.message}`
-        );
-
-        throw error;
+        throw e;
     }
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// MAIN
-// ═══════════════════════════════════════════════════════════════════════════════
+/* ─────────────────────────────────────────────
+   MAIN BOOTSTRAP
+───────────────────────────────────────────── */
 
 try {
 
-    console.log('🚀 app.js starting...');
-    console.log(`   Node: ${process.version}`);
-    console.log(`   CWD: ${process.cwd()}`);
+    console.log('\n🚀 APP STARTING');
+    console.log(process.version);
 
-    // ONLY VERIFY IMPORTANT FILES
     verifyCriticalFiles();
 
-    // IMPORTS
-    const {
-        config,
-        connectDatabase
-    } = await safeImport(
-        './config/index.js'
-    );
+    const { config, connectDatabase } =
+        await safeImport('./config/index.js');
 
-    const {
-        default: logger
-    } = await safeImport(
-        './utils/logger.js'
-    );
+    await safeImport('./utils/logger.js');
 
-    // TRACE BOT
-    console.log(
-        '\n📂 Starting deep import trace...'
-    );
+    console.log('\n📂 tracing bot...');
+    const botModule =
+        await traceImportChain('./bot/index.js');
 
-    const importedBot =
-        await traceImportChain(
-            './bot/index.js'
-        );
-
-    if (!importedBot?.default) {
-
-        throw new Error(
-            'TelegramBot export missing from ./bot/index.js'
-        );
+    if (!botModule?.default) {
+        throw new Error('Bot export missing');
     }
 
-    const TelegramBot =
-        importedBot.default;
+    const Bot = botModule.default;
 
-    const {
-        startServer
-    } = await safeImport(
-        './api/index.js'
-    );
+    const { startServer } =
+        await safeImport('./api/index.js');
 
-    const {
-        default: CronJobs
-    } = await safeImport(
-        './cron/index.js'
-    );
+    const { default: Cron } =
+        await safeImport('./cron/index.js');
 
-    let bot = null;
+    await connectDatabase();
 
-    const port =
-        config?.server?.port ||
-        process.env.PORT ||
-        3000;
+    const bot = new Bot();
+    await bot.launch();
 
-    const startApp = async () => {
+    startServer(config?.server?.port || 3000);
 
-        await connectDatabase();
+    new Cron().start();
 
-        bot = new TelegramBot();
-
-        await bot.launch();
-
-        startServer(port);
-
-        const cron = new CronJobs();
-
-        cron.start();
-
-        console.log(
-            `🎉 App started on port ${port}`
-        );
-    };
-
-    startApp();
+    console.log('\n🎉 SYSTEM ONLINE');
 
 } catch (err) {
-
-    console.error(
-        '\n💥 FATAL ERROR:',
-        err.message
-    );
-
-    if (err.stack) {
-
-        console.error('\nStack:');
-
-        const locations =
-            parseStackTrace(err.stack);
-
-        locations.forEach((loc, i) => {
-
-            console.error(
-                `  ${i + 1}. ${loc.filePath}:${loc.lineNum}:${loc.colNum}`
-            );
-        });
-    }
-
+    console.error('\n💥 FATAL ERROR');
+    console.error(err.stack || err.message);
     process.exit(1);
-}
+    }
