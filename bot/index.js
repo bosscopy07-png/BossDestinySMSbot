@@ -783,7 +783,7 @@ class TelegramBot {
                 //  NEW: Tier search input handler (non-admin users)
                 //  Must run BEFORE admin handlers to avoid conflicts
                 // ═════════════════════════════════════════════════════════════════
-                if (!isAdmin && ctx.session?.tierFlowStep?.startsWith('searching_')) {
+                                if (!isAdmin && ctx.session?.tierFlowStep?.startsWith('searching_')) {
                     const otpCommands = this.commandModules.get('otp');
                     if (otpCommands?.handleTierSearchInput) {
                         const handled = await otpCommands.handleTierSearchInput(ctx);
@@ -800,6 +800,62 @@ class TelegramBot {
 
                     if (ctx.session.awaitingBroadcast) {
                         const { target, filter, label } = ctx.session.awaitingBroadcast;
+                        delete ctx.session.awaitingBroadcast;
+                        return adminCommands.executeBroadcast(ctx, filter, label, ctx.message.text);
+                    }
+
+                    if (ctx.session.awaitingAddBalance) {
+                        const targetId = ctx.session.awaitingAddBalance;
+                        delete ctx.session.awaitingAddBalance;
+                        const amount = parseFloat(ctx.message.text);
+                        if (isNaN(amount) || amount <= 0) {
+                            return adminCommands.replyError(ctx, '❌ <b>Invalid amount.</b>');
+                        }
+                        return adminCommands.processAddBalance(ctx, targetId, amount, 'Admin credit via inline');
+                    }
+
+                    if (ctx.session.awaitingDeductBalance) {
+                        const targetId = ctx.session.awaitingDeductBalance;
+                        delete ctx.session.awaitingDeductBalance;
+                        const amount = parseFloat(ctx.message.text);
+                        if (isNaN(amount) || amount <= 0) {
+                            return adminCommands.replyError(ctx, '❌ <b>Invalid amount.</b>');
+                        }
+                        return adminCommands.processDeductBalance(ctx, targetId, amount, 'Admin deduction via inline');
+                    }
+
+                    if (ctx.session.awaitingBlacklistReason) {
+                        const targetId = ctx.session.awaitingBlacklistReason;
+                        delete ctx.session.awaitingBlacklistReason;
+                        const reason = ctx.message.text.trim().toLowerCase() === 'skip'
+                            ? 'Manual blacklist'
+                            : ctx.message.text.trim();
+                        return adminCommands.processBlacklist(ctx, targetId, reason);
+                    }
+
+                    if (ctx.session.awaitingMessageUser) {
+                        const targetId = ctx.session.awaitingMessageUser;
+                        delete ctx.session.awaitingMessageUser;
+                        return adminCommands.processMessageUser(ctx, targetId, ctx.message.text);
+                    }
+                }
+                return next();
+            } catch (err) {
+                logger.error('Text message handler error', { error: err.message, userId: ctx.from?.id });
+                await this.alertAdmins(err, {
+                    userId: ctx.from?.id,
+                    updateType: 'message',
+                    command: ctx.message?.text,
+                    source: 'handler.textMessage',
+                    note: 'Text handler crash'
+                });
+            }
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    //  END OF PART 2/3 — Continues in Part 3/3 below
+    // ═══════════════════════════════════════════════════════════════════════════════
                   // ═══════════════════════════════════════════════════════════════════════════════
     // bot/TelegramBot.js — Part 3/3
     // Launch Sequence, Deposit Scanner, Metrics, Health & Graceful Shutdown
