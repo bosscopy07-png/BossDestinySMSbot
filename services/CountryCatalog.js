@@ -1,10 +1,10 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 //  services/CountryCatalog.js — Country Discovery with Live Pricing & Search
-//  Handles 120+ countries without loading all at once
+//  DYNAMIC: Uses CheapPanelProvider.getAvailableCountries() as single source of truth
+//  No hardcoded COUNTRIES import. Backfills top countries to reach minAvailable.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { TOP_COUNTRIES, COUNTRY_ALIASES, PAGINATION, CACHE_TTL, TIER_CONFIG } from '../config/tierConfig.js';
-import { COUNTRIES } from '../utils/constants.js';
 import logger from '../utils/logger.js';
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -12,10 +12,9 @@ import logger from '../utils/logger.js';
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Generate stable cache key from sorted inputs (immutable)
+ * Generate stable cache key
  */
 function makeCacheKey(tierKey, service, countryCodes) {
-    // Slice to avoid mutating caller's array, then sort
     const sorted = countryCodes.slice().sort();
     return `${tierKey}:${service}:${sorted.join(',')}`;
 }
@@ -28,12 +27,14 @@ function isNoStockError(error) {
     return (
         error.message.includes('TIER_NO_STOCK') ||
         error.message.includes('NO_SERVICE') ||
-        error.message.includes('NOT_AVAILABLE')
+        error.message.includes('NOT_AVAILABLE') ||
+        error.message.includes('BAD_COUNTRY') ||
+        error.message.includes('BAD_SERVICE')
     );
 }
 
 /**
- * Convert ISO 3166-1 alpha-2 code to emoji flag
+ * Convert ISO code to emoji flag
  */
 function isoToFlag(code) {
     if (!code || typeof code !== 'string' || code.length !== 2) return '🌍';
@@ -62,66 +63,134 @@ class CountryCatalog {
         this.provider = cheapPanelProvider;
         this.tierSelector = tierSelector;
 
-        // Build country index
-        this._countryMap = new Map();      // iso -> country data
+        // Dynamic country index — populated from provider, NOT hardcoded
+        this._countryMap = new Map();      // iso -> { code, name, flag }
         this._nameIndex = new Map();       // normalized name -> iso
-        this._buildIndex();
+        this._aliasMap = new Map();        // alias -> iso
 
-        // Price cache with bounded size (LRU-like eviction)
+        // Available countries cache per service: service -> { countries[], timestamp }
+        this._availableCache = new Map();
+        this._availableCacheTtl = CACHE_TTL.tierPrices || 2 * 60 * 1000; // 2 minutes default
+
+        // Price cache for specific country/service/tier combos
         this._priceCache = new Map();
-        this._maxCacheSize = 200;          // Prevent unbounded growth
-    }
+        this._maxPriceCacheSize = 200;
 
-    _buildIndex() {
-        for (const country of COUNTRIES) {
-            if (!country?.code || !country?.name) {
-                logger.warn('Skipping invalid country entry', { country });
-                continue;
-            }
+        // Build alias index from config (aliases are static)
+        this._buildAliasIndex();
 
-            const code = country.code.toUpperCase();
-            this._countryMap.set(code, country);
-            this._nameIndex.set(country.name.toLowerCase(), code);
-
-            // Index aliases that point to this country
-            for (const [alias, aliasCode] of Object.entries(COUNTRY_ALIASES)) {
-                if (aliasCode === code) {
-                    this._nameIndex.set(alias.toLowerCase(), code);
-                }
-            }
-        }
-
-        logger.info('Country catalog indexed', {
-            totalCountries: this._countryMap.size,
-            aliasesIndexed: this._nameIndex.size - this._countryMap.size
+        logger.info('CountryCatalog initialized', {
+            provider: cheapPanelProvider.name || 'unknown',
+            providerActive: cheapPanelProvider.isActive
         });
     }
 
+    _buildAliasIndex() {
+        for (const [alias, isoCode] of Object.entries(COUNTRY_ALIASES)) {
+            this._aliasMap.set(alias.toLowerCase(), isoCode.toUpperCase());
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
-    //  PUBLIC API — Tier-Aware Country Listing
+    //  DYNAMIC CATALOG LOADING
     // ═══════════════════════════════════════════════════════════════════════
 
     /**
-     * Validate service identifier
+     * Fetch available countries for a service from 5SIM
+     * This is the SINGLE SOURCE OF TRUTH for country availability
      */
-    _validateService(service) {
-        if (!service || typeof service !== 'string') {
-            throw new Error('INVALID_SERVICE: service must be a non-empty string');
+    async _loadAvailableCountries(service) {
+        const normalizedService = this._normalizeService(service);
+        const cacheKey = normalizedService;
+
+        // Check cache
+        const cached = this._availableCache.get(cacheKey);
+        if (cached && (Date.now() - cached.timestamp) < this._availableCacheTtl) {
+            logger.debug('Using cached available countries', { service: normalizedService, count: cached.countries.length });
+            return cached.countries;
         }
+
+        // Fetch from provider
+        const result = await this.provider.getAvailableCountries(normalizedService);
+
+        if (!result.success || !result.countries) {
+            logger.error('Failed to load available countries', { service: normalizedService, error: result.error });
+            return [];
+        }
+
+        // Update dynamic index
+        const countries = result.countries.map(c => ({
+            code: c.code.toUpperCase(),
+            name: c.name,
+            flag: isoToFlag(c.code),
+            simCode: c.simCode
+        }));
+
+        // Rebuild indexes with fresh data
+        this._rebuildCountryIndex(countries);
+
+        // Cache
+        this._availableCache.set(cacheKey, {
+            countries,
+            timestamp: Date.now()
+        });
+
+        logger.info('Loaded available countries from provider', {
+            service: normalizedService,
+            count: countries.length,
+            sample: countries.slice(0, 5).map(c => c.code)
+        });
+
+        return countries;
+    }
+
+    _rebuildCountryIndex(countries) {
+        this._countryMap.clear();
+        this._nameIndex.clear();
+
+        for (const country of countries) {
+            this._countryMap.set(country.code, country);
+            this._nameIndex.set(country.name.toLowerCase(), country.code);
+
+            // Also index aliases that point to this country
+            for (const [alias, isoCode] of this._aliasMap.entries()) {
+                if (isoCode === country.code) {
+                    this._nameIndex.set(alias, country.code);
+                }
+            }
+        }
+    }
+
+    _normalizeService(service) {
+        if (!service || typeof service !== 'string') return 'other';
         return service.trim();
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  PUBLIC API
+    // ═══════════════════════════════════════════════════════════════════════
+
     /**
-     * Get countries for a service, sorted by tier-aware pricing
+     * Get countries for a service with availability backfill
+     * 
+     * @param {string} service - Service name (e.g., 'whatsapp', 'telegram')
+     * @param {string} tierKey - 'budget' | 'standard' | 'premium'
+     * @param {Object} options
+     *   @param {number} options.page - Page number
+     *   @param {number} options.perPage - Items per page
+     *   @param {string|null} options.searchQuery - Search by name/ISO/alias
+     *   @param {boolean} options.topOnly - Prefer top countries, backfill if sparse
+     *   @param {number} options.minAvailable - Minimum available countries (default: 20)
      */
     async getCountriesForService(service, tierKey, options = {}) {
-        const validatedService = this._validateService(service);
+        const normalizedService = this._normalizeService(service);
 
         const {
             page = 1,
             perPage = PAGINATION.countriesPerPage,
             searchQuery = null,
-            topOnly = false
+            topOnly = false,
+            minAvailable = 20
         } = options;
 
         const tier = TIER_CONFIG[tierKey];
@@ -130,43 +199,112 @@ class CountryCatalog {
         }
 
         if (!Number.isInteger(page) || page < 1) {
-            throw new Error(`INVALID_PAGE: page must be a positive integer, got ${page}`);
+            throw new Error(`INVALID_PAGE: page must be positive integer, got ${page}`);
         }
         if (!Number.isInteger(perPage) || perPage < 1 || perPage > 100) {
             throw new Error(`INVALID_PER_PAGE: perPage must be 1-100, got ${perPage}`);
         }
 
-        // Determine which countries to check
-        let countryCodes;
-        if (searchQuery) {
-            countryCodes = this._searchCountries(searchQuery);
-        } else if (topOnly) {
-            countryCodes = TOP_COUNTRIES.filter(code => this._countryMap.has(code));
-        } else {
-            countryCodes = Array.from(this._countryMap.keys());
-        }
+        // ── Load dynamic catalog for this service ──
+        const availableCountries = await this._loadAvailableCountries(normalizedService);
+        const availableCodes = new Set(availableCountries.map(c => c.code));
 
-        if (countryCodes.length === 0) {
+        if (availableCountries.length === 0) {
             return {
                 countries: [],
                 pagination: { page: 1, perPage, total: 0, totalPages: 0, hasNext: false, hasPrev: false },
                 tierInfo: this.tierSelector.getTierInfo(tierKey),
-                searchQuery: searchQuery || null
+                service: normalizedService,
+                message: `No countries available for ${normalizedService} at this time.`
             };
         }
 
-        // Fetch live prices for these countries (parallel, batched)
+        // ── Determine which country codes to check ──
+        let countryCodes;
+        let isSearchMode = false;
+
+        if (searchQuery) {
+            countryCodes = this._searchCountries(searchQuery, availableCodes);
+            isSearchMode = true;
+        } else if (topOnly) {
+            // Start with TOP_COUNTRIES that are available for this service
+            countryCodes = TOP_COUNTRIES.filter(code => availableCodes.has(code));
+        } else {
+            // All available countries
+            countryCodes = Array.from(availableCodes);
+        }
+
+        // ── Search mode: handle explicit unavailability ──
+        if (isSearchMode) {
+            // Check if search matched countries NOT available for this service
+            const allMatches = this._searchAllMatches(searchQuery); // Includes unavailable
+            const unavailableMatches = allMatches.filter(code => !availableCodes.has(code));
+
+            if (countryCodes.length === 0 && unavailableMatches.length > 0) {
+                // User searched a valid country, but it's not available for this service
+                const unavailableCountries = unavailableMatches.map(code => ({
+                    code,
+                    name: this._getCountryName(code),
+                    flag: isoToFlag(code),
+                    price: null,
+                    displayPrice: null,
+                    stock: 0,
+                    operator: null,
+                    score: 0,
+                    currency: 'USD',
+                    available: false,
+                    unavailableReason: 'service_not_available',
+                    message: `${this._getCountryName(code)} is not available for ${normalizedService}. Try another service or country.`
+                }));
+
+                return {
+                    countries: unavailableCountries,
+                    pagination: { page: 1, perPage, total: unavailableCountries.length, totalPages: 1, hasNext: false, hasPrev: false },
+                    tierInfo: this.tierSelector.getTierInfo(tierKey),
+                    service: normalizedService,
+                    searchQuery: searchQuery.trim(),
+                    searchMatched: true,
+                    allUnavailable: true,
+                    message: `The country you searched is not available for ${normalizedService}. Try another service or country.`
+                };
+            }
+
+            if (countryCodes.length === 0) {
+                return {
+                    countries: [],
+                    pagination: { page: 1, perPage, total: 0, totalPages: 0, hasNext: false, hasPrev: false },
+                    tierInfo: this.tierSelector.getTierInfo(tierKey),
+                    service: normalizedService,
+                    searchQuery: searchQuery.trim(),
+                    searchMatched: false,
+                    message: `No countries found matching "${searchQuery}" for ${normalizedService}.`
+                };
+            }
+        }
+
+        // ── Backfill for topOnly mode ──
+        if (topOnly && !isSearchMode) {
+            const backfillCodes = this._computeBackfill(countryCodes, availableCodes, minAvailable);
+            countryCodes = backfillCodes;
+        }
+
+        // ── Fetch live prices ──
         const countriesWithPrices = await this._fetchCountryPrices(
-            countryCodes, validatedService, tierKey, tier
+            countryCodes,
+            normalizedService,
+            tierKey,
+            tier
         );
 
-        // Sort: cheapest first, then by stock (null prices last)
+        // Sort: available first (cheapest), then unavailable
         countriesWithPrices.sort((a, b) => {
-            const aHasPrice = a.price !== null && a.price !== undefined;
-            const bHasPrice = b.price !== null && b.price !== undefined;
-            if (aHasPrice && bHasPrice) return a.price - b.price;
-            if (aHasPrice) return -1;
-            if (bHasPrice) return 1;
+            if (a.available && !b.available) return -1;
+            if (!a.available && b.available) return 1;
+            if (a.available && b.available) {
+                if (a.price !== null && b.price !== null) return a.price - b.price;
+                if (a.price !== null) return -1;
+                if (b.price !== null) return 1;
+            }
             return (b.stock || 0) - (a.stock || 0);
         });
 
@@ -187,15 +325,22 @@ class CountryCatalog {
                 hasPrev: page > 1
             },
             tierInfo: this.tierSelector.getTierInfo(tierKey),
-            searchQuery: searchQuery || null
+            service: normalizedService,
+            searchQuery: searchQuery || null,
+            searchMatched: isSearchMode ? true : null,
+            allUnavailable: isSearchMode ? pageCountries.every(c => !c.available) : null
         };
     }
 
+    /**
+     * Get top countries with backfill guarantee
+     */
     async getTopCountries(service, tierKey, limit = 20) {
         return this.getCountriesForService(service, tierKey, {
             topOnly: true,
             perPage: limit,
-            page: 1
+            page: 1,
+            minAvailable: limit
         });
     }
 
@@ -212,9 +357,44 @@ class CountryCatalog {
     hasCountry(code) {
         if (!code || typeof code !== 'string') return false;
         return this._countryMap.has(code.toUpperCase());
-                              }
-                        // ═══════════════════════════════════════════════════════════════════════
-    //  INTERNAL — Price Fetching (Improved)
+        }
+                    // ═══════════════════════════════════════════════════════════════════════
+    //  INTERNAL — Backfill Logic
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Compute backfill: if top countries < minAvailable, add more available countries
+     * Preserves top country priority order, appends backfill by catalog order
+     */
+    _computeBackfill(topCodes, availableCodes, minAvailable) {
+        if (topCodes.length >= minAvailable) {
+            return topCodes; // Sufficient top countries available
+        }
+
+        const needed = minAvailable - topCodes.length;
+        const result = [...topCodes];
+        const added = new Set(topCodes);
+
+        // Add remaining available countries in provider catalog order
+        for (const code of availableCodes) {
+            if (added.has(code)) continue;
+            result.push(code);
+            added.add(code);
+            if (result.length >= minAvailable) break;
+        }
+
+        logger.info('Backfilled countries', {
+            topAvailable: topCodes.length,
+            needed,
+            backfilledTo: result.length,
+            totalAvailable: availableCodes.size
+        });
+
+        return result;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  INTERNAL — Price Fetching
     // ═══════════════════════════════════════════════════════════════════════
 
     async _fetchCountryPrices(countryCodes, service, tierKey, tier) {
@@ -222,13 +402,12 @@ class CountryCatalog {
         const cached = this._priceCache.get(cacheKey);
 
         if (cached && (Date.now() - cached.timestamp) < CACHE_TTL.tierPrices) {
-            logger.debug('Cache hit for country prices', { cacheKey, count: cached.data.length });
             return cached.data;
         }
 
         const batchSize = 10;
         const results = [];
-        const errors = []; // Collect errors for logging, not swallowing
+        const errors = [];
 
         for (let i = 0; i < countryCodes.length; i += batchSize) {
             const batch = countryCodes.slice(i, i + batchSize);
@@ -236,7 +415,7 @@ class CountryCatalog {
             const batchPromises = batch.map(async (code) => {
                 const country = this._countryMap.get(code);
                 if (!country) {
-                    logger.warn('Unknown country code in batch', { code });
+                    logger.warn('Country not in dynamic index', { code, service });
                     return null;
                 }
 
@@ -248,13 +427,11 @@ class CountryCatalog {
                     return {
                         code,
                         name: country.name,
-                        flag: country.flag || isoToFlag(code),
-                        price: selection.price,
-                        displayPrice: selection.displayPrice,
+                        flag: country.flag,
                         price: selection.price ?? null,
                         displayPrice: selection.displayPrice ?? null,
                         stock: selection.stock ?? 0,
-                        operator: selection.operator ?? null,
+                        operator: selection.operator,
                         score: selection.score ?? 0,
                         currency: 'USD',
                         available: true
@@ -263,24 +440,17 @@ class CountryCatalog {
                 } catch (error) {
                     const noStock = isNoStockError(error);
 
-                    // Log at appropriate level based on error type
                     if (noStock) {
                         logger.debug('No stock for country/service', { code, service, tierKey });
                     } else {
-                        logger.warn('Price fetch failed for country', {
-                            code,
-                            service,
-                            tierKey,
-                            error: error.message,
-                            stack: error.stack
-                        });
+                        logger.warn('Price fetch failed', { code, service, tierKey, error: error.message });
                         errors.push({ code, error: error.message });
                     }
 
                     return {
                         code,
                         name: country.name,
-                        flag: country.flag || isoToFlag(code),
+                        flag: country.flag,
                         price: null,
                         displayPrice: null,
                         stock: 0,
@@ -289,7 +459,7 @@ class CountryCatalog {
                         currency: 'USD',
                         available: false,
                         unavailableReason: noStock ? 'no_stock' : 'error',
-                        retryable: !noStock  // transient errors can be retried
+                        retryable: !noStock
                     };
                 }
             });
@@ -302,77 +472,100 @@ class CountryCatalog {
                 }
             }
 
-            // Adaptive delay: only sleep if more batches remain
             if (i + batchSize < countryCodes.length) {
                 await new Promise(r => setTimeout(r, 100));
             }
         }
 
-        // Log summary if there were errors
         if (errors.length > 0) {
-            logger.info('Country price fetch completed with errors', {
-                totalRequested: countryCodes.length,
+            logger.info('Price fetch summary', {
+                total: countryCodes.length,
                 successful: results.filter(r => r.available).length,
-                failed: errors.length,
-                sampleErrors: errors.slice(0, 5)
+                failed: errors.length
             });
         }
 
-        // Cache and enforce size limit
-        this._setCacheEntry(cacheKey, results);
-
+        this._setPriceCacheEntry(cacheKey, results);
         return results;
     }
 
-    _setCacheEntry(key, data) {
-        // Evict oldest entries if at capacity
-        if (this._priceCache.size >= this._maxCacheSize) {
+    _setPriceCacheEntry(key, data) {
+        if (this._priceCache.size >= this._maxPriceCacheSize) {
             const oldestKey = this._priceCache.keys().next().value;
             this._priceCache.delete(oldestKey);
-            logger.debug('Evicted oldest cache entry', { evictedKey: oldestKey });
         }
-
-        this._priceCache.set(key, {
-            data,
-            timestamp: Date.now()
-        });
+        this._priceCache.set(key, { data, timestamp: Date.now() });
     }
-
+        // ═══════════════════════════════════════════════════════════════════════
+    //  INTERNAL — Search
     // ═══════════════════════════════════════════════════════════════════════
-    //  INTERNAL — Search (Single Source of Truth)
-    // ═══════════════════════════════════════════════════════════════════════
 
-    _searchCountries(query) {
+    /**
+     * Search countries available for the service
+     */
+    _searchCountries(query, availableCodes = null) {
         const normalized = query.toLowerCase().trim();
         if (!normalized) return [];
+
+        const matches = new Set();
 
         // Direct ISO match
         const upperCode = normalized.toUpperCase();
         if (this._countryMap.has(upperCode)) {
-            return [upperCode];
+            if (!availableCodes || availableCodes.has(upperCode)) {
+                matches.add(upperCode);
+            }
         }
 
         // Alias match
-        if (COUNTRY_ALIASES[normalized]) {
-            return [COUNTRY_ALIASES[normalized]];
+        if (this._aliasMap.has(normalized)) {
+            const aliasCode = this._aliasMap.get(normalized);
+            if (!availableCodes || availableCodes.has(aliasCode)) {
+                matches.add(aliasCode);
+            }
         }
 
-        // Prefix/substring match against unified name index
+        // Name prefix/substring match
+        for (const [name, code] of this._nameIndex) {
+            if (name.includes(normalized) || normalized.includes(name)) {
+                if (!availableCodes || availableCodes.has(code)) {
+                    matches.add(code);
+                }
+            }
+        }
+
+        return Array.from(matches);
+    }
+
+    /**
+     * Search ALL matches including unavailable (for unavailability messaging)
+     */
+    _searchAllMatches(query) {
+        const normalized = query.toLowerCase().trim();
+        if (!normalized) return [];
+
         const matches = new Set();
+
+        // Direct ISO
+        const upperCode = normalized.toUpperCase();
+        if (this._countryMap.has(upperCode)) matches.add(upperCode);
+
+        // Alias
+        if (this._aliasMap.has(normalized)) matches.add(this._aliasMap.get(normalized));
+
+        // Name match
         for (const [name, code] of this._nameIndex) {
             if (name.includes(normalized) || normalized.includes(name)) {
                 matches.add(code);
             }
         }
 
-        // Also match against native country names (catches entries not in _nameIndex)
-        for (const country of COUNTRIES) {
-            if (country?.name?.toLowerCase().includes(normalized)) {
-                matches.add(country.code.toUpperCase());
-            }
-        }
-
         return Array.from(matches);
+    }
+
+    _getCountryName(code) {
+        const country = this._countryMap.get(code.toUpperCase());
+        return country?.name || code;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -380,38 +573,31 @@ class CountryCatalog {
     // ═══════════════════════════════════════════════════════════════════════
 
     clearCache() {
-        const size = this._priceCache.size;
+        const priceSize = this._priceCache.size;
+        const availableSize = this._availableCache.size;
         this._priceCache.clear();
-        logger.info('CountryCatalog cache cleared', { entriesRemoved: size });
+        this._availableCache.clear();
+        logger.info('CountryCatalog caches cleared', { priceEntries: priceSize, availableEntries: availableSize });
     }
 
     /**
-     * Remove cache entries for a specific service (selective invalidation)
+     * Invalidate available countries cache for a specific service
      */
     invalidateService(service) {
-        const validated = this._validateService(service);
-        let removed = 0;
-        for (const key of this._priceCache.keys()) {
-            if (key.includes(`:${validated}:`)) {
-                this._priceCache.delete(key);
-                removed++;
-            }
-        }
-        logger.info('Invalidated service cache', { service: validated, entriesRemoved: removed });
+        const normalized = this._normalizeService(service);
+        const removed = this._availableCache.delete(normalized);
+        logger.info('Invalidated service cache', { service: normalized, wasCached: removed });
         return removed;
     }
 
-    /**
-     * Get cache statistics for monitoring
-     */
     getCacheStats() {
         return {
-            size: this._priceCache.size,
-            maxSize: this._maxCacheSize,
-            keys: Array.from(this._priceCache.keys())
+            priceCacheSize: this._priceCache.size,
+            priceCacheMax: this._maxPriceCacheSize,
+            availableCacheSize: this._availableCache.size,
+            availableCacheKeys: Array.from(this._availableCache.keys())
         };
     }
 }
 
 export default CountryCatalog;
-                
