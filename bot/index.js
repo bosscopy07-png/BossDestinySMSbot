@@ -922,8 +922,90 @@ class TelegramBot {
             logger.error('Error stopping scanner', { error: error.message });
         }
     }
+    // ═══════════════════════════════════════════════════════════════════════
+    //  LAUNCH SEQUENCE
+    // ═══════════════════════════════════════════════════════════════════════
 
-    // ══════════════
+    async launch() {
+        try {
+            logger.info('Initializing database...');
+            await initModels();
+
+            await this.setupCommands();
+            this.setupTextHandler();
+
+            this.startDepositScanner();
+
+            await this.bot.telegram.deleteWebhook({ drop_pending_updates: true });
+            await this.bot.launch();
+
+            this.isReady = true;
+            logger.info('Bot launched successfully');
+
+            process.once('SIGINT', () => this.gracefulShutdown('SIGINT'));
+            process.once('SIGTERM', () => this.gracefulShutdown('SIGTERM'));
+
+            setInterval(() => this.logMetrics(), 300000);
+
+        } catch (error) {
+            logger.error('Launch failed', { error: error.message });
+            await this.alertAdmins(error, {
+                source: 'launch.botLaunch',
+                note: 'Bot failed to launch — critical'
+            });
+            throw error;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  GRACEFEFUL SHUTDOWN
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async gracefulShutdown(signal) {
+        if (this.isShuttingDown) return;
+        this.isShuttingDown = true;
+
+        logger.info(`Shutting down (${signal})`);
+
+        try {
+            this.bot.stop(signal);
+        } catch (e) {
+            logger.warn('Error stopping bot', { error: e.message });
+        }
+
+        this.stopDepositScanner();
+
+        // Shutdown tier integration
+        if (this.tierIntegrationService) {
+            try {
+                await this.tierIntegrationService.shutdown?.();
+                logger.info('Tier Integration Service shut down');
+            } catch (e) {
+                logger.warn('Tier Integration Service shutdown failed', { error: e.message });
+            }
+        }
+
+        if (this.smsProviderManager) {
+            try {
+                await this.smsProviderManager.shutdown();
+            } catch (e) {
+                logger.warn('SMS Provider Manager shutdown failed', { error: e.message });
+            }
+        }
+
+        try {
+            await Promise.race([
+                this.walletService?.disconnect?.(),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+            ]);
+        } catch (e) {
+            logger.warn('Wallet disconnect timeout or error', { error: e.message });
+        }
+
+        // Exit with delay to allow final logs/alerts to flush
+        setTimeout(() => process.exit(0), 2000);
+    }
+    
 
     // ═══════════════════════════════════════════════════════════════════════
     //  METRICS & HEALTH
