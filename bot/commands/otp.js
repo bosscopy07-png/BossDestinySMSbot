@@ -118,7 +118,8 @@ class OTPCommands {
             this.countryCatalog = null;
         }
     }
-}
+
+
 
     // ─── Auto-bind all handler methods ─────────────────────────────────────
     _bindAllHandlers() {
