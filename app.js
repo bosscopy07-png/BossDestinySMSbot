@@ -318,9 +318,8 @@ try {
     console.log('\n🔍 Pre-verifying critical files...');
     const criticalFiles = [
         './bot/index.js',
-        './bot/TelegramBot.js',
-        './bot/telegrambot.js',
-        './bot/Telegram bot.js'
+        './bot/TelegramBot.js'
+        
     ];
     
     for (const file of criticalFiles) {
