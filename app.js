@@ -2,7 +2,7 @@ import { readFileSync } from 'fs';
 import path from 'path';
 
 /* ─────────────────────────────────────────────
-   GLOBAL ERROR HANDLERS (SINGLE SOURCE)
+   GLOBAL ERROR HANDLERS
 ───────────────────────────────────────────── */
 
 process.on('uncaughtException', (err) => {
@@ -16,39 +16,6 @@ process.on('unhandledRejection', (reason) => {
     console.error(reason?.stack || reason);
     process.exit(1);
 });
-
-/* ─────────────────────────────────────────────
-   STACK PARSER (ROBUST)
-───────────────────────────────────────────── */
-
-const parseStackTrace = (stack = '') => {
-    const locations = [];
-
-    for (const line of stack.split('\n')) {
-        const match = line.match(/(file:\/\/[^\s)]+|\/.*\.js:\d+:\d+)/);
-        if (!match) continue;
-
-        let raw = match[1];
-        let lineNum = 0;
-        let colNum = 0;
-
-        const pos = raw.match(/:(\d+):(\d+)$/);
-
-        if (pos) {
-            lineNum = +pos[1];
-            colNum = +pos[2];
-            raw = raw.slice(0, -pos[0].length);
-        }
-
-        if (raw.startsWith('file://')) {
-            raw = new URL(raw).pathname;
-        }
-
-        locations.push({ filePath: raw, lineNum, colNum });
-    }
-
-    return locations;
-};
 
 /* ─────────────────────────────────────────────
    CONTEXT DEBUGGER
@@ -75,51 +42,123 @@ const getLineContext = (filePath, lineNum, context = 3) => {
 };
 
 /* ─────────────────────────────────────────────
-   FILE INTEGRITY CHECK (IMPROVED)
+   STACK PARSER
 ───────────────────────────────────────────── */
 
-const verifyFileBalance = (content) => {
-    let brace = 0;
+const parseStackTrace = (stack = '') => {
+    const locations = [];
 
-    for (const c of content) {
-        if (c === '{') brace++;
-        if (c === '}') brace--;
+    for (const line of stack.split('\n')) {
+
+        const match = line.match(
+            /(file:\/\/[^\s)]+|\/.*\.js:\d+:\d+)/
+        );
+
+        if (!match) continue;
+
+        let raw = match[1];
+        let lineNum = 0;
+        let colNum = 0;
+
+        const pos = raw.match(/:(\d+):(\d+)$/);
+
+        if (pos) {
+            lineNum = +pos[1];
+            colNum = +pos[2];
+            raw = raw.slice(0, -pos[0].length);
+        }
+
+        if (raw.startsWith('file://')) {
+            raw = new URL(raw).pathname;
+        }
+
+        locations.push({ filePath: raw, lineNum, colNum });
     }
 
-    return brace;
+    return locations;
 };
 
-const findUnclosedTokens = (content) => {
+/* ─────────────────────────────────────────────
+   UNCLOSED TOKEN DETECTOR (FIXED VERSION)
+───────────────────────────────────────────── */
+
+const findUnclosedTokens = (content, filePath) => {
 
     const stack = [];
-    const issues = [];
+    const results = [];
 
-    const openMap = { '{': '}', '(': ')', '[': ']' };
-    const closeMap = { '}': '{', ')': '(', ']': '[' };
+    const openMap = {
+        '{': '}',
+        '(': ')',
+        '[': ']'
+    };
+
+    const closeMap = {
+        '}': '{',
+        ')': '(',
+        ']': '['
+    };
 
     for (let i = 0; i < content.length; i++) {
+
         const c = content[i];
 
+        // OPEN
         if (openMap[c]) {
             stack.push({ char: c, index: i });
         }
 
+        // CLOSE
         if (closeMap[c]) {
+
             const last = stack[stack.length - 1];
 
             if (last && last.char === closeMap[c]) {
                 stack.pop();
             } else {
-                issues.push({ type: 'mismatch', char: c, index: i });
+                results.push({ type: 'mismatch', char: c, index: i });
             }
         }
     }
 
-    return { stack, issues };
+    console.log('\n🧠 UNCLOSED TOKENS REPORT\n');
+
+    if (!stack.length && !results.length) {
+        console.log('✅ Clean file - no syntax imbalance');
+        return;
+    }
+
+    for (const item of stack.slice(-8)) {
+
+        console.log(`\n❌ UNOPENED "${item.char}" near:`);
+
+        console.log(
+            content.substring(
+                Math.max(0, item.index - 60),
+                item.index + 60
+            )
+        );
+
+        console.log('─'.repeat(70));
+    }
+
+    for (const item of results.slice(-8)) {
+
+        console.log(`\n⚠️ MISMATCH "${item.char}" near:`);
+
+        console.log(
+            content.substring(
+                Math.max(0, item.index - 60),
+                item.index + 60
+            )
+        );
+
+        console.log('─'.repeat(70));
+    }
 };
 
 /* ─────────────────────────────────────────────
-   CRITICAL FILE CHECK (CLEAN OUTPUT)
+   FILE CHECK (ONLY CRITICAL FILES)
 ───────────────────────────────────────────── */
 
 const verifyCriticalFiles = () => {
@@ -132,30 +171,27 @@ const verifyCriticalFiles = () => {
     ];
 
     for (const file of files) {
+
         try {
+
             const full = new URL(file, import.meta.url).pathname;
             const content = readFileSync(full, 'utf8');
 
-            const balance = verifyFileBalance(content);
+            // simple balance check
+            let brace = 0;
 
-            if (balance === 0) {
-                console.log(`✅ ${file}`);
-            } else {
-                console.log(`❌ ${file} (brace imbalance: ${balance})`);
+            for (const c of content) {
+                if (c === '{') brace++;
+                if (c === '}') brace--;
+            }
 
-                const { stack, issues } = findUnclosedTokens(content);
+            console.log(
+                `${brace === 0 ? '✅' : '❌'} ${file} (brace balance: ${brace})`
+            );
 
-                if (stack.length || issues.length) {
-                    console.log('\n🧠 Detailed issues:');
-
-                    for (const s of stack.slice(-5)) {
-                        console.log(`UNOPENED ${s.char}`);
-                    }
-
-                    for (const i of issues.slice(-5)) {
-                        console.log(`MISMATCH ${i.char}`);
-                    }
-                }
+            // deep analysis ONLY if broken
+            if (brace !== 0) {
+                findUnclosedTokens(content, full);
             }
 
         } catch {
@@ -165,7 +201,7 @@ const verifyCriticalFiles = () => {
 };
 
 /* ─────────────────────────────────────────────
-   SAFE IMPORT (CLEAN + DEBUG READY)
+   SAFE IMPORT
 ───────────────────────────────────────────── */
 
 const safeImport = async (p) => {
@@ -174,8 +210,8 @@ const safeImport = async (p) => {
         const mod = await import(p);
         console.log(`✅ ${p}`);
         return mod;
-
     } catch (e) {
+
         console.error(`❌ ${p}`);
         console.error(e.message);
 
@@ -191,7 +227,7 @@ const safeImport = async (p) => {
 };
 
 /* ─────────────────────────────────────────────
-   IMPORT TRACE (DEBUG MODE)
+   IMPORT TRACE
 ───────────────────────────────────────────── */
 
 const traceImportChain = async (p, visited = new Set()) => {
@@ -202,11 +238,15 @@ const traceImportChain = async (p, visited = new Set()) => {
     console.log(`📂 ${p}`);
 
     try {
+
         const mod = await import(p);
+
         console.log(`✅ ${p}`);
+
         return mod;
 
     } catch (e) {
+
         console.log(`❌ ${p}`);
 
         if (e instanceof SyntaxError) {
@@ -221,7 +261,7 @@ const traceImportChain = async (p, visited = new Set()) => {
 };
 
 /* ─────────────────────────────────────────────
-   MAIN BOOTSTRAP
+   MAIN
 ───────────────────────────────────────────── */
 
 try {
@@ -264,7 +304,9 @@ try {
     console.log('\n🎉 SYSTEM ONLINE');
 
 } catch (err) {
+
     console.error('\n💥 FATAL ERROR');
     console.error(err.stack || err.message);
+
     process.exit(1);
-    }
+}
