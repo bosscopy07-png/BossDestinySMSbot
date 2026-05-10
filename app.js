@@ -317,8 +317,7 @@ try {
     // Pre-verify critical files before importing
     console.log('\n🔍 Pre-verifying critical files...');
     const criticalFiles = [
-        './bot/index.js',
-        './bot/TelegramBot.js'
+        './bot/index.js'
         
     ];
     
