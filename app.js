@@ -1,89 +1,153 @@
-import fs from 'fs';
+import { pathToFileURL } from 'url';
+import { readFileSync, readdirSync, statSync } from 'fs';
 import path from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// GLOBAL ERROR HANDLERS
-// ═══════════════════════════════════════════════════════════════════════════════
 
 process.on('uncaughtException', (err) => {
-    console.error('\n💥 UNCAUGHT EXCEPTION');
-    console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.error(err.stack || err.message || err);
+    console.error('💥 UNCAUGHT EXCEPTION:', err.message);
+    console.error('Stack:', err.stack);
     process.exit(1);
 });
 
-process.on('unhandledRejection', (reason) => {
-    console.error('\n💥 UNHANDLED REJECTION');
-    console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.error(reason?.stack || reason);
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('💥 UNHANDLED REJECTION at:', promise);
+    console.error('Reason:', reason);
     process.exit(1);
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// PATHS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// HELPERS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-const divider = () => {
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-};
-
-const exists = (target) => {
-    try {
-        fs.accessSync(target);
-        return true;
-    } catch {
-        return false;
-    }
-};
-
+/**
+ * Extract line context from a file around a specific line number
+ */
 const getLineContext = (filePath, lineNum, context = 3) => {
     try {
-        const content = fs.readFileSync(filePath, 'utf8');
+        const content = readFileSync(filePath, 'utf-8');
         const lines = content.split('\n');
-
         const start = Math.max(0, lineNum - context - 1);
         const end = Math.min(lines.length, lineNum + context);
 
-        let output = `\n📄 ${filePath}\n`;
-        output += '─'.repeat(70) + '\n';
+        let result = `\n📄 FILE: ${filePath}\n`;
+        result += '─'.repeat(60) + '\n';
 
         for (let i = start; i < end; i++) {
-            const marker = i === lineNum - 1 ? '👉' : '  ';
-            output += `${marker} ${(i + 1)
-                .toString()
-                .padStart(4)} | ${lines[i]}\n`;
+            const marker = i === lineNum - 1 ? '>>> ' : '    ';
+            const lineStr = String(i + 1).padStart(4, ' ');
+            result += `${marker}${lineStr} | ${lines[i]}\n`;
         }
 
-        output += '─'.repeat(70);
-
-        return output;
-    } catch (err) {
-        return `Could not read file: ${err.message}`;
+        result += '─'.repeat(60);
+        return result;
+    } catch (e) {
+        return `Could not read file: ${filePath} (${e.message})`;
     }
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// RECURSIVE FILE SCANNER
-// ═══════════════════════════════════════════════════════════════════════════════
+/**
+ * Parse stack trace to find the exact file, line, and column
+ */
+const parseStackTrace = (stack) => {
+    const lines = stack.split('\n');
+    const locations = [];
 
-const getAllJsFiles = (dir, collected = []) => {
-    if (!exists(dir)) return collected;
+    for (const line of lines) {
+        const match = line.match(
+            /(?:at\s+)?(?:\(?)(file:\/\/[^\s)]+|[^\s(]+\.js:\d+:\d+)(?:\)?)/
+        );
 
-    const files = fs.readdirSync(dir);
+        if (match) {
+            const rawPath = match[1];
+
+            let filePath = rawPath;
+            let lineNum = 0;
+            let colNum = 0;
+
+            const posMatch = rawPath.match(/:(\d+):(\d+)$/);
+
+            if (posMatch) {
+                lineNum = parseInt(posMatch[1], 10);
+                colNum = parseInt(posMatch[2], 10);
+                filePath = rawPath.slice(0, -posMatch[0].length);
+            }
+
+            if (filePath.startsWith('file://')) {
+                try {
+                    filePath = new URL(filePath).pathname;
+                } catch {}
+            }
+
+            locations.push({
+                filePath,
+                lineNum,
+                colNum,
+                raw: rawPath
+            });
+        }
+    }
+
+    return locations;
+};
+
+/**
+ * Verify a file is complete (not truncated)
+ */
+const verifyFileComplete = (filePath) => {
+    try {
+        const content = readFileSync(filePath, 'utf-8');
+
+        let braceCount = 0;
+        let inString = false;
+        let stringChar = null;
+
+        for (let i = 0; i < content.length; i++) {
+            const char = content[i];
+
+            if (
+                !inString &&
+                (char === '"' || char === "'" || char === '`')
+            ) {
+                inString = true;
+                stringChar = char;
+                continue;
+            }
+
+            if (
+                inString &&
+                char === stringChar &&
+                content[i - 1] !== '\\'
+            ) {
+                inString = false;
+                stringChar = null;
+                continue;
+            }
+
+            if (inString) continue;
+
+            if (char === '{') braceCount++;
+            if (char === '}') braceCount--;
+        }
+
+        return {
+            complete: braceCount === 0,
+            braceBalance: braceCount,
+            totalChars: content.length
+        };
+    } catch (e) {
+        return {
+            complete: false,
+            error: e.message
+        };
+    }
+};
+
+/**
+ * FULL PROJECT SCANNER
+ */
+const scanProjectFiles = (dir) => {
+    const files = readdirSync(dir);
 
     for (const file of files) {
         const fullPath = path.join(dir, file);
 
         try {
-            const stat = fs.statSync(fullPath);
+            const stat = statSync(fullPath);
 
             if (stat.isDirectory()) {
                 if (
@@ -95,226 +159,201 @@ const getAllJsFiles = (dir, collected = []) => {
                     continue;
                 }
 
-                getAllJsFiles(fullPath, collected);
+                scanProjectFiles(fullPath);
+
             } else if (
                 file.endsWith('.js') ||
                 file.endsWith('.mjs')
             ) {
-                collected.push(fullPath);
+                try {
+                    const check = verifyFileComplete(fullPath);
+
+                    const status = check.complete ? '✅' : '❌';
+
+                    console.log(
+                        `   ${status} ${fullPath} (balance: ${check.braceBalance}, chars: ${check.totalChars})`
+                    );
+
+                    if (!check.complete) {
+                        console.log(
+                            `      ⚠️ Brace imbalance: ${check.braceBalance}`
+                        );
+                    }
+
+                } catch (err) {
+                    console.log(`   ❌ ${fullPath}`);
+                    console.log(`      ${err.message}`);
+                }
             }
+
         } catch {}
     }
-
-    return collected;
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// BRACE VALIDATOR
-// ═══════════════════════════════════════════════════════════════════════════════
+/**
+ * Safe import with detailed error reporting
+ */
+const safeImport = async (modulePath) => {
+    console.log(`📦 Importing: ${modulePath}...`);
 
-const verifyBraceBalance = (content) => {
-    let braces = 0;
-    let brackets = 0;
-    let parens = 0;
-
-    let inString = false;
-    let stringChar = '';
-
-    for (let i = 0; i < content.length; i++) {
-        const char = content[i];
-        const prev = content[i - 1];
-
-        if (
-            !inString &&
-            (char === '"' || char === "'" || char === '`')
-        ) {
-            inString = true;
-            stringChar = char;
-            continue;
-        }
-
-        if (
-            inString &&
-            char === stringChar &&
-            prev !== '\\'
-        ) {
-            inString = false;
-            continue;
-        }
-
-        if (inString) continue;
-
-        if (char === '{') braces++;
-        if (char === '}') braces--;
-
-        if (char === '(') parens++;
-        if (char === ')') parens--;
-
-        if (char === '[') brackets++;
-        if (char === ']') brackets--;
-    }
-
-    return {
-        braces,
-        brackets,
-        parens,
-        balanced:
-            braces === 0 &&
-            brackets === 0 &&
-            parens === 0
-    };
-};
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// RAW SYNTAX CHECKER
-// ═══════════════════════════════════════════════════════════════════════════════
-
-const scanFileSyntax = (filePath) => {
     try {
-        const content = fs.readFileSync(filePath, 'utf8');
+        const module = await import(modulePath);
 
-        // Parse JS without executing imports
-        new Function(content);
+        console.log(`✅ Imported: ${modulePath}`);
 
-        const balance = verifyBraceBalance(content);
+        return module;
 
-        return {
-            ok: true,
-            chars: content.length,
-            balance
-        };
-    } catch (err) {
-        return {
-            ok: false,
-            error: err,
-            chars: 0
-        };
+    } catch (error) {
+
+        console.error(`\n❌ FAILED to import: ${modulePath}`);
+        console.error(`   Error Type: ${error.constructor.name}`);
+        console.error(`   Message: ${error.message}`);
+
+        if (error instanceof SyntaxError && error.stack) {
+
+            console.error('\n🔍 SYNTAX ERROR DETECTED');
+
+            const locations = parseStackTrace(error.stack);
+
+            if (locations.length > 0) {
+
+                const primary = locations[0];
+
+                console.error(`\n🎯 PRIMARY LOCATION:`);
+                console.error(`   File: ${primary.filePath}`);
+                console.error(`   Line: ${primary.lineNum}`);
+                console.error(`   Column: ${primary.colNum}`);
+
+                if (primary.lineNum > 0) {
+                    console.error(
+                        getLineContext(
+                            primary.filePath,
+                            primary.lineNum,
+                            2
+                        )
+                    );
+                }
+            }
+        }
+
+        throw error;
     }
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// FULL PROJECT VALIDATOR
-// ═══════════════════════════════════════════════════════════════════════════════
+/**
+ * Deep import tracer
+ */
+const traceImportChain = async (
+    modulePath,
+    depth = 0,
+    visited = new Set()
+) => {
 
-const validateProject = () => {
-    console.log('\n🔍 SCANNING ENTIRE PROJECT...');
-    divider();
+    const indent = '  '.repeat(depth);
 
-    const files = getAllJsFiles(__dirname);
-
-    if (files.length === 0) {
-        throw new Error('No JS files found');
+    if (visited.has(modulePath)) {
+        console.log(`${indent}♻️ Already visited: ${modulePath}`);
+        return null;
     }
 
-    console.log(`📦 Found ${files.length} JS files\n`);
+    visited.add(modulePath);
 
-    const brokenFiles = [];
+    console.log(`${indent}📂 Tracing: ${modulePath}`);
 
-    for (const file of files) {
-        const result = scanFileSyntax(file);
+    try {
 
-        if (result.ok) {
-            console.log(
-                `✅ ${path.relative(__dirname, file)} (${result.chars} chars)`
+        const module = await import(modulePath);
+
+        console.log(`${indent}✅ OK: ${modulePath}`);
+
+        return module;
+
+    } catch (error) {
+
+        console.error(`${indent}❌ BROKEN: ${modulePath}`);
+
+        if (error instanceof SyntaxError) {
+
+            console.error(`\n${indent}🎯 SYNTAX ERROR FOUND`);
+            console.error(`${indent}   File: ${modulePath}`);
+            console.error(`${indent}   Message: ${error.message}`);
+
+            const locations = parseStackTrace(error.stack);
+
+            const primaryLoc =
+                locations[0] || {
+                    filePath: modulePath,
+                    lineNum: 0,
+                    colNum: 0
+                };
+
+            console.error(
+                `${indent}   Location: ${primaryLoc.filePath}:${primaryLoc.lineNum}:${primaryLoc.colNum}`
             );
-        } else {
-            console.log(
-                `❌ ${path.relative(__dirname, file)}`
-            );
 
-            console.log(`   ${result.error.message}`);
-
-            const match = result.error.stack?.match(
-                /<anonymous>:(\d+):(\d+)/
-            );
-
-            if (match) {
-                const line = parseInt(match[1]);
-                const column = parseInt(match[2]);
-
-                console.log(`   Line: ${line}`);
-                console.log(`   Column: ${column}`);
-
-                console.log(getLineContext(file, line));
+            if (primaryLoc.lineNum > 0) {
+                console.error(
+                    getLineContext(
+                        primaryLoc.filePath,
+                        primaryLoc.lineNum,
+                        3
+                    )
+                );
             }
 
-            brokenFiles.push(file);
-        }
-    }
-
-    divider();
-
-    if (brokenFiles.length > 0) {
-        console.error(
-            `\n💥 FOUND ${brokenFiles.length} BROKEN FILE(S)`
-        );
-
-        brokenFiles.forEach((file) => {
-            console.error(`   ❌ ${file}`);
-        });
-
-        process.exit(1);
-    }
-
-    console.log('\n✅ ALL FILES PASSED VALIDATION');
-};
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// SAFE IMPORT
-// ═══════════════════════════════════════════════════════════════════════════════
-
-const safeImport = async (modulePath) => {
-    try {
-        console.log(`\n📦 Importing ${modulePath}`);
-
-        const absolute = path.resolve(__dirname, modulePath);
-
-        if (!exists(absolute)) {
-            throw new Error(`Module file not found: ${absolute}`);
+            throw new Error(
+                `SYNTAX ERROR in ${modulePath}: ${error.message}`
+            );
         }
 
-        const moduleUrl = pathToFileURL(absolute).href;
+        if (error.code === 'ERR_MODULE_NOT_FOUND') {
 
-        const imported = await import(moduleUrl);
+            console.error(`${indent}📦 MODULE NOT FOUND`);
+            console.error(`${indent}   ${error.message}`);
 
-        console.log(`✅ Imported ${modulePath}`);
+            throw error;
+        }
 
-        return imported;
-    } catch (err) {
-        console.error(`\n❌ FAILED IMPORT: ${modulePath}`);
-        console.error(err.stack || err);
+        console.error(`${indent}   Error: ${error.message}`);
 
-        throw err;
+        throw error;
     }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// APP BOOT
+// MAIN
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const boot = async () => {
-    console.log('\n🚀 APPLICATION STARTING');
-    divider();
+try {
 
-    console.log(`🟢 Node Version: ${process.version}`);
-    console.log(`📂 Root: ${__dirname}`);
+    console.log('🚀 app.js starting...');
+    console.log(`   Node: ${process.version}`);
+    console.log(`   CWD: ${process.cwd()}`);
 
-    // STEP 1 — Validate ENTIRE project
-    validateProject();
+    // FULL PROJECT SCAN
+    console.log('\n🔍 FULL PROJECT SCAN...');
+    scanProjectFiles('./');
 
-    divider();
-
-    console.log('\n🚀 STARTING IMPORT CHAIN');
-
-    // STEP 2 — Imports
+    // IMPORTS
     const { config, connectDatabase } =
         await safeImport('./config/index.js');
 
     const { default: logger } =
         await safeImport('./utils/logger.js');
 
-    const { default: TelegramBot } =
-        await safeImport('./bot/index.js');
+    // DEEP TRACE
+    console.log('\n📂 Starting deep import trace...');
+
+    const importedBot =
+        await traceImportChain('./bot/index.js');
+
+    if (!importedBot?.default) {
+        throw new Error(
+            'TelegramBot export missing from ./bot/index.js'
+        );
+    }
+
+    const TelegramBot = importedBot.default;
 
     const { startServer } =
         await safeImport('./api/index.js');
@@ -322,39 +361,48 @@ const boot = async () => {
     const { default: CronJobs } =
         await safeImport('./cron/index.js');
 
-    divider();
-
-    console.log('\n🚀 STARTING SERVICES');
-
-    await connectDatabase();
-
-    const bot = new TelegramBot();
-
-    await bot.launch();
+    let bot = null;
 
     const port =
         config?.server?.port ||
         process.env.PORT ||
         3000;
 
-    startServer(port);
+    const startApp = async () => {
 
-    const cron = new CronJobs();
+        await connectDatabase();
 
-    cron.start();
+        bot = new TelegramBot();
 
-    divider();
+        await bot.launch();
 
-    console.log(`\n🎉 APPLICATION RUNNING ON PORT ${port}`);
-};
+        startServer(port);
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// START
-// ═══════════════════════════════════════════════════════════════════════════════
+        const cron = new CronJobs();
 
-boot().catch((err) => {
-    console.error('\n💥 FATAL STARTUP ERROR');
-    divider();
-    console.error(err.stack || err);
+        cron.start();
+
+        console.log(`🎉 App started on port ${port}`);
+    };
+
+    startApp();
+
+} catch (err) {
+
+    console.error('\n💥 FATAL ERROR:', err.message);
+
+    if (err.stack) {
+
+        console.error('\nStack:');
+
+        const locations = parseStackTrace(err.stack);
+
+        locations.forEach((loc, i) => {
+            console.error(
+                `  ${i + 1}. ${loc.filePath}:${loc.lineNum}:${loc.colNum}`
+            );
+        });
+    }
+
     process.exit(1);
-});
+            }
