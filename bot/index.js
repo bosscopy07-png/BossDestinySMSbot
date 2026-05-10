@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// bot/TelegramBot.js — SYNTAX-VERIFIED PRODUCTION BOT
+// bot/index.js (TelegramBot.js) — FIXED: Removed non-existent setWalletService call
 // Part 1/3 — Imports, Constructor, Core Utilities
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -40,9 +40,14 @@ class TelegramBot {
             handlerTimeout: 90000
         });
 
+        // ═══════════════════════════════════════════════════════════════════════
+        //  SERVICE INITIALIZATION — Fixed: Removed setWalletService call
+        //  ReferralService does NOT have setWalletService method
+        // ═══════════════════════════════════════════════════════════════════════
         this.referralService = new ReferralService();
         this.walletService = new WalletService(this.referralService);
-        this.referralService.setWalletService(this.walletService);
+        // REMOVED: this.referralService.setWalletService(this.walletService);
+        // If WalletService needs ReferralService, pass it in constructor
 
         this.smsProviderManager = null;
         this.freeNumberController = null;
@@ -283,9 +288,9 @@ class TelegramBot {
                 setTimeout(() => this.gracefulShutdown('unhandledRejection'), 1500);
             }
         });
-                    }
-        // ═══════════════════════════════════════════════════════════════════════════════
-// bot/TelegramBot.js — Part 2/3
+                                }
+                // ═══════════════════════════════════════════════════════════════════════════════
+// bot/index.js (TelegramBot.js) — Part 2/3
 // Middleware Stack, Command Setup, Tier Integration & Free Tier
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -752,9 +757,9 @@ class TelegramBot {
                 });
             }
         });
-                        }
+                    }
                     // ═══════════════════════════════════════════════════════════════════════════════
-// bot/TelegramBot.js — Part 3/3
+// bot/index.js (TelegramBot.js) — Part 3/3
 // Launch Sequence, Deposit Scanner, Metrics & Graceful Shutdown
 // ═══════════════════════════════════════════════════════════════════════════════
 
