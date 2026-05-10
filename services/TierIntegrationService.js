@@ -85,7 +85,8 @@ class TierIntegrationService {
             const { default: TierOperatorSelector } = await import('./TierOperatorSelector.js');
             const { default: CountryCatalog } = await import('./CountryCatalog.js');
 
-            this._serviceCatalog = new ServiceCatalog();
+            // FIXED: Pass cheapPanelProvider to ServiceCatalog for dynamic catalog loading
+            this._serviceCatalog = new ServiceCatalog(this._cheapProvider);
             this._tierSelector = new TierOperatorSelector(this._cheapProvider);
             this._countryCatalog = new CountryCatalog(this._cheapProvider, this._tierSelector);
 
@@ -114,64 +115,68 @@ class TierIntegrationService {
                this._countryCatalog !== null &&
                this._cheapProvider !== null &&
                this._cheapProvider.isActive;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
+                    }
+                    // ═══════════════════════════════════════════════════════════════════════
     //  SERVICE SELECTION (Step 1)
     // ═══════════════════════════════════════════════════════════════════════
 
     /**
      * Get popular services for initial display
+     * FIXED: Now async due to dynamic catalog loading
      */
-    getPopularServices() {
+    async getPopularServices() {
         if (!this.isAvailable()) return null;
         return this._serviceCatalog.getPopularServices();
     }
 
     /**
      * Search services by query
+     * FIXED: Now async due to dynamic catalog loading
      */
-    searchServices(query, limit = 30) {
+    async searchServices(query, limit = 30) {
         if (!this.isAvailable()) return null;
         return this._serviceCatalog.searchServices(query, limit);
     }
 
     /**
      * Get services by category
+     * FIXED: Now async due to dynamic catalog loading
      */
-    getServicesByCategory(category) {
+    async getServicesByCategory(category) {
         if (!this.isAvailable()) return null;
         return this._serviceCatalog.getServicesByCategory(category);
     }
 
     /**
      * Get all categories with counts
+     * FIXED: Now async due to dynamic catalog loading
      */
-    getCategories() {
+    async getCategories() {
         if (!this.isAvailable()) return null;
         return this._serviceCatalog.getCategories();
     }
 
     /**
      * Get paginated service list
+     * FIXED: Now async due to dynamic catalog loading
      */
-    getServicesPage(page, perPage, filter = null) {
+    async getServicesPage(page, perPage, filter = null) {
         if (!this.isAvailable()) return null;
         return this._serviceCatalog.getServicesPage(page, perPage, filter);
     }
 
     /**
      * Validate service exists
+     * FIXED: Now async due to dynamic catalog loading
      */
-    isValidService(serviceName) {
+    async isValidService(serviceName) {
         if (!this.isAvailable()) {
             // Fallback to constants array
             return SERVICES.map(s => s.toLowerCase()).includes(serviceName.toLowerCase());
         }
         return this._serviceCatalog.hasService(serviceName);
     }
-
-    // ═══════════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
     //  TIER SELECTION (Step 2)
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -584,8 +589,10 @@ class TierIntegrationService {
         this._baselinePriceCache.clear();
         this._countryCatalog?.clearCache();
         this._tierSelector?.clearCaches();
+        this._serviceCatalog?.clearCache();
         logger.info('TierIntegrationService caches cleared');
     }
 }
 
 export default TierIntegrationService;
+                
