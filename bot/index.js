@@ -948,4 +948,4 @@ class TelegramBot {
 }
 
 
-export TelegramBot;
+export default TelegramBot;
