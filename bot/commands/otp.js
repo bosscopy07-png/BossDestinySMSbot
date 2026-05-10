@@ -66,17 +66,29 @@ const KEYBOARDS = {
 // ═══════════════════════════════════════════════════════════════════════════════
 //  OTPCommands Class
 // ═══════════════════════════════════════════════════════════════════════════════
-
 class OTPCommands {
-    constructor(bot, walletService, smsProviderManager = null) {
+    constructor(bot, walletService, smsProviderManager = null, tierIntegrationService = null) {
         this.bot = bot;
         this.walletService = walletService;
         this.smsProviderManager = smsProviderManager;
         
         // ═════════════════════════════════════════════════════════════════
-        //  NEW: Initialize tier system components
+        //  NEW: Tier system integration (injected from TelegramBot)
         // ═════════════════════════════════════════════════════════════════
-        this._initTierSystem();
+        this.tierService = tierIntegrationService;
+        
+        // Extract individual components for convenience
+        if (tierIntegrationService) {
+            this.tierSelector = tierIntegrationService._tierSelector;
+            this.serviceCatalog = tierIntegrationService._serviceCatalog;
+            this.countryCatalog = tierIntegrationService._countryCatalog;
+            logger.info('OTPCommands: Tier system injected', {
+                available: tierIntegrationService.isAvailable()
+            });
+        } else {
+            // Legacy fallback: initialize tier components directly
+            this._initTierSystem();
+        }
         
         // Bind all handler methods to ensure `this` context
         this._bindAllHandlers();
@@ -88,24 +100,29 @@ class OTPCommands {
         }
     }
 
-    // ─── NEW: Tier System Initialization ─────────────────────────────────
+    // ─── Legacy Tier System Initialization (fallback) ───────────────────────
     _initTierSystem() {
+        const { default: ServiceCatalog } = require('../services/ServiceCatalog.js');
+        const { default: TierOperatorSelector } = require('../services/TierOperatorSelector.js');
+        const { default: CountryCatalog } = require('../services/CountryCatalog.js');
+
         this.serviceCatalog = new ServiceCatalog();
         
         const cheapProvider = this.smsProviderManager?.getProvider('CHEAP_PANEL');
         if (cheapProvider) {
             this.tierSelector = new TierOperatorSelector(cheapProvider);
             this.countryCatalog = new CountryCatalog(cheapProvider, this.tierSelector);
-            logger.info('Tier system initialized', { 
+            logger.info('OTPCommands: Tier system initialized internally', { 
                 hasProvider: true,
-                tiers: Object.keys(TIER_CONFIG)
+                tiers: Object.keys(require('../config/tierConfig.js').TIER_CONFIG)
             });
         } else {
-            logger.warn('Tier system initialized WITHOUT cheap provider — CHEAP mode will use legacy flow');
+            logger.warn('OTPCommands: Tier system initialized WITHOUT cheap provider — CHEAP mode will use legacy flow');
             this.tierSelector = null;
             this.countryCatalog = null;
         }
     }
+    
 
     // ─── Auto-bind all handler methods ─────────────────────────────────────
     _bindAllHandlers() {
