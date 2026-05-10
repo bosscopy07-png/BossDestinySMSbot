@@ -967,8 +967,7 @@ class TelegramBot {
         if (this.isShuttingDown) return;
         this.isShuttingDown = true;
 
-        logger.info(`Shutting down (${signal})`);
-
+        
         try {
             this.bot.stop(signal);
         } catch (e) {
