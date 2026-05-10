@@ -317,41 +317,84 @@ const traceImportChain = async (modulePath, depth = 0, visited = new Set()) => {
 };
 
 /**
- * Debug unclosed tokens in a file
+ * Debug unclosed tokens in a file with full context
  */
 const debugUnclosedTokens = (filePath) => {
     try {
         const content = readFileSync(filePath, 'utf-8');
+        const lines = content.split('\n');
         const openBraces = [];
         const openParens = [];
+        const openBrackets = [];
 
         for (let i = 0; i < content.length; i++) {
             const char = content[i];
+            const lineNum = content.substring(0, i).split('\n').length;
 
             if (char === '{') {
-                openBraces.push(i);
+                openBraces.push({ pos: i, line: lineNum });
             }
             if (char === '}') {
                 openBraces.pop();
             }
             if (char === '(') {
-                openParens.push(i);
+                openParens.push({ pos: i, line: lineNum });
             }
             if (char === ')') {
                 openParens.pop();
+            }
+            if (char === '[') {
+                openBrackets.push({ pos: i, line: lineNum });
+            }
+            if (char === ']') {
+                openBrackets.pop();
             }
         }
 
         console.log('\n🧠 UNCLOSED TOKENS:');
 
-        for (const pos of openBraces.slice(-5)) {
-            const before = content.substring(Math.max(0, pos - 40), pos + 40);
-            console.log(`\n{ near:\n${before}`);
+        if (openBraces.length === 0 && openParens.length === 0 && openBrackets.length === 0) {
+            console.log('   ✅ All tokens are properly closed!');
+            return;
         }
 
-        for (const pos of openParens.slice(-5)) {
-            const before = content.substring(Math.max(0, pos - 40), pos + 40);
-            console.log(`\n( near:\n${before}`);
+        for (const item of openBraces.slice(-5)) {
+            const before = content.substring(Math.max(0, item.pos - 60), item.pos + 60);
+            console.log(`\n❌ UNCLOSED { at line ${item.line}:`);
+            console.log('─'.repeat(70));
+            const contextLines = before.split('\n');
+            contextLines.forEach((line, idx) => {
+                const actualLine = item.line - (contextLines.length - idx) + 1;
+                const marker = (actualLine === item.line) ? '>>>' : '   ';
+                console.log(`${marker} ${String(actualLine).padStart(4)} | ${line}`);
+            });
+            console.log('─'.repeat(70));
+        }
+
+        for (const item of openParens.slice(-5)) {
+            const before = content.substring(Math.max(0, item.pos - 60), item.pos + 60);
+            console.log(`\n❌ UNCLOSED ( at line ${item.line}:`);
+            console.log('─'.repeat(70));
+            const contextLines = before.split('\n');
+            contextLines.forEach((line, idx) => {
+                const actualLine = item.line - (contextLines.length - idx) + 1;
+                const marker = (actualLine === item.line) ? '>>>' : '   ';
+                console.log(`${marker} ${String(actualLine).padStart(4)} | ${line}`);
+            });
+            console.log('─'.repeat(70));
+        }
+
+        for (const item of openBrackets.slice(-5)) {
+            const before = content.substring(Math.max(0, item.pos - 60), item.pos + 60);
+            console.log(`\n❌ UNCLOSED [ at line ${item.line}:`);
+            console.log('─'.repeat(70));
+            const contextLines = before.split('\n');
+            contextLines.forEach((line, idx) => {
+                const actualLine = item.line - (contextLines.length - idx) + 1;
+                const marker = (actualLine === item.line) ? '>>>' : '   ';
+                console.log(`${marker} ${String(actualLine).padStart(4)} | ${line}`);
+            });
+            console.log('─'.repeat(70));
         }
 
     } catch (e) {
@@ -417,5 +460,5 @@ try {
     }
 
     process.exit(1);
-                   }
-       
+}
+    
