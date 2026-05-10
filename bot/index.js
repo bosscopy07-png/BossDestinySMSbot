@@ -889,14 +889,18 @@ this.bot.use(async (ctx, next) => {
         setTimeout(checkAndStart, 3000);
     }
 
-    stopDepositScanner() {
+        stopDepositScanner() {
         try {
             this.walletService?.stopDepositScanner?.();
         } catch (error) {
             logger.error('Error stopping scanner', { error: error.message });
         }
-    }
+    }                                   // ← ADD THIS }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  LAUNCH SEQUENCE
+    // ═══════════════════════════════════════════════════════════════════════
+    
     // ═══════════════════════
     
     // ═══════════════════════════════════════════════════════════════════════
