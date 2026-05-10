@@ -283,7 +283,7 @@ class TelegramBot {
                 setTimeout(() => this.gracefulShutdown('unhandledRejection'), 1500);
             }
         });
-    }
+                    }
         // ═══════════════════════════════════════════════════════════════════════════════
 // bot/TelegramBot.js — Part 2/3
 // Middleware Stack, Command Setup, Tier Integration & Free Tier
@@ -752,8 +752,8 @@ class TelegramBot {
                 });
             }
         });
-            }
-                                                         // ═══════════════════════════════════════════════════════════════════════════════
+                        }
+                    // ═══════════════════════════════════════════════════════════════════════════════
 // bot/TelegramBot.js — Part 3/3
 // Launch Sequence, Deposit Scanner, Metrics & Graceful Shutdown
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -831,7 +831,7 @@ class TelegramBot {
         if (this.isShuttingDown) return;
         this.isShuttingDown = true;
 
-        logger.info(`Shutting down (${signal})`);
+        logger.info('Shutting down (' + signal + ')');
 
         try {
             this.bot.stop(signal);
