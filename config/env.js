@@ -82,6 +82,14 @@ export const config = {
         rateLimitWindowMs: envVars.RATE_LIMIT_WINDOW_MS,
         rateLimitMaxRequests: envVars.RATE_LIMIT_MAX_REQUESTS
     },
+    
+    tierFeatures: {
+        enableTierFlow: process.env.ENABLE_TIER_FLOW !== 'false',
+        enableLegacyFallback: process.env.ENABLE_LEGACY_FALLBACK !== 'false',
+        showTierPrices: process.env.SHOW_TIER_PRICES !== 'false',
+        enableTierFallback: process.env.ENABLE_TIER_FALLBACK !== 'false'
+    },
+
     pricing: {
         cheapOtp: envVars.CHEAP_OTP_PRICE,
         vipMonthly: envVars.VIP_MONTHLY_PRICE,
