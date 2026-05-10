@@ -14,10 +14,6 @@ import config from '../../config/env.js';
 // ═══════════════════════════════════════════════════════════════════════════════
 //  NEW TIER SYSTEM IMPORTS
 // ═══════════════════════════════════════════════════════════════════════════════
-import TierOperatorSelector from '../../services/TierOperatorSelector.js';
-import ServiceCatalog from '../../services/ServiceCatalog.js';
-import CountryCatalog from '../../services/CountryCatalog.js';
-import { TIER_CONFIG, POPULAR_SERVICES } from '../../config/tierConfig.js';
 
 // ─── Image Assets ─────────────────────────────────────────────────────────────
 const IMAGES = {
@@ -102,9 +98,9 @@ class OTPCommands {
 
     // ─── Legacy Tier System Initialization (fallback) ───────────────────────
     _initTierSystem() {
-        const { default: ServiceCatalog } = require('../services/ServiceCatalog.js');
-        const { default: TierOperatorSelector } = require('../services/TierOperatorSelector.js');
-        const { default: CountryCatalog } = require('../services/CountryCatalog.js');
+        const { default: ServiceCatalog } = require('../../services/ServiceCatalog.js');
+        const { default: TierOperatorSelector } = require('../../services/TierOperatorSelector.js');
+        const { default: CountryCatalog } = require('../../services/CountryCatalog.js');
 
         this.serviceCatalog = new ServiceCatalog();
         
@@ -114,7 +110,7 @@ class OTPCommands {
             this.countryCatalog = new CountryCatalog(cheapProvider, this.tierSelector);
             logger.info('OTPCommands: Tier system initialized internally', { 
                 hasProvider: true,
-                tiers: Object.keys(require('../config/tierConfig.js').TIER_CONFIG)
+                tiers: Object.keys(require('../../config/tierConfig.js').TIER_CONFIG)
             });
         } else {
             logger.warn('OTPCommands: Tier system initialized WITHOUT cheap provider — CHEAP mode will use legacy flow');
