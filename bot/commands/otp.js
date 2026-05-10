@@ -2196,12 +2196,9 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
         await this.sendPhotoWithCaption(ctx, IMAGES.countrySelect, message, Markup.inlineKeyboard(buttons), 'HTML');
                                                          }
                                                                                                   
-    /**
-     * LEGACY: Show country selection for CHEAP mode using 5SIM's available countries
-     */
-  /**
+        /**
      * Legacy country selection with CHEAP provider prices.
-     * Fetches live prices, falls back to static list on failure.
+     * FIXED: Uses dynamic country catalog as fallback instead of hardcoded COUNTRIES
      * 
      * @param {Object} ctx - Telegraf context
      * @param {string} service - Service code (e.g., 'wa', 'ig')
@@ -2268,10 +2265,17 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
 
             logger.error('Failed to fetch CHEAP countries', { userId, service, error: error.message });
             
-            const message = `🌍 <b>Select Country</b>\n\n⚠️ Live prices unavailable. Showing default list for <b>${service}</b>:`;
-            const buttons = COUNTRIES.map(c => [
+            // FIXED: Use dynamic country catalog fallback instead of hardcoded COUNTRIES
+            const fallbackCountries = await this.countryCatalog.getCountriesForService(service, 'standard', {
+                topOnly: true,
+                perPage: 20
+            });
+
+            const message = `🌍 <b>Select Country</b>\n\n⚠️ Live prices unavailable. Showing available countries for <b>${service}</b>:`;
+            
+            const buttons = fallbackCountries.countries.map(c => [
                 Markup.button.callback(
-                    `${c.flag} ${c.name}${c.priceModifier > 0 ? ` (+$${c.priceModifier})` : ''}`, 
+                    `${c.flag} ${c.name}${c.displayPrice ? ` (${formatCurrency(c.displayPrice)})` : ''}`, 
                     `country_${c.code}`
                 )
             ]);
@@ -2287,6 +2291,7 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
             );
         }
     }
+        
 
     /**
      * Safely delete a message, ignoring errors.
@@ -2352,31 +2357,28 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
 
         return buttons;
     }
-
+        
     /**
      * Get emoji flag for country code.
+     * FIXED: Uses isoToFlag utility instead of hardcoded map
      * @private
      */
     _getFlag(code) {
-        const flags = {
-            'US': '🇺🇸', 'UK': '🇬🇧', 'CA': '🇨🇦', 'RU': '🇷🇺', 'CN': '🇨🇳',
-            'IN': '🇮🇳', 'NG': '🇳🇬', 'DE': '🇩🇪', 'FR': '🇫🇷', 'BR': '🇧🇷',
-            'MX': '🇲🇽', 'ID': '🇮🇩', 'PH': '🇵🇭', 'VN': '🇻🇳', 'TH': '🇹🇭',
-            'TR': '🇹🇷', 'PL': '🇵🇱', 'UA': '🇺🇦', 'KZ': '🇰🇿', 'RO': '🇷🇴',
-            'ES': '🇪🇸', 'IT': '🇮🇹', 'NL': '🇳🇱', 'SE': '🇸🇪', 'NO': '🇳🇴',
-            'FI': '🇫🇮', 'DK': '🇩🇰', 'AU': '🇦🇺', 'JP': '🇯🇵', 'KR': '🇰🇷',
-            'SG': '🇸🇬', 'MY': '🇲🇾', 'ZA': '🇿🇦', 'EG': '🇪🇬', 'SA': '🇸🇦',
-            'AE': '🇦🇪', 'IL': '🇮🇱', 'BE': '🇧🇪', 'AT': '🇦🇹', 'CH': '🇨🇭',
-            'PT': '🇵🇹', 'GR': '🇬🇷', 'CZ': '🇨🇿', 'HU': '🇭🇺', 'SK': '🇸🇰',
-            'BG': '🇧🇬', 'HR': '🇭🇷', 'SI': '🇸🇮', 'LT': '🇱🇹', 'LV': '🇱🇻',
-            'EE': '🇪🇪', 'MD': '🇲🇩', 'GE': '🇬🇪', 'AM': '🇦🇲', 'AZ': '🇦🇿',
-            'BY': '🇧🇾', 'KG': '🇰🇬', 'TJ': '🇹🇯', 'TM': '🇹🇲', 'UZ': '🇺🇿',
-            'AL': '🇦🇱', 'BA': '🇧🇦', 'MK': '🇲🇰', 'ME': '🇲🇪', 'RS': '🇷🇸',
-            'XK': '🇽🇰'
-        };
-        return flags[code] || '🌍';
+        // Use the same utility as CountryCatalog for consistency
+        if (!code || typeof code !== 'string' || code.length !== 2) return '🌍';
+        const cc = code.toUpperCase();
+        const OFFSET = 127397;
+        try {
+            return (
+                String.fromCodePoint(cc.charCodeAt(0) + OFFSET) +
+                String.fromCodePoint(cc.charCodeAt(1) + OFFSET)
+            );
+        } catch {
+            return '🌍';
+        }
     }
-    
+        
+
                             
 // ═══════════════════════════════════════════════════════════════════════════════
 //  OTPCommands.js — Part 3: Core Purchase Logic, Polling, Check OTP, Cancel
