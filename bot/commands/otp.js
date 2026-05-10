@@ -2068,9 +2068,9 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
 
         await this.showTierCountrySelection(ctx, service, tierKey, page);
     }
-
     // ═══════════════════════════════════════════════════════════════════════
     //  NEW: Search Handlers
+    //  FIXED: Async calls to searchServices()
     // ═══════════════════════════════════════════════════════════════════════
 
     async handleTierSearchService(ctx, query) {
@@ -2078,7 +2078,8 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
             return ctx.reply('❌ Please enter at least 2 characters to search.');
         }
 
-        const results = this.serviceCatalog.searchServices(query);
+        // FIXED: await async searchServices()
+        const results = await this.serviceCatalog.searchServices(query);
         
         if (results.length === 0) {
             return ctx.reply(
@@ -2093,11 +2094,22 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
         let message = `🔍 <b>Search Results for "${query}"</b>\n\nFound ${results.length} services:\n\n`;
         const buttons = [];
 
+        const serviceEmojis = {
+            'WhatsApp': '💬', 'Telegram': '✈️', 'Facebook': '👤', 'Instagram': '📸',
+            'Twitter': '🐦', 'TikTok': '🎵', 'Binance': '💰', 'Coinbase': '₿',
+            'Gmail': '📧', 'Outlook': '📨', 'Netflix': '🎬', 'Amazon': '📦',
+            'PayPal': '💳', 'Snapchat': '👻', 'Discord': '🎮', 'Spotify': '🎧',
+            'Uber': '🚗', 'Airbnb': '🏠', 'WeChat': '💬', 'Signal': '🔒',
+            'LinkedIn': '💼', 'Tinder': '🔥', 'Google': '🔍', 'Microsoft': '🪟',
+            'Apple': '🍎', 'Viber': '📞', 'Line': '📱', 'KakaoTalk': '💬',
+            'Imo': '📹', 'Zalo': '💬', 'Badoo': '❤️'
+        };
+
         for (const r of results.slice(0, 10)) {
-            const popularMark = r.isPopular ? ' 🔥' : '';
-            message += `• ${r.name}${popularMark} — ${r.category}\n`;
+            const emoji = serviceEmojis[r.name] || '📱';
+            message += `• ${emoji} ${r.name}${r.isPopular ? ' 🔥' : ''}\n`;
             buttons.push([Markup.button.callback(
-                `${r.name}${popularMark}`,
+                `${emoji} ${r.name}`,
                 `service_${r.name}`
             )]);
         }
@@ -2119,6 +2131,7 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
             return ctx.reply('❌ Session expired. Please start over with /otp');
         }
 
+        // countryCatalog.searchCountries is synchronous (returns array)
         const matches = this.countryCatalog.searchCountries(query);
         
         if (matches.length === 0) {
@@ -2133,6 +2146,8 @@ async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = nu
 
         await this.showTierCountrySelection(ctx, service, tierKey, 1, query);
     }
+        
+    
             // ═══════════════════════════════════════════════════════════════════════
     //  SERVICE & COUNTRY SELECTION
     //  FIXED: Uses dynamic catalog, no hardcoded SERVICES/COUNTRIES
