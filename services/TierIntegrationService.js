@@ -568,4 +568,24 @@ class TierIntegrationService {
                 serviceCatalog: this._serviceCatalog !== null,
                 tierSelector: this._tierSelector !== null,
                 countryCatalog: this._countryCatalog !== null,
-                cheapProvider: this._cheapProvider
+                cheapProvider: this._cheapProvider !== null && this._cheapProvider.isActive
+            },
+            metrics: this._metrics,
+            cacheSizes: {
+                baselinePrices: this._baselinePriceCache.size
+            }
+        };
+    }
+
+    /**
+     * Clear all caches
+     */
+    clearCaches() {
+        this._baselinePriceCache.clear();
+        this._countryCatalog?.clearCache();
+        this._tierSelector?.clearCaches();
+        logger.info('TierIntegrationService caches cleared');
+    }
+}
+
+export default TierIntegrationService;
