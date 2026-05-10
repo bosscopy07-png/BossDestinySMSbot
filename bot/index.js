@@ -1,7 +1,5 @@
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // bot/TelegramBot.js — High-Performance Production Bot
-// Part 1/3 — Imports, Constructor, Admin Utilities & Error Handling
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { Telegraf, session as telegrafSession } from 'telegraf';
@@ -22,10 +20,8 @@ import FreeNumberController from '../services/sms/FreeNumberController.js';
 import StartVerification from './verification/StartVerification.js';
 import TierIntegrationService from '../services/TierIntegrationService.js';
 import TierFlowMiddleware from './middleware/tierFlowMiddleware.js';
-import { Worker } from 'worker_threads';
 import { cpus } from 'os';
 
-// Re-verify membership every 24 hours for existing users
 const VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
 
 class TelegramBot {
@@ -42,12 +38,11 @@ class TelegramBot {
             },
             handlerTimeout: 90000
         });
-        this.walletService = new WalletService(this.referralService);
-        this.smsProviderManager = null;
-        this.referralService = new ReferralService(this.walletService);
-        this.freeNumberController = null;
 
-        // Tier System Integration
+        this.walletService = new WalletService(this.referralService);
+        this.referralService = new ReferralService(this.walletService);
+        this.smsProviderManager = null;
+        this.freeNumberController = null;
         this.tierIntegrationService = null;
         this.tierFlowMiddleware = null;
 
@@ -70,17 +65,12 @@ class TelegramBot {
 
         this._adminIds = null;
         this._adminIdsTimestamp = 0;
-
         this.startVerification = null;
 
         this.setupErrorHandling();
         this.setupMiddleware();
         this.setupWorkerPool();
     }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  ADMIN UTILITIES — STRICT ENV-BASED, GROUP-ID FILTERED
-    // ═══════════════════════════════════════════════════════════════════════
 
     getAdminIds() {
         const now = Date.now();
@@ -89,7 +79,6 @@ class TelegramBot {
         }
 
         const raw = process.env.ADMIN_ID || config.bot?.adminId || '';
-
         this._adminIds = raw
             .toString()
             .split(',')
@@ -99,13 +88,13 @@ class TelegramBot {
                 const num = parseInt(id, 10);
                 const isValid = !isNaN(num) && num > 0 && num.toString() === id.trim();
                 if (!isValid) {
-                    logger.warn('Invalid admin ID filtered out — must be positive user ID', { id });
+                    logger.warn('Invalid admin ID filtered out', { id });
                 }
                 return isValid;
             });
 
         this._adminIdsTimestamp = now;
-        logger.info('Admin IDs resolved from ENV', { count: this._adminIds.length });
+        logger.info('Admin IDs resolved', { count: this._adminIds.length });
         return this._adminIds;
     }
 
@@ -126,15 +115,11 @@ class TelegramBot {
         return this.isAdmin(effectiveId);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  ERROR ALERTING — ADMIN DMs ONLY, NEVER GROUPS
-    // ═══════════════════════════════════════════════════════════════════════
-
     async alertAdmins(error, context = {}) {
         try {
             const adminIds = this.getAdminIds();
             if (!adminIds.length) {
-                logger.error('No valid admin IDs configured — cannot send alerts');
+                logger.error('No valid admin IDs configured');
                 return;
             }
 
@@ -168,35 +153,23 @@ class TelegramBot {
             await Promise.allSettled(adminIds.map(async (adminId) => {
                 try {
                     const chat = await this.bot.telegram.getChat(adminId).catch(() => null);
-
                     if (!chat || chat.type !== 'private') {
-                        logger.warn('Skipping alert — target is not a private user chat', {
-                            adminId,
-                            type: chat?.type || 'unknown'
-                        });
+                        logger.warn('Skipping alert — not a private chat', { adminId, type: chat?.type });
                         return;
                     }
-
                     await this.bot.telegram.sendMessage(adminId, alertText, {
                         parse_mode: 'HTML',
                         disable_notification: false
                     });
-
-                    logger.info('Error alert sent to admin', { adminId });
-
+                    logger.info('Error alert sent', { adminId });
                 } catch (sendErr) {
                     logger.error('Failed to alert admin', { adminId, error: sendErr.message });
                 }
             }));
-
         } catch (alertErr) {
-            logger.error('alertAdmins itself crashed', { error: alertErr.message });
+            logger.error('alertAdmins crashed', { error: alertErr.message });
         }
     }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  WORKER POOL
-    // ═══════════════════════════════════════════════════════════════════════
 
     setupWorkerPool() {
         for (let i = 0; i < this.maxWorkers; i++) {
@@ -217,14 +190,9 @@ class TelegramBot {
         });
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  ERROR HANDLING — GLOBAL CAPTURE FOR ALL ERRORS
-    // ═══════════════════════════════════════════════════════════════════════
-
     setupErrorHandling() {
         this.bot.catch(async (err, ctx) => {
             this.metrics.requestsFailed++;
-
             try {
                 if (!err.message?.includes('403') && !err.message?.includes('429')) {
                     await this.alertAdmins(err, {
@@ -235,26 +203,13 @@ class TelegramBot {
                         note: 'Telegraf handler error'
                     });
                 }
-
-                if (err.message?.includes('ETELEGRAM') && err.message?.includes('403')) {
-                    return;
-                }
+                if (err.message?.includes('ETELEGRAM') && err.message?.includes('403')) return;
                 if (err.message?.includes('ETELEGRAM') && err.message?.includes('429')) {
                     logger.warn('Telegram rate limit', { userId: ctx.from?.id });
                     return;
                 }
-
-                logger.error('Bot error', {
-                    error: err.message,
-                    userId: ctx.from?.id,
-                    updateType: ctx.updateType
-                });
-
-                if (err.message?.includes('WALLET_NOT_READY')) {
-                    ctx.reply('⏳ Blockchain connection warming up. Try again shortly.').catch(() => {});
-                } else {
-                    ctx.reply('❌ An error occurred. Please try again.').catch(() => {});
-                }
+                logger.error('Bot error', { error: err.message, userId: ctx.from?.id, updateType: ctx.updateType });
+                ctx.reply('❌ An error occurred. Please try again.').catch(() => {});
             } catch (catchErr) {
                 logger.error('Error inside bot.catch', { error: catchErr.message });
             }
@@ -263,10 +218,7 @@ class TelegramBot {
         process.on('uncaughtException', async (err) => {
             try {
                 logger.error('Uncaught Exception', { error: err.message, stack: err.stack });
-                await this.alertAdmins(err, {
-                    source: 'process.uncaughtException',
-                    note: 'Process crash — immediate shutdown required'
-                });
+                await this.alertAdmins(err, { source: 'process.uncaughtException', note: 'Process crash' });
             } catch (alertErr) {
                 logger.error('Failed to alert on uncaughtException', { error: alertErr.message });
             }
@@ -279,10 +231,7 @@ class TelegramBot {
             try {
                 const err = reason instanceof Error ? reason : new Error(String(reason));
                 logger.error('Unhandled Rejection', { reason: String(reason), stack: err.stack });
-                await this.alertAdmins(err, {
-                    source: 'process.unhandledRejection',
-                    note: 'Unhandled promise rejection'
-                });
+                await this.alertAdmins(err, { source: 'process.unhandledRejection', note: 'Unhandled promise rejection' });
             } catch (alertErr) {
                 logger.error('Failed to alert on unhandledRejection', { error: alertErr.message });
             }
@@ -291,10 +240,6 @@ class TelegramBot {
             }
         });
     }
-
-    // ═══════════════════════════════════════════════════════════════════════════════
-    //  Part 2/3 — Middleware Stack, Command Setup, Tier Integration & Free Tier
-    // ═══════════════════════════════════════════════════════════════════════════════
 
     setupMiddleware() {
         this.bot.use(telegrafSession({
@@ -324,7 +269,6 @@ class TelegramBot {
                 captchaAnswer: null,
                 captchaAttempts: 0,
                 captchaBlockedUntil: null,
-                // Tier flow session state
                 otpMode: null,
                 otpService: null,
                 selectedTier: null,
@@ -338,7 +282,6 @@ class TelegramBot {
             })
         }));
 
-        // Global metrics tracking
         this.bot.use(async (ctx, next) => {
             const startTime = Date.now();
             const effectiveUserId = this._getEffectiveUserId(ctx);
@@ -354,7 +297,6 @@ class TelegramBot {
             }
         });
 
-        // Rate limiting
         this.bot.use(rateLimit({
             window: 60,
             max: 50,
@@ -365,24 +307,19 @@ class TelegramBot {
             }
         }));
 
-        // /start INTERCEPTOR
         this.bot.use(async (ctx, next) => {
             try {
                 const text = ctx.message?.text || '';
                 const isStartCommand = text === '/start' || /^\/start@/.test(text);
-
                 if (!isStartCommand) {
                     return next();
                 }
-
                 if (!this.startVerification) {
                     logger.error('[StartInterceptor] StartVerification not initialized');
-                    return ctx.reply('⏳ Bot is still starting. Please try again in a moment.').catch(() => {});
+                    return ctx.reply('⏳ Bot is still starting. Please try again.').catch(() => {});
                 }
-
                 logger.debug('[StartInterceptor] Intercepted /start', { userId: ctx.from?.id });
                 return await this.startVerification.handleStart(ctx);
-
             } catch (err) {
                 logger.error('[StartInterceptor] Fatal error', { error: err.message, userId: ctx.from?.id });
                 await this.alertAdmins(err, {
@@ -396,7 +333,6 @@ class TelegramBot {
             }
         });
 
-        // Auth middleware
         this.bot.use(async (ctx, next) => {
             try {
                 return await requireAuth(ctx, next);
@@ -412,47 +348,36 @@ class TelegramBot {
             }
         });
 
-        // Global join verification
         this.bot.use(async (ctx, next) => {
             try {
                 if (ctx.chat?.type !== 'private') {
                     return next();
                 }
-
                 if (this.isEffectiveAdmin(ctx)) {
                     return next();
                 }
-
                 if (ctx.callbackQuery?.data && /^captcha_(-?\d+)$/.test(ctx.callbackQuery.data)) {
                     return next();
                 }
-
                 if (ctx.callbackQuery?.data === 'verify_join_status') {
                     return next();
                 }
-
                 if (ctx.session?.joinVerified !== true) {
                     await ctx.reply(
-                        '⛔ <b>Access Denied</b>\n\n' +
-                        'You must complete verification before using this bot.\n\n' +
-                        'Please tap /start to begin.',
+                        '⛔ <b>Access Denied</b>\n\nYou must complete verification before using this bot.\n\nPlease tap /start to begin.',
                         { parse_mode: 'HTML' }
                     );
                     return;
                 }
-
                 const isFresh = ctx.session?.joinVerifiedAt &&
                                 (Date.now() - ctx.session.joinVerifiedAt < VERIFICATION_TTL_MS);
-
                 if (!isFresh && this.startVerification) {
                     const stillJoined = await this.startVerification.reverifyUser(ctx.from?.id, ctx);
                     if (!stillJoined) {
                         return;
                     }
                 }
-
                 return next();
-
             } catch (err) {
                 logger.error('Global verification middleware error', { error: err.message, userId: ctx.from?.id });
                 await this.alertAdmins(err, {
@@ -465,24 +390,18 @@ class TelegramBot {
             }
         });
 
-        // Maintenance mode
         this.bot.use(async (ctx, next) => {
             try {
                 if (this.isShuttingDown) {
-                    return ctx.reply('🔴 Bot is restarting. Please try again in a moment.').catch(() => {});
+                    return ctx.reply('🔴 Bot is restarting. Please try again.').catch(() => {});
                 }
-
                 const isAdmin = this.isEffectiveAdmin(ctx);
-
                 if (config.maintenance && !isAdmin) {
                     return ctx.reply(
-                        '🔧 <b>Maintenance Mode</b>\n\n' +
-                        'The bot is currently under maintenance. Please try again later.\n\n' +
-                        '<i>We apologize for any inconvenience.</i>',
+                        '🔧 <b>Maintenance Mode</b>\n\nThe bot is currently under maintenance. Please try again later.',
                         { parse_mode: 'HTML' }
                     ).catch(() => {});
                 }
-
                 return next();
             } catch (err) {
                 logger.error('Maintenance middleware error', { error: err.message });
@@ -499,33 +418,22 @@ class TelegramBot {
             this.bot.use(async (ctx, next) => {
                 const start = Date.now();
                 await next();
-                logger.debug(`Handler took ${Date.now() - start}ms`, {
-                    updateType: ctx.updateType,
-                    userId: ctx.from?.id
-                });
+                logger.debug(`Handler took ${Date.now() - start}ms`, { updateType: ctx.updateType, userId: ctx.from?.id });
             });
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  COMMAND SETUP
-    // ═══════════════════════════════════════════════════════════════════════
-
-        async setupCommands() {
+    async setupCommands() {
         try {
             this.smsProviderManager = new SMSProviderManager();
             await this.smsProviderManager.initialize();
-            logger.info('SMS Provider Manager initialized in bot');
+            logger.info('SMS Provider Manager initialized');
         } catch (error) {
             logger.error('Failed to initialize SMS Provider Manager', { error: error.message });
             this.smsProviderManager = null;
-            await this.alertAdmins(error, {
-                source: 'setup.setupCommands',
-                note: 'SMS Provider Manager init failed'
-            });
+            await this.alertAdmins(error, { source: 'setup.setupCommands', note: 'SMS Provider Manager init failed' });
         }
 
-        // Initialize Tier Integration Service
         try {
             this.tierIntegrationService = new TierIntegrationService(this.smsProviderManager);
             await this.tierIntegrationService.initialize();
@@ -536,46 +444,27 @@ class TelegramBot {
         } catch (error) {
             logger.error('Failed to initialize Tier Integration Service', { error: error.message });
             this.tierIntegrationService = null;
-            await this.alertAdmins(error, {
-                source: 'setup.setupCommands',
-                note: 'Tier Integration Service init failed — CHEAP mode will use legacy flow'
-            });
+            await this.alertAdmins(error, { source: 'setup.setupCommands', note: 'Tier Integration Service init failed' });
         }
 
-        // Initialize command modules
         const userCommands = new UserCommands(this.bot, this.walletService);
-        
-        // Pass tier integration to OTPCommands
-        const otpCommands = new OTPCommands(
-            this.bot, 
-            this.walletService, 
-            this.smsProviderManager,
-            this.tierIntegrationService
-        );
-        
+        const otpCommands = new OTPCommands(this.bot, this.walletService, this.smsProviderManager, this.tierIntegrationService);
         const adminCommands = new AdminCommands(this.bot, this.walletService, this.referralService, this.smsProviderManager);
-        const advancedAdmin = new Admin(
-            this.bot,
-            this.walletService,
-            this.referralService,
-            this.smsProviderManager
-        );
+        const advancedAdmin = new Admin(this.bot, this.walletService, this.referralService, this.smsProviderManager);
 
         this.commandModules.set('user', userCommands);
         this.commandModules.set('otp', otpCommands);
         this.commandModules.set('admin', adminCommands);
         this.commandModules.set('advancedAdmin', advancedAdmin);
 
-        // Register Tier Flow Middleware
         if (this.tierIntegrationService && this.tierIntegrationService.isAvailable()) {
             this.tierFlowMiddleware = new TierFlowMiddleware(this.tierIntegrationService, otpCommands);
             this.tierFlowMiddleware.register(this.bot);
             logger.info('Tier Flow Middleware registered');
         } else {
-            logger.warn('Tier Flow Middleware NOT registered — tier system unavailable');
+            logger.warn('Tier Flow Middleware NOT registered');
         }
 
-        // Initialize StartVerification
         this.startVerification = new StartVerification(
             this.bot,
             userCommands,
@@ -583,7 +472,6 @@ class TelegramBot {
             (err, ctx) => this.alertAdmins(err, ctx)
         );
 
-        // FREE TIER CONTROLLER
         this.freeNumberController = new FreeNumberController(this.bot);
 
         this.bot.action('mode_free', async (ctx) => {
@@ -592,360 +480,4 @@ class TelegramBot {
                 await this.freeNumberController.handleFreeRequest(ctx);
             } catch (error) {
                 logger.error('mode_free action error', { error: error.message, userId: ctx.from?.id });
-                await this.alertAdmins(error, {
-                    userId: ctx.from?.id,
-                    updateType: 'callback_query',
-                    command: 'mode_free',
-                    source: 'action.mode_free',
-                    note: 'Free mode entry crash'
-                });
-            }
-        });
-
-        this.bot.action(/watch_ad_(.+)/, async (ctx) => {
-            try {
-                await this.freeNumberController.handleWatchAd(ctx, ctx.match[1]);
-            } catch (error) {
-                logger.error('watch_ad action error', { error: error.message, userId: ctx.from?.id });
-                await ctx.answerCbQuery('❌ Ad unavailable').catch(() => {});
-            }
-        });
-
-        this.bot.action(/verify_ad_(.+)/, async (ctx) => {
-            try {
-                await this.freeNumberController.handleVerifyAd(ctx, ctx.match[1]);
-            } catch (error) {
-                logger.error('verify_ad action error', { error: error.message, userId: ctx.from?.id });
-                await ctx.answerCbQuery('❌ Verification failed').catch(() => {});
-            }
-        });
-
-        this.bot.action(/cancel_free_(.+)/, async (ctx) => {
-            try {
-                await this.freeNumberController.handleCancel(ctx, ctx.match[1]);
-            } catch (error) {
-                logger.error('cancel_free action error', { error: error.message, userId: ctx.from?.id });
-                await ctx.answerCbQuery('❌ Cancel failed').catch(() => {});
-            }
-        });
-
-        this.bot.action(/check_free_(.+)/, async (ctx) => {
-            try {
-                await this.freeNumberController.handleCheckNow(ctx, ctx.match[1]);
-            } catch (error) {
-                logger.error('check_free action error', { error: error.message, userId: ctx.from?.id });
-                await ctx.answerCbQuery('❌ Check failed').catch(() => {});
-            }
-        });
-
-        // GLOBAL ACTION HANDLERS
-        this.bot.action('help', async (ctx) => {
-            try {
-                ctx.answerCbQuery().catch(() => {});
-                const helpMessage = [
-                    "<b>❓ Help & Commands</b>",
-                    "",
-                    "📱 <code>/otp</code> — Request OTP",
-                    "💰 <code>/balance</code> — Check balance",
-                    "💳 <code>/deposit</code> — Add funds",
-                    "📜 <code>/history</code> — Transaction history",
-                    "🎁 <code>/referral</code> — Referral program",
-                    "📊 <code>/stats</code> — Your statistics",
-                    "⚙️ <code>/settings</code> — Bot settings",
-                    "❌ <code>/cancel</code> — Cancel active session",
-                    "",
-                    "<b>Admin Only:</b>",
-                    "🔐 <code>/admin</code> — Admin dashboard"
-                ].join("\n");
-                await ctx.reply(helpMessage, { parse_mode: 'HTML' });
-            } catch (error) {
-                logger.error('Help action error', { error: error.message });
-                await this.alertAdmins(error, {
-                    userId: ctx.from?.id,
-                    updateType: 'callback_query',
-                    command: 'help',
-                    source: 'action.help',
-                    note: 'Help action crash'
-                });
-            }
-        });
-
-        this.bot.action('menu', async (ctx) => {
-            try {
-                ctx.answerCbQuery().catch(() => {});
-                await userCommands.handleMenu(ctx);
-            } catch (error) {
-                logger.error('Menu action error', { error: error.message });
-                await this.alertAdmins(error, {
-                    userId: ctx.from?.id,
-                    updateType: 'callback_query',
-                    command: 'menu',
-                    source: 'action.menu',
-                    note: 'Menu action crash'
-                });
-            }
-        });
-
-        this.bot.action('open_admin_dashboard', async (ctx) => {
-            try {
-                if (!this.isEffectiveAdmin(ctx)) {
-                    return ctx.answerCbQuery('⛔ Admin only!', { show_alert: true });
-                }
-                await advancedAdmin.showDashboard(ctx, true);
-            } catch (err) {
-                logger.error('Admin dashboard action error', { error: err.message });
-                await this.alertAdmins(err, {
-                    userId: ctx.from?.id,
-                    updateType: 'callback_query',
-                    command: 'open_admin_dashboard',
-                    source: 'action.openAdminDashboard',
-                    note: 'Admin dashboard action crash'
-                });
-            }
-        });
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  TEXT MESSAGE HANDLER
-    // ═══════════════════════════════════════════════════════════════════════
-
-    setupTextHandler() {
-        this.bot.on(message('text'), async (ctx, next) => {
-            try {
-                if (!ctx.session) return next();
-
-                const isAdmin = this.isEffectiveAdmin(ctx);
-
-                // Tier search input handler (non-admin users)
-                if (!isAdmin && ctx.session?.tierFlowStep?.startsWith('searching_')) {
-                    const otpCommands = this.commandModules.get('otp');
-                    if (otpCommands?.handleTierSearchInput) {
-                        const handled = await otpCommands.handleTierSearchInput(ctx);
-                        if (handled) return;
-                    }
-                }
-
-                if (isAdmin) {
-                    const advancedAdmin = this.commandModules.get('advancedAdmin');
-                    const adminCommands = this.commandModules.get('admin');
-
-                    const handled = await advancedAdmin.handleTextInput(ctx);
-                    if (handled) return;
-
-                    if (ctx.session.awaitingBroadcast) {
-                        const { target, filter, label } = ctx.session.awaitingBroadcast;
-                        delete ctx.session.awaitingBroadcast;
-                        return adminCommands.executeBroadcast(ctx, filter, label, ctx.message.text);
-                    }
-
-                    if (ctx.session.awaitingAddBalance) {
-                        const targetId = ctx.session.awaitingAddBalance;
-                        delete ctx.session.awaitingAddBalance;
-                        const amount = parseFloat(ctx.message.text);
-                        if (isNaN(amount) || amount <= 0) {
-                            return adminCommands.replyError(ctx, '❌ <b>Invalid amount.</b>');
-                        }
-                        return adminCommands.processAddBalance(ctx, targetId, amount, 'Admin credit via inline');
-                    }
-
-                    if (ctx.session.awaitingDeductBalance) {
-                        const targetId = ctx.session.awaitingDeductBalance;
-                        delete ctx.session.awaitingDeductBalance;
-                        const amount = parseFloat(ctx.message.text);
-                        if (isNaN(amount) || amount <= 0) {
-                            return adminCommands.replyError(ctx, '❌ <b>Invalid amount.</b>');
-                        }
-                        return adminCommands.processDeductBalance(ctx, targetId, amount, 'Admin deduction via inline');
-                    }
-
-                    if (ctx.session.awaitingBlacklistReason) {
-                        const targetId = ctx.session.awaitingBlacklistReason;
-                        delete ctx.session.awaitingBlacklistReason;
-                        const reason = ctx.message.text.trim().toLowerCase() === 'skip'
-                            ? 'Manual blacklist'
-                            : ctx.message.text.trim();
-                        return adminCommands.processBlacklist(ctx, targetId, reason);
-                    }
-
-                    if (ctx.session.awaitingMessageUser) {
-                        const targetId = ctx.session.awaitingMessageUser;
-                        delete ctx.session.awaitingMessageUser;
-                        return adminCommands.processMessageUser(ctx, targetId, ctx.message.text);
-                    }
-                }
-                return next();
-            } catch (err) {
-                logger.error('Text message handler error', { error: err.message, userId: ctx.from?.id });
-                await this.alertAdmins(err, {
-                    userId: ctx.from?.id,
-                    updateType: 'message',
-                    command: ctx.message?.text,
-                    source: 'handler.textMessage',
-                    note: 'Text handler crash'
-                });
-            }
-        });
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════════
-    //  Part 3/3 — Launch, Deposit Scanner, Metrics, Health & Graceful Shutdown
-    // ═══════════════════════════════════════════════════════════════════════════════
-
-    startDepositScanner() {
-        let retryDelay = 5000;
-        const maxRetryDelay = 60000;
-
-        const checkAndStart = async () => {
-            if (this.isShuttingDown) return;
-
-            try {
-                if (this.walletService?.isReady) {
-                    this.walletService.startDepositScanner(30000);
-                    logger.info('Deposit scanner started');
-                    retryDelay = 5000;
-                } else {
-                    logger.warn('Wallet not ready, retrying...');
-                    setTimeout(checkAndStart, retryDelay);
-                    retryDelay = Math.min(retryDelay * 2, maxRetryDelay);
-                }
-            } catch (error) {
-                logger.error('Deposit scanner error', { error: error.message });
-                await this.alertAdmins(error, {
-                    source: 'scanner.depositScanner',
-                    note: 'Deposit scanner retry loop error'
-                });
-                setTimeout(checkAndStart, retryDelay);
-                retryDelay = Math.min(retryDelay * 2, maxRetryDelay);
-            }
-        };
-
-        setTimeout(checkAndStart, 3000);
-    }
-
-    stopDepositScanner() {
-        try {
-            this.walletService?.stopDepositScanner?.();
-        } catch (error) {
-            logger.error('Error stopping scanner', { error: error.message });
-        }
-    }
-
-    async launch() {
-        try {
-            logger.info('Initializing database...');
-            await initModels();
-
-            await this.setupCommands();
-            this.setupTextHandler();
-
-            this.startDepositScanner();
-
-            await this.bot.telegram.deleteWebhook({ drop_pending_updates: true });
-            await this.bot.launch();
-
-            this.isReady = true;
-            logger.info('Bot launched successfully');
-
-            process.once('SIGINT', () => this.gracefulShutdown('SIGINT'));
-            process.once('SIGTERM', () => this.gracefulShutdown('SIGTERM'));
-
-            setInterval(() => this.logMetrics(), 300000);
-
-        } catch (error) {
-            logger.error('Launch failed', { error: error.message });
-            await this.alertAdmins(error, {
-                source: 'launch.botLaunch',
-                note: 'Bot failed to launch — critical'
-            });
-            throw error;
-        }
-    }
-
-    async gracefulShutdown(signal) {
-        if (this.isShuttingDown) return;
-        this.isShuttingDown = true;
-
-        logger.info(`Shutting down (${signal})`);
-
-        try {
-            this.bot.stop(signal);
-        } catch (e) {}
-
-        this.stopDepositScanner();
-
-        if (this.tierIntegrationService) {
-            try {
-                this.tierIntegrationService.clearCaches();
-                logger.info('Tier integration caches cleared');
-            } catch (e) {
-                logger.warn('Tier integration shutdown error', { error: e.message });
-            }
-        }
-
-        if (this.smsProviderManager) {
-            try {
-                await this.smsProviderManager.shutdown();
-            } catch (e) {
-                logger.warn('SMS Provider Manager shutdown failed', { error: e.message });
-            }
-        }
-
-        try {
-            await Promise.race([
-                this.walletService?.disconnect?.(),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
-            ]);
-        } catch (e) {}
-
-        setTimeout(() => process.exit(0), 2000);
-    }
-
-    updateMetrics(duration) {
-        this.metrics.requestsHandled++;
-        this.metrics.avgResponseTime =
-            (this.metrics.avgResponseTime * (this.metrics.requestsHandled - 1) + duration)
-            / this.metrics.requestsHandled;
-    }
-
-    trackEvent(event, userId) {
-        setImmediate(() => {
-            logger.debug('Event tracked', { event, userId });
-        });
-    }
-
-    logMetrics() {
-        const uptime = (Date.now() - this.metrics.startTime) / 1000;
-        logger.info('Bot metrics', {
-            uptime: `${Math.floor(uptime / 60)}m`,
-            requestsHandled: this.metrics.requestsHandled,
-            requestsFailed: this.metrics.requestsFailed,
-            avgResponseTime: `${Math.round(this.metrics.avgResponseTime)}ms`,
-            activeUsers: this.metrics.activeUsers.size
-        });
-    }
-
-    getHealth() {
-        return {
-            status: this.isShuttingDown ? 'shutting_down' : this.isReady ? 'healthy' : 'starting',
-            uptime: process.uptime(),
-            memory: process.memoryUsage(),
-            metrics: {
-                requests: this.metrics.requestsHandled,
-                failed: this.metrics.requestsFailed,
-                avgResponseTime: Math.round(this.metrics.avgResponseTime),
-                activeUsers: this.metrics.activeUsers.size
-            },
-            walletReady: this.walletService?.isReady || false,
-            walletScanMode: this.walletService?.scanMode || 'unknown',
-            walletRpcType: this.walletService?.currentProviderType || 'none',
-            smsProviderReady: !!this.smsProviderManager?.isInitialized,
-            freeTierReady: !!this.freeNumberController?.provider?.isActive,
-            tierSystemReady: !!this.tierIntegrationService?.isAvailable(),
-            tierSystemHealth: this.tierIntegrationService?.getHealth() || null,
-            timestamp: new Date().toISOString()
-        };
-    }
-}
-
-
-export default TelegramBot;
+                await this.
