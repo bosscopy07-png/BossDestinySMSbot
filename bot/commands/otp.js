@@ -1863,34 +1863,37 @@ async handleFreeCountrySelected(ctx, countryCode) {
 
     // ═══════════════════════════════════════════════════════════════════════
     //  NEW: Country Selection with Tier-Aware Live Pricing (Step 3)
-    // ══════
-            async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = null) {
+    // ═════
+            // ═══════════════════════════════════════════════════════════════════════
+    //  COUNTRY SELECTION — 2 or 3 columns, equal buttons, auto-edit
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = null) {
         const tierInfo = this.tierSelector.getTierInfo(tierKey);
         
         try {
-            await ctx.editMessageCaption(
-                `🌍 <b>Loading countries for ${tierInfo.emoji} ${tierInfo.label}...</b>`,
-                { parse_mode: 'HTML' }
-            );
-        } catch (e) {}
+            // Try to edit loading message or send new
+            try {
+                await ctx.editMessageCaption(
+                    `🌍 <b>Loading ${tierInfo.emoji} ${tierInfo.label} countries...</b>`,
+                    { parse_mode: 'HTML' }
+                );
+            } catch (e) {
+                // Not a caption message or can't edit
+            }
 
-        try {
-            // FIXED: Remove topOnly, fetch ALL available countries sorted by price
-            // perPage 15 for 3×5 grid
             const result = await this.countryCatalog.getCountriesForService(
                 service, 
                 tierKey, 
                 { 
                     page, 
-                    perPage: 15,  // 15 per page = 3×5 grid
+                    perPage: 12,  // 12 = 3×4 or 2×6 grid
                     searchQuery,
-                    topOnly: false,  // FIXED: Don't limit to TOP_COUNTRIES
-                    minAvailable: 15  // Ensure at least 15
+                    topOnly: false  // Show all available, sorted by price
                 }
             );
 
-            
-        if (!result.countries || result.countries.length === 0) {
+            if (!result.countries || result.countries.length === 0) {
                 const noStockMessage = 
                     `⚠️ <b>No ${tierInfo.label} Numbers Available</b>\n\n` +
                     `No ${tierInfo.label.toLowerCase()} numbers available for <b>${service}</b> currently.\n\n` +
@@ -1900,7 +1903,6 @@ async handleFreeCountrySelected(ctx, countryCode) {
                     `• Search for a specific country`;
 
                 const fallbackButtons = [];
-                
                 const otherTiers = this.tierSelector.getAllTierInfos().filter(t => t.key !== tierKey);
                 for (const t of otherTiers) {
                     fallbackButtons.push([Markup.button.callback(
@@ -1908,7 +1910,6 @@ async handleFreeCountrySelected(ctx, countryCode) {
                         `tier_${t.key}`
                     )]);
                 }
-                
                 fallbackButtons.push([Markup.button.callback('🔙 Back to Tiers', 'tier_back_tier')]);
                 fallbackButtons.push([Markup.button.callback('🔙 Main Menu', 'menu')]);
 
@@ -1926,41 +1927,56 @@ async handleFreeCountrySelected(ctx, countryCode) {
                 message += `🔍 Search: "${searchQuery}"\n`;
             }
 
-            message += `Showing ${result.countries.length} countries (sorted by price):\n\n`;
+            message += `Showing ${result.countries.length} countries (cheapest first):\n\n`;
 
             const buttons = [];
+            const COLUMNS = 3; // 3 columns per row (4 rows = 12 countries)
 
-            for (const country of result.countries) {
-                const flag = country.flag || this._getFlag(country.code);
-                const priceText = country.displayPrice 
-                    ? ` ${formatCurrency(country.displayPrice)}`
-                    : (country.price ? ` ~${formatCurrency(country.price)}` : '');
-                const stockText = country.stock > 0 ? ` (${country.stock} avail)` : ' (no stock)';
-                const unavailable = country.unavailable ? ' ❌' : '';
-
-                buttons.push([Markup.button.callback(
-                    `${flag} ${country.name}${priceText}${stockText}${unavailable}`,
-                    `tier_country_${country.code}`
-                )]);
+            for (let i = 0; i < result.countries.length; i += COLUMNS) {
+                const row = result.countries.slice(i, i + COLUMNS).map(country => {
+                    const flag = country.flag || isoToFlag(country.code);
+                    const priceText = country.displayPrice 
+                        ? ` $${country.displayPrice.toFixed(2)}`
+                        : (country.price ? ` ~$${country.price.toFixed(2)}` : '');
+                    const stockText = country.stock > 0 ? ` ✅` : ' ❌';
+                    
+                    // Compact format for equal button sizes
+                    const label = `${flag} ${country.code}${priceText}${stockText}`;
+                    
+                    return Markup.button.callback(label, `country_select_${country.code}`);
+                });
+                buttons.push(row);
             }
 
-            const paginationButtons = [];
+            // Pagination: Prev | Search | Next
+            const navRow = [];
             if (result.pagination.hasPrev) {
-                paginationButtons.push(Markup.button.callback('◀️ Prev', `country_page_${page - 1}`));
+                navRow.push(Markup.button.callback('◀️ Prev', `country_page_${page - 1}`));
             }
+            navRow.push(Markup.button.callback('🔍 Search', 'country_search_prompt'));
             if (result.pagination.hasNext) {
-                paginationButtons.push(Markup.button.callback('Next ▶️', `country_page_${page + 1}`));
+                navRow.push(Markup.button.callback('Next ▶️', `country_page_${page + 1}`));
             }
-            if (paginationButtons.length > 0) buttons.push(paginationButtons);
+            if (navRow.length > 0) buttons.push(navRow);
 
-            buttons.push([Markup.button.callback('🔍 Search Country...', 'country_search_prompt')]);
             buttons.push([Markup.button.callback('🔙 Back to Tiers', 'tier_back_tier')]);
             buttons.push([Markup.button.callback('🔙 Main Menu', 'menu')]);
 
-            await this.sendPhotoWithCaption(
-                ctx, IMAGES.countrySelect, message, 
-                Markup.inlineKeyboard(buttons), 'HTML'
-            );
+            const keyboard = Markup.inlineKeyboard(buttons);
+
+            // FIXED: Auto-edit or delete+send
+            try {
+                await ctx.editMessageCaption(message, {
+                    parse_mode: 'HTML',
+                    reply_markup: keyboard.reply_markup
+                });
+            } catch (editError) {
+                try {
+                    await ctx.deleteMessage();
+                } catch (delErr) {}
+                
+                await this.sendPhotoWithCaption(ctx, IMAGES.countrySelect, message, keyboard, 'HTML');
+            }
 
         } catch (error) {
             logger.error('Tier country selection failed', { 
@@ -1977,9 +1993,10 @@ async handleFreeCountrySelected(ctx, countryCode) {
                 'HTML'
             );
         }
-    }
-
-    
+        }
+                                                             
+            
+            
     async handleTierCountrySelect(ctx, countryCode) {
         const userId = ctx.from.id.toString();
         const service = ctx.session?.otpService;
