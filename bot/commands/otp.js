@@ -2,16 +2,13 @@
 //  OTPCommands.js — Part 1: Imports, Setup, User Helpers, VIP & Deposit
 //  INTEGRATED: Tier-based operator selection system for CHEAP mode
 // ═══════════════════════════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════════════════════
-//  OTPCommands.js — Constructor & Tier System Initialization (FIXED)
-// ═══════════════════════════════════════════════════════════════════════════════
+
 
 
 import ServiceCatalog from '../../services/ServiceCatalog.js';
 import TierOperatorSelector from '../../services/TierOperatorSelector.js';
 import CountryCatalog from '../../services/CountryCatalog.js';
 import { TIER_CONFIG } from '../../config/tierConfig.js';
-import { applyProfitMargin } from '../../services/TierIntegrationService.js';
 
 import { Markup } from 'telegraf';
 import { Session, User, Number as NumberModel, Transaction } from '../../models/index.js';
@@ -24,7 +21,12 @@ import config from '../../config/env.js';
 // ═══════════════════════════════════════════════════════════════════════════════
 //  NEW TIER SYSTEM IMPORTS
 // ═══════════════════════════════════════════════════════════════════════════════
-
+const PROFIT_MARGIN = 0.20;
+function applyProfitMargin(rawPrice) {
+    if (rawPrice === null || rawPrice === undefined || isNaN(rawPrice)) return null;
+    return parseFloat((rawPrice + PROFIT_MARGIN).toFixed(4));
+                        }
+       
 // ─── Image Assets ─────────────────────────────────────────────────────────────
 const IMAGES = {
     otpMenu: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231499/file_000000006c1c724685bb402218b7c208_ste2ky.png',
@@ -881,6 +883,7 @@ setupTextHandlers() {
         return `⚠️ ${this.escapeTelegramText(status.message || status.error || '...')}`;
     }
 
+ 
     async sendPollUpdate(ctx, status) {
         const message = this.formatPollStatus(status);
         try {
