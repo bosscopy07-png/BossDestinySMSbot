@@ -2559,7 +2559,90 @@ async handleFreeCountrySelected(ctx, countryCode) {
         }
     }
         
+    /**
+     * Get popular services, with global top 15 first, then config, then A-Z backfill
+     * FIXED: Prioritizes actually popular services (WhatsApp, Telegram, etc.)
+     */
+    async getPopularServices(minCount = 15) {
+        await this._ensureLoaded();
 
+        if (this._allServices.size === 0) {
+            return [];
+        }
+
+        const result = [];
+        const added = new Set();
+
+        // FIXED: Hardcoded global top 15 most popular services worldwide
+        const GLOBAL_TOP_15 = [
+            'WhatsApp', 'Telegram', 'Facebook', 'Instagram', 'Twitter',
+            'TikTok', 'Gmail', 'Google', 'Netflix', 'Amazon',
+            'PayPal', 'Snapchat', 'Discord', 'Spotify', 'Uber'
+        ];
+
+        // Step 1: Add global top 15 that exist in catalog
+        for (const name of GLOBAL_TOP_15) {
+            const normalized = name.toLowerCase();
+            if (this._serviceMap.has(normalized)) {
+                const displayName = this._serviceMap.get(normalized);
+                if (!added.has(displayName)) {
+                    result.push({
+                        name: displayName,
+                        category: this._getServiceCategory(displayName),
+                        isPopular: true,
+                        isGlobalTop: true
+                    });
+                    added.add(displayName);
+                }
+            }
+        }
+
+        // Step 2: Add from POPULAR_SERVICES config (excluding already added)
+        for (const name of POPULAR_SERVICES) {
+            if (added.size >= minCount) break;
+            const normalized = name.toLowerCase();
+            if (this._serviceMap.has(normalized)) {
+                const displayName = this._serviceMap.get(normalized);
+                if (!added.has(displayName)) {
+                    result.push({
+                        name: displayName,
+                        category: this._getServiceCategory(displayName),
+                        isPopular: true,
+                        isGlobalTop: false
+                    });
+                    added.add(displayName);
+                }
+            }
+        }
+
+        // Step 3: Backfill from catalog A-Z until minCount reached
+        const needed = minCount - result.length;
+        if (needed > 0) {
+            const remaining = Array.from(this._allServices)
+                .filter(s => !added.has(s))
+                .sort((a, b) => a.localeCompare(b)); // A-Z sort
+
+            for (const name of remaining.slice(0, needed)) {
+                result.push({
+                    name,
+                    category: this._getServiceCategory(name),
+                    isPopular: false,
+                    isGlobalTop: false
+                });
+                added.add(name);
+            }
+        }
+
+        logger.debug('Popular services', {
+            globalTop: result.filter(s => s.isGlobalTop).length,
+            configPopular: result.filter(s => s.isPopular && !s.isGlobalTop).length,
+            backfill: result.filter(s => !s.isPopular).length,
+            total: result.length
+        });
+
+        return result;
+    }
+        
                             
 // ═══════════════════════════════════════════════════════════════════════════════
 //  OTPCommands.js — Part 3: Core Purchase Logic, Polling, Check OTP, Cancel
