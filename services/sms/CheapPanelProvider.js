@@ -1,16 +1,70 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+//  services/CheapPanelProvider.js — 5SIM API Integration
+//  CRITICAL FIXES:
+//  - Rate limiting on all API requests (prevents 429)
+//  - Removed duplicate checkAvailability method
+//  - extractOTP: Proper type guards before string operations
+//  - checkSMS: Correctly handles 5SIM response structure
+//  - getNumber: Returns actual cost vs display price separately
+//  - cancelNumber: Validates activation ID is numeric
+// ═══════════════════════════════════════════════════════════════════════════════
+
 import axios from 'axios';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
 
+// ═══════════════════════════════════════════════════════════════════════
+//  RATE LIMITER — Prevents 429 Too Many Requests from 5SIM
+// ═══════════════════════════════════════════════════════════════════════
+
+class RateLimiter {
+    constructor(maxRequests = 3, windowMs = 1000) {
+        this.maxRequests = maxRequests;
+        this.windowMs = windowMs;
+        this.requests = [];
+        this.queue = [];
+        this.processing = false;
+    }
+
+    async acquire() {
+        return new Promise((resolve) => {
+            this.queue.push(resolve);
+            this._process();
+        });
+    }
+
+    async _process() {
+        if (this.processing) return;
+        this.processing = true;
+
+        while (this.queue.length > 0) {
+            const now = Date.now();
+            this.requests = this.requests.filter(t => now - t < this.windowMs);
+
+            if (this.requests.length >= this.maxRequests) {
+                const oldest = this.requests[0];
+                const wait = Math.max(0, this.windowMs - (now - oldest));
+                if (wait > 0) {
+                    await this._sleep(wait);
+                }
+                continue;
+            }
+
+            this.requests.push(now);
+            const next = this.queue.shift();
+            next();
+        }
+
+        this.processing = false;
+    }
+
+    _sleep(ms) {
+        return new Promise(r => setTimeout(r, ms));
+    }
+}
+
 /**
  * CheapPanelProvider — 5SIM API Integration
- * 
- * CRITICAL FIXES:
- * - extractOTP: Proper type guards before string operations
- * - checkSMS: Correctly handles 5SIM response structure (sms field, not text)
- * - getNumber: Returns actual cost vs display price separately
- * - cancelNumber: Validates activation ID is numeric, not phone number
- * - request: Proper error logging without crashing
  */
 class CheapPanelProvider {
     constructor() {
@@ -31,6 +85,9 @@ class CheapPanelProvider {
             getCountries: '/guest/countries',
             getProducts: '/guest/prices'
         };
+
+        // Rate limiter: 3 requests per second max
+        this.rateLimiter = new RateLimiter(3, 1000);
 
         this.stats = {
             totalSent: 0,
@@ -144,6 +201,43 @@ class CheapPanelProvider {
         } else {
             logger.warn('CheapPanelProvider disabled - no API key configured');
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  RATE-LIMITED REQUEST HELPER
+    // ═══════════════════════════════════════════════════════════
+
+    async request(method, endpoint, data = null, timeout = 10000) {
+        // Acquire rate limit token before making request
+        await this.rateLimiter.acquire();
+
+        const url = `${this.baseUrl}${endpoint}`;
+        const axiosConfig = {
+            method,
+            url,
+            headers: this.getHeaders(),
+            timeout,
+            validateStatus: () => true
+        };
+        
+        if (data) axiosConfig.data = data;
+        
+        const response = await axios(axiosConfig);
+        
+        if (response.status === 429) {
+            logger.warn('5SIM rate limited (429) — consider reducing request frequency', { url });
+        }
+        
+        if (response.status >= 400) {
+            logger.error('5SIM API error response', {
+                url,
+                status: response.status,
+                statusText: response.statusText,
+                data: response.data
+            });
+        }
+        
+        return response;
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -408,10 +502,9 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  PRE-FLIGHT AVAILABILITY CHECK
+    //  PRE-FLIGHT AVAILABILITY CHECK (SINGLE INSTANCE — NO DUPLICATE)
     // ═══════════════════════════════════════════════════════════
 
-    
     async checkAvailability(country, service) {
         try {
             const providerCountry = this.mapCountry(country);
@@ -641,8 +734,9 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  SMS CHECKING — CRITICAL FIX FOR text.match CRASH
+    //  SMS CHECKING
     // ═══════════════════════════════════════════════════════════
+
     async checkSMS(activationId) {
         try {
             if (!this.isActive) {
@@ -678,11 +772,9 @@ class CheapPanelProvider {
             const status = (data?.status || '').toUpperCase();
 
             if (status === 'RECEIVED' || status === 'FINISHED') {
-                // CRITICAL FIX: 5SIM returns SMS text in "sms" field, which can be string OR array of objects
                 const otp = this.extractOTP(data.code, data.sms);
                 
                 if (otp) {
-                    // FIX: Handle array format for fullText storage
                     let fullText = null;
                     if (Array.isArray(data.sms)) {
                         fullText = data.sms[0]?.text || data.sms[0]?.sms || JSON.stringify(data.sms);
@@ -723,9 +815,13 @@ class CheapPanelProvider {
             logger.error('5SMS check failed', { activationId, error: error.message });
             return { success: false, error: error.message, status: 'ERROR' };
         }
-                }
-                            extractOTP(code, text) {
-        // PRIORITY 1: Handle 5SIM "code" field (can be string, number, or null)
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  OTP EXTRACTION
+    // ═══════════════════════════════════════════════════════════
+
+    extractOTP(code, text) {
         if (code !== null && code !== undefined) {
             const codeStr = code.toString().trim();
             const cleanCode = codeStr.replace(/[\s\-]/g, '');
@@ -735,13 +831,11 @@ class CheapPanelProvider {
             logger.debug('5SIM code field present but invalid format', { code, cleanCode });
         }
 
-        // PRIORITY 2: Parse "sms" text field
         if (text === null || text === undefined) {
             logger.debug('No SMS text provided', { text });
             return null;
         }
 
-        // ========== FIX: Handle Array format from 5SIM ==========
         let textStr;
         
         if (Array.isArray(text)) {
@@ -761,7 +855,6 @@ class CheapPanelProvider {
                     }
                 }
                 
-                // Also try to get code from array element if main code param failed
                 if (firstMessage.code && (!code || code === null)) {
                     const arrayCode = firstMessage.code.toString().trim().replace(/[\s\-]/g, '');
                     if (/^\d{4,8}$/.test(arrayCode)) {
@@ -792,7 +885,6 @@ class CheapPanelProvider {
             return null;
         }
 
-        // Now safe to use .match() since textStr is guaranteed string
         const patterns = [
             /\b\d{4,8}\b/,
             /code[:\s]+(\d{4,8})/i,
@@ -820,20 +912,17 @@ class CheapPanelProvider {
             }
         }
 
-        // Fallback: find any 4-8 digit sequence
         const digits = textStr.match(/\b\d{4,8}\b/g);
         if (digits?.length > 0) return digits[digits.length - 1];
 
         return null;
-                            }
-    
- 
-   
+    }
 
     // ═══════════════════════════════════════════════════════════
     //  NUMBER MANAGEMENT
     // ═══════════════════════════════════════════════════════════
 
+    
     async cancelNumber(activationId) {
         try {
             if (!this.isActive) {
@@ -911,39 +1000,10 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  REQUEST HELPER
-    // ═══════════════════════════════════════════════════════════
-
-    async request(method, endpoint, data = null, timeout = 10000) {
-        const url = `${this.baseUrl}${endpoint}`;
-        const config = {
-            method,
-            url,
-            headers: this.getHeaders(),
-            timeout,
-            validateStatus: () => true
-        };
-        
-        if (data) config.data = data;
-        
-        const response = await axios(config);
-        
-        if (response.status >= 400) {
-            logger.error('5SIM API error response', {
-                url,
-                status: response.status,
-                statusText: response.statusText,
-                data: response.data
-            });
-        }
-        
-        return response;
-    }
-
-    // ═══════════════════════════════════════════════════════════
     //  MAPPING HELPERS
     // ═══════════════════════════════════════════════════════════
-                    mapService(service) {
+
+    mapService(service) {
         if (!service || service === 'Any') return 'other';
         return this.serviceMap[service] || 'other';
     }
