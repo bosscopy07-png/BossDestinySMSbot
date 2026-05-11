@@ -7,35 +7,34 @@
 import { TIER_CONFIG, CACHE_TTL } from '../config/tierConfig.js';
 import logger from '../utils/logger.js';
 
+const PROFIT_MARGIN = 0.20; // $0.20 profit per number
+
+/**
+ * Apply profit margin to a raw provider price
+ */
+function applyProfitMargin(rawPrice) {
+    if (rawPrice === null || rawPrice === undefined || isNaN(rawPrice)) return null;
+    return parseFloat((rawPrice + PROFIT_MARGIN).toFixed(4));
+}
+
 /**
  * TierIntegrationService — Central orchestrator for the 3-tier CHEAP flow
- * 
- * Responsibilities:
- *   - Initializes and wires all tier components
- *   - Provides single entry point for bot handlers
- *   - Normalizes errors across the flow
- *   - Manages cross-cutting concerns (caching, logging, metrics)
- *   - Falls back to legacy flow if tier system unavailable
  */
 class TierIntegrationService {
     constructor(smsProviderManager, options = {}) {
         this.providerManager = smsProviderManager;
         
-        // Lazy-loaded components (initialized on first use)
         this._serviceCatalog = null;
         this._tierSelector = null;
         this._countryCatalog = null;
         this._cheapProvider = null;
         
-        // Cache for tier baseline prices (used in tier selection UI)
         this._baselinePriceCache = new Map();
-        this._baselineCacheTtl = 60 * 1000; // 1 minute
+        this._baselineCacheTtl = 60 * 1000;
         
-        // Feature flags
         this._enabled = options.enableTierFlow !== false;
         this._legacyFallback = options.legacyFallback !== false;
         
-        // Metrics
         this._metrics = {
             tierSelections: 0,
             tierPurchases: 0,
@@ -54,9 +53,6 @@ class TierIntegrationService {
     //  INITIALIZATION
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Initialize all tier components. Call once after construction.
-     */
     async initialize() {
         if (!this._enabled) {
             logger.info('Tier flow disabled, skipping initialization');
@@ -64,7 +60,6 @@ class TierIntegrationService {
         }
 
         try {
-            // Get CheapPanelProvider instance from manager
             this._cheapProvider = this.providerManager?.getProvider('CHEAP_PANEL');
             
             if (!this._cheapProvider) {
@@ -79,12 +74,10 @@ class TierIntegrationService {
                 return;
             }
 
-            // Dynamic imports to avoid circular dependencies
             const { default: ServiceCatalog } = await import('./ServiceCatalog.js');
             const { default: TierOperatorSelector } = await import('./TierOperatorSelector.js');
             const { default: CountryCatalog } = await import('./CountryCatalog.js');
 
-            // FIXED: Pass cheapPanelProvider to ServiceCatalog for dynamic catalog loading
             this._serviceCatalog = new ServiceCatalog(this._cheapProvider);
             this._tierSelector = new TierOperatorSelector(this._cheapProvider);
             this._countryCatalog = new CountryCatalog(this._cheapProvider, this._tierSelector);
@@ -104,9 +97,6 @@ class TierIntegrationService {
         }
     }
 
-    /**
-     * Check if tier flow is available and initialized
-     */
     isAvailable() {
         return this._enabled && 
                this._serviceCatalog !== null && 
@@ -120,86 +110,50 @@ class TierIntegrationService {
     //  SERVICE SELECTION (Step 1)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Get popular services for initial display
-     * FIXED: Now async due to dynamic catalog loading
-     */
     async getPopularServices() {
         if (!this.isAvailable()) return null;
         return this._serviceCatalog.getPopularServices();
     }
 
-    /**
-     * Search services by query
-     * FIXED: Now async due to dynamic catalog loading
-     */
     async searchServices(query, limit = 30) {
         if (!this.isAvailable()) return null;
         return this._serviceCatalog.searchServices(query, limit);
     }
 
-    /**
-     * Get services by category
-     * FIXED: Now async due to dynamic catalog loading
-     */
     async getServicesByCategory(category) {
         if (!this.isAvailable()) return null;
         return this._serviceCatalog.getServicesByCategory(category);
     }
 
-    /**
-     * Get all categories with counts
-     * FIXED: Now async due to dynamic catalog loading
-     */
     async getCategories() {
         if (!this.isAvailable()) return null;
         return this._serviceCatalog.getCategories();
     }
 
-    /**
-     * Get paginated service list
-     * FIXED: Now async due to dynamic catalog loading
-     */
     async getServicesPage(page, perPage, filter = null) {
         if (!this.isAvailable()) return null;
         return this._serviceCatalog.getServicesPage(page, perPage, filter);
     }
 
-    /**
-     * Validate service exists
-     * FIXED: Removed hardcoded SERVICES fallback. Dynamic catalog is the only source of truth.
-     */
     async isValidService(serviceName) {
-        if (!this.isAvailable()) {
-            // No fallback to hardcoded list — dynamic catalog is the only source of truth
-            return false;
-        }
+        if (!this.isAvailable()) return false;
         return this._serviceCatalog.hasService(serviceName);
-}
-            // ═══════════════════════════════════════════════════════════════════════
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     //  TIER SELECTION (Step 2)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Get all tier infos for display
-     */
     getAllTierInfos() {
         if (!this.isAvailable()) return null;
         return this._tierSelector.getAllTierInfos();
     }
 
-    /**
-     * Get tier info by key
-     */
     getTierInfo(tierKey) {
         if (!this.isAvailable()) return null;
         return this._tierSelector.getTierInfo(tierKey);
     }
 
-    /**
-     * Get tier baseline prices for a service (for UI display)
-     * Caches results to avoid hammering the API
-     */
     async getTierBaselinePrices(service, country = 'US') {
         if (!this.isAvailable()) return null;
 
@@ -219,6 +173,9 @@ class TierIntegrationService {
                     tier.key, country, service, { timeoutMs: 8000 }
                 ).catch(() => null);
 
+                const rawPrice = baseline?.displayPrice || baseline?.price || null;
+                const markedUpPrice = applyProfitMargin(rawPrice);
+
                 results.push({
                     tierKey: tier.key,
                     label: tier.label,
@@ -226,7 +183,8 @@ class TierIntegrationService {
                     description: tier.description,
                     badge: tier.badge,
                     priceMultiplier: tier.priceMultiplier,
-                    baselinePrice: baseline?.displayPrice || null,
+                    baselinePrice: markedUpPrice,
+                    rawPrice: rawPrice,
                     baselineStock: baseline?.stock || 0,
                     operatorCount: tier.operatorCount
                 });
@@ -239,6 +197,7 @@ class TierIntegrationService {
                     badge: tier.badge,
                     priceMultiplier: tier.priceMultiplier,
                     baselinePrice: null,
+                    rawPrice: null,
                     baselineStock: 0,
                     operatorCount: tier.operatorCount,
                     error: error.message
@@ -254,9 +213,6 @@ class TierIntegrationService {
         return results;
     }
 
-    /**
-     * Check if a tier has ANY stock for service/country (lightweight)
-     */
     async hasTierStock(tierKey, country, service) {
         if (!this.isAvailable()) return { available: false, reason: 'TIER_SYSTEM_UNAVAILABLE' };
         return this._tierSelector.hasTierStock(tierKey, country, service);
@@ -266,9 +222,6 @@ class TierIntegrationService {
     //  COUNTRY SELECTION (Step 3)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Get countries for service with tier-aware pricing
-     */
     async getCountriesForService(service, tierKey, options = {}) {
         if (!this.isAvailable()) {
             return { 
@@ -292,17 +245,11 @@ class TierIntegrationService {
         }
     }
 
-    /**
-     * Search countries by query
-     */
     searchCountries(query) {
         if (!this.isAvailable()) return [];
         return this._countryCatalog.searchCountries(query);
     }
 
-    /**
-     * Get top countries with pricing
-     */
     async getTopCountries(service, tierKey, limit = 20) {
         if (!this.isAvailable()) return { countries: [], tierInfo: null };
         return this._countryCatalog.getTopCountries(service, tierKey, limit);
@@ -312,25 +259,6 @@ class TierIntegrationService {
     //  PURCHASE ORCHESTRATION (Step 4)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Select best operator and purchase number
-     * This is the MAIN entry point for automatic provider selection + purchase
-     * 
-     * @returns {Promise<{
-     *   success: boolean,
-     *   phoneNumber: string,
-     *   providerNumberId: string,
-     *   operator: string,
-     *   price: number,
-     *   displayPrice: number,
-     *   stock: number,
-     *   score: number,
-     *   tier: string,
-     *   country: string,
-     *   service: string,
-     *   error: string
-     * }>}
-     */
     async purchaseNumber(tierKey, country, service, options = {}) {
         if (!this.isAvailable()) {
             return { 
@@ -344,7 +272,6 @@ class TierIntegrationService {
         this._metrics.tierSelections++;
 
         try {
-            // Step 1: Select best operator
             const selection = await this._tierSelector.selectOperator(
                 tierKey, country, service, { 
                     timeoutMs: options.timeoutMs || 15000,
@@ -352,20 +279,23 @@ class TierIntegrationService {
                 }
             );
 
-            // Step 2: Purchase via CheapPanelProvider with selected operator
             const purchaseResult = await this._cheapProvider.getNumber(
                 country, service, selection.operator
             );
 
             this._metrics.tierPurchases++;
 
+            const finalPrice = applyProfitMargin(selection.price);
+            const finalDisplayPrice = applyProfitMargin(selection.displayPrice);
+
             logger.info('Tier purchase successful', {
                 tier: tierKey,
                 country,
                 service,
                 operator: selection.operator,
-                price: selection.price,
-                displayPrice: selection.displayPrice,
+                price: finalPrice,
+                displayPrice: finalDisplayPrice,
+                rawPrice: selection.price,
                 duration: Date.now() - startTime
             });
 
@@ -374,8 +304,10 @@ class TierIntegrationService {
                 phoneNumber: purchaseResult.phoneNumber,
                 providerNumberId: purchaseResult.providerNumberId,
                 operator: selection.operator,
-                price: selection.price,
-                displayPrice: selection.displayPrice,
+                price: finalPrice,
+                displayPrice: finalDisplayPrice,
+                rawPrice: selection.price,
+                rawDisplayPrice: selection.displayPrice,
                 stock: selection.stock,
                 score: selection.score,
                 tier: tierKey,
@@ -388,7 +320,6 @@ class TierIntegrationService {
         } catch (error) {
             this._metrics.errors++;
 
-            // Check if we should try fallback operators within same tier
             if (options.allowFallback !== false && 
                 (error.message?.includes('NO_NUMBERS') || 
                  error.message?.includes('NOT_AVAILABLE') ||
@@ -412,9 +343,6 @@ class TierIntegrationService {
         }
     }
 
-    /**
-     * Attempt fallback purchase with next-best operator in same tier
-     */
     async _attemptFallbackPurchase(tierKey, country, service, options, originalError) {
         this._metrics.tierFallbacks++;
 
@@ -432,7 +360,6 @@ class TierIntegrationService {
                 };
             }
 
-            // Try each fallback operator
             for (const fallback of fallbackOps.slice(0, 3)) {
                 try {
                     const purchaseResult = await this._cheapProvider.getNumber(
@@ -441,13 +368,18 @@ class TierIntegrationService {
 
                     this._metrics.tierPurchases++;
 
+                    const finalPrice = applyProfitMargin(fallback.price);
+                    const finalDisplayPrice = applyProfitMargin(fallback.displayPrice);
+
                     logger.info('Fallback purchase successful', {
                         tier: tierKey,
                         country,
                         service,
-                        originalOperator: 'unknown',
+                        originalOperator: originalError?.operator || 'unknown',
                         fallbackOperator: fallback.operator,
-                        score: fallback.score
+                        score: fallback.score,
+                        price: finalPrice,
+                        displayPrice: finalDisplayPrice
                     });
 
                     return {
@@ -455,8 +387,10 @@ class TierIntegrationService {
                         phoneNumber: purchaseResult.phoneNumber,
                         providerNumberId: purchaseResult.providerNumberId,
                         operator: fallback.operator,
-                        price: fallback.price,
-                        displayPrice: fallback.displayPrice,
+                        price: finalPrice,
+                        displayPrice: finalDisplayPrice,
+                        rawPrice: fallback.price,
+                        rawDisplayPrice: fallback.displayPrice,
                         stock: fallback.stock,
                         score: fallback.score,
                         tier: tierKey,
@@ -493,9 +427,6 @@ class TierIntegrationService {
         }
     }
 
-    /**
-     * Get fallback operators for display (when primary fails)
-     */
     async getFallbackOperators(tierKey, country, service, excludeOperator = null) {
         if (!this.isAvailable()) return [];
         return this._tierSelector.getFallbackOperators(tierKey, country, service, excludeOperator);
@@ -505,9 +436,6 @@ class TierIntegrationService {
     //  LEGACY COMPATIBILITY
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Get legacy CHEAP price (for non-tier fallback)
-     */
     async getLegacyCheapPrice(country, service) {
         try {
             return await this.providerManager.getCheapPrice(country, service);
@@ -516,16 +444,10 @@ class TierIntegrationService {
         }
     }
 
-    /**
-     * Get legacy CHEAP number (for non-tier fallback)
-     */
     async getLegacyCheapNumber(country, service) {
         return this.providerManager.getCheapNumber(country, service);
     }
 
-    /**
-     * Get legacy CHEAP countries (for non-tier fallback)
-     */
     async getLegacyCheapCountries(service) {
         return this.providerManager.getCheapCountries(service);
     }
@@ -582,9 +504,6 @@ class TierIntegrationService {
         };
     }
 
-    /**
-     * Clear all caches
-     */
     clearCaches() {
         this._baselinePriceCache.clear();
         this._countryCatalog?.clearCache();
@@ -595,4 +514,4 @@ class TierIntegrationService {
 }
 
 export default TierIntegrationService;
-                        
+                    
