@@ -2164,21 +2164,26 @@ async handleFreeCountrySelected(ctx, countryCode) {
     // ═══════════════════════════════════════════════════════════════════════
     //  NEW: Pagination Handlers
     // ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SERVICE PAGE NAVIGATION — Edit existing message
+    // ═══════════════════════════════════════════════════════════════════════
 
     async handleTierServicePage(ctx, page) {
-        const service = ctx.session?.otpService;
-        const tierKey = ctx.session?.selectedTier;
-        
-        if (!tierKey) {
-            return this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
+        try {
+            await ctx.answerCbQuery(`Page ${page}`);
+            
+            // Just call showServiceSelection which handles editing
+            await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode, null, page);
+            
+        } catch (error) {
+            logger.error('handleTierServicePage failed', { error: error.message, page });
+            ctx.answerCbQuery('❌ Error loading page').catch(() => {});
         }
-
-        if (service) {
-            return this.showTierCountrySelection(ctx, service, tierKey, page);
-        }
-
-        await ctx.answerCbQuery(`Page ${page}`);
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  COUNTRY PAGE NAVIGATION — Edit existing message
+    // ═══════════════════════════════════════════════════════════════════════
 
     async handleTierCountryPage(ctx, page) {
         const service = ctx.session?.otpService;
@@ -2188,8 +2193,15 @@ async handleFreeCountrySelected(ctx, countryCode) {
             return ctx.answerCbQuery('❌ Session expired', { show_alert: true });
         }
 
-        await this.showTierCountrySelection(ctx, service, tierKey, page);
+        try {
+            await ctx.answerCbQuery(`Page ${page}`);
+            await this.showTierCountrySelection(ctx, service, tierKey, page);
+        } catch (error) {
+            logger.error('handleTierCountryPage failed', { error: error.message, page, service, tierKey });
+            ctx.answerCbQuery('❌ Error loading page').catch(() => {});
+        }
     }
+        
     // ═══════════════════════════════════════════════════════════════════════
     //  NEW: Search Handlers
     //  FIXED: Async calls to searchServices()
