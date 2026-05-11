@@ -281,8 +281,9 @@ class CountryCatalog {
     hasCountry(code) {
         if (!code || typeof code !== 'string') return false;
         return this._countryMap.has(code.toUpperCase());
-                }
-        // ═══════════════════════════════════════════════════════════════════════
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     //  INTERNAL — Backfill Logic
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -495,3 +496,4 @@ class CountryCatalog {
 }
 
 export default CountryCatalog;
+                                     
