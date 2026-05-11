@@ -313,9 +313,10 @@ const KEYBOARDS = {
     // ═══════════════════════════════════════════════════════════════════════
     //  COMMAND REGISTRATION
     // ═══════════════════════════════════════════════════════════════════════
-
     registerCommands() {
-        // Slash commands
+        // ═════════════════════════════════════════════════════════════════
+        //  SLASH COMMANDS
+        // ═════════════════════════════════════════════════════════════════
         this.bot.command('otp', this.handleOTPCommand);
         this.bot.command('mynumber', this.handleMyNumberCommand);
         this.bot.command('cancel', this.handleCancel);
@@ -326,18 +327,24 @@ const KEYBOARDS = {
         this.bot.command('settings', this.handleSettings);
         this.bot.command('faq', this.handleFaq);
         
-        // Mode selection actions
+        // ═════════════════════════════════════════════════════════════════
+        //  MODE SELECTION
+        // ═════════════════════════════════════════════════════════════════
         this.bot.action('mode_free', this.handleFreeMode);
         this.bot.action('mode_cheap', this.handleCheapMode);
         this.bot.action('mode_vip', this.handleVIPMode);
         this.bot.action('mode_bundle', this.handleBundleMode);
         
-        // My Number & VIP actions
+        // ═════════════════════════════════════════════════════════════════
+        //  MY NUMBER & VIP ACTIONS
+        // ═════════════════════════════════════════════════════════════════
         this.bot.action('view_my_number', this.handleViewMyNumber);
         this.bot.action('request_otp_vip', this.handleRequestOtpVip);
         this.bot.action('buy_bundle_otp', this.handleBuyBundleOtp);
         
-        // Bundle quantity actions
+        // ═════════════════════════════════════════════════════════════════
+        //  BUNDLE QUANTITY ACTIONS
+        // ═════════════════════════════════════════════════════════════════
         this.bot.action('bundle_qty_5', (ctx) => this.handleBundleQuantity(ctx, 5));
         this.bot.action('bundle_qty_10', (ctx) => this.handleBundleQuantity(ctx, 10));
         this.bot.action('bundle_qty_25', (ctx) => this.handleBundleQuantity(ctx, 25));
@@ -345,111 +352,14 @@ const KEYBOARDS = {
         this.bot.action('bundle_qty_custom', this.handleBundleQuantityCustom);
         this.bot.action('confirm_bundle_purchase', this.handleConfirmBundlePurchase);
         
-        // Service & Country selection
-        this.bot.action(/service_(.+)/, this.handleServiceSelect);
-        this.bot.action(/country_(.+)/, this.handleCountrySelect);
-        
-        // Purchase confirmations
-        this.bot.action('buy_bundle', this.handleBuyBundle);
-        this.bot.action('confirm_free_mode', this.handleConfirmFreeMode);
-        this.bot.action('buy_vip', this.handleBuyVIP);
-        this.bot.action('confirm_bundle', this.handleConfirmBundle);
-        this.bot.action('confirm_vip', this.handleConfirmVIP);
-        
-        // OTP Hub
-        this.bot.action('otp_hub', this.handleOTPHub);
-        
-        // OTP actions
-        this.bot.action(/reveal_(.+)/, this.handleRevealOTP);
-        this.bot.action('check_deposit', this.handleCheckDeposit);
-        this.bot.action('cancel_otp', (ctx) => this.handleCancel(ctx));
-        this.bot.action('deposit', this.handleDepositInfo);
-        this.bot.action('menu', this.handleMenu);
-        this.bot.action('contact_support', this.handleContactSupport);
-        this.bot.action('cancel_vip_subscription', this.handleCancelVipSubscription);
-        this.bot.action('confirm_vip_cancel', this.handleConfirmVipCancel);
-        
-        // New feature actions
-        this.bot.action('history', this.handleHistory);
-        this.bot.action('referral', this.handleReferral);
-        this.bot.action('stats', this.handleStats);
-        this.bot.action('quick_buy', this.handleQuickBuy);
-        this.bot.action('provider_status', this.handleProviderStatus);
-        this.bot.action('settings', this.handleSettings);
-        this.bot.action('toggle_notifications', this.handleToggleNotifications);
-        this.bot.action('faq', this.handleFaq);
-        this.bot.action('terms', this.handleTerms);
-        
-        // OTP check with pattern
-        this.bot.action(/check_otp_(.+)/, this.handleCheckOTP);
-
         // ═════════════════════════════════════════════════════════════════
-        //  AD CREDIT SYSTEM ACTIONS
-        // ═════════════════════════════════════════════════════════════════
-        this.bot.action(/watch_ad_(.+)/, async (ctx) => {
-            try {
-                await this.handleWatchAd(ctx, ctx.match[1]);
-            } catch (error) {
-                logger.error('watch_ad action error', { error: error.message, userId: ctx.from?.id });
-                ctx.answerCbQuery('❌ Error loading ad').catch(() => {});
-            }
-        });
-
-        this.bot.action('check_credits', async (ctx) => {
-            try {
-                await this.handleCheckCredits(ctx);
-            } catch (error) {
-                logger.error('check_credits action error', { error: error.message, userId: ctx.from?.id });
-                ctx.answerCbQuery('❌ Error checking credits').catch(() => {});
-            }
-        });
-
-        this.bot.action(/free_service_(.+)/, async (ctx) => {
-            try {
-                await this.handleFreeServiceSelected(ctx, ctx.match[1]);
-            } catch (error) {
-                logger.error('free_service action error', { error: error.message, userId: ctx.from?.id });
-                ctx.answerCbQuery('❌ Error').catch(() => {});
-            }
-        });
-
-        this.bot.action(/free_country_(.+)/, async (ctx) => {
-            try {
-                await this.handleFreeCountrySelected(ctx, ctx.match[1]);
-            } catch (error) {
-                logger.error('free_country action error', { error: error.message, userId: ctx.from?.id });
-                ctx.answerCbQuery('❌ Error').catch(() => {});
-            }
-        });
-
-        this.bot.action(/cancel_free_(.+)/, async (ctx) => {
-            try {
-                await this.handleCancel(ctx);
-            } catch (error) {
-                logger.error('cancel_free action error', { error: error.message, userId: ctx.from?.id });
-                ctx.answerCbQuery('❌ Cancel failed').catch(() => {});
-            }
-        });
-
-        this.bot.action(/check_free_(.+)/, async (ctx) => {
-            try {
-                await this.handleCheckFree(ctx, ctx.match[1]);
-            } catch (error) {
-                logger.error('check_free action error', { error: error.message, userId: ctx.from?.id });
-                ctx.answerCbQuery('❌ Check failed').catch(() => {});
-            }
-        });
-
-
-
-        // ═════════════════════════════════════════════════════════════════
-        //  SERVICE SELECTION ACTIONS (FIXED: Distinct prefixes)
+        //  SERVICE SELECTION — NEW TIER FLOW (FIXED: Distinct prefixes only)
         // ═════════════════════════════════════════════════════════════════
         
         // Service selection (user taps a service name)
-                this.bot.action(/service_select_(.+)/, async (ctx) => {
+        this.bot.action(/service_select_(.+)/, async (ctx) => {
             try {
-                const serviceName = ctx.match[1]; // This should be a string
+                const serviceName = ctx.match[1];
                 await this.handleServiceSelect(ctx, serviceName);
                 await ctx.answerCbQuery('✅ Service selected');
             } catch (error) {
@@ -461,7 +371,6 @@ const KEYBOARDS = {
                 ctx.answerCbQuery('❌ Error selecting service').catch(() => {});
             }
         });
-        
 
         // Service page navigation (Next/Prev)
         this.bot.action(/service_page_(\d+)/, async (ctx) => {
@@ -499,9 +408,8 @@ const KEYBOARDS = {
         });
 
         // ═════════════════════════════════════════════════════════════════
-        //  TIER SELECTION ACTIONS
+        //  TIER SELECTION
         // ═════════════════════════════════════════════════════════════════
-        
         this.bot.action(/tier_(budget|standard|premium)/, async (ctx) => {
             try {
                 await this.handleTierSelect(ctx, ctx.match[1]);
@@ -512,10 +420,10 @@ const KEYBOARDS = {
         });
 
         // ═════════════════════════════════════════════════════════════════
-        //  COUNTRY SELECTION ACTIONS (FIXED: Distinct prefixes)
+        //  COUNTRY SELECTION — NEW TIER FLOW (FIXED: Distinct prefixes only)
         // ═════════════════════════════════════════════════════════════════
         
-        // Country selection (user taps a country) — routes to tier or legacy
+        // Country selection (user taps a country)
         this.bot.action(/country_select_(.+)/, async (ctx) => {
             try {
                 await this.handleCountrySelect(ctx, ctx.match[1]);
@@ -571,7 +479,6 @@ const KEYBOARDS = {
                     return ctx.answerCbQuery('❌ Session expired', { show_alert: true });
                 }
                 
-                // Re-run country select with fallback operator hint
                 ctx.session.fallbackOperator = operator;
                 await this.handleTierCountrySelect(ctx, country);
             } catch (error) {
@@ -603,7 +510,105 @@ const KEYBOARDS = {
                 logger.error('tier_back_tier error', { error: error.message });
             }
         });
+
+        // ═════════════════════════════════════════════════════════════════
+        //  PURCHASE CONFIRMATIONS
+        // ═════════════════════════════════════════════════════════════════
+        this.bot.action('buy_bundle', this.handleBuyBundle);
+        this.bot.action('confirm_free_mode', this.handleConfirmFreeMode);
+        this.bot.action('buy_vip', this.handleBuyVIP);
+        this.bot.action('confirm_bundle', this.handleConfirmBundle);
+        this.bot.action('confirm_vip', this.handleConfirmVIP);
+        
+        // ═════════════════════════════════════════════════════════════════
+        //  OTP HUB & ACTIONS
+        // ═════════════════════════════════════════════════════════════════
+        this.bot.action('otp_hub', this.handleOTPHub);
+        this.bot.action(/reveal_(.+)/, this.handleRevealOTP);
+        this.bot.action(/check_otp_(.+)/, this.handleCheckOTP);
+        this.bot.action('check_deposit', this.handleCheckDeposit);
+        this.bot.action('cancel_otp', (ctx) => this.handleCancel(ctx));
+        this.bot.action('deposit', this.handleDepositInfo);
+        this.bot.action('menu', this.handleMenu);
+        this.bot.action('contact_support', this.handleContactSupport);
+        this.bot.action('cancel_vip_subscription', this.handleCancelVipSubscription);
+        this.bot.action('confirm_vip_cancel', this.handleConfirmVipCancel);
+        
+        // ═════════════════════════════════════════════════════════════════
+        //  UTILITY ACTIONS
+        // ═════════════════════════════════════════════════════════════════
+        this.bot.action('history', this.handleHistory);
+        this.bot.action('referral', this.handleReferral);
+        this.bot.action('stats', this.handleStats);
+        this.bot.action('quick_buy', this.handleQuickBuy);
+        this.bot.action('provider_status', this.handleProviderStatus);
+        this.bot.action('settings', this.handleSettings);
+        this.bot.action('toggle_notifications', this.handleToggleNotifications);
+        this.bot.action('faq', this.handleFaq);
+        this.bot.action('terms', this.handleTerms);
+                // ═════════════════════════════════════════════════════════════════
+        //  FREE MODE ACTIONS (Legacy — uses free_service_ and free_country_)
+        // ═════════════════════════════════════════════════════════════════
+        this.bot.action(/free_service_(.+)/, async (ctx) => {
+            try {
+                await this.handleFreeServiceSelected(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('free_service action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error').catch(() => {});
+            }
+        });
+
+        this.bot.action(/free_country_(.+)/, async (ctx) => {
+            try {
+                await this.handleFreeCountrySelected(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('free_country action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error').catch(() => {});
+            }
+        });
+
+        this.bot.action(/cancel_free_(.+)/, async (ctx) => {
+            try {
+                await this.handleCancel(ctx);
+            } catch (error) {
+                logger.error('cancel_free action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Cancel failed').catch(() => {});
+            }
+        });
+
+        this.bot.action(/check_free_(.+)/, async (ctx) => {
+            try {
+                await this.handleCheckFree(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('check_free action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Check failed').catch(() => {});
+            }
+        });
+
+        // ═════════════════════════════════════════════════════════════════
+        //  AD CREDIT SYSTEM ACTIONS
+        // ═════════════════════════════════════════════════════════════════
+        this.bot.action(/watch_ad_(.+)/, async (ctx) => {
+            try {
+                await this.handleWatchAd(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('watch_ad action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error loading ad').catch(() => {});
+            }
+        });
+
+        this.bot.action('check_credits', async (ctx) => {
+            try {
+                await this.handleCheckCredits(ctx);
+            } catch (error) {
+                logger.error('check_credits action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error checking credits').catch(() => {});
+            }
+        });
     }
+        
+
+                
     
     // ═══════════════════════════════════════════════════════════════════════
     //  UTILITY METHODS
