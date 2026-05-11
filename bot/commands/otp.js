@@ -151,7 +151,7 @@ const KEYBOARDS = {
             // NEW: Tier system handlers
             'handleTierSelect', 'handleTierCountrySelect',
             'handleTierSearchService', 'handleTierSearchCountry',
-            'handleTierServicePage', 'handleTierCountryPage'
+            'handleTierServicePage', 'hasService', 'handleTierCountryPage'
         ];
         
         for (const name of handlerNames) {
@@ -2246,12 +2246,42 @@ async handleFreeCountrySelected(ctx, countryCode) {
     //  SERVICE & COUNTRY SELECTION
     //  FIXED: Uses dynamic catalog, no hardcoded SERVICES/COUNTRIES
     // ═══════════════════════════════════════════════════════════════════════
-    async handleServiceSelect(ctx, serviceName = null) {
-        // If called from action, serviceName is passed directly
-        // If called from text handler, extract from context
-        const service = serviceName || ctx.message?.text?.trim();
+          /**
+     * Check if a service exists in dynamic catalog
+     * FIXED: Added type guard to prevent non-string inputs
+     */
+    async hasService(serviceName) {
+        await this._ensureLoaded();
         
-        if (!service) {
+        // FIXED: Type guard — ensure serviceName is a string
+        if (!serviceName || typeof serviceName !== 'string') {
+            logger.warn('hasService called with invalid type', { 
+                serviceName, 
+                type: typeof serviceName 
+            });
+            return false;
+        }
+        
+        return this._serviceMap.has(serviceName.toLowerCase());
+    }
+        
+        
+        async handleServiceSelect(ctx, serviceName = null) {
+        // FIXED: Ensure serviceName is a string, not an object or number
+        let service = serviceName;
+        
+        if (!service && ctx.message?.text) {
+            service = ctx.message.text.trim();
+        }
+        
+        // Guard against non-string inputs
+        if (!service || typeof service !== 'string') {
+            logger.warn('handleServiceSelect: invalid service input', { 
+                service, 
+                type: typeof service,
+                serviceName,
+                match: ctx.match?.[1]
+            });
             return ctx.answerCbQuery('❌ Invalid service').catch(() => {});
         }
         
@@ -2261,6 +2291,7 @@ async handleFreeCountrySelected(ctx, countryCode) {
             return ctx.answerCbQuery('❌ Invalid service').catch(() => {});
         }
         
+    
         ctx.session = ctx.session || {};
         ctx.session.otpService = service;
         
