@@ -2206,13 +2206,11 @@ async handleFreeCountrySelected(ctx, countryCode) {
     //  NEW: Search Handlers
     //  FIXED: Async calls to searchServices()
     // ═══════════════════════════════════════════════════════════════════════
-
     async handleTierSearchService(ctx, query) {
         if (!query || query.trim().length < 2) {
             return ctx.reply('❌ Please enter at least 2 characters to search.');
         }
 
-        // FIXED: await async searchServices()
         const results = await this.serviceCatalog.searchServices(query);
         
         if (results.length === 0) {
@@ -2239,23 +2237,36 @@ async handleFreeCountrySelected(ctx, countryCode) {
             'Imo': '📹', 'Zalo': '💬', 'Badoo': '❤️'
         };
 
-        for (const r of results.slice(0, 10)) {
-            const emoji = serviceEmojis[r.name] || '📱';
-            message += `• ${emoji} ${r.name}${r.isPopular ? ' 🔥' : ''}\n`;
-            buttons.push([Markup.button.callback(
-                `${emoji} ${r.name}`,
-                `service_${r.name}`
-            )]);
+        // 3 columns
+        for (let i = 0; i < results.length && i < 15; i += 3) {
+            const row = results.slice(i, i + 3).map(r => {
+                const emoji = serviceEmojis[r.name] || '📱';
+                return Markup.button.callback(
+                    `${emoji} ${r.name}`,
+                    `service_select_${r.name}`
+                );
+            });
+            buttons.push(row);
         }
 
         buttons.push([Markup.button.callback('🔍 New Search', 'service_search_prompt')]);
         buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
 
-        await ctx.reply(message, {
-            parse_mode: 'HTML',
-            reply_markup: Markup.inlineKeyboard(buttons).reply_markup
-        });
-    }
+        // Try to edit, fallback to reply
+        try {
+            await ctx.editMessageCaption(message, {
+                parse_mode: 'HTML',
+                reply_markup: Markup.inlineKeyboard(buttons).reply_markup
+            });
+        } catch (e) {
+            await ctx.reply(message, {
+                parse_mode: 'HTML',
+                reply_markup: Markup.inlineKeyboard(buttons).reply_markup
+            });
+        }
+                            }
+        
+    
 
     async handleTierSearchCountry(ctx, query) {
         const service = ctx.session?.otpService;
