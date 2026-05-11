@@ -1717,19 +1717,42 @@ async handleFreeCountrySelected(ctx, countryCode) {
     // ═══════════════════════════════════════════════════════════════════════
 
         async showServiceSelection(ctx, mode, imageUrl, displayPrice = null, page = 1) {
-        if (!this.serviceCatalog || mode !== 'CHEAP') {
-            return this._showLegacyServiceSelection(ctx, mode, imageUrl, displayPrice);
+    if (!this.serviceCatalog || mode !== 'CHEAP') {
+        return this._showLegacyServiceSelection(ctx, mode, imageUrl, displayPrice);
+    }
+
+    try {
+        let services = [];
+        let totalPages = 1;
+        let isPopularPage = false;
+
+        if (page === 1) {
+            const popular = await this.serviceCatalog.getPopularServices(15);
+            services = popular;
+            isPopularPage = true;
+            
+            const allServices = await this.serviceCatalog.getServicesPage(1, 1000);
+            const remainingCount = Math.max(0, allServices.pagination.total - 15);
+            totalPages = 1 + Math.ceil(remainingCount / 15);
+        } else {
+            const allPage = page - 1;
+            const allServices = await this.serviceCatalog.getServicesPage(allPage, 15);
+            services = allServices.services;
+            const totalAll = allServices.pagination.total;
+            totalPages = 1 + Math.ceil(Math.max(0, totalAll - 15) / 15);
         }
 
         const priceText = displayPrice ? `\n💰 Starting from ${formatCurrency(displayPrice)}` : '';
         let message = `📱 <b>${mode} Mode</b>${priceText}\n\n`;
         
-        // Get ALL services from catalog, paginate here
-        const allServicesResult = await this.serviceCatalog.getServicesPage(page, 15);
-        const services = allServicesResult.services;
+        if (isPopularPage) {
+            message += `🔥 <b>Popular Services</b> (Top 15)\n`;
+            message += `<i>Most used worldwide</i>\n\n`;
+        } else {
+            message += `📋 <b>All Services</b> (A-Z) — Page ${page}/${totalPages}\n\n`;
+        }
         
-        message += `🔥 <b>Popular Services</b> (Page ${page}/${allServicesResult.pagination.totalPages})\n\n`;
-        message += `Select a service or use options below:`;
+        message += `<i>Select a service:</i>`;
 
         const buttons = [];
         const serviceEmojis = {
@@ -1740,39 +1763,143 @@ async handleFreeCountrySelected(ctx, countryCode) {
             'Uber': '🚗', 'Airbnb': '🏠', 'WeChat': '💬', 'Signal': '🔒',
             'LinkedIn': '💼', 'Tinder': '🔥', 'Google': '🔍', 'Microsoft': '🪟',
             'Apple': '🍎', 'Viber': '📞', 'Line': '📱', 'KakaoTalk': '💬',
-            'Imo': '📹', 'Zalo': '💬', 'Badoo': '❤️'
+            'Imo': '📹', 'Zalo': '💬', 'Badoo': '❤️', 'Yahoo': '📧',
+            'Yandex': '🔍', 'Mail.ru': '📧', 'Odnoklassniki': '👥', 'VK': '🔷',
+            'Avito': '📰', 'OLX': '📰', 'Alibaba': '📦', 'Taobao': '📦',
+            'JD': '📦', 'Weibo': '📱', 'QQ': '💬', 'Baidu': '🔍',
+            'DingTalk': '💬', 'Meituan': '🍔', 'Douyin': '🎵', 'Kuaishou': '🎥',
+            'Pinduoduo': '🛒', 'Xiaohongshu': '📕', 'Tantan': '❤️', 'Momo': '💬',
+            'Hepsiburada': '🛒', 'Trendyol': '🛒', 'N11': '🛒', 'Gittigidiyor': '🛒',
+            'Letgo': '📱', 'OfferUp': '📱', 'Mercari': '📦', 'Rakuten': '🛒',
+            'Shopee': '🛒', 'Lazada': '🛒', 'Tokopedia': '🛒', 'Bukalapak': '🛒',
+            'Flipkart': '🛒', 'Snapdeal': '🛒', 'Myntra': '👕', 'Zomato': '🍔',
+            'Swiggy': '🍔', 'Ola': '🚗', 'Grab': '🚗', 'Gojek': '🚗',
+            'Bolt': '🚗', 'Careem': '🚗', 'Pathao': '🚗', 'Foodpanda': '🍔',
+            'Deliveroo': '🍔', 'UberEats': '🍔', 'DoorDash': '🍔', 'Grubhub': '🍔'
         };
 
-        // 3 columns × 5 rows = 15 services
         for (let i = 0; i < services.length; i += 3) {
             const row = services.slice(i, i + 3).map(s => {
                 const emoji = serviceEmojis[s.name] || '📱';
+                const popularMark = s.isGlobalTop ? '🔥' : (s.isPopular ? '⭐' : '');
                 return Markup.button.callback(
-                    `${emoji} ${s.name}`,
-                    `service_select_${s.name}`  // FIXED: Different prefix to avoid collision
+                    `${emoji} ${s.name}${popularMark}`,
+                    `service_select_${s.name}`
                 );
             });
             buttons.push(row);
         }
 
-        // Bottom navigation row
-        const navButtons = [];
-        if (allServicesResult.pagination.hasPrev) {
-            navButtons.push(Markup.button.callback('◀️ Prev', `service_page_${page - 1}`));
+        const navRow = [];
+        if (page > 1) {
+            navRow.push(Markup.button.callback('◀️ Prev', `service_page_${page - 1}`));
         }
-        navButtons.push(Markup.button.callback('🔍 Search', 'service_search_prompt'));
-        if (allServicesResult.pagination.hasNext) {
-            navButtons.push(Markup.button.callback('Next ▶️', `service_page_${page + 1}`));
+        navRow.push(Markup.button.callback('🔍 Search', 'service_search_prompt'));
+        if (page < totalPages) {
+            navRow.push(Markup.button.callback('Next ▶️', `service_page_${page + 1}`));
         }
-        buttons.push(navButtons);
+        if (navRow.length > 0) buttons.push(navRow);
 
-        // Browse all button
-        buttons.push([Markup.button.callback('📋 Browse All Services', 'service_browse_all')]);
+        if (page === 1 && totalPages > 1) {
+            buttons.push([Markup.button.callback('📋 Browse All A-Z', 'service_page_2')]);
+        }
         buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
 
-        await this.sendPhotoWithCaption(ctx, imageUrl, message, Markup.inlineKeyboard(buttons), 'HTML');
+        const keyboard = Markup.inlineKeyboard(buttons);
+
+        // ─── FIXED: Robust auto-edit with correct method selection ───
+        const editSuccess = await this._tryEditMessage(ctx, message, keyboard);
+        
+        if (!editSuccess) {
+            await this._fallbackSendMessage(ctx, message, keyboard, imageUrl);
+        }
+
+    } catch (error) {
+        logger.error('showServiceSelection failed', { error: error.message, page, stack: error.stack });
+        ctx.reply('❌ Error loading services. Please try /otp again.').catch(() => {});
+    }
+}
+
+/**
+ * Try to edit the existing message.
+ * Uses editMessageCaption for photos, editMessageText for text messages.
+ * Returns true if successful, false if should fallback.
+ */
+async _tryEditMessage(ctx, message, keyboard) {
+    try {
+        // Determine if current message has a photo (caption) or is text-only
+        const msg = ctx.callbackQuery?.message || ctx.message;
+        const hasPhoto = msg?.photo && msg.photo.length > 0;
+        
+        const options = {
+            parse_mode: 'HTML',
+            reply_markup: keyboard.reply_markup
+        };
+
+        if (hasPhoto) {
+            await ctx.editMessageCaption(message, options);
+        } else {
+            await ctx.editMessageText(message, options);
         }
         
+        return true;
+    } catch (error) {
+        // Expected errors when edit is not possible:
+        // - message not modified (same content)
+        // - message is not a photo (for caption)
+        // - message to edit not found
+        // - message can't be edited
+        const isExpectedError = [
+            'message is not modified',
+            'message to edit not found',
+            'there is no caption in the message',
+            "message can't be edited",
+            'MESSAGE_NOT_MODIFIED',
+            'MESSAGE_ID_INVALID',
+            ' Bad Request: message is not modified'
+        ].some(errMsg => error.message?.includes(errMsg) || error.description?.includes(errMsg));
+
+        if (!isExpectedError) {
+            logger.warn('Unexpected edit error', { error: error.message, userId: ctx.from?.id });
+        }
+        
+        return false;
+    }
+}
+
+/**
+ * Fallback: delete old message and send new one.
+ */
+async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
+    try {
+        await ctx.deleteMessage();
+    } catch (delErr) {
+        // Message already deleted or can't delete — ignore
+    }
+
+    try {
+        if (imageUrl) {
+            await ctx.replyWithPhoto(imageUrl, {
+                caption: message,
+                parse_mode: 'HTML',
+                reply_markup: keyboard.reply_markup
+            });
+        } else {
+            await ctx.reply(message, {
+                parse_mode: 'HTML',
+                reply_markup: keyboard.reply_markup
+            });
+        }
+    } catch (sendErr) {
+        logger.error('Fallback send failed', { error: sendErr.message, userId: ctx.from?.id });
+        // Last resort
+        await ctx.reply(message, {
+            parse_mode: 'HTML',
+            reply_markup: keyboard.reply_markup
+        }).catch(() => {});
+    }
+}
+
 
     // ═══════════════════════════════════════════════════════════════════════
     //  LEGACY: Old service selection (all services at once)
