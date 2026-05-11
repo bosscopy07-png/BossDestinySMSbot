@@ -2271,22 +2271,22 @@ async handleFreeCountrySelected(ctx, countryCode) {
         return this._serviceMap.has(serviceName.toLowerCase());
     }
         
-        
-        async handleServiceSelect(ctx, serviceName = null) {
-        // FIXED: Ensure serviceName is a string, not an object or number
+            async handleServiceSelect(ctx, serviceName = null) {
+        // FIXED: Ensure serviceName is a string
         let service = serviceName;
         
         if (!service && ctx.message?.text) {
             service = ctx.message.text.trim();
         }
         
-        // Guard against non-string inputs
+        // Guard against non-string inputs (function, object, number, etc.)
         if (!service || typeof service !== 'string') {
             logger.warn('handleServiceSelect: invalid service input', { 
                 service, 
                 type: typeof service,
                 serviceName,
-                match: ctx.match?.[1]
+                match: ctx.match?.[1],
+                matchType: typeof ctx.match
             });
             return ctx.answerCbQuery('❌ Invalid service').catch(() => {});
         }
@@ -2297,7 +2297,6 @@ async handleFreeCountrySelected(ctx, countryCode) {
             return ctx.answerCbQuery('❌ Invalid service').catch(() => {});
         }
         
-    
         ctx.session = ctx.session || {};
         ctx.session.otpService = service;
         
@@ -2322,13 +2321,15 @@ async handleFreeCountrySelected(ctx, countryCode) {
         const buttons = availableCountries.countries.map(c => [
             Markup.button.callback(
                 `${c.flag} ${c.name}${c.displayPrice ? ` (${formatCurrency(c.displayPrice)})` : ''}`, 
-                `country_select_${c.code}`  // FIXED: Different prefix
+                `country_select_${c.code}`
             )
         ]);
         
         buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
         await this.sendPhotoWithCaption(ctx, IMAGES.countrySelect, message, Markup.inlineKeyboard(buttons), 'HTML');
             }
+        
+        
         
                                                                                                       
         /**
