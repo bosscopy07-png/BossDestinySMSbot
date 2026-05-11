@@ -634,20 +634,22 @@ setupTextHandlers() {
     this.bot.on('text', async (ctx, next) => {
         // Skip commands
         if (ctx.message.text.startsWith('/')) return next();
-
+        
         // Handle service search
-        if (ctx.session?.awaitingServiceSearch) {
-            ctx.session.awaitingServiceSearch = false;
-            const query = ctx.message.text.trim();
-            
-            if (!query) {
-                await ctx.reply('❌ Please enter a valid service name.');
-                return;
-            }
+  if (ctx.session?.awaitingServiceSearch) {
+    ctx.session.awaitingServiceSearch = false;
+    const query = ctx.message.text.trim();
+    
+    if (!query) {
+        await ctx.reply('❌ Please enter a valid service name.');
+        return;
+    }
 
-            try {
-                const results = await this.tierIntegration.searchServices(query, 30);
-                
+    try {
+        const results = await this.tierIntegration?.searchServices(query, 30) 
+            ?? await this.serviceCatalog?.searchServices(query, 30) 
+            ?? [];
+        
                 if (!results || results.length === 0) {
                     await ctx.reply(`❌ No services found matching "${query}".\n\nTry: WhatsApp, Telegram, Facebook, Instagram, TikTok, etc.`, {
                         parse_mode: 'HTML',
