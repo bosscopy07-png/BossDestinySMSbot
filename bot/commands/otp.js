@@ -447,15 +447,21 @@ const KEYBOARDS = {
         // ═════════════════════════════════════════════════════════════════
         
         // Service selection (user taps a service name)
-        this.bot.action(/service_select_(.+)/, async (ctx) => {
+                this.bot.action(/service_select_(.+)/, async (ctx) => {
             try {
-                await this.handleServiceSelect(ctx, ctx.match[1]);
+                const serviceName = ctx.match[1]; // This should be a string
+                await this.handleServiceSelect(ctx, serviceName);
                 await ctx.answerCbQuery('✅ Service selected');
             } catch (error) {
-                logger.error('service_select action error', { error: error.message, userId: ctx.from?.id });
+                logger.error('service_select action error', { 
+                    error: error.message, 
+                    userId: ctx.from?.id,
+                    match: ctx.match 
+                });
                 ctx.answerCbQuery('❌ Error selecting service').catch(() => {});
             }
         });
+        
 
         // Service page navigation (Next/Prev)
         this.bot.action(/service_page_(\d+)/, async (ctx) => {
