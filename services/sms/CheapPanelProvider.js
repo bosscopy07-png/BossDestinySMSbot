@@ -1,67 +1,17 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 //  services/CheapPanelProvider.js — 5SIM API Integration
+// 
 //  CRITICAL FIXES:
-//  - Rate limiting on all API requests (prevents 429)
-//  - Removed duplicate checkAvailability method
 //  - extractOTP: Proper type guards before string operations
-//  - checkSMS: Correctly handles 5SIM response structure
+//  - checkSMS: Correctly handles 5SIM response structure (sms field, not text)
 //  - getNumber: Returns actual cost vs display price separately
-//  - cancelNumber: Validates activation ID is numeric
+//  - cancelNumber: Validates activation ID is numeric, not phone number
+//  - request: Proper error logging without crashing
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import axios from 'axios';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
-
-// ═══════════════════════════════════════════════════════════════════════
-//  RATE LIMITER — Prevents 429 Too Many Requests from 5SIM
-// ═══════════════════════════════════════════════════════════════════════
-
-class RateLimiter {
-    constructor(maxRequests = 3, windowMs = 1000) {
-        this.maxRequests = maxRequests;
-        this.windowMs = windowMs;
-        this.requests = [];
-        this.queue = [];
-        this.processing = false;
-    }
-
-    async acquire() {
-        return new Promise((resolve) => {
-            this.queue.push(resolve);
-            this._process();
-        });
-    }
-
-    async _process() {
-        if (this.processing) return;
-        this.processing = true;
-
-        while (this.queue.length > 0) {
-            const now = Date.now();
-            this.requests = this.requests.filter(t => now - t < this.windowMs);
-
-            if (this.requests.length >= this.maxRequests) {
-                const oldest = this.requests[0];
-                const wait = Math.max(0, this.windowMs - (now - oldest));
-                if (wait > 0) {
-                    await this._sleep(wait);
-                }
-                continue;
-            }
-
-            this.requests.push(now);
-            const next = this.queue.shift();
-            next();
-        }
-
-        this.processing = false;
-    }
-
-    _sleep(ms) {
-        return new Promise(r => setTimeout(r, ms));
-    }
-}
 
 /**
  * CheapPanelProvider — 5SIM API Integration
@@ -85,9 +35,6 @@ class CheapPanelProvider {
             getCountries: '/guest/countries',
             getProducts: '/guest/prices'
         };
-
-        // Rate limiter: 3 requests per second max
-        this.rateLimiter = new RateLimiter(3, 1000);
 
         this.stats = {
             totalSent: 0,
@@ -204,15 +151,12 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  RATE-LIMITED REQUEST HELPER
+    //  REQUEST HELPER — No rate limiting
     // ═══════════════════════════════════════════════════════════
 
     async request(method, endpoint, data = null, timeout = 10000) {
-        // Acquire rate limit token before making request
-        await this.rateLimiter.acquire();
-
         const url = `${this.baseUrl}${endpoint}`;
-        const axiosConfig = {
+        const config = {
             method,
             url,
             headers: this.getHeaders(),
@@ -220,13 +164,9 @@ class CheapPanelProvider {
             validateStatus: () => true
         };
         
-        if (data) axiosConfig.data = data;
+        if (data) config.data = data;
         
-        const response = await axios(axiosConfig);
-        
-        if (response.status === 429) {
-            logger.warn('5SIM rate limited (429) — consider reducing request frequency', { url });
-        }
+        const response = await axios(config);
         
         if (response.status >= 400) {
             logger.error('5SIM API error response', {
@@ -502,7 +442,7 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  PRE-FLIGHT AVAILABILITY CHECK (SINGLE INSTANCE — NO DUPLICATE)
+    //  PRE-FLIGHT AVAILABILITY CHECK
     // ═══════════════════════════════════════════════════════════
 
     async checkAvailability(country, service) {
@@ -734,7 +674,7 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  SMS CHECKING
+    //  SMS CHECKING — CRITICAL FIX FOR text.match CRASH
     // ═══════════════════════════════════════════════════════════
 
     async checkSMS(activationId) {
@@ -916,13 +856,12 @@ class CheapPanelProvider {
         if (digits?.length > 0) return digits[digits.length - 1];
 
         return null;
-    }
-
+                                            }
+    
     // ═══════════════════════════════════════════════════════════
     //  NUMBER MANAGEMENT
     // ═══════════════════════════════════════════════════════════
 
-    
     async cancelNumber(activationId) {
         try {
             if (!this.isActive) {
@@ -1113,3 +1052,4 @@ class CheapPanelProvider {
 }
 
 export default CheapPanelProvider;
+    
