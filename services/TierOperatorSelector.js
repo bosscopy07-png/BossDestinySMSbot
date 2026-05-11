@@ -1,6 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 //  services/TierOperatorSelector.js — Intelligent Tier-Based Provider Selection
 //  Core engine: selects best operator within tier using live data
+//  FIXED: Rate limiting handled at CheapPanelProvider level
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { TIER_CONFIG, CACHE_TTL } from '../config/tierConfig.js';
@@ -8,39 +9,21 @@ import logger from '../utils/logger.js';
 
 /**
  * TierOperatorSelector — Selects the best available operator within a tier
- * 
- * Design principles:
- *   - NO cross-tier fallback (enforced)
- *   - All provider names come from config only
- *   - Async stock/price checks with timeout racing
- *   - Health scoring for smart selection
  */
 class TierOperatorSelector {
     constructor(cheapPanelProvider) {
         this.provider = cheapPanelProvider;
         
-        // In-memory caches
-        this._priceCache = new Map();      // key: `${country}:${service}:${tierKey}` -> { operators[], timestamp }
-        this._healthCache = new Map();     // key: `${provider}:${operator}` -> { successRate, avgSpeed, timestamp }
-        this._operatorStats = new Map();   // Runtime stats: operator -> { attempts, successes, failures, avgResponseTime }
-        
-        // Pending request deduplication
-        this._pendingChecks = new Map();   // key -> Promise
+        this._priceCache = new Map();
+        this._healthCache = new Map();
+        this._operatorStats = new Map();
+        this._pendingChecks = new Map();
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  PUBLIC API — Main Selection Entry Point
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Select the best operator for a given tier, country, and service
-     * 
-     * @param {string} tierKey - 'budget' | 'standard' | 'premium'
-     * @param {string} country - ISO country code (e.g., 'US')
-     * @param {string} service - Service name (e.g., 'WhatsApp')
-     * @param {Object} options - { skipCache: boolean, timeoutMs: number }
-     * @returns {Promise<{operator: string, price: number, stock: number, score: number, displayPrice: number}>}
-     */
     async selectOperator(tierKey, country, service, options = {}) {
         const tier = TIER_CONFIG[tierKey];
         if (!tier) {
@@ -54,12 +37,10 @@ class TierOperatorSelector {
 
         logger.info('Selecting operator', { tier: tierKey, country, service, operators: operators.length });
 
-        // Step 1: Get live data for ALL operators in tier (parallel with timeout)
         const operatorData = await this._fetchTierOperatorData(
             tierKey, country, service, operators, options.timeoutMs || 15000
         );
 
-        // Step 2: Filter operators with sufficient stock
         const available = operatorData.filter(op => op.stock >= tier.minStock);
         
         if (available.length === 0) {
@@ -67,13 +48,11 @@ class TierOperatorSelector {
             throw new Error(`TIER_NO_STOCK: No ${tierKey} operators have stock for ${service} in ${country}. Best available: ${bestStock}`);
         }
 
-        // Step 3: Score and rank available operators
         const scored = available.map(op => ({
             ...op,
             score: this._calculateOperatorScore(op, tier.sortPriority, tierKey)
         }));
 
-        // Sort by score (highest first)
         scored.sort((a, b) => b.score - a.score);
 
         const selected = scored[0];
@@ -98,15 +77,11 @@ class TierOperatorSelector {
             displayPrice,
             stock: selected.stock,
             score: selected.score,
-            allOptions: scored.slice(0, 5), // Top 5 for debugging/admin
+            allOptions: scored.slice(0, 5),
             tier: tierKey
         };
     }
 
-    /**
-     * Get fallback operators within the SAME tier (ordered by preference)
-     * Used when primary operator fails during purchase
-     */
     async getFallbackOperators(tierKey, country, service, excludeOperator = null) {
         const tier = TIER_CONFIG[tierKey];
         if (!tier || !tier.fallbackWithinTier) {
@@ -130,9 +105,6 @@ class TierOperatorSelector {
         return scored;
     }
 
-    /**
-     * Check if ANY operator in tier has stock (lightweight check)
-     */
     async hasTierStock(tierKey, country, service) {
         try {
             await this.selectOperator(tierKey, country, service, { timeoutMs: 8000 });
@@ -145,9 +117,6 @@ class TierOperatorSelector {
         }
     }
 
-    /**
-     * Get tier display info for UI
-     */
     getTierInfo(tierKey) {
         const tier = TIER_CONFIG[tierKey];
         if (!tier) return null;
@@ -163,9 +132,6 @@ class TierOperatorSelector {
         };
     }
 
-    /**
-     * Get all tier infos for UI
-     */
     getAllTierInfos() {
         return Object.entries(TIER_CONFIG).map(([key, tier]) => this.getTierInfo(key));
     }
@@ -174,16 +140,11 @@ class TierOperatorSelector {
     //  INTERNAL — Data Fetching
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Fetch live price/stock data for multiple operators in parallel
-     * Uses caching and request deduplication
-     */
     async _fetchTierOperatorData(tierKey, country, service, operators, timeoutMs) {
         const cacheKey = `${country}:${service}:${tierKey}`;
         const cached = this._priceCache.get(cacheKey);
         
         if (cached && (Date.now() - cached.timestamp) < CACHE_TTL.tierPrices) {
-            // Filter cached data to only requested operators
             const cachedOps = cached.data.filter(op => operators.includes(op.operator));
             if (cachedOps.length === operators.length) {
                 logger.debug('Using cached tier prices', { cacheKey, operators: operators.length });
@@ -191,7 +152,6 @@ class TierOperatorSelector {
             }
         }
 
-        // Deduplication: if another request is already fetching this, wait for it
         const pendingKey = `${cacheKey}:${operators.join(',')}`;
         if (this._pendingChecks.has(pendingKey)) {
             return this._pendingChecks.get(pendingKey);
@@ -203,13 +163,11 @@ class TierOperatorSelector {
         try {
             const result = await promise;
             
-            // Update cache
             this._priceCache.set(cacheKey, {
                 data: result,
                 timestamp: Date.now()
             });
 
-            // Cleanup old cache entries
             this._cleanupCache(this._priceCache, CACHE_TTL.tierPrices * 2);
 
             return result;
@@ -218,15 +176,10 @@ class TierOperatorSelector {
         }
     }
 
-    /**
-     * Uncached fetch — hits 5SIM API for each operator
-     * Uses Promise.all with individual timeouts
-     */
     async _fetchOperatorDataUncached(country, service, operators, timeoutMs) {
         const providerCountry = this.provider.mapCountry(country);
         const providerService = this.provider.mapService(service);
 
-        // Fetch full product catalog once (shared across operators)
         let products;
         try {
             products = await this.provider.getProducts();
@@ -239,14 +192,12 @@ class TierOperatorSelector {
             const startTime = Date.now();
             
             try {
-                // Method 1: Try targeted endpoint first (fastest)
                 const targetedEndpoint = `${this.provider.endpoints.getPrices}?country=${providerCountry}&product=${providerService}&operator=${operator}`;
                 
                 let response;
                 try {
                     response = await this.provider.request('get', targetedEndpoint, null, 8000);
                 } catch (err) {
-                    // Fall through to catalog method
                     response = null;
                 }
 
@@ -266,7 +217,6 @@ class TierOperatorSelector {
                     }
                 }
 
-                // Method 2: Fallback to cached catalog
                 if (price === Infinity && products) {
                     const countryData = products[providerCountry];
                     if (countryData) {
@@ -279,7 +229,6 @@ class TierOperatorSelector {
                     }
                 }
 
-                // Update runtime stats
                 this._updateOperatorStats(operator, true, Date.now() - startTime);
 
                 return {
@@ -303,7 +252,6 @@ class TierOperatorSelector {
             }
         });
 
-        // Race with overall timeout
         const results = await Promise.all(
             requests.map(p => 
                 Promise.race([
@@ -322,7 +270,6 @@ class TierOperatorSelector {
             )
         );
 
-        // Map results back to operators (preserving order)
         return operators.map((op, i) => {
             const result = results[i];
             if (result.operator === 'unknown') result.operator = op;
@@ -338,30 +285,23 @@ class TierOperatorSelector {
         const stats = this._operatorStats.get(op.operator) || { attempts: 0, successes: 0, avgResponseTime: 5000 };
         const successRate = stats.attempts > 0 ? stats.successes / stats.attempts : 0.5;
         const normalizedPrice = this._normalizePrice(op.price);
-        const normalizedStock = Math.min(op.stock / 10, 1); // Cap at 10+ stock = 1.0
-        const normalizedSpeed = Math.max(0, 1 - (op.responseTime / 10000)); // Faster = higher
+        const normalizedStock = Math.min(op.stock / 10, 1);
+        const normalizedSpeed = Math.max(0, 1 - (op.responseTime / 10000));
 
         switch (sortPriority) {
             case 'price':
-                // 70% price (lower is better, so invert), 20% stock, 10% success rate
                 return (1 - normalizedPrice) * 0.7 + normalizedStock * 0.2 + successRate * 0.1;
-            
             case 'balanced':
-                // 40% price (inverted), 30% stock, 20% success rate, 10% speed
                 return (1 - normalizedPrice) * 0.4 + normalizedStock * 0.3 + successRate * 0.2 + normalizedSpeed * 0.1;
-            
             case 'quality':
-                // 50% success rate, 25% stock, 15% speed, 10% price (inverted)
                 return successRate * 0.5 + normalizedStock * 0.25 + normalizedSpeed * 0.15 + (1 - normalizedPrice) * 0.1;
-            
             default:
                 return (1 - normalizedPrice) * 0.5 + normalizedStock * 0.3 + successRate * 0.2;
         }
     }
 
     _normalizePrice(price) {
-        if (price === null || price === undefined || price <= 0) return 1.0; // Worst score for unknown
-        // Normalize to 0-1 range assuming $0.05-$2.00 range
+        if (price === null || price === undefined || price <= 0) return 1.0;
         return Math.min(Math.max((price - 0.05) / 1.95, 0), 1);
     }
 
@@ -387,18 +327,12 @@ class TierOperatorSelector {
         }
     }
 
-    /**
-     * Clear all caches (useful for admin operations or testing)
-     */
     clearCaches() {
         this._priceCache.clear();
         this._healthCache.clear();
         logger.info('TierOperatorSelector caches cleared');
     }
 
-    /**
-     * Get runtime statistics for monitoring
-     */
     getStats() {
         return {
             cacheSize: {
@@ -412,4 +346,4 @@ class TierOperatorSelector {
 }
 
 export default TierOperatorSelector;
-                                            
+                                                                  
