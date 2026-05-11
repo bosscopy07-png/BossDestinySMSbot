@@ -1715,111 +1715,114 @@ async handleFreeCountrySelected(ctx, countryCode) {
     //  NEW: Service Selection with Search, Popular, Pagination
     //  FIXED: Async calls, shows service names with emojis, no category groups
     // ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SERVICE SELECTION — Auto-edit with proper fallback
+    // ═══════════════════════════════════════════════════════════════════════
 
-        async showServiceSelection(ctx, mode, imageUrl, displayPrice = null, page = 1) {
-    if (!this.serviceCatalog || mode !== 'CHEAP') {
-        return this._showLegacyServiceSelection(ctx, mode, imageUrl, displayPrice);
-    }
+    async showServiceSelection(ctx, mode, imageUrl, displayPrice = null, page = 1) {
+        if (!this.serviceCatalog || mode !== 'CHEAP') {
+            return this._showLegacyServiceSelection(ctx, mode, imageUrl, displayPrice);
+        }
 
-    try {
-        let services = [];
-        let totalPages = 1;
-        let isPopularPage = false;
+        try {
+            let services = [];
+            let totalPages = 1;
+            let isPopularPage = false;
 
-        if (page === 1) {
-            const popular = await this.serviceCatalog.getPopularServices(15);
-            services = popular;
-            isPopularPage = true;
+            if (page === 1) {
+                const popular = await this.serviceCatalog.getPopularServices(15);
+                services = popular;
+                isPopularPage = true;
+                
+                const allServices = await this.serviceCatalog.getServicesPage(1, 1000);
+                const remainingCount = Math.max(0, allServices.pagination.total - 15);
+                totalPages = 1 + Math.ceil(remainingCount / 15);
+            } else {
+                const allPage = page - 1;
+                const allServices = await this.serviceCatalog.getServicesPage(allPage, 15);
+                services = allServices.services;
+                const totalAll = allServices.pagination.total;
+                totalPages = 1 + Math.ceil(Math.max(0, totalAll - 15) / 15);
+            }
+
+            const priceText = displayPrice ? `\n💰 Starting from ${formatCurrency(displayPrice)}` : '';
+            let message = `📱 <b>${mode} Mode</b>${priceText}\n\n`;
             
-            const allServices = await this.serviceCatalog.getServicesPage(1, 1000);
-            const remainingCount = Math.max(0, allServices.pagination.total - 15);
-            totalPages = 1 + Math.ceil(remainingCount / 15);
-        } else {
-            const allPage = page - 1;
-            const allServices = await this.serviceCatalog.getServicesPage(allPage, 15);
-            services = allServices.services;
-            const totalAll = allServices.pagination.total;
-            totalPages = 1 + Math.ceil(Math.max(0, totalAll - 15) / 15);
+            if (isPopularPage) {
+                message += `🔥 <b>Popular Services</b> (Top 15)\n`;
+                message += `<i>Most used worldwide</i>\n\n`;
+            } else {
+                message += `📋 <b>All Services</b> (A-Z) — Page ${page}/${totalPages}\n\n`;
+            }
+            
+            message += `<i>Select a service:</i>`;
+
+            const buttons = [];
+            const serviceEmojis = {
+                'WhatsApp': '💬', 'Telegram': '✈️', 'Facebook': '👤', 'Instagram': '📸',
+                'Twitter': '🐦', 'TikTok': '🎵', 'Binance': '💰', 'Coinbase': '₿',
+                'Gmail': '📧', 'Outlook': '📨', 'Netflix': '🎬', 'Amazon': '📦',
+                'PayPal': '💳', 'Snapchat': '👻', 'Discord': '🎮', 'Spotify': '🎧',
+                'Uber': '🚗', 'Airbnb': '🏠', 'WeChat': '💬', 'Signal': '🔒',
+                'LinkedIn': '💼', 'Tinder': '🔥', 'Google': '🔍', 'Microsoft': '🪟',
+                'Apple': '🍎', 'Viber': '📞', 'Line': '📱', 'KakaoTalk': '💬',
+                'Imo': '📹', 'Zalo': '💬', 'Badoo': '❤️', 'Yahoo': '📧',
+                'Yandex': '🔍', 'Mail.ru': '📧', 'Odnoklassniki': '👥', 'VK': '🔷',
+                'Avito': '📰', 'OLX': '📰', 'Alibaba': '📦', 'Taobao': '📦',
+                'JD': '📦', 'Weibo': '📱', 'QQ': '💬', 'Baidu': '🔍',
+                'DingTalk': '💬', 'Meituan': '🍔', 'Douyin': '🎵', 'Kuaishou': '🎥',
+                'Pinduoduo': '🛒', 'Xiaohongshu': '📕', 'Tantan': '❤️', 'Momo': '💬',
+                'Hepsiburada': '🛒', 'Trendyol': '🛒', 'N11': '🛒', 'Gittigidiyor': '🛒',
+                'Letgo': '📱', 'OfferUp': '📱', 'Mercari': '📦', 'Rakuten': '🛒',
+                'Shopee': '🛒', 'Lazada': '🛒', 'Tokopedia': '🛒', 'Bukalapak': '🛒',
+                'Flipkart': '🛒', 'Snapdeal': '🛒', 'Myntra': '👕', 'Zomato': '🍔',
+                'Swiggy': '🍔', 'Ola': '🚗', 'Grab': '🚗', 'Gojek': '🚗',
+                'Bolt': '🚗', 'Careem': '🚗', 'Pathao': '🚗', 'Foodpanda': '🍔',
+                'Deliveroo': '🍔', 'UberEats': '🍔', 'DoorDash': '🍔', 'Grubhub': '🍔'
+            };
+
+            for (let i = 0; i < services.length; i += 3) {
+                const row = services.slice(i, i + 3).map(s => {
+                    const emoji = serviceEmojis[s.name] || '📱';
+                    const popularMark = s.isGlobalTop ? '🔥' : (s.isPopular ? '⭐' : '');
+                    return Markup.button.callback(
+                        `${emoji} ${s.name}${popularMark}`,
+                        `service_select_${s.name}`
+                    );
+                });
+                buttons.push(row);
+            }
+
+            const navRow = [];
+            if (page > 1) {
+                navRow.push(Markup.button.callback('◀️ Prev', `service_page_${page - 1}`));
+            }
+            navRow.push(Markup.button.callback('🔍 Search', 'service_search_prompt'));
+            if (page < totalPages) {
+                navRow.push(Markup.button.callback('Next ▶️', `service_page_${page + 1}`));
+            }
+            if (navRow.length > 0) buttons.push(navRow);
+
+            if (page === 1 && totalPages > 1) {
+                buttons.push([Markup.button.callback('📋 Browse All A-Z', 'service_page_2')]);
+            }
+            buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
+
+            const keyboard = Markup.inlineKeyboard(buttons);
+
+            const editSuccess = await this._tryEditMessage(ctx, message, keyboard);
+            
+            if (!editSuccess) {
+                await this._fallbackSendMessage(ctx, message, keyboard, imageUrl);
+            }
+
+        } catch (error) {
+            logger.error('showServiceSelection failed', { error: error.message, page, stack: error.stack });
+            ctx.reply('❌ Error loading services. Please try /otp again.').catch(() => {});
         }
-
-        const priceText = displayPrice ? `\n💰 Starting from ${formatCurrency(displayPrice)}` : '';
-        let message = `📱 <b>${mode} Mode</b>${priceText}\n\n`;
-        
-        if (isPopularPage) {
-            message += `🔥 <b>Popular Services</b> (Top 15)\n`;
-            message += `<i>Most used worldwide</i>\n\n`;
-        } else {
-            message += `📋 <b>All Services</b> (A-Z) — Page ${page}/${totalPages}\n\n`;
-        }
-        
-        message += `<i>Select a service:</i>`;
-
-        const buttons = [];
-        const serviceEmojis = {
-            'WhatsApp': '💬', 'Telegram': '✈️', 'Facebook': '👤', 'Instagram': '📸',
-            'Twitter': '🐦', 'TikTok': '🎵', 'Binance': '💰', 'Coinbase': '₿',
-            'Gmail': '📧', 'Outlook': '📨', 'Netflix': '🎬', 'Amazon': '📦',
-            'PayPal': '💳', 'Snapchat': '👻', 'Discord': '🎮', 'Spotify': '🎧',
-            'Uber': '🚗', 'Airbnb': '🏠', 'WeChat': '💬', 'Signal': '🔒',
-            'LinkedIn': '💼', 'Tinder': '🔥', 'Google': '🔍', 'Microsoft': '🪟',
-            'Apple': '🍎', 'Viber': '📞', 'Line': '📱', 'KakaoTalk': '💬',
-            'Imo': '📹', 'Zalo': '💬', 'Badoo': '❤️', 'Yahoo': '📧',
-            'Yandex': '🔍', 'Mail.ru': '📧', 'Odnoklassniki': '👥', 'VK': '🔷',
-            'Avito': '📰', 'OLX': '📰', 'Alibaba': '📦', 'Taobao': '📦',
-            'JD': '📦', 'Weibo': '📱', 'QQ': '💬', 'Baidu': '🔍',
-            'DingTalk': '💬', 'Meituan': '🍔', 'Douyin': '🎵', 'Kuaishou': '🎥',
-            'Pinduoduo': '🛒', 'Xiaohongshu': '📕', 'Tantan': '❤️', 'Momo': '💬',
-            'Hepsiburada': '🛒', 'Trendyol': '🛒', 'N11': '🛒', 'Gittigidiyor': '🛒',
-            'Letgo': '📱', 'OfferUp': '📱', 'Mercari': '📦', 'Rakuten': '🛒',
-            'Shopee': '🛒', 'Lazada': '🛒', 'Tokopedia': '🛒', 'Bukalapak': '🛒',
-            'Flipkart': '🛒', 'Snapdeal': '🛒', 'Myntra': '👕', 'Zomato': '🍔',
-            'Swiggy': '🍔', 'Ola': '🚗', 'Grab': '🚗', 'Gojek': '🚗',
-            'Bolt': '🚗', 'Careem': '🚗', 'Pathao': '🚗', 'Foodpanda': '🍔',
-            'Deliveroo': '🍔', 'UberEats': '🍔', 'DoorDash': '🍔', 'Grubhub': '🍔'
-        };
-
-        for (let i = 0; i < services.length; i += 3) {
-            const row = services.slice(i, i + 3).map(s => {
-                const emoji = serviceEmojis[s.name] || '📱';
-                const popularMark = s.isGlobalTop ? '🔥' : (s.isPopular ? '⭐' : '');
-                return Markup.button.callback(
-                    `${emoji} ${s.name}${popularMark}`,
-                    `service_select_${s.name}`
-                );
-            });
-            buttons.push(row);
-        }
-
-        const navRow = [];
-        if (page > 1) {
-            navRow.push(Markup.button.callback('◀️ Prev', `service_page_${page - 1}`));
-        }
-        navRow.push(Markup.button.callback('🔍 Search', 'service_search_prompt'));
-        if (page < totalPages) {
-            navRow.push(Markup.button.callback('Next ▶️', `service_page_${page + 1}`));
-        }
-        if (navRow.length > 0) buttons.push(navRow);
-
-        if (page === 1 && totalPages > 1) {
-            buttons.push([Markup.button.callback('📋 Browse All A-Z', 'service_page_2')]);
-        }
-        buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
-
-        const keyboard = Markup.inlineKeyboard(buttons);
-
-        // ─── FIXED: Robust auto-edit with correct method selection ───
-        const editSuccess = await this._tryEditMessage(ctx, message, keyboard);
-        
-        if (!editSuccess) {
-            await this._fallbackSendMessage(ctx, message, keyboard, imageUrl);
-        }
-
-    } catch (error) {
-        logger.error('showServiceSelection failed', { error: error.message, page, stack: error.stack });
-        ctx.reply('❌ Error loading services. Please try /otp again.').catch(() => {});
     }
-}
 
+    
 /**
  * Try to edit the existing message.
  * Uses editMessageCaption for photos, editMessageText for text messages.
@@ -1991,15 +1994,13 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
     // ═══════════════════════════════════════════════════════════════════════
     //  NEW: Country Selection with Tier-Aware Live Pricing (Step 3)
     // ═════
-            // ═══════════════════════════════════════════════════════════════════════
-    //  COUNTRY SELECTION — 2 or 3 columns, equal buttons, auto-edit
-    // ═══════════════════════════════════════════════════════════════════════
+            
 
     async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = null) {
         const tierInfo = this.tierSelector.getTierInfo(tierKey);
         
         try {
-            // Try to edit loading message or send new
+            // Try to edit loading message
             try {
                 await ctx.editMessageCaption(
                     `🌍 <b>Loading ${tierInfo.emoji} ${tierInfo.label} countries...</b>`,
@@ -2014,9 +2015,9 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
                 tierKey, 
                 { 
                     page, 
-                    perPage: 12,  // 12 = 3×4 or 2×6 grid
+                    perPage: 12,
                     searchQuery,
-                    topOnly: false  // Show all available, sorted by price
+                    topOnly: false
                 }
             );
 
@@ -2057,17 +2058,19 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
             message += `Showing ${result.countries.length} countries (cheapest first):\n\n`;
 
             const buttons = [];
-            const COLUMNS = 3; // 3 columns per row (4 rows = 12 countries)
+            const COLUMNS = 3;
 
             for (let i = 0; i < result.countries.length; i += COLUMNS) {
                 const row = result.countries.slice(i, i + COLUMNS).map(country => {
                     const flag = country.flag || isoToFlag(country.code);
-                    const priceText = country.displayPrice 
-                        ? ` $${country.displayPrice.toFixed(2)}`
-                        : (country.price ? ` ~$${country.price.toFixed(2)}` : '');
-                    const stockText = country.stock > 0 ? ` ✅` : ' ❌';
+                    // FIXED: Apply profit margin to display price
+                    const rawPrice = country.displayPrice || country.price;
+                    const displayPrice = rawPrice ? applyProfitMargin(rawPrice) : null;
+                    const priceText = displayPrice 
+                        ? ` $${displayPrice.toFixed(2)}`
+                        : (country.price ? ` ~$${applyProfitMargin(country.price).toFixed(2)}` : '');
+                        const stockText = country.stock > 0 ? ` ✅` : ' ❌';
                     
-                    // Compact format for equal button sizes
                     const label = `${flag} ${country.code}${priceText}${stockText}`;
                     
                     return Markup.button.callback(label, `country_select_${country.code}`);
@@ -2075,7 +2078,6 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
                 buttons.push(row);
             }
 
-            // Pagination: Prev | Search | Next
             const navRow = [];
             if (result.pagination.hasPrev) {
                 navRow.push(Markup.button.callback('◀️ Prev', `country_page_${page - 1}`));
@@ -2091,18 +2093,11 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
 
             const keyboard = Markup.inlineKeyboard(buttons);
 
-            // FIXED: Auto-edit or delete+send
-            try {
-                await ctx.editMessageCaption(message, {
-                    parse_mode: 'HTML',
-                    reply_markup: keyboard.reply_markup
-                });
-            } catch (editError) {
-                try {
-                    await ctx.deleteMessage();
-                } catch (delErr) {}
-                
-                await this.sendPhotoWithCaption(ctx, IMAGES.countrySelect, message, keyboard, 'HTML');
+            // FIXED: Robust auto-edit
+            const editSuccess = await this._tryEditMessage(ctx, message, keyboard);
+            
+            if (!editSuccess) {
+                await this._fallbackSendMessage(ctx, message, keyboard, IMAGES.countrySelect);
             }
 
         } catch (error) {
@@ -2121,9 +2116,9 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
             );
         }
         }
-                                                             
-            
-            
+                            
+                                                                  
+                  
     async handleTierCountrySelect(ctx, countryCode) {
         const userId = ctx.from.id.toString();
         const service = ctx.session?.otpService;
