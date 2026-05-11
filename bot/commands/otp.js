@@ -440,9 +440,62 @@ const KEYBOARDS = {
             }
         });
 
+
+
         // ═════════════════════════════════════════════════════════════════
-        //  NEW: TIER SYSTEM ACTION HANDLERS
+        //  SERVICE SELECTION ACTIONS (FIXED: Distinct prefixes)
         // ═════════════════════════════════════════════════════════════════
+        
+        // Service selection (user taps a service name)
+        this.bot.action(/service_select_(.+)/, async (ctx) => {
+            try {
+                await this.handleServiceSelect(ctx, ctx.match[1]);
+                await ctx.answerCbQuery('✅ Service selected');
+            } catch (error) {
+                logger.error('service_select action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error selecting service').catch(() => {});
+            }
+        });
+
+        // Service page navigation (Next/Prev)
+        this.bot.action(/service_page_(\d+)/, async (ctx) => {
+            try {
+                await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode, null, parseInt(ctx.match[1]));
+                await ctx.answerCbQuery(`Page ${ctx.match[1]}`);
+            } catch (error) {
+                logger.error('service_page action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error').catch(() => {});
+            }
+        });
+
+        // Service search prompt
+        this.bot.action('service_search_prompt', async (ctx) => {
+            try {
+                ctx.session.awaitingServiceSearch = true;
+                await ctx.reply('🔍 <b>Search for a service:</b>\n\nType the service name (e.g., "WhatsApp", "Telegram", "Netflix"):', {
+                    parse_mode: 'HTML',
+                    reply_markup: Markup.forceReply().reply_markup
+                });
+                await ctx.answerCbQuery('🔍 Type service name');
+            } catch (error) {
+                logger.error('service_search_prompt error', { error: error.message });
+            }
+        });
+
+        // Browse all services
+        this.bot.action('service_browse_all', async (ctx) => {
+            try {
+                await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode, null, 1);
+                await ctx.answerCbQuery('📋 Showing all services');
+            } catch (error) {
+                logger.error('service_browse_all error', { error: error.message });
+            }
+        });
+
+        // ═════════════════════════════════════════════════════════════════
+        //  TIER SELECTION ACTIONS
+        // ═════════════════════════════════════════════════════════════════
+        
         this.bot.action(/tier_(budget|standard|premium)/, async (ctx) => {
             try {
                 await this.handleTierSelect(ctx, ctx.match[1]);
@@ -452,86 +505,21 @@ const KEYBOARDS = {
             }
         });
 
-        this.bot.action(/tier_country_(.+)/, async (ctx) => {
+        // ═════════════════════════════════════════════════════════════════
+        //  COUNTRY SELECTION ACTIONS (FIXED: Distinct prefixes)
+        // ═════════════════════════════════════════════════════════════════
+        
+        // Country selection (user taps a country) — routes to tier or legacy
+        this.bot.action(/country_select_(.+)/, async (ctx) => {
             try {
-                await this.handleTierCountrySelect(ctx, ctx.match[1]);
+                await this.handleCountrySelect(ctx, ctx.match[1]);
             } catch (error) {
-                logger.error('tier_country action error', { error: error.message, userId: ctx.from?.id });
+                logger.error('country_select action error', { error: error.message, userId: ctx.from?.id });
                 ctx.answerCbQuery('❌ Error selecting country').catch(() => {});
             }
         });
 
-        this.bot.action(/tier_fallback_(.+)/, async (ctx) => {
-            try {
-                const operator = ctx.match[1];
-                const country = ctx.session?.selectedCountry;
-                const service = ctx.session?.otpService;
-                const tierKey = ctx.session?.selectedTier;
-                if (!country || !service || !tierKey) {
-                    return ctx.answerCbQuery('❌ Session expired', { show_alert: true });
-                }
-                await this.handleTierCountrySelect(ctx, country);
-            } catch (error) {
-                logger.error('tier_fallback action error', { error: error.message });
-                ctx.answerCbQuery('❌ Error').catch(() => {});
-            }
-        });
-        
-        
-
-// AFTER (fixed):
-// Handle service SELECTION
-this.bot.action(/service_select_(.+)/, async (ctx) => {
-    try {
-        await this.handleServiceSelect(ctx, ctx.match[1]);
-    } catch (error) {
-        logger.error('service_select action error', { error: error.message });
-        ctx.answerCbQuery('❌ Error').catch(() => {});
-    }
-});
-
-// Handle service PAGE navigation
-this.bot.action(/service_page_(\d+)/, async (ctx) => {
-    try {
-        await this.handleTierServicePage(ctx, parseInt(ctx.match[1]));
-    } catch (error) {
-        logger.error('service_page action error', { error: error.message });
-        ctx.answerCbQuery('❌ Error').catch(() => {});
-    }
-});
-
-// Handle search prompt
-this.bot.action('service_search_prompt', async (ctx) => {
-    try {
-        ctx.session.awaitingServiceSearch = true;
-        await ctx.reply('🔍 <b>Search for a service:</b>\n\nType the service name (e.g., "WhatsApp", "Telegram", "Netflix"):', {
-            parse_mode: 'HTML',
-            reply_markup: Markup.forceReply().reply_markup
-        });
-    } catch (error) {
-        logger.error('service_search_prompt error', { error: error.message });
-    }
-});
-
-// Handle browse all
-this.bot.action('service_browse_all', async (ctx) => {
-    try {
-        await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode, null, 1);
-    } catch (error) {
-        logger.error('service_browse_all error', { error: error.message });
-    }
-});
-            
-
-        this.bot.action(/service_page_(\d+)/, async (ctx) => {
-            try {
-                await this.handleTierServicePage(ctx, parseInt(ctx.match[1]));
-            } catch (error) {
-                logger.error('service_page action error', { error: error.message, userId: ctx.from?.id });
-                ctx.answerCbQuery('❌ Error').catch(() => {});
-            }
-        });
-
+        // Country page navigation
         this.bot.action(/country_page_(\d+)/, async (ctx) => {
             try {
                 await this.handleTierCountryPage(ctx, parseInt(ctx.match[1]));
@@ -541,9 +529,56 @@ this.bot.action('service_browse_all', async (ctx) => {
             }
         });
 
+        // Country search prompt
+        this.bot.action('country_search_prompt', async (ctx) => {
+            try {
+                ctx.session.awaitingCountrySearch = true;
+                await ctx.reply('🔍 <b>Search for a country:</b>\n\nType country name or ISO code (e.g., "USA", "United Kingdom", "Germany"):', {
+                    parse_mode: 'HTML',
+                    reply_markup: Markup.forceReply().reply_markup
+                });
+                await ctx.answerCbQuery('🔍 Type country name');
+            } catch (error) {
+                logger.error('country_search_prompt error', { error: error.message });
+            }
+        });
+
+        // Tier country selection (direct from tier flow)
+        this.bot.action(/tier_country_(.+)/, async (ctx) => {
+            try {
+                await this.handleTierCountrySelect(ctx, ctx.match[1]);
+            } catch (error) {
+                logger.error('tier_country action error', { error: error.message, userId: ctx.from?.id });
+                ctx.answerCbQuery('❌ Error selecting country').catch(() => {});
+            }
+        });
+
+        // Tier fallback operator
+        this.bot.action(/tier_fallback_(.+)/, async (ctx) => {
+            try {
+                const operator = ctx.match[1];
+                const country = ctx.session?.selectedCountry;
+                const service = ctx.session?.otpService;
+                const tierKey = ctx.session?.selectedTier;
+                
+                if (!country || !service || !tierKey) {
+                    return ctx.answerCbQuery('❌ Session expired', { show_alert: true });
+                }
+                
+                // Re-run country select with fallback operator hint
+                ctx.session.fallbackOperator = operator;
+                await this.handleTierCountrySelect(ctx, country);
+            } catch (error) {
+                logger.error('tier_fallback action error', { error: error.message });
+                ctx.answerCbQuery('❌ Error').catch(() => {});
+            }
+        });
+
+        // Back buttons
         this.bot.action('tier_back_service', async (ctx) => {
             try {
                 await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
+                await ctx.answerCbQuery('🔙 Back to services');
             } catch (error) {
                 logger.error('tier_back_service error', { error: error.message });
             }
@@ -557,26 +592,10 @@ this.bot.action('service_browse_all', async (ctx) => {
                 } else {
                     await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
                 }
+                await ctx.answerCbQuery('🔙 Back to tiers');
             } catch (error) {
                 logger.error('tier_back_tier error', { error: error.message });
             }
-        });
-
-        // Search prompts
-        this.bot.action('service_search_prompt', async (ctx) => {
-            ctx.session.awaitingServiceSearch = true;
-            await ctx.reply('🔍 <b>Search for a service:</b>\n\nType the service name (e.g., "WhatsApp", "Telegram", "Netflix"):', {
-                parse_mode: 'HTML',
-                reply_markup: Markup.forceReply().reply_markup
-            });
-        });
-
-        this.bot.action('country_search_prompt', async (ctx) => {
-            ctx.session.awaitingCountrySearch = true;
-            await ctx.reply('🔍 <b>Search for a country:</b>\n\nType country name or ISO code (e.g., "USA", "United Kingdom", "Germany"):', {
-                parse_mode: 'HTML',
-                reply_markup: Markup.forceReply().reply_markup
-            });
         });
     }
     
@@ -596,7 +615,19 @@ this.bot.action('service_browse_all', async (ctx) => {
                 : ctx.reply(caption, { parse_mode: parseMode });
         }
     }
-
+    /**
+     * Safely delete a message, ignoring errors.
+     * @private
+     */
+    async _safeDeleteMessage(ctx, message) {
+        if (!message?.message_id) return;
+        try {
+            await ctx.deleteMessage(message.message_id);
+        } catch (err) {
+            logger.debug('Failed to delete message', { error: err.message, messageId: message.message_id });
+        }
+    }
+        
     async editOrSendPhoto(ctx, imageUrl, caption, keyboard = null, parseMode = 'HTML') {
         try {
             if (ctx.callbackQuery?.message?.photo) {
@@ -2455,14 +2486,22 @@ async handleFreeCountrySelected(ctx, countryCode) {
     // ═══════════════════════════════════════════════════════════════════════
     //  COUNTRY SELECTED — ACQUIRE NUMBER (CORE LOGIC)
     // ═══════════════════════════════════════════════════════════════════════
-    
-            
-    async handleCountrySelect(ctx) {
-        const country = ctx.match[1];
-        const userId = ctx.from.id.toString();
+        // ═══════════════════════════════════════════════════════════════════════
+    //  COUNTRY SELECTED — ACQUIRE NUMBER (CORE LOGIC)
+    //  MERGED: Handles both tier-based and legacy flows
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleCountrySelect(ctx, countryCode = null) {
+        const country = countryCode || ctx.match?.[1];
+        const userId = ctx.from?.id?.toString();
         const mode = ctx.session?.otpMode;
         const service = ctx.session?.otpService;
         const useVipNumber = ctx.session?.useVipNumber;
+
+        // ── Validation ──
+        if (!country) {
+            return ctx.answerCbQuery('❌ Invalid country').catch(() => {});
+        }
 
         if (!mode || !service) {
             return this.sendPhotoWithCaption(ctx, IMAGES.default, 
@@ -2471,6 +2510,18 @@ async handleFreeCountrySelected(ctx, countryCode) {
             );
         }
 
+        // Validate country exists in dynamic catalog
+        const hasCountry = this.countryCatalog?.hasCountry(country);
+        if (!hasCountry && mode === 'CHEAP' && this.tierSelector) {
+            return ctx.answerCbQuery('🌍 Invalid country selected. Please try again.', { show_alert: true });
+        }
+
+        // ── Route to tier-based flow if applicable ──
+        if (mode === 'CHEAP' && this.tierSelector && ctx.session?.selectedTier) {
+            return this.handleTierCountrySelect(ctx, country);
+        }
+
+        // ── Check existing session ──
         const existingSession = await this._getActiveSession(userId);
         if (existingSession && existingSession.status !== 'RECEIVED') {
             return this.sendPhotoWithCaption(
@@ -2502,11 +2553,7 @@ async handleFreeCountrySelected(ctx, countryCode) {
                     await User.updateOne({ userId }, { $inc: { bundleRemaining: -1 } });
                 }
 
-                try {
-                    if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
-                } catch (delErr) {
-                    logger.debug('Failed to delete loading message', { error: delErr.message });
-                }
+                await this._safeDeleteMessage(ctx, loadingMsg);
 
                 const costText = mode === 'VIP' ? 'VIP (daily quota)' : 'BUNDLE (1 credit)';
 
@@ -2543,11 +2590,7 @@ async handleFreeCountrySelected(ctx, countryCode) {
             if (mode === 'BUNDLE') {
                 const user = await User.findOne({ userId });
                 if (!user?.bundleRemaining || user.bundleRemaining <= 0) {
-                    try {
-                        if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
-                    } catch (delErr) {
-                        logger.debug('Failed to delete loading message', { error: delErr.message });
-                    }
+                    await this._safeDeleteMessage(ctx, loadingMsg);
                     
                     return this.sendPhotoWithCaption(
                         ctx, IMAGES.bundleFirst,
@@ -2563,19 +2606,13 @@ async handleFreeCountrySelected(ctx, countryCode) {
                 await User.updateOne({ userId }, { $inc: { bundleRemaining: -1 } });
 
                 if (!this.smsProviderManager) {
-                    try {
-                        if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
-                    } catch (delErr) {}
+                    await this._safeDeleteMessage(ctx, loadingMsg);
                     throw new Error('SMS_PROVIDER_NOT_AVAILABLE');
                 }
 
                 const bundleResult = await this.smsProviderManager.getVipNumber(country, service, userId);
 
-                try {
-                    if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
-                } catch (delErr) {
-                    logger.debug('Failed to delete loading message', { error: delErr.message });
-                }
+                await this._safeDeleteMessage(ctx, loadingMsg);
 
                 const session = await sessionManager.createSessionWithNumber(
                     userId, mode, service, country,
@@ -2610,19 +2647,13 @@ async handleFreeCountrySelected(ctx, countryCode) {
             // ═════════════════════════════════════════════════════════════════
             if (mode === 'FREE') {
                 if (!this.smsProviderManager) {
-                    try {
-                        if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
-                    } catch (delErr) {}
+                    await this._safeDeleteMessage(ctx, loadingMsg);
                     throw new Error('SMS_PROVIDER_NOT_AVAILABLE');
                 }
 
                 const freeResult = await this.smsProviderManager.getFreeNumber(country, service);
 
-                try {
-                    if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
-                } catch (delErr) {
-                    logger.debug('Failed to delete loading message', { error: delErr.message });
-                }
+                await this._safeDeleteMessage(ctx, loadingMsg);
 
                 const session = await sessionManager.createSessionWithNumber(
                     userId, mode, service, country,
@@ -2660,9 +2691,7 @@ async handleFreeCountrySelected(ctx, countryCode) {
             // ═════════════════════════════════════════════════════════════════
             if (mode === 'CHEAP') {
                 if (!this.smsProviderManager) {
-                    try {
-                        if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
-                    } catch (delErr) {}
+                    await this._safeDeleteMessage(ctx, loadingMsg);
                     throw new Error('SMS_PROVIDER_NOT_AVAILABLE');
                 }
 
@@ -2685,9 +2714,7 @@ async handleFreeCountrySelected(ctx, countryCode) {
 
                 const user = ctx.state.user;
                 if (this._getAvailableBalance(user) < displayPrice) {
-                    try {
-                        if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
-                    } catch (delErr) {}
+                    await this._safeDeleteMessage(ctx, loadingMsg);
                     
                     const message = 
                         `💰 <b>Insufficient Balance</b>\n\n` +
@@ -2706,11 +2733,7 @@ async handleFreeCountrySelected(ctx, countryCode) {
 
                 const cheapResult = await this.smsProviderManager.getCheapNumber(country, service);
 
-                try {
-                    if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
-                } catch (delErr) {
-                    logger.debug('Failed to delete loading message', { error: delErr.message });
-                }
+                await this._safeDeleteMessage(ctx, loadingMsg);
 
                 const session = await sessionManager.createSessionWithNumber(
                     userId, 
@@ -2751,9 +2774,7 @@ async handleFreeCountrySelected(ctx, countryCode) {
             // ═════════════════════════════════════════════════════════════════
             if (mode === 'VIP') {
                 if (!this.smsProviderManager) {
-                    try {
-                        if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
-                    } catch (delErr) {}
+                    await this._safeDeleteMessage(ctx, loadingMsg);
                     throw new Error('SMS_PROVIDER_NOT_AVAILABLE');
                 }
 
@@ -2762,11 +2783,7 @@ async handleFreeCountrySelected(ctx, countryCode) {
 
                 const vipResult = await this.smsProviderManager.getVipNumber(country, service, userId);
 
-                try {
-                    if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
-                } catch (delErr) {
-                    logger.debug('Failed to delete loading message', { error: delErr.message });
-                }
+                await this._safeDeleteMessage(ctx, loadingMsg);
 
                 const session = await sessionManager.createSessionWithNumber(
                     userId, mode, service, country,
@@ -2796,22 +2813,17 @@ async handleFreeCountrySelected(ctx, countryCode) {
                 return;
             }
 
-            try {
-                if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
-            } catch (delErr) {}
+            await this._safeDeleteMessage(ctx, loadingMsg);
             throw new Error(`UNKNOWN_MODE: ${mode}`);
 
         } catch (error) {
-            try {
-                if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
-            } catch (delErr) {}
+            await this._safeDeleteMessage(ctx, loadingMsg);
 
             logger.error('OTP session creation failed', { userId, mode, service, country, error: error.message });
 
+            // Restore credits on failure
             if (mode === 'BUNDLE') {
                 await User.updateOne({ userId }, { $inc: { bundleRemaining: 1 } }).catch(() => {});
-            } else if (mode === 'VIP' && useVipNumber) {
-                await User.updateOne({ userId }, { $inc: { vipDailyUsed: -1 } }).catch(() => {});
             } else if (mode === 'VIP') {
                 await User.updateOne({ userId }, { $inc: { vipDailyUsed: -1 } }).catch(() => {});
             }
@@ -2849,7 +2861,11 @@ async handleFreeCountrySelected(ctx, countryCode) {
                 KEYBOARDS.supportOrRetry(), 'HTML'
             );
         }
-    }
+                    }
+                    
+    
+                    
+        
 
     // ═══════════════════════════════════════════════════════════════════════
     //  FREE POLLING — Unified free OTP polling
