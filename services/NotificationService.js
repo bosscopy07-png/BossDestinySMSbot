@@ -1,14 +1,16 @@
+
 import { Notification } from '../models/index.js';
 import logger from '../utils/logger.js';
 
-// ───────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
 //  NotificationService
 //  Handles creating, queuing, and delivering notifications
-// ───────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
 
 class NotificationService {
-    constructor(telegramBot = null) {
-        this.telegramBot = telegramBot;
+    constructor(telegramInstance = null) {
+        // Support both Telegraf bot (bot.telegram) and raw telegram instances
+        this.telegram = telegramInstance;
     }
 
     // ─── Core: Create and optionally send immediately ───
@@ -37,7 +39,7 @@ class NotificationService {
             });
 
             // Send immediately if requested and channel available
-            if (immediate && channel === 'TELEGRAM' && this.telegramBot && telegramChatId) {
+            if (immediate && channel === 'TELEGRAM' && this.telegram && telegramChatId) {
                 await this._sendTelegram(notification);
             }
 
@@ -55,7 +57,7 @@ class NotificationService {
 
     // ─── Send to Telegram bot ───
     async _sendTelegram(notification) {
-        if (!this.telegramBot || !notification.telegramChatId) {
+        if (!this.telegram || !notification.telegramChatId) {
             logger.warn('Telegram bot or chatId missing, notification queued', {
                 notificationId: notification.notificationId
             });
@@ -63,7 +65,7 @@ class NotificationService {
         }
 
         try {
-            await this.telegramBot.sendMessage(
+            await this.telegram.sendMessage(
                 notification.telegramChatId,
                 this._formatTelegramMessage(notification),
                 { parse_mode: 'HTML' }
@@ -191,4 +193,4 @@ ${message}
 }
 
 export default NotificationService;
-                         
+            
