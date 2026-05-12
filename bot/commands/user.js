@@ -501,6 +501,20 @@ async handleRequestOTP(ctx) {
             logger.error('Custom deposit error', { userId, error: error.message });
         }
     }
+        // ═══════════════════════════════════════════════════════════
+    //  HANDLE PRESET DEPOSIT — Missing method that was referenced
+    // ═══════════════════════════════════════════════════════════
+    async handlePresetDeposit(ctx, amount) {
+        const userId = ctx.from.id.toString();
+        try {
+            await ctx.answerCbQuery(`Deposit $${amount}`);
+            await this.showDepositDetails(ctx, userId, amount);
+        } catch (error) {
+            logger.error('Preset deposit error', { userId, amount, error: error.message });
+            await ctx.answerCbQuery('❌ Error').catch(() => {});
+        }
+    }
+    
 
     async handleDepositAmountInput(ctx) {
         const userId = ctx.from.id.toString();
