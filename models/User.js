@@ -9,6 +9,12 @@ const userSchema = new mongoose.Schema({
     },
 
 
+telegramChatId: {
+    type: String,
+    index: true,
+    sparse: true
+},
+    
 adCredits: {
     type: Number,
     default: 0,
