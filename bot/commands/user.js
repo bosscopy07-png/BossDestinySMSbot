@@ -57,9 +57,14 @@ const WALLET_LINKS = Object.freeze({
 });
 
 class UserCommands {
-    constructor(bot, walletService) {
+    // ═══════════════════════════════════════════════════════════
+    //  CONSTRUCTOR — Fixed: Added referralService and notificationService
+    // ═══════════════════════════════════════════════════════════
+    constructor(bot, walletService, referralService = null, notificationService = null) {
         this.bot = bot;
         this.walletService = walletService;
+        this.referralService = referralService;
+        this.notificationService = notificationService;
         this.registerCommands();
     }
 
@@ -263,8 +268,12 @@ class UserCommands {
             }
             return await ctx.reply(caption);
         }
-        }
-        async handleStart(ctx) {
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  HANDLE START — Fixed: Added notification to referrer on new signup
+    // ═══════════════════════════════════════════════════════════
+    async handleStart(ctx) {
         const userId = ctx.from.id.toString();
         let user = await this._ensureUserFresh(ctx);
 
@@ -287,11 +296,30 @@ class UserCommands {
                     { $inc: { referralCount: 1 } }
                 );
 
+                // FIXED: Use this.referralService (now properly injected)
                 if (this.referralService) {
                     try {
                         await this.referralService.trackReferral(userId, referrerCode);
                     } catch (err) {
                         logger.error('ReferralService tracking failed', { userId, error: err.message });
+                    }
+                }
+
+                // 🔔 NOTIFY REFERRER: New signup (direct Telegram message)
+                if (this.notificationService && referrer.userId) {
+                    try {
+                        await this.notificationService.send(referrer.userId, {
+                            type: 'REFERRAL_JOINED',
+                            title: '🎉 New Referral!',
+                            message: `A new user just joined using your code! You'll earn ${((config.referral?.percentage || 0.05) * 100).toFixed(0)}% of their first deposit.`,
+                            telegramChatId: referrer.userId, // Telegram chat ID = userId for bots
+                            immediate: true
+                        });
+                    } catch (notifyErr) {
+                        logger.error('Failed to notify referrer of new signup', {
+                            referrerId: referrer.userId,
+                            error: notifyErr.message
+                        });
                     }
                 }
 
@@ -388,7 +416,7 @@ class UserCommands {
         }
     }
 
-    async handleRequestOTP(ctx) {
+async handleRequestOTP(ctx) {
         try { await ctx.answerCbQuery('Opening OTP...'); } catch (e) {}
 
         const user = await this._ensureUserFresh(ctx);
@@ -411,8 +439,7 @@ class UserCommands {
         ]);
 
         await this.sendPhotoWithCaption(ctx, IMAGES.welcome, message, keyboard, 'HTML');
-    }
-
+}
     async handleBalance(ctx) {
         const userId = ctx.from.id.toString();
         const user = await this._ensureUserFresh(ctx);
@@ -456,45 +483,6 @@ class UserCommands {
         ]);
 
         await this.sendPhotoWithCaption(ctx, IMAGES.balance, message, keyboard, 'HTML');
-    }
-
-    async handleDeposit(ctx) {
-        const userId = ctx.from.id.toString();
-        try {
-            const message =
-                '💳 <b>Select Deposit Amount</b>\n\n' +
-                'Choose how much <b>USDT (BEP-20)</b> you want to deposit:';
-
-            const keyboard = Markup.inlineKeyboard([
-                [
-                    Markup.button.callback('💵 $5', 'deposit_5'),
-                    Markup.button.callback('💵 $10', 'deposit_10'),
-                    Markup.button.callback('💵 $20', 'deposit_20')
-                ],
-                [
-                    Markup.button.callback('💵 $50', 'deposit_50'),
-                    Markup.button.callback('💵 $100', 'deposit_100')
-                ],
-                [Markup.button.callback('✏️ Custom Amount', 'deposit_custom')],
-                [Markup.button.callback('🔙 Back', 'menu')]
-            ]);
-
-            await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, keyboard, 'HTML');
-        } catch (error) {
-            logger.error('Deposit handler error', { userId, error: error.message });
-            await ctx.reply('❌ Error. Please try /deposit again.');
-        }
-    }
-
-    async handlePresetDeposit(ctx, amount) {
-        const userId = ctx.from.id.toString();
-        try {
-            await ctx.answerCbQuery('Generating $' + amount + ' deposit...');
-            await this.showDepositDetails(ctx, userId, amount);
-        } catch (error) {
-            logger.error('Preset deposit error', { userId, amount, error: error.message });
-            await ctx.answerCbQuery('❌ Error');
-        }
     }
 
     async handleCustomDeposit(ctx) {
@@ -577,105 +565,103 @@ class UserCommands {
 
             await ctx.reply('❌ Error generating deposit. Please try again.');
         }
-                    }
-                    
-                     
-           
-async handleDepositQR(ctx) {
-    const userId = ctx.from.id.toString();
-    
-    try {
-        const user = await User.findOne({ userId });
-        const trackingAmount = user?.depositTrackingAmount;
-        const requestedAmount = user?.depositRequestedAmount || trackingAmount;
+    }
 
-        if (!trackingAmount) {
-            return ctx.answerCbQuery('⚠️ Click Deposit first').catch(() => {});
-        }
-
-        let masterAddress = '';
-        try {
-            if (this.walletService?.getMasterAddress) {
-                masterAddress = await this.walletService.getMasterAddress();
-            }
-        } catch (e) {
-            return ctx.answerCbQuery('❌ Address unavailable').catch(() => {});
-        }
-
-        await ctx.answerCbQuery('📱 Loading deposit...').catch(() => {});
-
-        const caption =
-            '💰 <b>Deposit to Fund Your Balance</b>\n\n' +
-            '📬 <b>Send Exactly:</b> <code>' + trackingAmount + '</code> USDT\n' +
-            '📬 <b>To Address:</b> <code>' + masterAddress + '</code>\n\n' +
-            '⚠️ <b>Must be BSC (BEP-20) Network Only!</b>\n\n' +
-            '💵 <b>Amount Credited:</b> <code>$' + requestedAmount + '</code>\n\n' +
-            '🔽 <b>Tap Your Wallet Below to Pay Instantly:</b>';
-
-        const keyboard = {
-            reply_markup: {
-                inline_keyboard: [
-                    [
-                        { text: '🛡️ Trust Wallet', url: 'https://link.trustwallet.com/send?asset=c20000714_t0x55d398326f99059fF775485246999027B3197955&address=' + masterAddress + '&amount=' + trackingAmount + '&memo=SwiftSMS' },
-                        { text: '🦊 MetaMask', url: 'https://metamask.app.link/send/0x55d398326f99059fF775485246999027B3197955@56/transfer?address=' + masterAddress + '&uint256=' + Math.round(trackingAmount * 1e6) }
-                    ],
-                    [
-                        { text: '🔶 Binance Pay', url: 'https://www.binance.com/en/my/wallet/account/payment/send' },
-                        { text: '🛡️ SafePal', url: 'https://link.safepal.io/send?address=' + masterAddress + '&amount=' + trackingAmount + '&token=USDT&chain=bsc' }
-                    ],
-                    [
-                        { text: '👛 TokenPocket', url: 'https://tokenpocket.pro/' },
-                        { text: '🔵 OKX Wallet', url: 'https://www.okx.com/web3' }
-                    ],
-                    [
-                        { text: '🔴 Bitget Wallet', url: 'https://web3.bitget.com/' },
-                        { text: '🟣 Bybit Wallet', url: 'https://www.bybit.com/en-US/web3' }
-                    ],
-                    [
-                        { text: '🟢 Gate.io', url: 'https://www.gate.io/web3' },
-                        { text: '🟠 MEXC', url: 'https://www.mexc.com/web3' }
-                    ],
-                    [{ text: '📋 Copy Address', callback_data: 'copy_address_' + masterAddress }],
-                    [
-                        { text: '🔍 Check Deposit', callback_data: 'check_deposit' },
-                        { text: '🔙 Back', callback_data: 'menu' }
-                    ]
-                ]
-            }
-        };
-
-        await ctx.replyWithPhoto(
-            IMAGES.deposit,
-            { 
-                caption: caption, 
-                parse_mode: 'HTML', 
-                reply_markup: keyboard.reply_markup 
-            }
-        );
-
-    } catch (error) {
-        logger.error('Deposit menu failed', { userId, error: error.message, stack: error.stack });
-        await ctx.answerCbQuery('❌ Error loading deposit').catch(() => {});
+    async handleDepositQR(ctx) {
+        const userId = ctx.from.id.toString();
         
         try {
             const user = await User.findOne({ userId });
-            const fa = user?.depositAddress || masterAddress || 'N/A';
-            const ta = user?.depositTrackingAmount || '?';
-            const ra = user?.depositRequestedAmount || ta;
-            
-            await ctx.reply(
-                `💰 <b>Deposit to Fund Your Balance</b>\n\n` +
-                `📬 Send Exactly: <code>${ta}</code> USDT\n` +
-                `📬 To Address: <code>${fa}</code>\n\n` +
-                `⚠️ Must be BSC (BEP-20) Network Only!\n\n` +
-                `💵 Amount Credited: <code>$${ra}</code>`,
-                { parse_mode: 'HTML' }
+            const trackingAmount = user?.depositTrackingAmount;
+            const requestedAmount = user?.depositRequestedAmount || trackingAmount;
+
+            if (!trackingAmount) {
+                return ctx.answerCbQuery('⚠️ Click Deposit first').catch(() => {});
+            }
+
+            let masterAddress = '';
+            try {
+                if (this.walletService?.getMasterAddress) {
+                    masterAddress = await this.walletService.getMasterAddress();
+                }
+            } catch (e) {
+                return ctx.answerCbQuery('❌ Address unavailable').catch(() => {});
+            }
+
+            await ctx.answerCbQuery('📱 Loading deposit...').catch(() => {});
+
+            const caption =
+                '💰 <b>Deposit to Fund Your Balance</b>\n\n' +
+                '📬 <b>Send Exactly:</b> <code>' + trackingAmount + '</code> USDT\n' +
+                '📬 <b>To Address:</b> <code>' + masterAddress + '</code>\n\n' +
+                '⚠️ <b>Must be BSC (BEP-20) Network Only!</b>\n\n' +
+                '💵 <b>Amount Credited:</b> <code>$' + requestedAmount + '</code>\n\n' +
+                '🔽 <b>Tap Your Wallet Below to Pay Instantly:</b>';
+
+            const keyboard = {
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: '🛡️ Trust Wallet', url: 'https://link.trustwallet.com/send?asset=c20000714_t0x55d398326f99059fF775485246999027B3197955&address=' + masterAddress + '&amount=' + trackingAmount + '&memo=SwiftSMS' },
+                            { text: '🦊 MetaMask', url: 'https://metamask.app.link/send/0x55d398326f99059fF775485246999027B3197955@56/transfer?address=' + masterAddress + '&uint256=' + Math.round(trackingAmount * 1e6) }
+                        ],
+                        [
+                            { text: '🔶 Binance Pay', url: 'https://www.binance.com/en/my/wallet/account/payment/send' },
+                            { text: '🛡️ SafePal', url: 'https://link.safepal.io/send?address=' + masterAddress + '&amount=' + trackingAmount + '&token=USDT&chain=bsc' }
+                        ],
+                        [
+                            { text: '👛 TokenPocket', url: 'https://tokenpocket.pro/' },
+                            { text: '🔵 OKX Wallet', url: 'https://www.okx.com/web3' }
+                        ],
+                        [
+                            { text: '🔴 Bitget Wallet', url: 'https://web3.bitget.com/' },
+                            { text: '🟣 Bybit Wallet', url: 'https://www.bybit.com/en-US/web3' }
+                        ],
+                        [
+                            { text: '🟢 Gate.io', url: 'https://www.gate.io/web3' },
+                            { text: '🟠 MEXC', url: 'https://www.mexc.com/web3' }
+                        ],
+                        [{ text: '📋 Copy Address', callback_data: 'copy_address_' + masterAddress }],
+                        [
+                            { text: '🔍 Check Deposit', callback_data: 'check_deposit' },
+                            { text: '🔙 Back', callback_data: 'menu' }
+                        ]
+                    ]
+                }
+            };
+
+            await ctx.replyWithPhoto(
+                IMAGES.deposit,
+                { 
+                    caption: caption, 
+                    parse_mode: 'HTML', 
+                    reply_markup: keyboard.reply_markup 
+                }
             );
-        } catch (e) {
-            logger.error('Fallback failed', { userId, error: e.message });
+
+        } catch (error) {
+            logger.error('Deposit menu failed', { userId, error: error.message, stack: error.stack });
+            await ctx.answerCbQuery('❌ Error loading deposit').catch(() => {});
+            
+            try {
+                const user = await User.findOne({ userId });
+                const fa = user?.depositAddress || masterAddress || 'N/A';
+                const ta = user?.depositTrackingAmount || '?';
+                const ra = user?.depositRequestedAmount || ta;
+                
+                await ctx.reply(
+                    `💰 <b>Deposit to Fund Your Balance</b>\n\n` +
+                    `📬 Send Exactly: <code>${ta}</code> USDT\n` +
+                    `📬 To Address: <code>${fa}</code>\n\n` +
+                    `⚠️ Must be BSC (BEP-20) Network Only!\n\n` +
+                    `💵 Amount Credited: <code>$${ra}</code>`,
+                    { parse_mode: 'HTML' }
+                );
+            } catch (e) {
+                logger.error('Fallback failed', { userId, error: e.message });
+            }
         }
     }
-}
     
     async handleShareAddress(ctx) {
         const address = ctx.match[1];
@@ -783,7 +769,8 @@ async handleDepositQR(ctx) {
 
         await this.sendPhotoWithCaption(ctx, IMAGES.history, message, keyboard, 'HTML');
     }
-        async handleExportHistory(ctx) {
+
+    async handleExportHistory(ctx) {
         const userId = ctx.from.id.toString();
         try {
             await ctx.answerCbQuery('📥 Generating CSV...');
@@ -967,8 +954,7 @@ async handleDepositQR(ctx) {
         await User.updateOne({ userId }, { $set: { preferredCountry: countryCode } });
         await ctx.reply('🌍 Country set to <code>' + countryCode + '</code>', { parse_mode: 'HTML' });
         await this.handleSettings(ctx);
-    }
-
+                }
     async handleSupport(ctx) {
         try {
             const message =
@@ -1167,4 +1153,3 @@ async handleDepositQR(ctx) {
 }
 
 export default UserCommands;
-                    
