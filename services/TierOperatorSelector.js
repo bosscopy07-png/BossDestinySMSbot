@@ -1,7 +1,8 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 //  services/TierOperatorSelector.js — Intelligent Tier-Based Provider Selection
 //  Core engine: selects best operator within tier using cached product data
-//  FIXED: displayPrice now includes $0.20 profit margin to match CheapPanelProvider
+//  FIXED: Uses provider's product cache instead of per-operator API calls
+//  Eliminates 429 errors by reading from cached catalog
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { TIER_CONFIG, CACHE_TTL } from '../config/tierConfig.js';
@@ -78,9 +79,7 @@ class TierOperatorSelector {
         scored.sort((a, b) => b.score - a.score);
 
         const selected = scored[0];
-        // FIXED: displayPrice now includes $0.20 profit margin to match CheapPanelProvider.getDisplayPrice()
-        const basePrice = selected.price ? parseFloat((selected.price * tier.priceMultiplier).toFixed(4)) : null;
-        const displayPrice = basePrice !== null ? parseFloat((basePrice + 0.20).toFixed(2)) : null;
+        const displayPrice = selected.price ? parseFloat((selected.price * tier.priceMultiplier).toFixed(2)) : null;
 
         logger.info('Operator selected', {
             tier: tierKey,
@@ -359,4 +358,4 @@ class TierOperatorSelector {
 }
 
 export default TierOperatorSelector;
-            
+                
