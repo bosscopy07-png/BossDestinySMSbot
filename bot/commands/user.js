@@ -602,14 +602,13 @@ class UserCommands {
 
         await ctx.answerCbQuery('📱 Generating QR...').catch(() => {});
 
-        // Generate QR as base64 data URI - NO FILE UPLOAD NEEDED
+        // Generate QR as base64, convert to buffer - NO FILE SYSTEM
         const qrDataUri = await QRCode.toDataURL(masterAddress, {
             width: 250,
             margin: 2,
             color: { dark: '#00BCD4', light: '#FFFFFF' }
         });
-
-        // Convert base64 to buffer for Telegram
+        
         const base64Data = qrDataUri.replace(/^data:image\/png;base64,/, '');
         const qrBuffer = Buffer.from(base64Data, 'base64');
 
@@ -643,10 +642,9 @@ class UserCommands {
             [{ text: '🔍 Check Deposit', callback_data: 'check_deposit' }, { text: '🔙 Back', callback_data: 'menu' }]
         ];
 
-        // FIX: Pass buffer directly with explicit filename
-        // This avoids filesystem streams entirely
+        // Upload buffer with filename - avoids filesystem streams
         await ctx.replyWithPhoto(
-            { source: qrBuffer, filename: 'deposit_qr.png' },
+            { source: qrBuffer, filename: 'qr.png' },
             { 
                 caption: caption, 
                 parse_mode: 'HTML', 
@@ -658,28 +656,26 @@ class UserCommands {
         logger.error('QR generation failed', { userId, error: error.message, stack: error.stack });
         await ctx.answerCbQuery('❌ Failed to generate QR').catch(() => {});
         
-        // FIX: Fallback with proper variable access
-        // Re-fetch user data or use the variables from outer scope
+        // Fallback: text only
         try {
             const user = await User.findOne({ userId });
-            const trackingAmount = user?.depositTrackingAmount;
-            const requestedAmount = user?.depositRequestedAmount || trackingAmount;
-            const masterAddress = user?.depositAddress || 'N/A';
+            const fa = user?.depositAddress || 'N/A';
+            const ta = user?.depositTrackingAmount || '?';
+            const ra = user?.depositRequestedAmount || ta;
             
             await ctx.reply(
                 `📱 <b>Deposit Address</b>\n\n` +
-                `💵 You receive: <code>$${requestedAmount || '?'}</code>\n` +
-                `📬 Send exactly: <code>${trackingAmount || '?'}</code> USDT\n` +
-                `📬 Address: <code>${masterAddress}</code>\n\n` +
-                `⚠️ Send EXACTLY <code>${trackingAmount || '?'}</code> USDT on BSC (BEP-20)`,
+                `💵 You receive: <code>$${ra}</code>\n` +
+                `📬 Send exactly: <code>${ta}</code> USDT\n` +
+                `📬 Address: <code>${fa}</code>\n\n` +
+                `⚠️ Send EXACTLY <code>${ta}</code> USDT on BSC (BEP-20)`,
                 { parse_mode: 'HTML' }
             );
-        } catch (fallbackErr) {
-            logger.error('Fallback text message failed', { userId, error: fallbackErr.message });
+        } catch (e) {
+            logger.error('Fallback failed', { userId, error: e.message });
         }
     }
      }
-    
     
     async handleShareAddress(ctx) {
         const address = ctx.match[1];
