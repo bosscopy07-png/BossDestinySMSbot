@@ -49,11 +49,11 @@ const SUPPORT_URL = 'https://t.me/swiftsmssupport_bot';
 const WALLET_LINKS = Object.freeze({
     trust: { name: 'Trust Wallet', icon: '🛡️', url: (addr, amt) => `https://link.trustwallet.com/send?asset=c20000714_t0x55d398326f99059fF775485246999027B3197955&address=${addr}&amount=${amt}&memo=SwiftSMS` },
     metamask: { name: 'MetaMask', icon: '🦊', url: (addr, amt) => `https://metamask.app.link/send/0x55d398326f99059fF775485246999027B3197955@56/transfer?address=${addr}&uint256=${Math.round(amt * 1e6)}` },
-    binance: { name: 'Binance', icon: '🔶', url: (addr, amt) => `bnc://app.binance.com/cedefi/transfer?address=${addr}&asset=USDT&amount=${amt}&network=BSC` },
+    binance: { name: 'Binance', icon: '🔶', url: (addr, amt) => `https://app.binance.com/cedefi/transfer?address=${addr}&asset=USDT&amount=${amt}&network=BSC` },
     safepal: { name: 'SafePal', icon: '🛡️', url: (addr, amt) => `https://link.safepal.io/send?address=${addr}&amount=${amt}&token=USDT&chain=bsc` },
-    tokenpocket: { name: 'TokenPocket', icon: '👛', url: (addr, amt) => `tpoutside://transfer?token=USDT&to=${addr}&amount=${amt}&chain=bsc` },
-    okx: { name: 'OKX', icon: '🔵', url: (addr, amt) => `okx://wallet/send?address=${addr}&amount=${amt}&token=USDT&chain=bsc` },
-    bitget: { name: 'Bitget', icon: '🔴', url: (addr, amt) => `bitkeep://transfer?address=${addr}&amount=${amt}&token=USDT&chain=bsc` }
+    tokenpocket: { name: 'TokenPocket', icon: '👛', url: (addr, amt) => `https://transfer?token=USDT&to=${addr}&amount=${amt}&chain=bsc` },
+    okx: { name: 'OKX', icon: '🔵', url: (addr, amt) => `https://wallet/send?address=${addr}&amount=${amt}&token=USDT&chain=bsc` },
+    bitget: { name: 'Bitget', icon: '🔴', url: (addr, amt) => `https://transfer?address=${addr}&amount=${amt}&token=USDT&chain=bsc` }
 });
 
 class UserCommands {
@@ -578,7 +578,7 @@ class UserCommands {
             await ctx.reply('❌ Error generating deposit. Please try again.');
         }
                     }
-            async handleDepositQR(ctx) {
+                async handleDepositQR(ctx) {
         const userId = ctx.from.id.toString();
         try {
             const user = await User.findOne({ userId });
@@ -600,13 +600,6 @@ class UserCommands {
 
             await ctx.answerCbQuery('📱 Generating QR...').catch(() => {});
 
-            // FIX: Smaller QR size (200px) to prevent upload timeout
-            const qrBuffer = await QRCode.toBuffer(masterAddress, {
-                width: 200,
-                margin: 1,
-                color: { dark: '#000000', light: '#FFFFFF' }
-            });
-
             const caption =
                 '📱 <b>Scan to Deposit</b>\n\n' +
                 '💵 You receive: <code>$' + requestedAmount + '</code>\n' +
@@ -617,61 +610,65 @@ class UserCommands {
 
             const walletUrl = 'https://bscscan.com/address/' + masterAddress;
 
-            // Build keyboard with wallet deep links
-            const keyboardRows = [];
-            const wallets = Object.values(WALLET_LINKS);
-            
-            for (let i = 0; i < wallets.length; i += 2) {
-                const row = [];
-                row.push({ text: wallets[i].icon + ' ' + wallets[i].name, url: wallets[i].url(masterAddress, trackingAmount) });
-                if (wallets[i + 1]) {
-                    row.push({ text: wallets[i + 1].icon + ' ' + wallets[i + 1].name, url: wallets[i + 1].url(masterAddress, trackingAmount) });
-                }
-                keyboardRows.push(row);
-            }
-
-            keyboardRows.push([{ text: '🔗 View on BSCScan', url: walletUrl }]);
-            keyboardRows.push([{ text: '📋 Copy Address', callback_data: 'copy_address_' + masterAddress }]);
-            keyboardRows.push([{ text: '🔍 Check Deposit', callback_data: 'check_deposit' }, { text: '🔙 Back', callback_data: 'menu' }]);
+            // FIX: bnc:// is invalid in Telegram. Use https:// fallback for Binance
+            const keyboardRows = [
+                [
+                    { text: '🛡️ Trust', url: 'https://link.trustwallet.com/send?asset=c20000714_t0x55d398326f99059fF775485246999027B3197955&address=' + masterAddress + '&amount=' + trackingAmount + '&memo=SwiftSMS' },
+                    { text: '🦊 MetaMask', url: 'https://metamask.app.link/send/0x55d398326f99059fF775485246999027B3197955@56/transfer?address=' + masterAddress + '&uint256=' + Math.round(trackingAmount * 1e6) }
+                ],
+                [
+                    { text: '🔶 Binance', url: 'https://www.binance.com/en/my/wallet/account/payment/send' }, // FIX: No bnc://, use web
+                    { text: '🛡️ SafePal', url: 'https://link.safepal.io/send?address=' + masterAddress + '&amount=' + trackingAmount + '&token=USDT&chain=bsc' }
+                ],
+                [
+                    { text: '👛 TokenPocket', url: 'https://tokenpocket.pro/' },
+                    { text: '🔵 OKX', url: 'https://www.okx.com/web3' }
+                ],
+                [
+                    { text: '🔴 Bitget', url: 'https://web3.bitget.com/' }
+                ],
+                [{ text: '🔗 View on BSCScan', url: walletUrl }],
+                [{ text: '📋 Copy Address', callback_data: 'copy_address_' + masterAddress }],
+                [{ text: '🔍 Check Deposit', callback_data: 'check_deposit' }, { text: '🔙 Back', callback_data: 'menu' }]
+            ];
 
             const keyboard = { reply_markup: { inline_keyboard: keyboardRows } };
 
-            // FIX: Try photo with explicit timeout, fallback to text-only if upload fails
+            // Try to generate and send QR
+            let qrSent = false;
             try {
-                await ctx.replyWithPhoto(
+                const qrBuffer = await QRCode.toBuffer(masterAddress, {
+                    width: 200,
+                    margin: 1,
+                    color: { dark: '#000000', light: '#FFFFFF' }
+                });
+
+                // Use Promise.race to timeout the upload after 10 seconds
+                const uploadPromise = ctx.replyWithPhoto(
                     { source: qrBuffer },
                     { caption: caption, parse_mode: 'HTML', reply_markup: keyboard.reply_markup }
                 );
-            } catch (photoErr) {
-                logger.warn('QR photo upload failed', { userId, error: photoErr.message });
                 
-                // Second try: send as document with smaller payload
-                try {
-                    await ctx.replyWithDocument(
-                        { source: qrBuffer, filename: 'deposit_qr.png' },
-                        { caption: caption, parse_mode: 'HTML', reply_markup: keyboard.reply_markup }
-                    );
-                } catch (docErr) {
-                    logger.error('QR document upload also failed', { userId, error: docErr.message });
-                    
-                    // FINAL FALLBACK: Send text-only with address and wallet links (no QR image)
-                    await ctx.reply(
-                        '📱 <b>Deposit QR Unavailable</b>\n\n' +
-                        '💵 You receive: <code>$' + requestedAmount + '</code>\n' +
-                        '📬 Send exactly: <code>' + trackingAmount + '</code> USDT\n' +
-                        '📬 Address: <code>' + masterAddress + '</code>\n\n' +
-                        '⚠️ Send EXACTLY <code>' + trackingAmount + '</code> USDT on BSC (BEP-20)\n\n' +
-                        '<b>Tap a wallet to open directly:</b>',
-                        { parse_mode: 'HTML', reply_markup: keyboard.reply_markup }
-                    );
-                }
+                const timeoutPromise = new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error('UPLOAD_TIMEOUT')), 10000)
+                );
+
+                await Promise.race([uploadPromise, timeoutPromise]);
+                qrSent = true;
+            } catch (uploadErr) {
+                logger.warn('QR upload failed or timed out', { userId, error: uploadErr.message });
+            }
+
+            // If QR didn't send, send text-only version
+            if (!qrSent) {
+                await ctx.reply(caption, { parse_mode: 'HTML', reply_markup: keyboard.reply_markup });
             }
 
         } catch (error) {
             logger.error('QR generation failed', { userId, error: error.message });
             await ctx.answerCbQuery('❌ Failed to generate QR').catch(() => {});
         }
-            }
+                }
     
 
     async handleShareAddress(ctx) {
