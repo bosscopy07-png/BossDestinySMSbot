@@ -578,8 +578,10 @@ class UserCommands {
             await ctx.reply('❌ Error generating deposit. Please try again.');
         }
                     }
-                async handleDepositQR(ctx) {
+                    async handleDepositQR(ctx) {
         const userId = ctx.from.id.toString();
+        let tempFilePath = null;
+        
         try {
             const user = await User.findOne({ userId });
             const trackingAmount = user?.depositTrackingAmount;
@@ -600,24 +602,37 @@ class UserCommands {
 
             await ctx.answerCbQuery('📱 Generating QR...').catch(() => {});
 
+            // Generate QR as buffer
+            const qrBuffer = await QRCode.toBuffer(masterAddress, {
+                width: 250,
+                margin: 2,
+                color: { dark: '#00BCD4', light: '#FFFFFF' }
+            });
+
+            // FIX: Write buffer to temp file, upload file path instead of raw buffer
+            const os = await import('os');
+            const path = await import('path');
+            const fs = await import('fs/promises');
+            
+            tempFilePath = path.join(os.tmpdir(), `swiftsms_qr_${userId}_${Date.now()}.png`);
+            await fs.writeFile(tempFilePath, qrBuffer);
+
             const caption =
                 '📱 <b>Scan to Deposit</b>\n\n' +
                 '💵 You receive: <code>$' + requestedAmount + '</code>\n' +
                 '📬 Send exactly: <code>' + trackingAmount + '</code> USDT\n' +
                 '📬 Address: <code>' + masterAddress + '</code>\n\n' +
-                '⚠️ Send EXACTLY <code>' + trackingAmount + '</code> USDT on BSC (BEP-20)\n' +
-                '💰 <code>$' + requestedAmount + '</code> will be credited.';
+                '⚠️ Send EXACTLY <code>' + trackingAmount + '</code> USDT on BSC (BEP-20)';
 
             const walletUrl = 'https://bscscan.com/address/' + masterAddress;
 
-            // FIX: bnc:// is invalid in Telegram. Use https:// fallback for Binance
             const keyboardRows = [
                 [
                     { text: '🛡️ Trust', url: 'https://link.trustwallet.com/send?asset=c20000714_t0x55d398326f99059fF775485246999027B3197955&address=' + masterAddress + '&amount=' + trackingAmount + '&memo=SwiftSMS' },
                     { text: '🦊 MetaMask', url: 'https://metamask.app.link/send/0x55d398326f99059fF775485246999027B3197955@56/transfer?address=' + masterAddress + '&uint256=' + Math.round(trackingAmount * 1e6) }
                 ],
                 [
-                    { text: '🔶 Binance', url: 'https://www.binance.com/en/my/wallet/account/payment/send' }, // FIX: No bnc://, use web
+                    { text: '🔶 Binance', url: 'https://www.binance.com/en/my/wallet/account/payment/send' },
                     { text: '🛡️ SafePal', url: 'https://link.safepal.io/send?address=' + masterAddress + '&amount=' + trackingAmount + '&token=USDT&chain=bsc' }
                 ],
                 [
@@ -632,45 +647,32 @@ class UserCommands {
                 [{ text: '🔍 Check Deposit', callback_data: 'check_deposit' }, { text: '🔙 Back', callback_data: 'menu' }]
             ];
 
-            const keyboard = { reply_markup: { inline_keyboard: keyboardRows } };
-
-            // Try to generate and send QR
-            let qrSent = false;
-            try {
-                const qrBuffer = await QRCode.toBuffer(masterAddress, {
-                    width: 200,
-                    margin: 1,
-                    color: { dark: '#000000', light: '#FFFFFF' }
-                });
-
-                // Use Promise.race to timeout the upload after 10 seconds
-                const uploadPromise = ctx.replyWithPhoto(
-                    { source: qrBuffer },
-                    { caption: caption, parse_mode: 'HTML', reply_markup: keyboard.reply_markup }
-                );
-                
-                const timeoutPromise = new Promise((_, reject) => 
-                    setTimeout(() => reject(new Error('UPLOAD_TIMEOUT')), 10000)
-                );
-
-                await Promise.race([uploadPromise, timeoutPromise]);
-                qrSent = true;
-            } catch (uploadErr) {
-                logger.warn('QR upload failed or timed out', { userId, error: uploadErr.message });
-            }
-
-            // If QR didn't send, send text-only version
-            if (!qrSent) {
-                await ctx.reply(caption, { parse_mode: 'HTML', reply_markup: keyboard.reply_markup });
-            }
+            // FIX: Upload from file path instead of buffer
+            await ctx.replyWithPhoto(
+                { source: tempFilePath },
+                { 
+                    caption: caption, 
+                    parse_mode: 'HTML', 
+                    reply_markup: { inline_keyboard: keyboardRows } 
+                }
+            );
 
         } catch (error) {
             logger.error('QR generation failed', { userId, error: error.message });
             await ctx.answerCbQuery('❌ Failed to generate QR').catch(() => {});
-        }
+        } finally {
+            // Cleanup temp file
+            if (tempFilePath) {
+                try {
+                    const fs = await import('fs/promises');
+                    await fs.unlink(tempFilePath);
+                } catch (cleanupErr) {
+                    // Ignore cleanup errors
                 }
+            }
+        }
+                     }
     
-
     async handleShareAddress(ctx) {
         const address = ctx.match[1];
         await ctx.answerCbQuery('📤 Address ready!');
