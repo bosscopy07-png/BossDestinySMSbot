@@ -1,9 +1,9 @@
 import mongoose from 'mongoose';
 import { generateId } from '../utils/helpers.js';
 
-// ───────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
 //  Notification Schema
-// ───────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
 
 const notificationSchema = new mongoose.Schema(
     {
@@ -247,3 +247,4 @@ notificationSchema.statics.markAllRead = async function (userId) {
 const Notification = mongoose.model('Notification', notificationSchema);
 
 export default Notification;
+            
