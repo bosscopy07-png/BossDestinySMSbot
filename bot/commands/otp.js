@@ -1534,6 +1534,7 @@ setupTextHandlers() {
     //  FREE SERVICE SELECTED — User picked a service in FREE mode
     // ═══════════════════════════════════════════════════════════════════════
 
+
     async handleFreeServiceSelected(ctx) {
         const userId = ctx.from?.id?.toString();
         const serviceId = ctx.match?.[1];
@@ -1545,27 +1546,7 @@ setupTextHandlers() {
             ctx.session.selectedService = serviceId;
             ctx.session.otpMode = 'FREE';
 
-            // Get available countries for this service in FREE mode
-            const freeProvider = this.smsProviderManager?.getProvider('FREE_PUBLIC');
-            let availableCountries = [];
-
-            if (freeProvider?.getAvailableCountries) {
-                availableCountries = await freeProvider.getAvailableCountries(serviceId);
-            } else {
-                // Fallback to common countries
-                availableCountries = [
-                    { code: 'US', name: '🇺🇸 United States', flag: '🇺🇸' },
-                    { code: 'UK', name: '🇬🇧 United Kingdom', flag: '🇬🇧' },
-                    { code: 'CA', name: '🇨🇦 Canada', flag: '🇨🇦' },
-                    { code: 'AU', name: '🇦🇺 Australia', flag: '🇦🇺' },
-                    { code: 'DE', name: '🇩🇪 Germany', flag: '🇩🇪' },
-                    { code: 'FR', name: '🇫🇷 France', flag: '🇫🇷' },
-                    { code: 'IN', name: '🇮🇳 India', flag: '🇮🇳' },
-                    { code: 'NG', name: '🇳🇬 Nigeria', flag: '🇳🇬' }
-                ];
-            }
-
-            const serviceName = SERVICES[serviceId]?.name || serviceId;
+            const serviceName = SERVICES[serviceId] || serviceId;
 
             const message =
                 '🆓 <b>Free Mode — Select Country</b>\n\n' +
@@ -1573,8 +1554,19 @@ setupTextHandlers() {
                 'Select a country for your free number:\n\n' +
                 '<i>Free numbers are shared and may be blocked by major services.</i>';
 
-            const buttons = availableCountries.slice(0, 8).map(c => [
-                Markup.button.callback(`${c.flag || '🌍'} ${c.name}`, `free_country_${c.code}_${serviceId}`)
+            const countries = [
+                { code: 'US', name: '🇺🇸 United States', flag: '🇺🇸' },
+                { code: 'UK', name: '🇬🇧 United Kingdom', flag: '🇬🇧' },
+                { code: 'CA', name: '🇨🇦 Canada', flag: '🇨🇦' },
+                { code: 'AU', name: '🇦🇺 Australia', flag: '🇦🇺' },
+                { code: 'DE', name: '🇩🇪 Germany', flag: '🇩🇪' },
+                { code: 'FR', name: '🇫🇷 France', flag: '🇫🇷' },
+                { code: 'IN', name: '🇮🇳 India', flag: '🇮🇳' },
+                { code: 'NG', name: '🇳🇬 Nigeria', flag: '🇳🇬' }
+            ];
+
+            const buttons = countries.map(c => [
+                Markup.button.callback(`${c.flag} ${c.name}`, `free_country_${c.code}_${serviceId}`)
             ]);
 
             buttons.push([Markup.button.callback('🔙 Back', 'confirm_free_mode')]);
@@ -1582,19 +1574,17 @@ setupTextHandlers() {
 
             const keyboard = Markup.inlineKeyboard(buttons);
 
-            await this.sendPhotoWithCaption(ctx, IMAGES.freeMode, message, keyboard, 'HTML');
+            await this.sendPhotoWithCaption(ctx, IMAGES.freeMode || IMAGES.default, message, keyboard, 'HTML');
 
         } catch (error) {
             logger.error('handleFreeServiceSelected error', { userId, serviceId, error: error.message });
             await ctx.answerCbQuery('❌ Error').catch(() => {});
-            await ctx.reply('❌ Failed to load countries. Try again.').catch(() => {});
         }
     }
-
-    // ═══════════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
     //  FREE COUNTRY SELECTED — User picked a country in FREE mode
     // ═══════════════════════════════════════════════════════════════════════
-
+        
     async handleFreeCountrySelected(ctx) {
         const userId = ctx.from?.id?.toString();
         const countryCode = ctx.match?.[1];
@@ -2162,21 +2152,29 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
     //  LEGACY: Old service selection (all services at once)
     // ═══════════════════════════════════════════════════════════════════════
 
-    async _showLegacyServiceSelection(ctx, mode, imageUrl, displayPrice = null) {
+        async _showLegacyServiceSelection(ctx, mode, imageUrl, displayPrice = null) {
         const priceText = displayPrice ? `\n💰 Starting from ${formatCurrency(displayPrice)}` : '';
         const message = `📱 <b>${mode} Mode</b>${priceText}\n\nChoose the service you need OTP for:`;
         const buttons = [];
         
+        // Mode-specific callback prefix
+        const callbackPrefix = mode === 'FREE' ? 'free_service_' :
+                               mode === 'CHEAP' ? 'cheap_service_' :
+                               mode === 'BUNDLE' ? 'bundle_service_' :
+                               mode === 'VIP' ? 'vip_service_' :
+                               'service_';
+        
         for (let i = 0; i < SERVICES.length; i += 3) {
             const row = SERVICES.slice(i, i + 3).map(s => 
-                Markup.button.callback(s, `service_${s}`)
+                Markup.button.callback(s, `${callbackPrefix}${s}`)
             );
             buttons.push(row);
         }
         
         buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
         await this.sendPhotoWithCaption(ctx, imageUrl, message, Markup.inlineKeyboard(buttons), 'HTML');
-    }
+        }
+        
 
     // ═══════════════════════════════════════════════════════════════════════
     //  NEW: Tier Selection (Step 2 of CHEAP flow)
