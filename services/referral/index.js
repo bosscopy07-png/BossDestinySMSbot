@@ -1,8 +1,5 @@
-// ═══════════════════════════════════════════════════════════
-//  PART 1: ReferralService with Notification & Race Fix
-// ═══════════════════════════════════════════════════════════
 
-import { User, Referral, Transaction, Notification } from '../../models/index.js';
+import { User, Referral, Transaction } from '../../models/index.js';
 import { generateId } from '../../utils/helpers.js';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
@@ -13,7 +10,10 @@ class ReferralService {
         this.notificationService = notificationService;
     }
 
-    // ─── Internal: Send notification to referrer ───
+    // ═══════════════════════════════════════════════════════════
+    //  INTERNAL: Send notification to referrer
+    // ═══════════════════════════════════════════════════════════
+
     async _notifyReferrer(referrerId, type, payload) {
         if (!this.notificationService) {
             logger.warn('NotificationService not available, referrer will not be alerted', { referrerId, type });
@@ -24,6 +24,7 @@ class ReferralService {
             await this.notificationService.send(referrerId, {
                 type,
                 ...payload,
+                telegramChatId: referrerId, // Telegram chat ID = userId for bot DMs
                 timestamp: new Date()
             });
         } catch (notifyError) {
@@ -36,7 +37,10 @@ class ReferralService {
         }
     }
 
-    // ─── Internal: Send deposit notification ───
+    // ═══════════════════════════════════════════════════════════
+    //  INTERNAL: Send deposit notification
+    // ═══════════════════════════════════════════════════════════
+
     async _notifyDeposit(referrerId, referredId, depositAmount, status) {
         const messages = {
             PENDING: `🎉 Great news! A new user joined with your referral code. They haven't deposited yet.`,
@@ -44,7 +48,7 @@ class ReferralService {
             BELOW_MINIMUM: `📉 Your referral deposited $${depositAmount.toFixed(2)}, but it's below the $${config.referral?.minDeposit ?? 5} minimum required for reward.`
         };
 
-        await this._notifyReferrer(referrerId, 'REFERRAL_UPDATE', {
+        await this._notifyReferrer(referrerId, 'REFERRAL_DEPOSITED', {
             title: 'Referral Update',
             message: messages[status] || 'Referral status updated.',
             referredId,
