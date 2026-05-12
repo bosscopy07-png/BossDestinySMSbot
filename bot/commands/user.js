@@ -580,101 +580,80 @@ class UserCommands {
                     }
                     
                      async handleDepositQR(ctx) {
-        const userId = ctx.from.id.toString();
-        let tempFilePath = null;
-        
-        try {
-            const user = await User.findOne({ userId });
-            const trackingAmount = user?.depositTrackingAmount;
-            const requestedAmount = user?.depositRequestedAmount || trackingAmount;
+   const userId = ctx.from.id.toString();
+   try {
+       const user = await User.findOne({ userId });
+       const trackingAmount = user?.depositTrackingAmount;
+       const requestedAmount = user?.depositRequestedAmount || trackingAmount;
 
-            if (!trackingAmount) {
-                return ctx.answerCbQuery('⚠️ Click Deposit first');
-            }
+       if (!trackingAmount) {
+           return ctx.answerCbQuery('⚠️ Click Deposit first');
+       }
 
-            let masterAddress = '';
-            try {
-                if (this.walletService?.getMasterAddress) {
-                    masterAddress = await this.walletService.getMasterAddress();
-                }
-            } catch (e) {
-                return ctx.answerCbQuery('❌ Address unavailable');
-            }
+       let masterAddress = '';
+       try {
+           if (this.walletService?.getMasterAddress) {
+               masterAddress = await this.walletService.getMasterAddress();
+           }
+       } catch (e) {
+           return ctx.answerCbQuery('❌ Address unavailable');
+       }
 
-            await ctx.answerCbQuery('📱 Generating QR...');
+       await ctx.answerCbQuery('📱 Generating QR...');
 
-            // YOUR ORIGINAL QR GENERATION — unchanged
-            const qrBuffer = await QRCode.toBuffer(masterAddress, {
-                width: 280,
-                margin: 2,
-                color: { dark: '#00BCD4', light: '#FFFFFF' }
-            });
+       const qrBuffer = await QRCode.toBuffer(masterAddress, {
+           width: 280,
+           margin: 2,
+           color: { dark: '#00BCD4', light: '#FFFFFF' }
+       });
 
-            // Write buffer to temp file for reliable upload
-            const os = await import('os');
-            const path = await import('path');
-            const fs = await import('fs/promises');
-            
-            tempFilePath = path.join(os.tmpdir(), `qr_${userId}_${Date.now()}.png`);
-            await fs.writeFile(tempFilePath, qrBuffer);
+       const caption =
+           '📱 <b>Scan to Deposit</b>\n\n' +
+           '💵 You receive: <code>$' + requestedAmount + '</code>\n' +
+           '📬 Send exactly: <code>' + trackingAmount + '</code> USDT\n' +
+           '📬 Address: <code>' + masterAddress + '</code>\n\n' +
+           '⚠️ Send EXACTLY <code>' + trackingAmount + '</code> USDT on BSC (BEP-20)\n' +
+           '💰 <code>$' + requestedAmount + '</code> will be credited to your balance.';
 
-            // YOUR ORIGINAL CAPTION — unchanged
-            const caption =
-                '📱 <b>Scan to Deposit</b>\n\n' +
-                '💵 You receive: <code>$' + requestedAmount + '</code>\n' +
-                '📬 Send exactly: <code>' + trackingAmount + '</code> USDT\n' +
-                '📬 Address: <code>' + masterAddress + '</code>\n\n' +
-                '⚠️ Send EXACTLY <code>' + trackingAmount + '</code> USDT on BSC (BEP-20)\n' +
-                '💰 <code>$' + requestedAmount + '</code> will be credited to your balance.';
+       const walletUrl = 'https://bscscan.com/address/' + masterAddress;
 
-            const walletUrl = 'https://bscscan.com/address/' + masterAddress;
+       const keyboard = {
+           reply_markup: {
+               inline_keyboard: [
+                   [
+                       { text: '🛡️ Trust', url: 'https://link.trustwallet.com/send?asset=c20000714_t0x55d398326f99059fF775485246999027B3197955&address=' + masterAddress + '&amount=' + trackingAmount + '&memo=SwiftSMS' },
+                       { text: '🦊 MetaMask', url: 'https://metamask.app.link/send/0x55d398326f99059fF775485246999027B3197955@56/transfer?address=' + masterAddress + '&uint256=' + Math.round(trackingAmount * 1e6) }
+                   ],
+                   [
+                       { text: '🔶 Binance', url: 'https://www.binance.com/en/my/wallet/account/payment/send' },
+                       { text: '🛡️ SafePal', url: 'https://link.safepal.io/send?address=' + masterAddress + '&amount=' + trackingAmount + '&token=USDT&chain=bsc' }
+                   ],
+                   [
+                       { text: '👛 TokenPocket', url: 'https://tokenpocket.pro/' },
+                       { text: '🔵 OKX', url: 'https://www.okx.com/web3' }
+                   ],
+                   [
+                       { text: '🔴 Bitget', url: 'https://web3.bitget.com/' }
+                   ],
+                   [{ text: '🔗 View on BSCScan', url: walletUrl }],
+                   [{ text: '📋 Copy Address', callback_data: 'copy_address_' + masterAddress }],
+                   [{ text: '🔍 Check Deposit', callback_data: 'check_deposit' }],
+                   [{ text: '🔙 Back', callback_data: 'menu' }]
+               ]
+           }
+       };
 
-            // WALLET DEEP LINKS ADDED — opens wallet apps directly
-            const keyboard = {
-                reply_markup: {
-                    inline_keyboard: [
-                        [
-                            { text: '🛡️ Trust Wallet', url: 'https://link.trustwallet.com/send?asset=c20000714_t0x55d398326f99059fF775485246999027B3197955&address=' + masterAddress + '&amount=' + trackingAmount + '&memo=SwiftSMS' },
-                            { text: '🦊 MetaMask', url: 'https://metamask.app.link/send/0x55d398326f99059fF775485246999027B3197955@56/transfer?address=' + masterAddress + '&uint256=' + Math.round(trackingAmount * 1e6) }
-                        ],
-                        [
-                            { text: '🔶 Binance Pay', url: 'https://www.binance.com/en/my/wallet/account/payment/send' },
-                            { text: '🛡️ SafePal', url: 'https://link.safepal.io/send?address=' + masterAddress + '&amount=' + trackingAmount + '&token=USDT&chain=bsc' }
-                        ],
-                        [
-                            { text: '👛 TokenPocket', url: 'https://tokenpocket.pro/' },
-                            { text: '🔵 OKX Wallet', url: 'https://www.okx.com/web3' }
-                        ],
-                        [
-                            { text: '🔴 Bitget Wallet', url: 'https://web3.bitget.com/' }
-                        ],
-                        [{ text: '🔗 View on BSCScan', url: walletUrl }],
-                        [{ text: '📋 Copy Address', callback_data: 'copy_address_' + masterAddress }],
-                        [{ text: '🔍 Check Deposit', callback_data: 'check_deposit' }],
-                        [{ text: '🔙 Back', callback_data: 'menu' }]
-                    ]
-                }
-            };
+       await ctx.replyWithPhoto(
+           { source: qrBuffer },
+           { caption: caption, parse_mode: 'HTML', reply_markup: keyboard.reply_markup }
+       );
 
-            // Upload from file path for reliable delivery
-            await ctx.replyWithPhoto(
-                { source: tempFilePath },
-                { caption: caption, parse_mode: 'HTML', reply_markup: keyboard.reply_markup }
-            );
-
-        } catch (error) {
-            logger.error('QR generation failed', { userId, error: error.message });
-            await ctx.answerCbQuery('❌ Failed to generate QR');
-        } finally {
-            // Cleanup temp file
-            if (tempFilePath) {
-                try {
-                    const fs = await import('fs/promises');
-                    await fs.unlink(tempFilePath);
-                } catch (e) {}
-            }
-        }
+   } catch (error) {
+       logger.error('QR generation failed', { userId, error: error.message });
+       await ctx.answerCbQuery('❌ Failed to generate QR');
+   }
                      }
+    
     
     
     async handleShareAddress(ctx) {
