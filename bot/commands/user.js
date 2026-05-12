@@ -578,7 +578,7 @@ class UserCommands {
             await ctx.reply('❌ Error generating deposit. Please try again.');
         }
                     }
-        async handleDepositQR(ctx) {
+            async handleDepositQR(ctx) {
         const userId = ctx.from.id.toString();
         try {
             const user = await User.findOne({ userId });
@@ -586,7 +586,7 @@ class UserCommands {
             const requestedAmount = user?.depositRequestedAmount || trackingAmount;
 
             if (!trackingAmount) {
-                return ctx.answerCbQuery('⚠️ Click Deposit first');
+                return ctx.answerCbQuery('⚠️ Click Deposit first').catch(() => {});
             }
 
             let masterAddress = '';
@@ -595,15 +595,16 @@ class UserCommands {
                     masterAddress = await this.walletService.getMasterAddress();
                 }
             } catch (e) {
-                return ctx.answerCbQuery('❌ Address unavailable');
+                return ctx.answerCbQuery('❌ Address unavailable').catch(() => {});
             }
 
-            await ctx.answerCbQuery('📱 Generating QR...');
+            await ctx.answerCbQuery('📱 Generating QR...').catch(() => {});
 
+            // FIX: Smaller QR size (200px) to prevent upload timeout
             const qrBuffer = await QRCode.toBuffer(masterAddress, {
-                width: 280,
-                margin: 2,
-                color: { dark: '#00BCD4', light: '#FFFFFF' }
+                width: 200,
+                margin: 1,
+                color: { dark: '#000000', light: '#FFFFFF' }
             });
 
             const caption =
@@ -612,16 +613,14 @@ class UserCommands {
                 '📬 Send exactly: <code>' + trackingAmount + '</code> USDT\n' +
                 '📬 Address: <code>' + masterAddress + '</code>\n\n' +
                 '⚠️ Send EXACTLY <code>' + trackingAmount + '</code> USDT on BSC (BEP-20)\n' +
-                '💰 <code>$' + requestedAmount + '</code> will be credited to your balance.\n\n' +
-                '<b>👇 Tap wallet to open:</b>';
+                '💰 <code>$' + requestedAmount + '</code> will be credited.';
 
             const walletUrl = 'https://bscscan.com/address/' + masterAddress;
 
-            // Build keyboard with wallet deep links + utilities
+            // Build keyboard with wallet deep links
             const keyboardRows = [];
-
-            // Wallet buttons in pairs
             const wallets = Object.values(WALLET_LINKS);
+            
             for (let i = 0; i < wallets.length; i += 2) {
                 const row = [];
                 row.push({ text: wallets[i].icon + ' ' + wallets[i].name, url: wallets[i].url(masterAddress, trackingAmount) });
@@ -637,25 +636,43 @@ class UserCommands {
 
             const keyboard = { reply_markup: { inline_keyboard: keyboardRows } };
 
-            // FIX: Try photo first, fallback to document on socket hang up
+            // FIX: Try photo with explicit timeout, fallback to text-only if upload fails
             try {
                 await ctx.replyWithPhoto(
                     { source: qrBuffer },
                     { caption: caption, parse_mode: 'HTML', reply_markup: keyboard.reply_markup }
                 );
-            } catch (sendErr) {
-                logger.warn('QR photo failed, sending as document', { userId, error: sendErr.message });
-                await ctx.replyWithDocument(
-                    { source: qrBuffer, filename: 'SwiftSMS_Deposit_QR.png' },
-                    { caption: caption, parse_mode: 'HTML', reply_markup: keyboard.reply_markup }
-                );
+            } catch (photoErr) {
+                logger.warn('QR photo upload failed', { userId, error: photoErr.message });
+                
+                // Second try: send as document with smaller payload
+                try {
+                    await ctx.replyWithDocument(
+                        { source: qrBuffer, filename: 'deposit_qr.png' },
+                        { caption: caption, parse_mode: 'HTML', reply_markup: keyboard.reply_markup }
+                    );
+                } catch (docErr) {
+                    logger.error('QR document upload also failed', { userId, error: docErr.message });
+                    
+                    // FINAL FALLBACK: Send text-only with address and wallet links (no QR image)
+                    await ctx.reply(
+                        '📱 <b>Deposit QR Unavailable</b>\n\n' +
+                        '💵 You receive: <code>$' + requestedAmount + '</code>\n' +
+                        '📬 Send exactly: <code>' + trackingAmount + '</code> USDT\n' +
+                        '📬 Address: <code>' + masterAddress + '</code>\n\n' +
+                        '⚠️ Send EXACTLY <code>' + trackingAmount + '</code> USDT on BSC (BEP-20)\n\n' +
+                        '<b>Tap a wallet to open directly:</b>',
+                        { parse_mode: 'HTML', reply_markup: keyboard.reply_markup }
+                    );
+                }
             }
 
         } catch (error) {
             logger.error('QR generation failed', { userId, error: error.message });
-            await ctx.answerCbQuery('❌ Failed to generate QR');
+            await ctx.answerCbQuery('❌ Failed to generate QR').catch(() => {});
         }
-    }
+            }
+    
 
     async handleShareAddress(ctx) {
         const address = ctx.match[1];
