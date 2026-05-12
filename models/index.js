@@ -15,6 +15,7 @@ import ApiKey from './ApiKey.js';
 import AdminLog from './AdminLog.js';
 import Settings from './Settings.js';
 import { OrphanSMS } from './OrphanSMS.js';
+import Notification from './Notification.js';
 
 const modelRegistry = {
     User,
@@ -26,7 +27,8 @@ const modelRegistry = {
     ApiKey,
     AdminLog,
     Settings,
-    OrphanSMS
+    OrphanSMS,
+    Notification
 };
 
 function validateModels() {
@@ -115,8 +117,8 @@ export {
     ApiKey,
     AdminLog,
     Settings,
-    OrphanSMS
+    OrphanSMS,
+    Notification
 };
 
 export default modelRegistry;
-        
