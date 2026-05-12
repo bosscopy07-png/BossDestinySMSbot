@@ -601,7 +601,6 @@ class UserCommands {
             return ctx.answerCbQuery('❌ Address unavailable').catch(() => {});
         }
 
-        // Acknowledge the callback immediately
         await ctx.answerCbQuery('📱 Generating QR...').catch(() => {});
 
         // Generate QR as buffer
@@ -654,9 +653,13 @@ class UserCommands {
             [{ text: '🔍 Check Deposit', callback_data: 'check_deposit' }, { text: '🔙 Back', callback_data: 'menu' }]
         ];
 
-        // FIX: Upload from file path and WAIT for it to complete before cleanup
+        // CRITICAL FIX: Create a read stream and explicitly wait for it to close
+        // before cleaning up the temp file
+        const fsSync = await import('fs');
+        const stream = fsSync.createReadStream(tempFilePath);
+        
         await ctx.replyWithPhoto(
-            { source: tempFilePath },  // Using file path is correct
+            { source: stream },
             { 
                 caption: caption, 
                 parse_mode: 'HTML', 
@@ -664,38 +667,44 @@ class UserCommands {
             }
         );
 
+        // Explicitly wait for stream to finish before cleanup
+        await new Promise((resolve, reject) => {
+            stream.on('end', resolve);
+            stream.on('close', resolve);
+            stream.on('error', reject);
+        });
+
     } catch (error) {
         logger.error('QR generation failed', { userId, error: error.message, stack: error.stack });
         await ctx.answerCbQuery('❌ Failed to generate QR').catch(() => {});
         
-        // Send a text fallback if photo fails
+        // Fallback: send text-only message
         try {
             await ctx.reply(
                 `📱 <b>Deposit Address</b>\n\n` +
-                `Address: <code>${masterAddress}</code>\n` +
-                `Amount: <code>${trackingAmount}</code> USDT\n\n` +
-                `⚠️ Send EXACTLY the amount on BSC (BEP-20)`,
+                `💵 You receive: <code>$${requestedAmount}</code>\n` +
+                `📬 Send exactly: <code>${trackingAmount}</code> USDT\n` +
+                `📬 Address: <code>${masterAddress}</code>\n\n` +
+                `⚠️ Send EXACTLY <code>${trackingAmount}</code> USDT on BSC (BEP-20)`,
                 { parse_mode: 'HTML' }
             );
         } catch (fallbackErr) {
-            // Ignore fallback errors
+            logger.error('Fallback text message failed', { userId, error: fallbackErr.message });
         }
         
     } finally {
-        // CRITICAL FIX: Only delete after the upload is confirmed done
-        // Give Telegram a moment to finish reading the file, or use fs sync to ensure it's closed
+        // CRITICAL FIX: Only delete after stream is fully consumed
         if (tempFilePath) {
             try {
                 const fs = await import('fs/promises');
-                // Small delay to ensure Telegram has finished reading the file handle
-                await new Promise(resolve => setTimeout(resolve, 1000));
                 await fs.unlink(tempFilePath);
             } catch (cleanupErr) {
-                // Ignore cleanup errors
+                // Ignore cleanup errors - file might already be deleted
             }
         }
     }
-    }
+        }
+                
     
     
     async handleShareAddress(ctx) {
