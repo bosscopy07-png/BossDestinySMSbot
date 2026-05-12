@@ -579,9 +579,8 @@ class UserCommands {
         }
                     }
                     
-    async handleDepositQR(ctx) {
+     async handleDepositQR(ctx) {
     const userId = ctx.from.id.toString();
-    let tempFilePath = null;
     
     try {
         const user = await User.findOne({ userId });
@@ -603,25 +602,16 @@ class UserCommands {
 
         await ctx.answerCbQuery('📱 Generating QR...').catch(() => {});
 
-        // Generate QR as buffer
-        const qrBuffer = await QRCode.toBuffer(masterAddress, {
+        // Generate QR as base64 data URI - NO FILE UPLOAD NEEDED
+        const qrDataUri = await QRCode.toDataURL(masterAddress, {
             width: 250,
             margin: 2,
             color: { dark: '#00BCD4', light: '#FFFFFF' }
         });
 
-        // Validate buffer
-        if (!qrBuffer || qrBuffer.length === 0) {
-            throw new Error('QR buffer is empty');
-        }
-
-        // Write to temp file
-        const os = await import('os');
-        const path = await import('path');
-        const fs = await import('fs/promises');
-        
-        tempFilePath = path.join(os.tmpdir(), `swiftsms_qr_${userId}_${Date.now()}.png`);
-        await fs.writeFile(tempFilePath, qrBuffer);
+        // Convert base64 to buffer for Telegram
+        const base64Data = qrDataUri.replace(/^data:image\/png;base64,/, '');
+        const qrBuffer = Buffer.from(base64Data, 'base64');
 
         const caption =
             '📱 <b>Scan to Deposit</b>\n\n' +
@@ -653,13 +643,10 @@ class UserCommands {
             [{ text: '🔍 Check Deposit', callback_data: 'check_deposit' }, { text: '🔙 Back', callback_data: 'menu' }]
         ];
 
-        // CRITICAL FIX: Create a read stream and explicitly wait for it to close
-        // before cleaning up the temp file
-        const fsSync = await import('fs');
-        const stream = fsSync.createReadStream(tempFilePath);
-        
+        // FIX: Pass buffer directly with explicit filename
+        // This avoids filesystem streams entirely
         await ctx.replyWithPhoto(
-            { source: stream },
+            { source: qrBuffer, filename: 'deposit_qr.png' },
             { 
                 caption: caption, 
                 parse_mode: 'HTML', 
@@ -667,44 +654,31 @@ class UserCommands {
             }
         );
 
-        // Explicitly wait for stream to finish before cleanup
-        await new Promise((resolve, reject) => {
-            stream.on('end', resolve);
-            stream.on('close', resolve);
-            stream.on('error', reject);
-        });
-
     } catch (error) {
         logger.error('QR generation failed', { userId, error: error.message, stack: error.stack });
         await ctx.answerCbQuery('❌ Failed to generate QR').catch(() => {});
         
-        // Fallback: send text-only message
+        // FIX: Fallback with proper variable access
+        // Re-fetch user data or use the variables from outer scope
         try {
+            const user = await User.findOne({ userId });
+            const trackingAmount = user?.depositTrackingAmount;
+            const requestedAmount = user?.depositRequestedAmount || trackingAmount;
+            const masterAddress = user?.depositAddress || 'N/A';
+            
             await ctx.reply(
                 `📱 <b>Deposit Address</b>\n\n` +
-                `💵 You receive: <code>$${requestedAmount}</code>\n` +
-                `📬 Send exactly: <code>${trackingAmount}</code> USDT\n` +
+                `💵 You receive: <code>$${requestedAmount || '?'}</code>\n` +
+                `📬 Send exactly: <code>${trackingAmount || '?'}</code> USDT\n` +
                 `📬 Address: <code>${masterAddress}</code>\n\n` +
-                `⚠️ Send EXACTLY <code>${trackingAmount}</code> USDT on BSC (BEP-20)`,
+                `⚠️ Send EXACTLY <code>${trackingAmount || '?'}</code> USDT on BSC (BEP-20)`,
                 { parse_mode: 'HTML' }
             );
         } catch (fallbackErr) {
             logger.error('Fallback text message failed', { userId, error: fallbackErr.message });
         }
-        
-    } finally {
-        // CRITICAL FIX: Only delete after stream is fully consumed
-        if (tempFilePath) {
-            try {
-                const fs = await import('fs/promises');
-                await fs.unlink(tempFilePath);
-            } catch (cleanupErr) {
-                // Ignore cleanup errors - file might already be deleted
-            }
-        }
     }
-        }
-                
+     }
     
     
     async handleShareAddress(ctx) {
