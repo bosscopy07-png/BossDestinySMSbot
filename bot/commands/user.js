@@ -561,7 +561,7 @@ class UserCommands {
             const keyboard = Markup.inlineKeyboard([
                 [Markup.button.callback('📋 Copy Address', 'copy_address_' + depositAddress)],
                 [Markup.button.callback('📤 Share Address', 'share_address_' + depositAddress)],
-                [Markup.button.callback('📱 Show QR Code', 'deposit_qr')],
+                [Markup.button.callback('📱 Show Instant Transfer', 'deposit_qr')],
                 [Markup.button.callback('🔍 Check Deposit', 'check_deposit')],
                 [Markup.button.callback('🔙 Back', 'menu')]
             ]);
@@ -583,13 +583,14 @@ class UserCommands {
            
 async handleDepositQR(ctx) {
     const userId = ctx.from.id.toString();
+    
     try {
         const user = await User.findOne({ userId });
         const trackingAmount = user?.depositTrackingAmount;
         const requestedAmount = user?.depositRequestedAmount || trackingAmount;
 
         if (!trackingAmount) {
-            return ctx.answerCbQuery('⚠️ Click Deposit first');
+            return ctx.answerCbQuery('⚠️ Click Deposit first').catch(() => {});
         }
 
         let masterAddress = '';
@@ -598,48 +599,84 @@ async handleDepositQR(ctx) {
                 masterAddress = await this.walletService.getMasterAddress();
             }
         } catch (e) {
-            return ctx.answerCbQuery('❌ Address unavailable');
+            return ctx.answerCbQuery('❌ Address unavailable').catch(() => {});
         }
 
-        await ctx.answerCbQuery('📱 Generating QR...');
-
-        const qrBuffer = await QRCode.toBuffer(masterAddress, {
-            width: 280,
-            margin: 2,
-            color: { dark: '#00BCD4', light: '#FFFFFF' }
-        });
+        await ctx.answerCbQuery('📱 Loading deposit...').catch(() => {});
 
         const caption =
-            '📱 <b>Scan to Deposit</b>\n\n' +
-            '💵 You receive: <code>$' + requestedAmount + '</code>\n' +
-            '📬 Send exactly: <code>' + trackingAmount + '</code> USDT\n' +
-            '📬 Address: <code>' + masterAddress + '</code>\n\n' +
-            '⚠️ Send EXACTLY <code>' + trackingAmount + '</code> USDT on BSC (BEP-20)\n' +
-            '💰 <code>$' + requestedAmount + '</code> will be credited to your balance.';
-
-        const walletUrl = 'https://bscscan.com/address/' + masterAddress;
+            '💰 <b>Deposit to Fund Your Balance</b>\n\n' +
+            '📬 <b>Send Exactly:</b> <code>' + trackingAmount + '</code> USDT\n' +
+            '📬 <b>To Address:</b> <code>' + masterAddress + '</code>\n\n' +
+            '⚠️ <b>Must be BSC (BEP-20) Network Only!</b>\n\n' +
+            '💵 <b>Amount Credited:</b> <code>$' + requestedAmount + '</code>\n\n' +
+            '🔽 <b>Tap Your Wallet Below to Pay Instantly:</b>';
 
         const keyboard = {
             reply_markup: {
                 inline_keyboard: [
-                    [{ text: '🔗 View on BSCScan', url: walletUrl }],
+                    [
+                        { text: '🛡️ Trust Wallet', url: 'https://link.trustwallet.com/send?asset=c20000714_t0x55d398326f99059fF775485246999027B3197955&address=' + masterAddress + '&amount=' + trackingAmount + '&memo=SwiftSMS' },
+                        { text: '🦊 MetaMask', url: 'https://metamask.app.link/send/0x55d398326f99059fF775485246999027B3197955@56/transfer?address=' + masterAddress + '&uint256=' + Math.round(trackingAmount * 1e6) }
+                    ],
+                    [
+                        { text: '🔶 Binance Pay', url: 'https://www.binance.com/en/my/wallet/account/payment/send' },
+                        { text: '🛡️ SafePal', url: 'https://link.safepal.io/send?address=' + masterAddress + '&amount=' + trackingAmount + '&token=USDT&chain=bsc' }
+                    ],
+                    [
+                        { text: '👛 TokenPocket', url: 'https://tokenpocket.pro/' },
+                        { text: '🔵 OKX Wallet', url: 'https://www.okx.com/web3' }
+                    ],
+                    [
+                        { text: '🔴 Bitget Wallet', url: 'https://web3.bitget.com/' },
+                        { text: '🟣 Bybit Wallet', url: 'https://www.bybit.com/en-US/web3' }
+                    ],
+                    [
+                        { text: '🟢 Gate.io', url: 'https://www.gate.io/web3' },
+                        { text: '🟠 MEXC', url: 'https://www.mexc.com/web3' }
+                    ],
                     [{ text: '📋 Copy Address', callback_data: 'copy_address_' + masterAddress }],
-                    [{ text: '🔍 Check Deposit', callback_data: 'check_deposit' }],
-                    [{ text: '🔙 Back', callback_data: 'menu' }]
+                    [
+                        { text: '🔍 Check Deposit', callback_data: 'check_deposit' },
+                        { text: '🔙 Back', callback_data: 'menu' }
+                    ]
                 ]
             }
         };
 
         await ctx.replyWithPhoto(
-            { source: qrBuffer },
-            { caption: caption, parse_mode: 'HTML', reply_markup: keyboard.reply_markup }
+            IMAGES.deposit,
+            { 
+                caption: caption, 
+                parse_mode: 'HTML', 
+                reply_markup: keyboard.reply_markup 
+            }
         );
 
     } catch (error) {
-        logger.error('QR generation failed', { userId, error: error.message });
-        await ctx.answerCbQuery('❌ Failed to generate QR');
+        logger.error('Deposit menu failed', { userId, error: error.message, stack: error.stack });
+        await ctx.answerCbQuery('❌ Error loading deposit').catch(() => {});
+        
+        try {
+            const user = await User.findOne({ userId });
+            const fa = user?.depositAddress || masterAddress || 'N/A';
+            const ta = user?.depositTrackingAmount || '?';
+            const ra = user?.depositRequestedAmount || ta;
+            
+            await ctx.reply(
+                `💰 <b>Deposit to Fund Your Balance</b>\n\n` +
+                `📬 Send Exactly: <code>${ta}</code> USDT\n` +
+                `📬 To Address: <code>${fa}</code>\n\n` +
+                `⚠️ Must be BSC (BEP-20) Network Only!\n\n` +
+                `💵 Amount Credited: <code>$${ra}</code>`,
+                { parse_mode: 'HTML' }
+            );
+        } catch (e) {
+            logger.error('Fallback failed', { userId, error: e.message });
+        }
     }
 }
+    
     async handleShareAddress(ctx) {
         const address = ctx.match[1];
         await ctx.answerCbQuery('📤 Address ready!');
