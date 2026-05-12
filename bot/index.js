@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// bot/index.js (TelegramBot.js) — FIXED: Removed non-existent setWalletService call
+// bot/index.js (TelegramBot.js) — FIXED: Added NotificationService wiring
 // Part 1/3 — Imports, Constructor, Core Utilities
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -21,6 +21,7 @@ import FreeNumberController from '../services/sms/FreeNumberController.js';
 import StartVerification from './verification/StartVerification.js';
 import TierIntegrationService from '../services/TierIntegrationService.js';
 import TierFlowMiddleware from './middleware/TierFlowMiddleware.js';
+import NotificationService from '../services/NotificationService.js';
 import { cpus } from 'os';
 
 const VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
@@ -41,13 +42,14 @@ class TelegramBot {
         });
 
         // ═══════════════════════════════════════════════════════════════════════
-        //  SERVICE INITIALIZATION — Fixed: Removed setWalletService call
-        //  ReferralService does NOT have setWalletService method
+        //  SERVICE INITIALIZATION — Fixed: Added NotificationService wiring
+        //  Order: NotificationService → ReferralService → WalletService
         // ═══════════════════════════════════════════════════════════════════════
-        this.referralService = new ReferralService();
+        this.notificationService = new NotificationService(this.bot.telegram);
+        this.referralService = new ReferralService(null, this.notificationService);
         this.walletService = new WalletService(this.referralService);
-        // REMOVED: this.referralService.setWalletService(this.walletService);
-        // If WalletService needs ReferralService, pass it in constructor
+        // Back-reference after WalletService is created
+        this.referralService.walletService = this.walletService;
 
         this.smsProviderManager = null;
         this.freeNumberController = null;
@@ -288,8 +290,9 @@ class TelegramBot {
                 setTimeout(() => this.gracefulShutdown('unhandledRejection'), 1500);
             }
         });
-                                }
-                // ═══════════════════════════════════════════════════════════════════════════════
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
 // bot/index.js (TelegramBot.js) — Part 2/3
 // Middleware Stack, Command Setup, Tier Integration & Free Tier
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -512,7 +515,15 @@ class TelegramBot {
             });
         }
 
-        const userCommands = new UserCommands(this.bot, this.walletService);
+        // ═══════════════════════════════════════════════════════════════════════
+        //  FIXED: Pass referralService and notificationService to UserCommands
+        // ═══════════════════════════════════════════════════════════════════════
+        const userCommands = new UserCommands(
+            this.bot, 
+            this.walletService, 
+            this.referralService, 
+            this.notificationService
+        );
         const otpCommands = new OTPCommands(this.bot, this.walletService, this.smsProviderManager);
         const adminCommands = new AdminCommands(this.bot, this.walletService, this.referralService, this.smsProviderManager);
         const advancedAdmin = new Admin(
@@ -757,8 +768,9 @@ class TelegramBot {
                 });
             }
         });
-                    }
-                    // ═══════════════════════════════════════════════════════════════════════════════
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
 // bot/index.js (TelegramBot.js) — Part 3/3
 // Launch Sequence, Deposit Scanner, Metrics & Graceful Shutdown
 // ═══════════════════════════════════════════════════════════════════════════════
