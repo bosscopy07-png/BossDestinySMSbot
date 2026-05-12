@@ -1544,103 +1544,173 @@ setupTextHandlers() {
     }
     
     // ═══════════════════════════════════════════════════════════════════════
-    //  FREE SERVICE SELECTED — User picks service after credits pass
+        // ═══════════════════════════════════════════════════════════════════════
+    //  FREE SERVICE SELECTED — User picked a service in FREE mode
     // ═══════════════════════════════════════════════════════════════════════
-async handleFreeCountrySelected(ctx, countryCode) {
+
+    async handleFreeServiceSelected(ctx) {
         const userId = ctx.from?.id?.toString();
+        const serviceId = ctx.match?.[1];
 
         try {
-            ctx.session = ctx.session || {};
-            const serviceCode = ctx.session.selectedService;
+            await ctx.answerCbQuery().catch(() => {});
 
-            if (!serviceCode) {
-                return ctx.editMessageText(
-                    '❌ Session expired. Please start over.',
-                    {
-                        parse_mode: 'HTML',
-                        reply_markup: Markup.inlineKeyboard([
-                            [Markup.button.callback('🔙 Main Menu', 'menu')]
-                        ]).reply_markup
-                    }
-                );
+            ctx.session = ctx.session || {};
+            ctx.session.selectedService = serviceId;
+            ctx.session.otpMode = 'FREE';
+
+            // Get available countries for this service in FREE mode
+            const freeProvider = this.smsProviderManager?.getProvider('FREE_PUBLIC');
+            let availableCountries = [];
+
+            if (freeProvider?.getAvailableCountries) {
+                availableCountries = await freeProvider.getAvailableCountries(serviceId);
+            } else {
+                // Fallback to common countries
+                availableCountries = [
+                    { code: 'US', name: '🇺🇸 United States', flag: '🇺🇸' },
+                    { code: 'UK', name: '🇬🇧 United Kingdom', flag: '🇬🇧' },
+                    { code: 'CA', name: '🇨🇦 Canada', flag: '🇨🇦' },
+                    { code: 'AU', name: '🇦🇺 Australia', flag: '🇦🇺' },
+                    { code: 'DE', name: '🇩🇪 Germany', flag: '🇩🇪' },
+                    { code: 'FR', name: '🇫🇷 France', flag: '🇫🇷' },
+                    { code: 'IN', name: '🇮🇳 India', flag: '🇮🇳' },
+                    { code: 'NG', name: '🇳🇬 Nigeria', flag: '🇳🇬' }
+                ];
             }
 
-            await ctx.editMessageText(
-                '⏳ <b>Requesting free number...</b>',
-                { parse_mode: 'HTML' }
-            );
+            const serviceName = SERVICES[serviceId]?.name || serviceId;
 
+            const message =
+                '🆓 <b>Free Mode — Select Country</b>\n\n' +
+                `Service: <b>${serviceName}</b>\n\n` +
+                'Select a country for your free number:\n\n' +
+                '<i>Free numbers are shared and may be blocked by major services.</i>';
+
+            const buttons = availableCountries.slice(0, 8).map(c => [
+                Markup.button.callback(`${c.flag || '🌍'} ${c.name}`, `free_country_${c.code}_${serviceId}`)
+            ]);
+
+            buttons.push([Markup.button.callback('🔙 Back', 'confirm_free_mode')]);
+            buttons.push([Markup.button.callback('🏠 Menu', 'menu')]);
+
+            const keyboard = Markup.inlineKeyboard(buttons);
+
+            await this.sendPhotoWithCaption(ctx, IMAGES.freeMode, message, keyboard, 'HTML');
+
+        } catch (error) {
+            logger.error('handleFreeServiceSelected error', { userId, serviceId, error: error.message });
+            await ctx.answerCbQuery('❌ Error').catch(() => {});
+            await ctx.reply('❌ Failed to load countries. Try again.').catch(() => {});
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  FREE COUNTRY SELECTED — User picked a country in FREE mode
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleFreeCountrySelected(ctx) {
+        const userId = ctx.from?.id?.toString();
+        const countryCode = ctx.match?.[1];
+        const serviceId = ctx.match?.[2];
+
+        try {
+            await ctx.answerCbQuery('⏳ Requesting free number...').catch(() => {});
+
+            ctx.session = ctx.session || {};
+            ctx.session.selectedCountry = countryCode;
+            ctx.session.selectedService = serviceId;
+            ctx.session.otpMode = 'FREE';
+
+            const user = ctx.state.user || await User.findOne({ userId });
+
+            // Check free limit again
+            if (!this._canUseFree(user)) {
+                return this._showFreeExhausted(ctx, user);
+            }
+
+            // Request free number via FreeNumberController
+            if (this.freeNumberController) {
+                // Store selection in session for FreeNumberController
+                ctx.session.freeSelection = {
+                    serviceId,
+                    countryCode,
+                    timestamp: Date.now()
+                };
+
+                // Delegate to FreeNumberController
+                return await this.freeNumberController.handleFreeRequest(ctx);
+            }
+
+            // Fallback if no FreeNumberController
             const freeProvider = this.smsProviderManager?.getProvider('FREE_PUBLIC');
             if (!freeProvider) {
-                return ctx.editMessageText(
-                    '❌ Free service unavailable.',
+                return ctx.reply('❌ Free service temporarily unavailable. Try CHEAP mode.', {
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('💰 CHEAP Mode', 'mode_cheap')],
+                        [Markup.button.callback('🔙 Back', 'menu')]
+                    ]).reply_markup
+                });
+            }
+
+            // Direct provider request fallback
+            const numberResult = await freeProvider.requestNumber({
+                userId,
+                service: serviceId,
+                country: countryCode
+            });
+
+            if (numberResult.success) {
+                // Increment free usage
+                await User.updateOne(
+                    { userId },
+                    { $inc: { freeUsedToday: 1 } }
+                );
+
+                const message =
+                    '📱 <b>Free Number Assigned</b>\n\n' +
+                    `📞 Number: <code>${numberResult.number}</code>\n` +
+                    `🌍 Country: ${countryCode}\n` +
+                    `🔢 Service: ${SERVICES[serviceId]?.name || serviceId}\n\n` +
+                    `⏳ Waiting for OTP...\n` +
+                    `<i>Free numbers expire in 10 minutes.</i>`;
+
+                await ctx.reply(message, {
+                    parse_mode: 'HTML',
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🔄 Check OTP', `check_otp_${numberResult.sessionId}`)],
+                        [Markup.button.callback('❌ Cancel', `cancel_free_${numberResult.sessionId}`)],
+                        [Markup.button.callback('🔙 Menu', 'menu')]
+                    ]).reply_markup
+                });
+
+            } else {
+                await ctx.reply(
+                    `❌ <b>${numberResult.error || 'Failed to get free number'}</b>\n\n` +
+                    'Free numbers may be temporarily unavailable.\n' +
+                    'Try CHEAP mode for guaranteed delivery.',
                     {
                         parse_mode: 'HTML',
                         reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('💰 CHEAP Mode', 'mode_cheap')],
                             [Markup.button.callback('🔙 Back', 'menu')]
                         ]).reply_markup
                     }
                 );
             }
 
-            const result = await freeProvider.requestNumber(userId, serviceCode, countryCode);
-
-            if (!result.success) {
-                return ctx.editMessageText(
-                    `❌ <b>Failed to get number</b>\n\n${result.message || 'Please try again.'}`,
-                    {
-                        parse_mode: 'HTML',
-                        reply_markup: Markup.inlineKeyboard([
-                            [Markup.button.callback('🔄 Try Again', `free_country_${countryCode}`)],
-                            [Markup.button.callback('🔙 Back', `free_service_${serviceCode}`)],
-                            [Markup.button.callback('🔙 Menu', 'menu')]
-                        ]).reply_markup
-                    }
-                );
-            }
-
-            const dbSession = await Session.create({
-                sessionId: result.sessionId || `free_${Date.now()}_${userId}`,
-                userId,
-                mode: 'FREE',
-                service: serviceCode,
-                country: countryCode,
-                number: result.number,
-                providerNumberId: result.providerNumberId,
-                status: 'CHECKING',
-                startTime: new Date()
-            });
-
-            ctx.session.freeSessionId = result.sessionId;
-            ctx.session.providerNumberId = result.providerNumberId;
-            ctx.session.number = result.number;
-            ctx.session.service = serviceCode;
-            ctx.session.dbSessionId = dbSession._id.toString();
-
-            await ctx.editMessageText(
-                `📱 <b>Free OTP Requested</b>\n\n` +
-                `Number: <code>${result.number}</code>\n` +
-                `Service: ${serviceCode}\n` +
-                `Country: ${countryCode}\n\n` +
-                `⏳ Waiting for SMS...\n\n` +
-                `<i>Number will be cancelled automatically if no SMS received within 10 minutes.</i>`,
-                {
-                    parse_mode: 'HTML',
-                    reply_markup: Markup.inlineKeyboard([
-                        [Markup.button.callback('🔄 Check Now', `check_free_${result.sessionId}`)],
-                        [Markup.button.callback('❌ Cancel', `cancel_free_${result.sessionId}`)]
-                    ]).reply_markup
-                }
-            );
-
-            this.startFreePolling(ctx, userId, result.sessionId, dbSession.sessionId);
-
         } catch (error) {
-            logger.error('handleFreeCountrySelected error', { userId, countryCode, error: error.message });
-            ctx.answerCbQuery('❌ Error requesting number').catch(() => {});
+            logger.error('handleFreeCountrySelected error', { 
+                userId, 
+                countryCode, 
+                serviceId, 
+                error: error.message 
+            });
+            await ctx.answerCbQuery('❌ Error').catch(() => {});
+            await ctx.reply('❌ Failed to request free number. Try again.').catch(() => {});
         }
     }
-
+        
     // ═══════════════════════════════════════════════════════════════════════
     //  FREE CHECK NOW — Manual poll for SMS
     // ═══════════════════════════════════════════════════════════════════════
