@@ -484,6 +484,40 @@ async handleRequestOTP(ctx) {
 
         await this.sendPhotoWithCaption(ctx, IMAGES.balance, message, keyboard, 'HTML');
     }
+        // ═══════════════════════════════════════════════════════════
+    //  HANDLE DEPOSIT — Fixed: Added missing method
+    // ═══════════════════════════════════════════════════════════
+    async handleDeposit(ctx) {
+        const userId = ctx.from.id.toString();
+        try {
+            await ctx.answerCbQuery('💳 Deposit').catch(() => {});
+
+            const message =
+                '💳 <b>Select Deposit Amount</b>\n\n' +
+                'Choose a preset amount or enter a custom amount:\n\n' +
+                '💵 <code>$5</code> — Quick start\n' +
+                '💵 <code>$10</code> — Popular\n' +
+                '💵 <code>$20</code> — Great value\n' +
+                '💵 <code>$50</code> — Power user\n' +
+                '💵 <code>$100</code> — Maximum bonus\n\n' +
+                'Or tap Custom to enter any amount.';
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('💵 $5', 'deposit_5'), Markup.button.callback('💵 $10', 'deposit_10')],
+                [Markup.button.callback('💵 $20', 'deposit_20'), Markup.button.callback('💵 $50', 'deposit_50')],
+                [Markup.button.callback('💵 $100', 'deposit_100')],
+                [Markup.button.callback('✏️ Custom Amount', 'deposit_custom')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]);
+
+            await this.sendPhotoWithCaption(ctx, IMAGES.deposit, message, keyboard, 'HTML');
+
+        } catch (error) {
+            logger.error('Deposit handler error', { userId, error: error.message });
+            await ctx.answerCbQuery('❌ Error').catch(() => {});
+        }
+    }
+    
 
     async handleCustomDeposit(ctx) {
         const userId = ctx.from.id.toString();
