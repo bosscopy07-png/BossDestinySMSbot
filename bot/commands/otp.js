@@ -520,6 +520,9 @@ registerCommands() {
     this.bot.action('contact_support', this.handleContactSupport);
     this.bot.action('cancel_vip_subscription', this.handleCancelVipSubscription);
     this.bot.action('confirm_vip_cancel', this.handleConfirmVipCancel);
+            // In registerCommands() or constructor, add
+    this.bot.action(/free_service_(.+)/, this.handleFreeServiceSelected.bind(this));
+    this.bot.action(/free_country_([A-Z]{2})_(.+)/, this.handleFreeCountrySelected.bind(this));
     
     // ═════════════════════════════════════════════════════════════════
     //  UTILITY ACTIONS
@@ -537,23 +540,6 @@ registerCommands() {
     // ═════════════════════════════════════════════════════════════════
     //  FREE MODE ACTIONS (Legacy)
     // ═════════════════════════════════════════════════════════════════
-    this.bot.action(/free_service_(.+)/, async (ctx) => {
-        try {
-            await this.handleFreeServiceSelected(ctx, ctx.match[1]);
-        } catch (error) {
-            logger.error('free_service action error', { error: error.message, userId: ctx.from?.id });
-            ctx.answerCbQuery('❌ Error').catch(() => {});
-        }
-    });
-
-    this.bot.action(/free_country_(.+)/, async (ctx) => {
-        try {
-            await this.handleFreeCountrySelected(ctx, ctx.match[1]);
-        } catch (error) {
-            logger.error('free_country action error', { error: error.message, userId: ctx.from?.id });
-            ctx.answerCbQuery('❌ Error').catch(() => {});
-        }
-    });
 
     this.bot.action(/cancel_free_(.+)/, async (ctx) => {
         try {
