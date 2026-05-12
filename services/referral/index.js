@@ -1,11 +1,56 @@
-import { User, Referral, Transaction } from '../../models/index.js';
+// ═══════════════════════════════════════════════════════════
+//  PART 1: ReferralService with Notification & Race Fix
+// ═══════════════════════════════════════════════════════════
+
+import { User, Referral, Transaction, Notification } from '../../models/index.js';
 import { generateId } from '../../utils/helpers.js';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
 
 class ReferralService {
-    constructor(walletService = null) {
+    constructor(walletService = null, notificationService = null) {
         this.walletService = walletService;
+        this.notificationService = notificationService;
+    }
+
+    // ─── Internal: Send notification to referrer ───
+    async _notifyReferrer(referrerId, type, payload) {
+        if (!this.notificationService) {
+            logger.warn('NotificationService not available, referrer will not be alerted', { referrerId, type });
+            return;
+        }
+
+        try {
+            await this.notificationService.send(referrerId, {
+                type,
+                ...payload,
+                timestamp: new Date()
+            });
+        } catch (notifyError) {
+            logger.error('Failed to send referral notification', {
+                referrerId,
+                type,
+                error: notifyError.message
+            });
+            // Non-blocking: don't throw, just log
+        }
+    }
+
+    // ─── Internal: Send deposit notification ───
+    async _notifyDeposit(referrerId, referredId, depositAmount, status) {
+        const messages = {
+            PENDING: `🎉 Great news! A new user joined with your referral code. They haven't deposited yet.`,
+            DEPOSITED: `💰 Your referral made their first deposit of $${depositAmount.toFixed(2)}! Reward is pending admin approval.`,
+            BELOW_MINIMUM: `📉 Your referral deposited $${depositAmount.toFixed(2)}, but it's below the $${config.referral?.minDeposit ?? 5} minimum required for reward.`
+        };
+
+        await this._notifyReferrer(referrerId, 'REFERRAL_UPDATE', {
+            title: 'Referral Update',
+            message: messages[status] || 'Referral status updated.',
+            referredId,
+            depositAmount,
+            status
+        });
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -31,31 +76,47 @@ class ReferralService {
                 return null;
             }
 
-            // Check if already referred
-            const existing = await Referral.findOne({ referredId });
-            if (existing) {
-                logger.info('User already has referral record', { referredId, status: existing.status });
-                return existing;
-            }
-
-            // Create referral record
-            const referral = await Referral.create({
-                referralId: generateId(),
-                referrerId: referrer.userId,
-                referredId,
-                status: 'PENDING',
-                rewardPercentage: config.referral?.percentage ?? 0.05,
-                metadata: {
-                    referrerCode: cleanCode,
-                    joinedAt: new Date()
+            // Atomic check-and-create to prevent race conditions
+            let referral;
+            try {
+                referral = await Referral.create({
+                    referralId: generateId(),
+                    referrerId: referrer.userId,
+                    referredId,
+                    status: 'PENDING',
+                    rewardPercentage: config.referral?.percentage ?? 0.05,
+                    metadata: {
+                        referrerCode: cleanCode,
+                        joinedAt: new Date()
+                    }
+                });
+            } catch (createError) {
+                // Duplicate key error — referral already exists
+                if (createError.code === 11000) {
+                    referral = await Referral.findOne({ referredId });
+                    logger.info('User already has referral record (race condition handled)', {
+                        referredId,
+                        status: referral?.status
+                    });
+                    return referral;
                 }
-            });
+                throw createError;
+            }
 
             // Increment referrer's referral count
             await User.updateOne(
                 { userId: referrer.userId },
                 { $inc: { referralCount: 1 } }
             );
+
+            // 🔔 NOTIFY REFERRER: New signup
+            await this._notifyReferrer(referrer.userId, 'REFERRAL_JOINED', {
+                title: '🎉 New Referral!',
+                message: `A new user just joined using your referral code! You'll earn ${(referral.rewardPercentage * 100).toFixed(0)}% of their first deposit.`,
+                referredId,
+                referralId: referral.referralId,
+                rewardPercentage: referral.rewardPercentage
+            });
 
             logger.info('Referral tracked', {
                 referralId: referral.referralId,
@@ -98,8 +159,9 @@ class ReferralService {
                 return null;
             }
 
-            // Check minimum deposit
             const minDeposit = config.referral?.minDeposit ?? 5;
+
+            // Check minimum deposit
             if (depositAmount < minDeposit) {
                 logger.info('Deposit below referral minimum', {
                     userId,
@@ -107,6 +169,28 @@ class ReferralService {
                     minimum: minDeposit,
                     referralId: referral.referralId
                 });
+
+                // 🔔 NOTIFY: Deposit too small
+                await this._notifyDeposit(
+                    referral.referrerId,
+                    userId,
+                    depositAmount,
+                    'BELOW_MINIMUM'
+                );
+
+                // Still mark as deposited but note it didn't qualify
+                await Referral.updateOne(
+                    { referralId: referral.referralId },
+                    {
+                        $set: {
+                            status: 'DEPOSITED_INELIGIBLE',
+                            firstDepositAmount: depositAmount,
+                            firstDepositDate: new Date(),
+                            ineligibleReason: `Below minimum deposit: $${depositAmount} < $${minDeposit}`
+                        }
+                    }
+                );
+
                 return null;
             }
 
@@ -115,11 +199,11 @@ class ReferralService {
                 'metadata.referralId': referral.referralId,
                 type: 'REFERRAL_REWARD'
             });
-            
+
             if (existingReward) {
-                logger.warn('Referral reward already exists', { 
+                logger.warn('Referral reward already exists', {
                     referralId: referral.referralId,
-                    existingTxId: existingReward.txId 
+                    existingTxId: existingReward.txId
                 });
                 return null;
             }
@@ -164,6 +248,14 @@ class ReferralService {
                 {
                     $inc: { referralRewardsPending: rewardAmount }
                 }
+            );
+
+            // 🔔 NOTIFY REFERRER: Deposit made, reward pending
+            await this._notifyDeposit(
+                referral.referrerId,
+                userId,
+                depositAmount,
+                'DEPOSITED'
             );
 
             logger.info('Referral reward pending approval', {
@@ -243,6 +335,15 @@ class ReferralService {
                 }
             );
 
+            // 🔔 NOTIFY REFERRER: Reward approved
+            await this._notifyReferrer(tx.userId, 'REFERRAL_REWARDED', {
+                title: '✅ Referral Reward Approved!',
+                message: `$${tx.amount.toFixed(2)} has been credited to your balance.`,
+                amount: tx.amount,
+                referralId,
+                txId
+            });
+
             logger.info('Referral reward approved', {
                 txId,
                 referrerId: tx.userId,
@@ -312,6 +413,15 @@ class ReferralService {
                     }
                 }
             );
+
+            // 🔔 NOTIFY REFERRER: Reward rejected
+            await this._notifyReferrer(tx.userId, 'REFERRAL_REJECTED', {
+                title: '❌ Referral Reward Rejected',
+                message: `Your referral reward of $${tx.amount.toFixed(2)} was rejected. Reason: ${reason}`,
+                amount: tx.amount,
+                reason,
+                txId
+            });
 
             logger.info('Referral reward rejected', {
                 txId,
@@ -419,6 +529,7 @@ class ReferralService {
                 totalReferrals: referrer.referralCount || 0,
                 successfulReferrals: referrals.filter(r => r.status === 'REWARDED').length,
                 pendingReferrals: referrals.filter(r => r.status === 'DEPOSITED').length,
+                ineligibleReferrals: referrals.filter(r => r.status === 'DEPOSITED_INELIGIBLE').length,
                 totalEarned,
                 pendingApproval: referrer.referralRewardsPending || 0,
                 recentReferrals: referrals.slice(0, 10).map(r => ({
@@ -426,6 +537,7 @@ class ReferralService {
                     status: r.status,
                     depositAmount: r.firstDepositAmount,
                     rewardAmount: r.rewardAmount,
+                    ineligibleReason: r.ineligibleReason,
                     date: r.createdAt
                 }))
             };
@@ -449,4 +561,4 @@ class ReferralService {
 }
 
 export default ReferralService;
-                
+
