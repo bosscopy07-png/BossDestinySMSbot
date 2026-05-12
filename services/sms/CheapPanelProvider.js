@@ -7,6 +7,7 @@
 //  - getNumber: Returns actual cost vs display price separately
 //  - cancelNumber: Validates activation ID is numeric, not phone number
 //  - request: Proper error logging without crashing
+//  - FIXED: Detects empty/HTML responses, throws meaningful errors for fallback
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import axios from 'axios';
@@ -156,7 +157,7 @@ class CheapPanelProvider {
 
     async request(method, endpoint, data = null, timeout = 10000) {
         const url = `${this.baseUrl}${endpoint}`;
-        const config = {
+        const axiosConfig = {
             method,
             url,
             headers: this.getHeaders(),
@@ -164,17 +165,41 @@ class CheapPanelProvider {
             validateStatus: () => true
         };
         
-        if (data) config.data = data;
+        if (data) axiosConfig.data = data;
         
-        const response = await axios(config);
+        const response = await axios(axiosConfig);
         
-        if (response.status >= 400) {
+        // CRITICAL FIX: Detect empty/HTML responses that indicate real errors
+        if (response.status >= 400 || !response.data || typeof response.data !== 'object') {
+            const errorData = response.data;
+            const isHtmlError = typeof errorData === 'string' && errorData.includes('<');
+            const isEmpty = !errorData || (typeof errorData === 'string' && errorData.trim() === '');
+            
             logger.error('5SIM API error response', {
                 url,
                 status: response.status,
                 statusText: response.statusText,
-                data: response.data
+                isHtmlError,
+                isEmpty,
+                dataPreview: isHtmlError ? 'HTML_ERROR_PAGE' : (isEmpty ? 'EMPTY_BODY' : errorData)
             });
+
+            // Throw with meaningful error so getNumber() can categorize it
+            if (response.status === 404) {
+                throw new Error(`NOT_AVAILABLE: 5SIM returned 404 for ${url}`);
+            }
+            if (response.status === 400) {
+                const msg = isHtmlError ? 'Invalid operator/country combination' : (errorData?.error || errorData?.message || 'Bad request');
+                throw new Error(`NOT_AVAILABLE: ${msg}`);
+            }
+            if (response.status === 429) {
+                throw new Error(`TIMEOUT: 5SIM rate limited (429)`);
+            }
+            if (isEmpty || isHtmlError) {
+                throw new Error(`NOT_AVAILABLE: 5SIM returned empty/invalid response for this operator`);
+            }
+            
+            throw new Error(`PROVIDER_ERROR: HTTP ${response.status} - ${errorData?.error || 'Unknown error'}`);
         }
         
         return response;
@@ -393,7 +418,7 @@ class CheapPanelProvider {
     //  PRODUCT CACHE
     // ═══════════════════════════════════════════════════════════
 
-    async getProducts() {
+        async getProducts() {
         const now = Date.now();
         if (this.productsCache && (now - this.productsCacheTime) < this.productsCacheTtl) {
             return this.productsCache;
@@ -576,30 +601,30 @@ class CheapPanelProvider {
                 message: data?.message
             });
 
-            if (statusCode >= 400) {
-                const errorMsg = data?.error || data?.message || `HTTP ${statusCode}`;
+            // CRITICAL FIX: Handle empty/invalid responses before checking data fields
+            if (statusCode >= 400 || !data || typeof data !== 'object') {
+                const errorMsg = data?.error || data?.message || (typeof data === 'string' ? data : null) || `HTTP ${statusCode}`;
+                const isEmptyResponse = !data || (typeof data === 'string' && data.trim() === '');
                 
-                if (errorMsg.toLowerCase().includes('not enough user balance') || 
-                    errorMsg.toLowerCase().includes('no balance') ||
-                    errorMsg.toLowerCase().includes('insufficient funds')) {
+                // Check balance errors first
+                const lowerMsg = (errorMsg || '').toLowerCase();
+                if (lowerMsg.includes('not enough user balance') || 
+                    lowerMsg.includes('no balance') ||
+                    lowerMsg.includes('insufficient funds')) {
                     throw new Error(`NO_BALANCE: ${errorMsg}`);
                 }
 
-                if (statusCode === 404) {
-                    if (errorMsg.includes('country') || errorMsg.includes('not found')) {
-                        throw new Error(`BAD_COUNTRY: ${providerCountry} not available`);
-                    }
-                    if (errorMsg.includes('service') || errorMsg.includes('product')) {
-                        throw new Error(`BAD_SERVICE: ${providerService} not available in ${providerCountry}`);
-                    }
-                    throw new Error(`NOT_AVAILABLE: ${errorMsg}`);
+                // 404 = not available (country/service/operator combo doesn't work)
+                if (statusCode === 404 || isEmptyResponse) {
+                    throw new Error(`NOT_AVAILABLE: ${service} not available in ${country} with operator ${operator}. Try another country or operator.`);
+                }
+
+                // 400 = bad request (often means operator doesn't support this combo)
+                if (statusCode === 400) {
+                    throw new Error(`NOT_AVAILABLE: Invalid combination: ${operator} for ${service} in ${country}. Try another operator.`);
                 }
                 
                 throw new Error(`PROVIDER_ERROR: ${errorMsg}`);
-            }
-
-            if (!data || typeof data !== 'object') {
-                throw new Error('INVALID_RESPONSE: Empty or non-object response');
             }
 
             if (!data.id) {
@@ -856,8 +881,8 @@ class CheapPanelProvider {
         if (digits?.length > 0) return digits[digits.length - 1];
 
         return null;
-                                            }
-    
+                                                                  }
+            
     // ═══════════════════════════════════════════════════════════
     //  NUMBER MANAGEMENT
     // ═══════════════════════════════════════════════════════════
@@ -1052,4 +1077,3 @@ class CheapPanelProvider {
 }
 
 export default CheapPanelProvider;
-    
