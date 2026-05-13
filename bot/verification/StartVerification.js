@@ -1,7 +1,9 @@
-// ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 //  bot/verification/StartVerification.js
 //  Mandatory CAPTCHA + Channel Join Verification
-// ═══════════════════════════════════════════════════════════
+//  FIXED: Session-persistent referral tracking, robust error handling,
+//         fail-closed security, atomic state management
+// ═══════════════════════════════════════════════════════════════════════════════
 
 import logger from '../../utils/logger.js';
 
@@ -30,10 +32,11 @@ class StartVerification {
         this._registerCallbacks();
     }
 
-    /**
-     * Resolves the effective user ID from a context.
-     * Handles anonymous channel/group posts where ctx.from is the sender_chat.
-     */
+    // ═══════════════════════════════════════════════════════
+    //  UTILITY: Resolve effective user ID
+    //  Handles anonymous channel/group posts (senderChat)
+    // ═══════════════════════════════════════════════════════
+
     _getEffectiveUserId(ctx) {
         if (ctx.senderChat?.id) {
             return ctx.senderChat.id;
@@ -42,7 +45,40 @@ class StartVerification {
     }
 
     // ═══════════════════════════════════════════════════════
+    //  UTILITY: Extract and persist referral code from context
+    //  CRITICAL: Must be called BEFORE any context-consuming operations
+    // ═══════════════════════════════════════════════════════
+
+    _captureReferralCode(ctx) {
+        const userId = this._getEffectiveUserId(ctx);
+        let captured = null;
+
+        // Source 1: Deep link payload (t.me/bot?start=CODE)
+        if (ctx.startPayload) {
+            captured = ctx.startPayload.toString().toUpperCase().trim();
+            logger.info('[StartVerification] Referral code captured from startPayload', { userId, code: captured });
+        }
+
+        // Source 2: Message text (user typed /start CODE manually)
+        const text = ctx.message?.text || '';
+        const startMatch = text.match(/^\/start\s+([A-Z0-9]+)/i);
+        if (!captured && startMatch) {
+            captured = startMatch[1].toUpperCase().trim();
+            logger.info('[StartVerification] Referral code captured from message text', { userId, code: captured });
+        }
+
+        // Persist to session if found and not already stored
+        if (captured && !ctx.session?.pendingReferralCode) {
+            ctx.session.pendingReferralCode = captured;
+            logger.info('[StartVerification] Referral code persisted to session', { userId, code: captured });
+        }
+
+        return captured;
+    }
+
+    // ═══════════════════════════════════════════════════════
     //  PUBLIC API: Main entry point for /start
+    //  Order: Capture code → Admin bypass → Block check → Fresh check → CAPTCHA → Membership
     // ═══════════════════════════════════════════════════════
 
     async handleStart(ctx) {
@@ -52,6 +88,10 @@ class StartVerification {
             logger.warn('[StartVerification] Missing userId in /start');
             return ctx.reply('❌ Unable to identify user. Please try again.').catch(() => {});
         }
+
+        // CRITICAL: Capture referral code IMMEDIATELY before any verification steps
+        // This is the only point where ctx.startPayload is reliably available
+        this._captureReferralCode(ctx);
 
         // ─── Admin bypass (supports anonymous posts) ───
         if (this.isAdmin(userId)) {
@@ -139,7 +179,6 @@ class StartVerification {
             `<code>${challenge.question}</code>\n\n` +
             `<i>Attempt ${ctx.session.captchaAttempts + 1}/${CAPTCHA_MAX_ATTEMPTS}</i>`;
 
-        // Shuffle options so correct answer isn't always in same position
         const options = this._shuffleArray([...challenge.options]);
 
         const keyboard = {
@@ -187,7 +226,6 @@ class StartVerification {
 
         const question = `${a} ${op} ${b} = ?`;
 
-        // Generate 3 wrong answers close to correct
         const options = new Set([answer]);
         while (options.size < 4) {
             const offset = Math.floor(Math.random() * 10) - 5;
@@ -243,7 +281,7 @@ class StartVerification {
                 await ctx.deleteMessage().catch(() => {});
                 await ctx.reply('✅ <b>Verified!</b> Now let\'s check your channel membership...', { parse_mode: 'HTML' });
 
-                // Continue to membership check
+                // Continue to membership check (which will call _runUserStart if passed)
                 return await this.handleStart(ctx);
             }
 
@@ -374,7 +412,6 @@ class StartVerification {
             return false;
 
         } catch (checkErr) {
-            // FAIL-CLOSED: On API error, revoke access rather than allow
             logger.error('[StartVerification] Re-verify check failed — revoking access', { userId, error: checkErr.message });
             ctx.session.joinVerified = false;
             delete ctx.session.joinVerifiedAt;
@@ -387,14 +424,13 @@ class StartVerification {
             return false;
         }
     }
-            // ═══════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════
     //  PRIVATE: Register callback actions
     // ═══════════════════════════════════════════════════════
 
     _registerCallbacks() {
         this.bot.action('verify_join_status', (ctx) => this.handleVerifyCallback(ctx));
-
-        // Register CAPTCHA answer handler — matches any captcha_N callback
         this.bot.action(/^captcha_(-?\d+)$/, (ctx) => this.handleCaptchaAnswer(ctx));
     }
 
@@ -485,39 +521,38 @@ class StartVerification {
         }
     }
 
-// ═══════════════════════════════════════════════════════
-//  PRIVATE: Forward to the real user start command
-//  FIXED: Preserve startPayload for referral tracking
-// ═══════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════
+    //  PRIVATE: Forward to the real user start command
+    //  FIXED: Session-persistent referral code is already captured
+    // ═══════════════════════════════════════════════════════
 
-async _runUserStart(ctx) {
-    try {
-        // Preserve original start payload if it exists (from deep link t.me/bot?start=CODE)
-        // This is critical because ctx.startPayload gets lost after CAPTCHA/channel verification callbacks
-        if (ctx.startPayload && !ctx.session?.pendingReferralCode) {
-            ctx.session.pendingReferralCode = ctx.startPayload.toUpperCase().trim();
-            logger.debug('[StartVerification] Preserved startPayload in session', { 
-                userId: this._getEffectiveUserId(ctx),
-                code: ctx.session.pendingReferralCode 
+    async _runUserStart(ctx) {
+        const userId = this._getEffectiveUserId(ctx);
+        
+        try {
+            // Log what we're passing to userCommands for debugging
+            const hasSessionCode = !!ctx.session?.pendingReferralCode;
+            logger.debug('[StartVerification] Forwarding to userCommands.handleStart', {
+                userId,
+                hasSessionCode,
+                sessionCode: ctx.session?.pendingReferralCode || null
             });
+            
+            return await this.userCommands.handleStart(ctx);
+        } catch (err) {
+            logger.error('[StartVerification] userCommands.handleStart failed', {
+                error: err.message,
+                userId
+            });
+            await this.alertAdmins(err, {
+                userId,
+                updateType: 'message',
+                command: '/start',
+                note: 'User verified but handleStart threw'
+            });
+            throw err;
         }
-        
-        return await this.userCommands.handleStart(ctx);
-    } catch (err) {
-        logger.error('[StartVerification] userCommands.handleStart failed', {
-            error: err.message,
-            userId: this._getEffectiveUserId(ctx)
-        });
-        await this.alertAdmins(err, {
-            userId: this._getEffectiveUserId(ctx),
-            updateType: 'message',
-            command: '/start',
-            note: 'User verified but handleStart threw'
-        });
-        throw err;
     }
-}
-        
 }
 
 export default StartVerification;
