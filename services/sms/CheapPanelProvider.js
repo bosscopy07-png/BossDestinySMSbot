@@ -9,6 +9,7 @@
 //  - request: Proper error logging without crashing
 //  - FIXED: Detects empty/HTML responses, throws meaningful errors for fallback
 //  - FIXED: Returns exact operator used in response to prevent mismatch
+//  - FIXED: mapOperator no longer uses stale hardcoded whitelist
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import axios from 'axios';
@@ -92,20 +93,6 @@ class CheapPanelProvider {
         this.reverseCountryMap = Object.fromEntries(
             Object.entries(this.countryMap).map(([iso, sim]) => [sim, iso])
         );
-
-        this.operatorMap = {
-            'default': ['any'],
-            'usa': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual8', 'virtual12', 'virtual15', 'virtual16', 'virtual20', 'virtual21', 'virtual23', 'virtual24', 'virtual25', 'virtual26', 'virtual29', 'virtual30', 'virtual31', 'virtual32', 'virtual33', 'virtual34', 'virtual35', 'virtual36', 'virtual37', 'virtual38', 'virtual39', 'virtual40', 'virtual41', 'virtual42', 'virtual43', 'virtual44', 'virtual45'],
-            'england': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual8', 'virtual16', 'virtual21', 'virtual26', 'virtual30', 'virtual32', 'virtual38'],
-            'canada': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual16', 'virtual21', 'virtual26'],
-            'russia': ['any', 'beeline', 'megafon', 'mts', 'tele2', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual8', 'virtual16', 'virtual21', 'virtual26'],
-            'china': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual16'],
-            'india': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual16', 'virtual21'],
-            'germany': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual16', 'virtual21', 'virtual26'],
-            'france': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual16', 'virtual21'],
-            'brazil': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual16'],
-            'mexico': ['any', 'virtual2', 'virtual4', 'virtual5', 'virtual7', 'virtual16']
-        };
 
         this.fakeNumbers = new Set([
             '0201', '1234567890', '1111111111', '0000000000',
@@ -439,7 +426,7 @@ class CheapPanelProvider {
     //  PRODUCT CACHE
     // ═══════════════════════════════════════════════════════════
 
-  async getProducts() {
+    async getProducts() {
         const now = Date.now();
         if (this.productsCache && (now - this.productsCacheTime) < this.productsCacheTtl) {
             return this.productsCache;
@@ -476,60 +463,7 @@ class CheapPanelProvider {
                     service: providerService,
                     error: err.message 
                 });
-                const products = await this.getProducts();
-                if (!products) {
-                    return { available: false, error: 'Failed to fetch product catalog' };
-                }
-                return this._checkAvailabilityFromProducts(products, providerCountry, providerService);
-            }
-
-            if (response.status >= 400) {
-                const products = await this.getProducts();
-                if (!products) {
-                    return { available: false, error: `Failed to fetch product catalog. HTTP ${response.status}` };
-                }
-                return this._checkAvailabilityFromProducts(products, providerCountry, providerService);
-            }
-
-            const data = response.data;
-            if (!data || typeof data !== 'object' || Object.keys(data).length === 0) {
-                return { available: false, error: `No data returned for ${providerCountry}/${providerService}` };
-            }
-
-            return this._checkAvailabilityFromProducts(data, providerCountry, providerService);
-
-        } catch (error) {
-            return { available: false, error: error.message };
-        }
-    }
-
-    _checkAvailabilityFromProducts(products, providerCountry, providerService) {
-        const countryData = products[providerCountry];
-        if (!countryData) {
-            return { available: false, error: `Country ${providerCountry} not available` };
-        }
-
-        const serviceData = countryData[providerService];
-        if (!serviceData) {
-            return { available: false, error: `Service ${providerService} not available in ${providerCountry}` };
-        }
-
-        const operators = serviceData;
-        const operatorNames = Object.keys(operators);
-        
-        const hasStock = operatorNames.some(opName => {
-            const op = operators[opName];
-            const count = typeof op === 'object' ? (op.count ?? 0) : (typeof op === 'number' ? op : 0);
-            return count > 0;
-        });
-
-        return { 
-            available: hasStock, 
-            operators: operatorNames,
-            data: serviceData 
-        };
-}
-    // ═══════════════════════════════════════════════════════════════════════════════
+ // ═══════════════════════════════════════════════════════════════════════════════
 //  CheapPanelProvider.js — Part 2/3
 //  Number Acquisition, SMS Checking & OTP Extraction
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -540,8 +474,8 @@ class CheapPanelProvider {
 
     /**
      * FIXED: Preserves exact operator passed from tier selection.
-     * Validates operator is used in request, returns operator in response.
-     * No silent fallback to 'any' when specific operator requested.
+     * No longer uses stale hardcoded operatorMap whitelist.
+     * TierOperatorSelector already validated operator via 5SIM API.
      */
     async getNumber(country = 'US', service = 'Any', preferredOperator = 'any') {
         const startTime = Date.now();
@@ -567,23 +501,9 @@ class CheapPanelProvider {
 
             const providerCountry = this.mapCountry(country);
             const providerService = this.mapService(service);
+            
+            // FIXED: Trust the operator from tier selection. No stale whitelist.
             const operator = this.mapOperator(providerCountry, preferredOperator);
-
-            // FIXED: Warn if preferred operator was overridden, but still use mapped operator
-            if (preferredOperator && preferredOperator !== 'any' && operator !== preferredOperator) {
-                logger.warn('Preferred operator mapped to available operator', {
-                    requested: preferredOperator,
-                    mapped: operator,
-                    country: providerCountry
-                });
-            }
-
-            if (availability.operators && !availability.operators.includes(operator) && operator !== 'any') {
-                logger.warn('Preferred operator not available, falling back to any', {
-                    operator,
-                    available: availability.operators
-                });
-            }
 
             logger.info('Requesting number from 5SIM', {
                 country: providerCountry,
@@ -591,7 +511,8 @@ class CheapPanelProvider {
                 operator,
                 originalCountry: country,
                 originalService: service,
-                preferredOperator,  // FIXED: Log what was requested vs what is used
+                preferredOperator,
+                usingPreferred: operator === preferredOperator,
                 balance: balanceResult.balance
             });
 
@@ -674,9 +595,9 @@ class CheapPanelProvider {
                 phone: this.maskPhone(phoneStr),
                 country: providerCountry,
                 service: providerService,
-                operator,  // FIXED: Log exact operator used
-                simPrice: simPrice,
-                displayPrice: displayPrice,
+                operator,
+                simPrice,
+                displayPrice,
                 duration
             });
 
@@ -689,7 +610,7 @@ class CheapPanelProvider {
                 service,
                 cost: simPrice,
                 displayCost: displayPrice,
-                operator: operator,  // FIXED: Return the EXACT operator used for purchase
+                operator: operator,
                 expiresAt: new Date(Date.now() + 20 * 60 * 1000),
                 isVirtual: true
             };
@@ -701,7 +622,7 @@ class CheapPanelProvider {
             logger.error('5SIM number acquisition failed', {
                 country,
                 service,
-                preferredOperator,  // FIXED: Log what operator was requested
+                preferredOperator,
                 error: error.message
             });
 
@@ -892,8 +813,8 @@ class CheapPanelProvider {
         if (digits?.length > 0) return digits[digits.length - 1];
 
         return null;
-        }
-        // ═══════════════════════════════════════════════════════════════════════════════
+                    }
+            // ═══════════════════════════════════════════════════════════════════════════════
 //  CheapPanelProvider.js — Part 3/3
 //  Number Management, Mapping Helpers, Stats
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -994,12 +915,21 @@ class CheapPanelProvider {
         return mapped;
     }
 
+    /**
+     * FIXED: No longer uses hardcoded operator whitelist.
+     * The tier system already validates operators via 5SIM API.
+     * Trust the selected operator unless it's truly invalid.
+     */
     mapOperator(country, preferred) {
-        if (preferred && preferred !== 'any') {
-            const operators = this.operatorMap[country] || this.operatorMap['default'];
-            if (operators && operators.includes(preferred)) return preferred;
+        // If no preference or explicitly 'any', use 'any'
+        if (!preferred || preferred === 'any') {
+            return 'any';
         }
-        return 'any';
+
+        // FIXED: Trust the tier system's operator selection.
+        // The TierOperatorSelector already verified this operator exists 
+        // and has stock via 5SIM's /guest/prices API.
+        return preferred;
     }
 
     // ═══════════════════════════════════════════════════════════
