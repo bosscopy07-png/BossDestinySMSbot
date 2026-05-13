@@ -288,26 +288,45 @@ class UserCommands {
         // ═══════════════════════════════════════════════════════════
         //  REFERRAL TRACKING — Fixed: Removed double-count, proper error handling
         // ═══════════════════════════════════════════════════════════
-        if (startPayload && !user.referredBy) {
-            const referrerCode = startPayload.toUpperCase().trim();
-            
-            logger.info('REFERRAL_START', {
-                userId,
-                referrerCode,
-                hasReferralService: !!this.referralService,
-                userAlreadyReferred: !!user.referredBy
-            });
+        // ═══════════════════════════════════════════════════════════
+        //  REFERRAL TRACKING — Fixed: Handle both ?start= and /start CODE formats
+        // ═══════════════════════════════════════════════════════════
+        
+        // Try multiple sources for referral code
+        let referrerCode = null;
+        
+        // Source 1: Deep link payload (t.me/bot?start=CODE)
+        if (ctx.startPayload) {
+            referrerCode = ctx.startPayload.toUpperCase().trim();
+            logger.info('REFERRAL_SOURCE_PAYLOAD', { userId, referrerCode });
+        }
+        
+        // Source 2: Message text (user typed /start CODE manually)
+        const text = ctx.message?.text || '';
+        const startMatch = text.match(/^\/start\s+([A-Z0-9]+)/i);
+        if (!referrerCode && startMatch) {
+            referrerCode = startMatch[1].toUpperCase().trim();
+            logger.info('REFERRAL_SOURCE_TEXT', { userId, referrerCode });
+        }
+        
+        // Source 3: Session fallback (stored from previous attempt)
+        if (!referrerCode && ctx.session?.pendingReferralCode) {
+            referrerCode = ctx.session.pendingReferralCode;
+            delete ctx.session.pendingReferralCode;
+            logger.info('REFERRAL_SOURCE_SESSION', { userId, referrerCode });
+        }
 
+        if (referrerCode && !user.referredBy) {
             const referrer = await User.findOne({ referralCode: referrerCode });
 
             if (referrer && referrer.userId !== userId) {
-                // Set referredBy on new user FIRST
+                // Set referredBy on new user
                 await User.updateOne(
                     { userId },
                     { $set: { referredBy: referrerCode } }
                 );
 
-                // Track via ReferralService — it handles referralCount + Referral record
+                // Track via ReferralService
                 let referralRecord = null;
                 let trackError = null;
 
@@ -317,32 +336,26 @@ class UserCommands {
                         logger.info('REFERRAL_TRACKED', {
                             referralId: referralRecord?.referralId,
                             referrerId: referrer.userId,
-                            referredId: userId,
-                            status: referralRecord?.status
+                            referredId: userId
                         });
                     } catch (err) {
                         trackError = err;
                         logger.error('REFERRAL_TRACK_FAILED', { 
                             userId, 
-                            referrerCode, 
-                            errorName: err.name,
-                            errorMessage: err.message,
-                            errorCode: err.code,
-                            keyPattern: err.keyPattern,
-                            keyValue: err.keyValue,
-                            stack: err.stack
+                            referrerCode,
+                            error: err.message,
+                            code: err.code
                         });
                     }
                 } else {
                     logger.error('REFERRAL_SERVICE_MISSING', { userId, referrerCode });
-                    // Fallback: manually increment only if no service
                     await User.updateOne(
                         { userId: referrer.userId },
                         { $inc: { referralCount: 1 } }
                     );
                 }
 
-                // Notify referrer (even if trackReferral failed, user still joined)
+                // Notify referrer
                 if (this.notificationService && referrer.userId) {
                     try {
                         await this.notificationService.send(referrer.userId, {
@@ -353,10 +366,7 @@ class UserCommands {
                             immediate: true
                         });
                     } catch (notifyErr) {
-                        logger.error('REFERRAL_NOTIFY_FAILED', {
-                            referrerId: referrer.userId,
-                            error: notifyErr.message
-                        });
+                        logger.error('REFERRAL_NOTIFY_FAILED', { referrerId: referrer.userId, error: notifyErr.message });
                     }
                 }
 
@@ -369,24 +379,12 @@ class UserCommands {
                     '💰 You will receive a <b>bonus</b> on your first deposit.\n\n';
 
                 isNewReferral = true;
-
-                // Refresh user data
                 user = await User.findOne({ userId }).lean();
-
-                // Show track error to user if it failed (for debugging)
-                if (trackError) {
-                    logger.warn('Referral tracking had error but user notified', {
-                        userId,
-                        error: trackError.message
-                    });
-                }
-
-            } else if (referrer && referrer.userId === userId) {
-                logger.warn('SELF_REFERRAL_BLOCKED', { userId, code: referrerCode });
-            } else {
-                logger.warn('INVALID_REFERRAL_CODE', { userId, code: referrerCode });
             }
-        }
+        } else if (!referrerCode) {
+            logger.info('NO_REFERRAL_CODE', { userId, startPayload: ctx.startPayload, text });
+                            }
+        
 
         const freeRemaining = this._freeRemaining(user);
         const isVip = this._isVipActive(user);
