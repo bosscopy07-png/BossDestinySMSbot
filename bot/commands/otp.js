@@ -1529,11 +1529,9 @@ setupTextHandlers() {
         }
     }
     
-    // ═══════════════════════════════════════════════════════════════════════
         // ═══════════════════════════════════════════════════════════════════════
     //  FREE SERVICE SELECTED — User picked a service in FREE mode
     // ═══════════════════════════════════════════════════════════════════════
-
 
     async handleFreeServiceSelected(ctx) {
         const userId = ctx.from?.id?.toString();
@@ -1562,12 +1560,27 @@ setupTextHandlers() {
                 { code: 'DE', name: '🇩🇪 Germany', flag: '🇩🇪' },
                 { code: 'FR', name: '🇫🇷 France', flag: '🇫🇷' },
                 { code: 'IN', name: '🇮🇳 India', flag: '🇮🇳' },
-                { code: 'NG', name: '🇳🇬 Nigeria', flag: '🇳🇬' }
+                { code: 'NG', name: '🇳🇬 Nigeria', flag: '🇳🇬' },
+                { code: 'BR', name: '🇧🇷 Brazil', flag: '🇧🇷' },
+                { code: 'ZA', name: '🇿🇦 South Africa', flag: '🇿🇦' },
+                { code: 'KE', name: '🇰🇪 Kenya', flag: '🇰🇪' },
+                { code: 'GH', name: '🇬🇭 Ghana', flag: '🇬🇭' },
+                { code: 'PH', name: '🇵🇭 Philippines', flag: '🇵🇭' },
+                { code: 'ID', name: '🇮🇩 Indonesia', flag: '🇮🇩' },
+                { code: 'PK', name: '🇵🇰 Pakistan', flag: '🇵🇰' },
+                { code: 'BD', name: '🇧🇩 Bangladesh', flag: '🇧🇩' },
+                { code: 'EG', name: '🇪🇬 Egypt', flag: '🇪🇬' },
+                { code: 'MA', name: '🇲🇦 Morocco', flag: '🇲🇦' }
             ];
 
-            const buttons = countries.map(c => [
-                Markup.button.callback(`${c.flag} ${c.name}`, `free_country_${c.code}_${serviceId}`)
-            ]);
+            // Build 3-column rows
+            const buttons = [];
+            for (let i = 0; i < countries.length; i += 3) {
+                const row = countries.slice(i, i + 3).map(c => 
+                    Markup.button.callback(`${c.flag} ${c.code}`, `free_country_${c.code}_${serviceId}`)
+                );
+                buttons.push(row);
+            }
 
             buttons.push([Markup.button.callback('🔙 Back', 'confirm_free_mode')]);
             buttons.push([Markup.button.callback('🏠 Menu', 'menu')]);
@@ -1581,6 +1594,7 @@ setupTextHandlers() {
             await ctx.answerCbQuery('❌ Error').catch(() => {});
         }
     }
+        
         // ═══════════════════════════════════════════════════════════════════════
     //  FREE COUNTRY SELECTED — User picked a country in FREE mode
     // ═══════════════════════════════════════════════════════════════════════
