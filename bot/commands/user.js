@@ -1,6 +1,6 @@
 import { Markup } from 'telegraf';
 import QRCode from 'qrcode';
-import { User, Session, Transaction } from '../../models/index.js';
+import { User, Session, Transaction, Referral } from '../../models/index.js';
 import { COUNTRIES, SERVICES } from '../../utils/constants.js';
 import { formatCurrency, generateReferralCode, isNewDay } from '../../utils/helpers.js';
 import config from '../../config/env.js';
@@ -79,7 +79,8 @@ class UserCommands {
         this.bot.command('support', this.handleSupport.bind(this));
         this.bot.command('buybundle', this.handleBuyBundle.bind(this));
         this.bot.command('buyvip', this.handleBuyVIP.bind(this));
-
+        this.bot.command('refdebug', this.handleRefDebug.bind(this));
+        
         this.bot.action('menu', this.handleMenu.bind(this));
         this.bot.action('deposit', this.handleDeposit.bind(this));
         this.bot.action('balance', this.handleBalance.bind(this));
@@ -273,7 +274,7 @@ class UserCommands {
     // ═══════════════════════════════════════════════════════════
     //  HANDLE START — Fixed: Added notification to referrer on new signup
     // ═══════════════════════════════════════════════════════════
-    async handleStart(ctx) {
+        async handleStart(ctx) {
         const userId = ctx.from.id.toString();
         let user = await this._ensureUserFresh(ctx);
 
@@ -281,42 +282,69 @@ class UserCommands {
         let referralNotice = '';
         let isNewReferral = false;
 
+        // ═══════════════════════════════════════════════════════════
+        //  REFERRAL TRACKING — Fixed: Removed double-count, added validation
+        // ═══════════════════════════════════════════════════════════
         if (startPayload && !user.referredBy) {
             const referrerCode = startPayload.toUpperCase().trim();
+            
+            // DEBUG: Log the referral attempt
+            logger.info('REFERRAL_DEBUG', {
+                userId,
+                referrerCode,
+                hasReferralService: !!this.referralService,
+                userAlreadyReferred: !!user.referredBy
+            });
+
             const referrer = await User.findOne({ referralCode: referrerCode });
 
             if (referrer && referrer.userId !== userId) {
+                // Set referredBy on new user FIRST
                 await User.updateOne(
                     { userId },
                     { $set: { referredBy: referrerCode } }
                 );
 
-                await User.updateOne(
-                    { userId: referrer.userId },
-                    { $inc: { referralCount: 1 } }
-                );
-
-                // FIXED: Use this.referralService (now properly injected)
+                // Track via ReferralService — it handles referralCount increment + Referral record creation
+                let referralRecord = null;
                 if (this.referralService) {
                     try {
-                        await this.referralService.trackReferral(userId, referrerCode);
+                        referralRecord = await this.referralService.trackReferral(userId, referrerCode);
+                        logger.info('Referral tracked successfully', {
+                            referralId: referralRecord?.referralId,
+                            referrerId: referrer.userId,
+                            referredId: userId
+                        });
                     } catch (err) {
-                        logger.error('ReferralService tracking failed', { userId, error: err.message });
+                        logger.error('ReferralService tracking FAILED', { 
+                            userId, 
+                            referrerCode, 
+                            error: err.message,
+                            stack: err.stack 
+                        });
+                        // Continue anyway — user already has referredBy set
                     }
+                } else {
+                    logger.error('REFERRAL_SERVICE_MISSING', { userId, referrerCode });
+                    // Fallback: manually increment if service missing
+                    await User.updateOne(
+                        { userId: referrer.userId },
+                        { $inc: { referralCount: 1 } }
+                    );
                 }
 
-                // 🔔 NOTIFY REFERRER: New signup (direct Telegram message)
+                // Notify referrer
                 if (this.notificationService && referrer.userId) {
                     try {
                         await this.notificationService.send(referrer.userId, {
                             type: 'REFERRAL_JOINED',
                             title: '🎉 New Referral!',
                             message: `A new user just joined using your code! You'll earn ${((config.referral?.percentage || 0.05) * 100).toFixed(0)}% of their first deposit.`,
-                            telegramChatId: referrer.userId, // Telegram chat ID = userId for bots
+                            telegramChatId: referrer.userId,
                             immediate: true
                         });
                     } catch (notifyErr) {
-                        logger.error('Failed to notify referrer of new signup', {
+                        logger.error('Failed to notify referrer', {
                             referrerId: referrer.userId,
                             error: notifyErr.message
                         });
@@ -333,9 +361,16 @@ class UserCommands {
 
                 isNewReferral = true;
 
+                // Refresh user data
                 user = await User.findOne({ userId }).lean();
+            } else if (referrer && referrer.userId === userId) {
+                logger.warn('Self-referral blocked', { userId, code: referrerCode });
+            } else {
+                logger.warn('Invalid referral code', { userId, code: referrerCode });
             }
         }
+
+        
 
         const freeRemaining = this._freeRemaining(user);
         const isVip = this._isVipActive(user);
@@ -382,6 +417,50 @@ class UserCommands {
             }
         }
     }
+        // ═══════════════════════════════════════════════════════════
+    //  DEBUG: Check referral status
+    // ═══════════════════════════════════════════════════════════
+    async handleRefDebug(ctx) {
+        const userId = ctx.from.id.toString();
+        
+        try {
+            const user = await User.findOne({ userId }).lean();
+            const referrals = await Referral.find({ referrerId: userId }).lean();
+            const referredUsers = await User.find({ referredBy: user.referralCode }).lean();
+
+            const message =
+                '🔍 <b>Referral Debug</b>\n\n' +
+                '<b>Your Info:</b>\n' +
+                `• User ID: <code>${userId}</code>\n` +
+                `• Referral Code: <code>${user.referralCode}</code>\n` +
+                `• referralCount: <code>${user.referralCount || 0}</code>\n` +
+                `• referralEarnings: <code>${user.referralEarnings || 0}</code>\n\n` +
+                '<b>Referral Records:</b>\n' +
+                `• Total in Referral collection: <code>${referrals.length}</code>\n` +
+                `• Users with referredBy set: <code>${referredUsers.length}</code>\n\n` +
+                '<b>Recent Referrals:</b>\n';
+
+            if (referrals.length === 0) {
+                message += '<i>No referral records found.</i>\n\n' +
+                    '⚠️ <b>Problem:</b> Referrals are not being tracked.\n' +
+                    'Possible causes:\n' +
+                    '• Users clicked link without ?start=CODE\n' +
+                    '• trackReferral() failed silently\n' +
+                    '• ReferralService not injected';
+            } else {
+                referrals.slice(0, 5).forEach((r, i) => {
+                    message += `${i+1}. ${r.referredId} — ${r.status} — ${r.createdAt?.toLocaleDateString() || 'unknown date'}\n`;
+                });
+            }
+
+            await ctx.reply(message, { parse_mode: 'HTML' });
+
+        } catch (error) {
+            logger.error('refdebug error', { userId, error: error.message });
+            await ctx.reply('❌ Debug failed: ' + error.message);
+        }
+    }
+    
 
     async handleMenu(ctx) {
         const user = await this._ensureUserFresh(ctx);
