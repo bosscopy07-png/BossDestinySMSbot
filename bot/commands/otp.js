@@ -1599,7 +1599,7 @@ setupTextHandlers() {
     //  FREE COUNTRY SELECTED — User picked a country in FREE mode
     // ═══════════════════════════════════════════════════════════════════════
         
-        async handleFreeCountrySelected(ctx) {
+            async handleFreeCountrySelected(ctx) {
         const userId = ctx.from?.id?.toString();
         const countryCode = ctx.match?.[1];
         const serviceId = ctx.match?.[2];
@@ -1637,14 +1637,14 @@ setupTextHandlers() {
                     `⏳ Waiting for OTP...\n` +
                     `<i>Free numbers expire in 10 minutes.</i>`;
 
-                await ctx.reply(message, {
-                    parse_mode: 'HTML',
-                    reply_markup: Markup.inlineKeyboard([
-                        [Markup.button.callback('🔄 Check OTP', `check_free_${result.sessionId}`)],
-                        [Markup.button.callback('❌ Cancel', `cancel_free_${result.sessionId}`)],
-                        [Markup.button.callback('🔙 Menu', 'menu')]
-                    ]).reply_markup
-                });
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Check OTP', `check_free_${result.sessionId}`)],
+                    [Markup.button.callback('❌ Cancel', `cancel_free_${result.sessionId}`)],
+                    [Markup.button.callback('🔙 Menu', 'menu')]
+                ]);
+
+                // FIXED: Use sendPhotoWithCaption with otpRequested image
+                await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
 
             } else {
                 throw new Error(result?.error || 'Failed to get free number');
@@ -1658,19 +1658,23 @@ setupTextHandlers() {
                 error: error.message 
             });
             await ctx.answerCbQuery('❌ Error').catch(() => {});
-            await ctx.reply(
-                '❌ Failed to get free number. Try again or use CHEAP mode.',
-                {
-                    parse_mode: 'HTML',
-                    reply_markup: Markup.inlineKeyboard([
-                        [Markup.button.callback('🔄 Try Again', `free_country_${countryCode}_${serviceId}`)],
-                        [Markup.button.callback('💰 CHEAP Mode', 'mode_cheap')],
-                        [Markup.button.callback('🔙 Menu', 'menu')]
-                    ]).reply_markup
-                }
-            ).catch(() => {});
+
+            // FIXED: Show error image with error message
+            const errorMessage =
+                '❌ <b>Free Number Error</b>\n\n' +
+                `Error: ${error.message}\n\n` +
+                'Try again or use CHEAP mode for guaranteed delivery.';
+
+            const errorKeyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('🔄 Try Again', `free_country_${countryCode}_${serviceId}`)],
+                [Markup.button.callback('💰 CHEAP Mode', 'mode_cheap')],
+                [Markup.button.callback('🔙 Menu', 'menu')]
+            ]);
+
+            await this.sendPhotoWithCaption(ctx, IMAGES.otpFailed, errorMessage, errorKeyboard, 'HTML');
         }
-        }
+            }
+        
         
     // ═══════════════════════════════════════════════════════════════════════
     //  FREE CHECK NOW — Manual poll for SMS
