@@ -1,4 +1,3 @@
-
 // ═══════════════════════════════════════════════════════════════════════════════
 //  bot/verification/StartVerification.js
 //  Mandatory CAPTCHA + Channel Join Verification + Referral Processing
@@ -130,14 +129,31 @@ class StartVerification {
             await User.updateOne({ userId: referrer.userId }, { $inc: { referralCount: 1 } });
         }
 
-        // Notify referrer
+        // ═══════════════════════════════════════════════════════
+        //  NOTIFY REFERRER — Rich notification with new user details
+        // ═══════════════════════════════════════════════════════
         if (this.notificationService && referrer.userId) {
             try {
                 const pct = ((this.config.referral?.percentage || 0.05) * 100).toFixed(0);
+                
+                // Get new user details for the notification
+                const newUser = await User.findOne({ userId }).lean();
+                const newUserName = ctx.from?.first_name 
+                    ? ctx.from.first_name + (ctx.from.last_name ? ' ' + ctx.from.last_name : '')
+                    : (ctx.from?.username ? '@' + ctx.from.username : 'New User');
+                const newUserUsername = ctx.from?.username ? `@${ctx.from.username}` : 'No username';
+                const newUserId = userId;
+
                 await this.notificationService.send(referrer.userId, {
                     type: 'REFERRAL_JOINED',
                     title: '🎉 New Referral!',
-                    message: `A new user joined using your code! You'll earn ${pct}% of their first deposit.`,
+                    message: 
+                        `🚀 <b>New Referral to SwiftSMS!</b>\n\n` +
+                        `👤 <b>User:</b> ${newUserName}\n` +
+                        `🔗 <b>Username:</b> ${newUserUsername}\n` +
+                        `🆔 <b>ID:</b> <code>${newUserId}</code>\n\n` +
+                        `💰 You'll earn <b>${pct}%</b> of their first deposit.\n\n` +
+                        `🔥 Keep inviting — we keep moving SwiftSMS! 🚀`,
                     telegramChatId: referrer.userId,
                     immediate: true
                 });
@@ -443,8 +459,7 @@ class StartVerification {
     //  JOIN REQUIREMENT UI
     // ═══════════════════════════════════════════════════════
 
-    
-         async _sendJoinRequirement(ctx) {
+   async _sendJoinRequirement(ctx) {
         const keyboard = {
             inline_keyboard: [
                 ...MANDATORY_CHANNELS.map(ch => ([{ text: `📢 Join ${ch.name}`, url: ch.url }])),
@@ -489,7 +504,7 @@ class StartVerification {
             return await this.userCommands.handleStart(ctx);
         } catch (err) {
             logger.error('[StartVerification] userCommands.handleStart failed', { error: err.message, userId });
-            await this.alertAdmins(err, { userId, updateType: 'message', command: '/start', note: 'Verified but handleStart threw' });
+            await this.alertAdmins(err, { userId, updateType: 'message', command: '/start', command: '/start', note: 'Verified but handleStart threw' });
             throw err;
         }
     }
