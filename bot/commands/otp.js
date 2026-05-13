@@ -1585,7 +1585,7 @@ setupTextHandlers() {
     //  FREE COUNTRY SELECTED — User picked a country in FREE mode
     // ═══════════════════════════════════════════════════════════════════════
         
-    async handleFreeCountrySelected(ctx) {
+        async handleFreeCountrySelected(ctx) {
         const userId = ctx.from?.id?.toString();
         const countryCode = ctx.match?.[1];
         const serviceId = ctx.match?.[2];
@@ -1605,38 +1605,10 @@ setupTextHandlers() {
                 return this._showFreeExhausted(ctx, user);
             }
 
-            // Request free number via FreeNumberController
-            if (this.freeNumberController) {
-                // Store selection in session for FreeNumberController
-                ctx.session.freeSelection = {
-                    serviceId,
-                    countryCode,
-                    timestamp: Date.now()
-                };
+            // Use SMSProviderManager.getFreeNumber — the correct method
+            const result = await this.smsProviderManager.getFreeNumber(countryCode, serviceId, userId);
 
-                // Delegate to FreeNumberController
-                return await this.freeNumberController.handleFreeRequest(ctx);
-            }
-
-            // Fallback if no FreeNumberController
-            const freeProvider = this.smsProviderManager?.getProvider('FREE_PUBLIC');
-            if (!freeProvider) {
-                return ctx.reply('❌ Free service temporarily unavailable. Try CHEAP mode.', {
-                    reply_markup: Markup.inlineKeyboard([
-                        [Markup.button.callback('💰 CHEAP Mode', 'mode_cheap')],
-                        [Markup.button.callback('🔙 Back', 'menu')]
-                    ]).reply_markup
-                });
-            }
-
-            // Direct provider request fallback
-            const numberResult = await freeProvider.requestNumber({
-                userId,
-                service: serviceId,
-                country: countryCode
-            });
-
-            if (numberResult.success) {
+            if (result && result.phoneNumber) {
                 // Increment free usage
                 await User.updateOne(
                     { userId },
@@ -1645,34 +1617,23 @@ setupTextHandlers() {
 
                 const message =
                     '📱 <b>Free Number Assigned</b>\n\n' +
-                    `📞 Number: <code>${numberResult.number}</code>\n` +
-                    `🌍 Country: ${countryCode}\n` +
-                    `🔢 Service: ${SERVICES[serviceId]?.name || serviceId}\n\n` +
+                    `📞 Number: <code>${result.phoneNumber}</code>\n` +
+                    `🌍 Country: ${result.country || countryCode}\n` +
+                    `🔢 Service: ${serviceId}\n\n` +
                     `⏳ Waiting for OTP...\n` +
                     `<i>Free numbers expire in 10 minutes.</i>`;
 
                 await ctx.reply(message, {
                     parse_mode: 'HTML',
                     reply_markup: Markup.inlineKeyboard([
-                        [Markup.button.callback('🔄 Check OTP', `check_otp_${numberResult.sessionId}`)],
-                        [Markup.button.callback('❌ Cancel', `cancel_free_${numberResult.sessionId}`)],
+                        [Markup.button.callback('🔄 Check OTP', `check_free_${result.sessionId}`)],
+                        [Markup.button.callback('❌ Cancel', `cancel_free_${result.sessionId}`)],
                         [Markup.button.callback('🔙 Menu', 'menu')]
                     ]).reply_markup
                 });
 
             } else {
-                await ctx.reply(
-                    `❌ <b>${numberResult.error || 'Failed to get free number'}</b>\n\n` +
-                    'Free numbers may be temporarily unavailable.\n' +
-                    'Try CHEAP mode for guaranteed delivery.',
-                    {
-                        parse_mode: 'HTML',
-                        reply_markup: Markup.inlineKeyboard([
-                            [Markup.button.callback('💰 CHEAP Mode', 'mode_cheap')],
-                            [Markup.button.callback('🔙 Back', 'menu')]
-                        ]).reply_markup
-                    }
-                );
+                throw new Error(result?.error || 'Failed to get free number');
             }
 
         } catch (error) {
@@ -1683,9 +1644,19 @@ setupTextHandlers() {
                 error: error.message 
             });
             await ctx.answerCbQuery('❌ Error').catch(() => {});
-            await ctx.reply('❌ Failed to request free number. Try again.').catch(() => {});
+            await ctx.reply(
+                '❌ Failed to get free number. Try again or use CHEAP mode.',
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🔄 Try Again', `free_country_${countryCode}_${serviceId}`)],
+                        [Markup.button.callback('💰 CHEAP Mode', 'mode_cheap')],
+                        [Markup.button.callback('🔙 Menu', 'menu')]
+                    ]).reply_markup
+                }
+            ).catch(() => {});
         }
-    }
+        }
         
     // ═══════════════════════════════════════════════════════════════════════
     //  FREE CHECK NOW — Manual poll for SMS
