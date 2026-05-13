@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// bot/index.js (TelegramBot.js) — FIXED: Added NotificationService wiring
+// bot/index.js (TelegramBot.js) — COMPLETE REWRITE
 // Part 1/3 — Imports, Constructor, Core Utilities
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -42,7 +42,7 @@ class TelegramBot {
         });
 
         // ═══════════════════════════════════════════════════════════════════════
-        //  SERVICE INITIALIZATION — Fixed: Added NotificationService wiring
+        //  SERVICE INITIALIZATION — Fixed: Proper initialization order
         //  Order: NotificationService → ReferralService → WalletService
         // ═══════════════════════════════════════════════════════════════════════
         this.notificationService = new NotificationService(this.bot.telegram);
@@ -290,9 +290,8 @@ class TelegramBot {
                 setTimeout(() => this.gracefulShutdown('unhandledRejection'), 1500);
             }
         });
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════════
+            }
+// ═══════════════════════════════════════════════════════════════════════════════
 // bot/index.js (TelegramBot.js) — Part 2/3
 // Middleware Stack, Command Setup, Tier Integration & Free Tier
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -324,7 +323,10 @@ class TelegramBot {
                 captchaPassed: false,
                 captchaAnswer: null,
                 captchaAttempts: 0,
-                captchaBlockedUntil: null
+                captchaBlockedUntil: null,
+                // FIXED: Added referral persistence fields
+                pendingReferralCode: null,
+                pendingReferralCodeAt: null
             })
         }));
 
@@ -353,10 +355,15 @@ class TelegramBot {
             }
         }));
 
+        // ═══════════════════════════════════════════════════════════════════════
+        //  START INTERCEPTOR — FIXED: Proper regex for all /start variants
+        //  Matches: /start, /start@botname, /start REFCODE, /start@botname REFCODE
+        // ═══════════════════════════════════════════════════════════════════════
         this.bot.use(async (ctx, next) => {
             try {
                 const text = ctx.message?.text || '';
-                const isStartCommand = text === '/start' || /^\/start@/.test(text);
+                // FIXED: Regex now matches /start, /start REFCODE, /start@botname, /start@botname REFCODE
+                const isStartCommand = /^\/start(?:@\w+)?(?:\s+(.+))?$/.test(text);
 
                 if (!isStartCommand) {
                     return await next();
@@ -516,7 +523,7 @@ class TelegramBot {
         }
 
         // ═══════════════════════════════════════════════════════════════════════
-        //  FIXED: Pass referralService and notificationService to UserCommands
+        //  COMMAND MODULES — Fixed: Pass notificationService to UserCommands
         // ═══════════════════════════════════════════════════════════════════════
         const userCommands = new UserCommands(
             this.bot, 
@@ -546,11 +553,19 @@ class TelegramBot {
         this.commandModules.set('admin', adminCommands);
         this.commandModules.set('advancedAdmin', advancedAdmin);
 
+        // ═══════════════════════════════════════════════════════════════════════
+        //  StartVerification — FIXED: Injected with all required services
+        // ═══════════════════════════════════════════════════════════════════════
         this.startVerification = new StartVerification(
             this.bot,
             userCommands,
             (userId) => this.isAdmin(userId),
-            (err, ctx) => this.alertAdmins(err, ctx)
+            (err, ctx) => this.alertAdmins(err, ctx),
+            {
+                referralService: this.referralService,
+                notificationService: this.notificationService,
+                config: config
+            }
         );
 
         if (this.tierIntegrationService && otpCommands) {
@@ -679,7 +694,7 @@ class TelegramBot {
         });
     }
 
-    setupTextHandler() {
+        setupTextHandler() {
         this.bot.on(message('text'), async (ctx, next) => {
             try {
                 const isAdmin = this.isEffectiveAdmin(ctx);
@@ -768,8 +783,7 @@ class TelegramBot {
                 });
             }
         });
-    }
-
+        }
     // ═══════════════════════════════════════════════════════════════════════════════
 // bot/index.js (TelegramBot.js) — Part 3/3
 // Launch Sequence, Deposit Scanner, Metrics & Graceful Shutdown
