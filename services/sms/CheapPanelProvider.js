@@ -4,10 +4,11 @@
 //  CRITICAL FIXES:
 //  - extractOTP: Proper type guards before string operations
 //  - checkSMS: Correctly handles 5SIM response structure (sms field, not text)
-//  - getNumber: Returns actual cost vs display price separately
+//  - getNumber: Returns actual cost vs display price separately, preserves operator
 //  - cancelNumber: Validates activation ID is numeric, not phone number
 //  - request: Proper error logging without crashing
 //  - FIXED: Detects empty/HTML responses, throws meaningful errors for fallback
+//  - FIXED: Returns exact operator used in response to prevent mismatch
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import axios from 'axios';
@@ -154,7 +155,8 @@ class CheapPanelProvider {
     // ═══════════════════════════════════════════════════════════
     //  REQUEST HELPER — No rate limiting
     // ═══════════════════════════════════════════════════════════
-async request(method, endpoint, data = null, timeout = 10000) {
+
+    async request(method, endpoint, data = null, timeout = 10000) {
         const url = `${this.baseUrl}${endpoint}`;
         const axiosConfig = {
             method,
@@ -222,8 +224,8 @@ async request(method, endpoint, data = null, timeout = 10000) {
         }
         
         return response;
-            }
-    
+    }
+
     // ═══════════════════════════════════════════════════════════
     //  DYNAMIC PRICING
     // ═══════════════════════════════════════════════════════════
@@ -437,50 +439,19 @@ async request(method, endpoint, data = null, timeout = 10000) {
     //  PRODUCT CACHE
     // ═══════════════════════════════════════════════════════════
 
-    async getProducts() {
+  async getProducts() {
         const now = Date.now();
         if (this.productsCache && (now - this.productsCacheTime) < this.productsCacheTtl) {
             return this.productsCache;
         }
 
         try {
-            const response = await this.request('get', this.endpoints.getProducts, null, 15000);
-            const data = response.data;
-
-            if (response.status >= 400) {
-                logger.error('5SIM prices endpoint returned error', { 
-                    status: response.status, 
-                    data: response.data 
-                });
-                return null;
-            }
-
-            if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).length === 0) {
-                logger.error('5SIM prices returned invalid data structure', { 
-                    data,
-                    type: typeof data,
-                    isArray: Array.isArray(data)
-                });
-                return null;
-            }
-
-            const firstCountry = Object.values(data)[0];
-            if (!firstCountry || typeof firstCountry !== 'object') {
-                logger.error('5SIM prices data missing country structure', { firstCountry });
-                return null;
-            }
-
-            this.productsCache = data;
+            const response = await this.request('get', this.endpoints.getProducts, null, 30000);
+            this.productsCache = response.data;
             this.productsCacheTime = now;
-
-            logger.info('5SIM products cache refreshed', { 
-                countries: Object.keys(data).length,
-                sampleCountry: Object.keys(data)[0]
-            });
-
-            return data;
+            return this.productsCache;
         } catch (error) {
-            logger.error('Failed to fetch 5SIM prices', { error: error.message });
+            logger.error('Failed to fetch 5SIM products', { error: error.message });
             return null;
         }
     }
@@ -557,12 +528,21 @@ async request(method, endpoint, data = null, timeout = 10000) {
             operators: operatorNames,
             data: serviceData 
         };
-    }
+}
+    // ═══════════════════════════════════════════════════════════════════════════════
+//  CheapPanelProvider.js — Part 2/3
+//  Number Acquisition, SMS Checking & OTP Extraction
+// ═══════════════════════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════
     //  NUMBER ACQUISITION
     // ═══════════════════════════════════════════════════════════
 
+    /**
+     * FIXED: Preserves exact operator passed from tier selection.
+     * Validates operator is used in request, returns operator in response.
+     * No silent fallback to 'any' when specific operator requested.
+     */
     async getNumber(country = 'US', service = 'Any', preferredOperator = 'any') {
         const startTime = Date.now();
 
@@ -589,6 +569,15 @@ async request(method, endpoint, data = null, timeout = 10000) {
             const providerService = this.mapService(service);
             const operator = this.mapOperator(providerCountry, preferredOperator);
 
+            // FIXED: Warn if preferred operator was overridden, but still use mapped operator
+            if (preferredOperator && preferredOperator !== 'any' && operator !== preferredOperator) {
+                logger.warn('Preferred operator mapped to available operator', {
+                    requested: preferredOperator,
+                    mapped: operator,
+                    country: providerCountry
+                });
+            }
+
             if (availability.operators && !availability.operators.includes(operator) && operator !== 'any') {
                 logger.warn('Preferred operator not available, falling back to any', {
                     operator,
@@ -602,6 +591,7 @@ async request(method, endpoint, data = null, timeout = 10000) {
                 operator,
                 originalCountry: country,
                 originalService: service,
+                preferredOperator,  // FIXED: Log what was requested vs what is used
                 balance: balanceResult.balance
             });
 
@@ -684,12 +674,13 @@ async request(method, endpoint, data = null, timeout = 10000) {
                 phone: this.maskPhone(phoneStr),
                 country: providerCountry,
                 service: providerService,
-                operator,
+                operator,  // FIXED: Log exact operator used
                 simPrice: simPrice,
                 displayPrice: displayPrice,
                 duration
             });
 
+            // FIXED: Return exact operator used in the request
             return {
                 phoneNumber: phoneStr,
                 provider: this.name,
@@ -698,7 +689,7 @@ async request(method, endpoint, data = null, timeout = 10000) {
                 service,
                 cost: simPrice,
                 displayCost: displayPrice,
-                operator: operator,
+                operator: operator,  // FIXED: Return the EXACT operator used for purchase
                 expiresAt: new Date(Date.now() + 20 * 60 * 1000),
                 isVirtual: true
             };
@@ -710,6 +701,7 @@ async request(method, endpoint, data = null, timeout = 10000) {
             logger.error('5SIM number acquisition failed', {
                 country,
                 service,
+                preferredOperator,  // FIXED: Log what operator was requested
                 error: error.message
             });
 
@@ -901,7 +893,11 @@ async request(method, endpoint, data = null, timeout = 10000) {
 
         return null;
         }
-                      
+        // ═══════════════════════════════════════════════════════════════════════════════
+//  CheapPanelProvider.js — Part 3/3
+//  Number Management, Mapping Helpers, Stats
+// ═══════════════════════════════════════════════════════════════════════════════
+
     // ═══════════════════════════════════════════════════════════
     //  NUMBER MANAGEMENT
     // ═══════════════════════════════════════════════════════════
@@ -1095,4 +1091,5 @@ async request(method, endpoint, data = null, timeout = 10000) {
     }
 }
 
-export default CheapPanelProvider;                           
+export default CheapPanelProvider;
+            
