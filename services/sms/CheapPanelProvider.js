@@ -447,6 +447,7 @@ class CheapPanelProvider {
     //  PRE-FLIGHT AVAILABILITY CHECK
     // ═══════════════════════════════════════════════════════════
 
+    
     async checkAvailability(country, service) {
         try {
             const providerCountry = this.mapCountry(country);
@@ -463,6 +464,59 @@ class CheapPanelProvider {
                     service: providerService,
                     error: err.message 
                 });
+                const products = await this.getProducts();
+                if (!products) {
+                    return { available: false, error: 'Failed to fetch product catalog' };
+                }
+                return this._checkAvailabilityFromProducts(products, providerCountry, providerService);
+            }
+
+            if (response.status >= 400) {
+                const products = await this.getProducts();
+                if (!products) {
+                    return { available: false, error: `Failed to fetch product catalog. HTTP ${response.status}` };
+                }
+                return this._checkAvailabilityFromProducts(products, providerCountry, providerService);
+            }
+
+            const data = response.data;
+            if (!data || typeof data !== 'object' || Object.keys(data).length === 0) {
+                return { available: false, error: `No data returned for ${providerCountry}/${providerService}` };
+            }
+
+            return this._checkAvailabilityFromProducts(data, providerCountry, providerService);
+
+        } catch (error) {
+            return { available: false, error: error.message };
+        }
+    }
+
+    _checkAvailabilityFromProducts(products, providerCountry, providerService) {
+        const countryData = products[providerCountry];
+        if (!countryData) {
+            return { available: false, error: `Country ${providerCountry} not available` };
+        }
+
+        const serviceData = countryData[providerService];
+        if (!serviceData) {
+            return { available: false, error: `Service ${providerService} not available in ${providerCountry}` };
+        }
+
+        const operators = serviceData;
+        const operatorNames = Object.keys(operators);
+        
+        const hasStock = operatorNames.some(opName => {
+            const op = operators[opName];
+            const count = typeof op === 'object' ? (op.count ?? 0) : (typeof op === 'number' ? op : 0);
+            return count > 0;
+        });
+
+        return { 
+            available: hasStock, 
+            operators: operatorNames,
+            data: serviceData 
+        };
+                                            }
  // ═══════════════════════════════════════════════════════════════════════════════
 //  CheapPanelProvider.js — Part 2/3
 //  Number Acquisition, SMS Checking & OTP Extraction
