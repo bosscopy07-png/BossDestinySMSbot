@@ -485,27 +485,39 @@ class StartVerification {
         }
     }
 
-    // ═══════════════════════════════════════════════════════
-    //  PRIVATE: Forward to the real user start command
-    // ═══════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════
+//  PRIVATE: Forward to the real user start command
+//  FIXED: Preserve startPayload for referral tracking
+// ═══════════════════════════════════════════════════════
 
-    async _runUserStart(ctx) {
-        try {
-            return await this.userCommands.handleStart(ctx);
-        } catch (err) {
-            logger.error('[StartVerification] userCommands.handleStart failed', {
-                error: err.message,
-                userId: this._getEffectiveUserId(ctx)
-            });
-            await this.alertAdmins(err, {
+async _runUserStart(ctx) {
+    try {
+        // Preserve original start payload if it exists (from deep link t.me/bot?start=CODE)
+        // This is critical because ctx.startPayload gets lost after CAPTCHA/channel verification callbacks
+        if (ctx.startPayload && !ctx.session?.pendingReferralCode) {
+            ctx.session.pendingReferralCode = ctx.startPayload.toUpperCase().trim();
+            logger.debug('[StartVerification] Preserved startPayload in session', { 
                 userId: this._getEffectiveUserId(ctx),
-                updateType: 'message',
-                command: '/start',
-                note: 'User verified but handleStart threw'
+                code: ctx.session.pendingReferralCode 
             });
-            throw err;
         }
+        
+        return await this.userCommands.handleStart(ctx);
+    } catch (err) {
+        logger.error('[StartVerification] userCommands.handleStart failed', {
+            error: err.message,
+            userId: this._getEffectiveUserId(ctx)
+        });
+        await this.alertAdmins(err, {
+            userId: this._getEffectiveUserId(ctx),
+            updateType: 'message',
+            command: '/start',
+            note: 'User verified but handleStart threw'
+        });
+        throw err;
     }
+}
+        
 }
 
 export default StartVerification;
