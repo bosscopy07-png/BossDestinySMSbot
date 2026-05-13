@@ -272,70 +272,79 @@ class UserCommands {
     }
 
 
-                            // ═══════════════════════════════════════════════════════════
-    //  HANDLE START — Fixed: Session-aware referral tracking
-    // ═══════════════════════════════════════════════════════════
-    async handleStart(ctx) {
+ 
+        // ═══════════════════════════════════════════════════════════
+//  HANDLE START — Subtle invitee referral acknowledgment
+//  Sent as separate message after welcome, not in welcome itself
+// ═══════════════════════════════════════════════════════════
+async handleStart(ctx) {
     const userId = ctx.from.id.toString();
     let user = await this._ensureUserFresh(ctx);
 
     const referralResult = ctx.state?.referralResult || { processed: false };
-    let referralNotice = '';
-    let isNewReferral = false;
-
+    
+    // Referral is processed silently in welcome — no clutter
     if (referralResult.processed) {
-        referralNotice = `🎉 <b>You were referred by ${referralResult.referrerName}!</b>\n💰 You will receive a <b>bonus</b> on your first deposit.\n\n`;
-        isNewReferral = true;
         user = await User.findOne({ userId }).lean();
     }
 
-        
-        const freeRemaining = this._freeRemaining(user);
-        const isVip = this._isVipActive(user);
-        const vipRemaining = isVip ? this._vipRemaining(user) : 0;
+    const freeRemaining = this._freeRemaining(user);
+    const isVip = this._isVipActive(user);
+    const vipRemaining = isVip ? this._vipRemaining(user) : 0;
 
-        const welcomeMessage =
-            '👋 <b>Welcome to SwiftSMS</b>, ' + (ctx.from.first_name || 'there') + '!\n\n' +
-            (isNewReferral ? referralNotice : '') +
-            '🔐 Get verification codes instantly for any service.\n\n' +
-            (isVip ? '👑 <b>VIP Active</b> — ' + vipRemaining + ' left today\n' : '') +
-            '💰 Balance: <code>' + formatCurrency(this._getAvailableBalance(user)) + '</code>\n' +
-            '📦 Bundle: <code>' + (user.bundleRemaining || 0) + '</code> OTPs\n' +
-            '🆓 Free Today: <code>' + (3 - freeRemaining) + '/3</code> used\n\n' +
-            'Choose your mode or deposit to get started:';
+    const welcomeMessage =
+        '👋 <b>Welcome to SwiftSMS</b>, ' + (ctx.from.first_name || 'there') + '!\n\n' +
+        '🔐 Get verification codes instantly for any service.\n\n' +
+        (isVip ? '👑 <b>VIP Active</b> — ' + vipRemaining + ' left today\n' : '') +
+        '💰 Balance: <code>' + formatCurrency(this._getAvailableBalance(user)) + '</code>\n' +
+        '📦 Bundle: <code>' + (user.bundleRemaining || 0) + '</code> OTPs\n' +
+        '🆓 Free Today: <code>' + (3 - freeRemaining) + '/3</code> used\n\n' +
+        'Choose your mode or deposit to get started:';
 
-        const keyboard = Markup.inlineKeyboard([
-            [Markup.button.callback('🆓 FREE OTP', 'mode_free'), Markup.button.callback('💵 CHEAP OTP', 'mode_cheap')],
-            [Markup.button.callback('📦 Buy Bundle', 'mode_bundle'), Markup.button.callback('👑 Upgrade VIP', 'mode_vip')],
-            [Markup.button.callback('💳 Deposit', 'deposit'), Markup.button.callback('📊 My Stats', 'stats')],
-            [Markup.button.callback('🎁 Referral', 'referral'), Markup.button.callback('⚙️ Settings', 'settings')],
-            [Markup.button.callback('💰 Check Balance', 'balance'), Markup.button.callback('🎧 Customer Service', 'support')]
-        ]);
+    const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('🆓 FREE OTP', 'mode_free'), Markup.button.callback('💵 CHEAP OTP', 'mode_cheap')],
+        [Markup.button.callback('📦 Buy Bundle', 'mode_bundle'), Markup.button.callback('👑 Upgrade VIP', 'mode_vip')],
+        [Markup.button.callback('💳 Deposit', 'deposit'), Markup.button.callback('📊 My Stats', 'stats')],
+        [Markup.button.callback('🎁 Referral', 'referral'), Markup.button.callback('⚙️ Settings', 'settings')],
+        [Markup.button.callback('💰 Check Balance', 'balance'), Markup.button.callback('🎧 Customer Service', 'support')]
+    ]);
 
-        try {
-            await this.sendPhotoWithCaption(ctx, IMAGES.welcome, welcomeMessage, keyboard, 'HTML');
-        } catch (err) {
-            logger.error('Failed to send welcome photo, falling back to text', { error: err.message });
-            await ctx.reply(welcomeMessage, {
-                parse_mode: 'HTML',
-                reply_markup: keyboard.reply_markup
-            });
-        }
-
-        if (isNewReferral && IMAGES.referral) {
-            try {
-                await ctx.reply(
-                    '✅ <b>Referral Confirmed</b>\n\n' +
-                    'Your referrer will be rewarded when you make your first deposit of at least ' +
-                    formatCurrency(config.referral?.minDeposit || 5) + '.',
-                    { parse_mode: 'HTML' }
-                );
-            } catch (err) {
-                logger.error('Failed to send referral confirmation', { userId, error: err.message });
-            }
-        }
+    try {
+        await this.sendPhotoWithCaption(ctx, IMAGES.welcome, welcomeMessage, keyboard, 'HTML');
+    } catch (err) {
+        logger.error('Failed to send welcome photo, falling back to text', { error: err.message });
+        await ctx.reply(welcomeMessage, {
+            parse_mode: 'HTML',
+            reply_markup: keyboard.reply_markup
+        });
     }
-    
+
+    // ═══════════════════════════════════════════════════════
+    //  INVITEE REFERRAL ACKNOWLEDGMENT — Cool & subtle
+    //  Sent AFTER welcome so it doesn't clutter the main screen
+    // ═══════════════════════════════════════════════════
+    if (referralResult.processed) {
+    try {
+        const referrerName = referralResult.referrerName || 'a friend';
+
+        const inviteeNotice =
+            `🎉 <b>You've got a head start!!</b>\n\n` +
+            `You were invited by <b>${referrerName}</b> 👀\n\n` +
+            `💰 Your advantage:\n` +
+            `• Faster onboarding\n` +
+            `• Priority access to virtual numbers\n` +
+            `• Instant number after your first deposit\n\n` +
+            `🚀 Make your first deposit now and start using SwiftSMS immediately!`;
+
+        await ctx.reply(inviteeNotice, { parse_mode: 'HTML' });
+    } catch (err) {
+        logger.error('Failed to send invitee referral notice', {
+            userId,
+            error: err.message
+        });
+    }
+    }
+}
     
         // ═══════════════════════════════════════════════════════════
     //  DEBUG: Check referral status
