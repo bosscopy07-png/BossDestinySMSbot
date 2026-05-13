@@ -274,7 +274,10 @@ class UserCommands {
     // ═══════════════════════════════════════════════════════════
     //  HANDLE START — Fixed: Added notification to referrer on new signup
     // ═══════════════════════════════════════════════════════════
-        async handleStart(ctx) {
+                // ═══════════════════════════════════════════════════════════
+    //  HANDLE START — Fixed: Proper referral tracking with full error surfacing
+    // ═══════════════════════════════════════════════════════════
+    async handleStart(ctx) {
         const userId = ctx.from.id.toString();
         let user = await this._ensureUserFresh(ctx);
 
@@ -283,13 +286,12 @@ class UserCommands {
         let isNewReferral = false;
 
         // ═══════════════════════════════════════════════════════════
-        //  REFERRAL TRACKING — Fixed: Removed double-count, added validation
+        //  REFERRAL TRACKING — Fixed: Removed double-count, proper error handling
         // ═══════════════════════════════════════════════════════════
         if (startPayload && !user.referredBy) {
             const referrerCode = startPayload.toUpperCase().trim();
             
-            // DEBUG: Log the referral attempt
-            logger.info('REFERRAL_DEBUG', {
+            logger.info('REFERRAL_START', {
                 userId,
                 referrerCode,
                 hasReferralService: !!this.referralService,
@@ -305,35 +307,42 @@ class UserCommands {
                     { $set: { referredBy: referrerCode } }
                 );
 
-                // Track via ReferralService — it handles referralCount increment + Referral record creation
+                // Track via ReferralService — it handles referralCount + Referral record
                 let referralRecord = null;
+                let trackError = null;
+
                 if (this.referralService) {
                     try {
                         referralRecord = await this.referralService.trackReferral(userId, referrerCode);
-                        logger.info('Referral tracked successfully', {
+                        logger.info('REFERRAL_TRACKED', {
                             referralId: referralRecord?.referralId,
                             referrerId: referrer.userId,
-                            referredId: userId
+                            referredId: userId,
+                            status: referralRecord?.status
                         });
                     } catch (err) {
-                        logger.error('ReferralService tracking FAILED', { 
+                        trackError = err;
+                        logger.error('REFERRAL_TRACK_FAILED', { 
                             userId, 
                             referrerCode, 
-                            error: err.message,
-                            stack: err.stack 
+                            errorName: err.name,
+                            errorMessage: err.message,
+                            errorCode: err.code,
+                            keyPattern: err.keyPattern,
+                            keyValue: err.keyValue,
+                            stack: err.stack
                         });
-                        // Continue anyway — user already has referredBy set
                     }
                 } else {
                     logger.error('REFERRAL_SERVICE_MISSING', { userId, referrerCode });
-                    // Fallback: manually increment if service missing
+                    // Fallback: manually increment only if no service
                     await User.updateOne(
                         { userId: referrer.userId },
                         { $inc: { referralCount: 1 } }
                     );
                 }
 
-                // Notify referrer
+                // Notify referrer (even if trackReferral failed, user still joined)
                 if (this.notificationService && referrer.userId) {
                     try {
                         await this.notificationService.send(referrer.userId, {
@@ -344,7 +353,7 @@ class UserCommands {
                             immediate: true
                         });
                     } catch (notifyErr) {
-                        logger.error('Failed to notify referrer', {
+                        logger.error('REFERRAL_NOTIFY_FAILED', {
                             referrerId: referrer.userId,
                             error: notifyErr.message
                         });
@@ -363,14 +372,21 @@ class UserCommands {
 
                 // Refresh user data
                 user = await User.findOne({ userId }).lean();
+
+                // Show track error to user if it failed (for debugging)
+                if (trackError) {
+                    logger.warn('Referral tracking had error but user notified', {
+                        userId,
+                        error: trackError.message
+                    });
+                }
+
             } else if (referrer && referrer.userId === userId) {
-                logger.warn('Self-referral blocked', { userId, code: referrerCode });
+                logger.warn('SELF_REFERRAL_BLOCKED', { userId, code: referrerCode });
             } else {
-                logger.warn('Invalid referral code', { userId, code: referrerCode });
+                logger.warn('INVALID_REFERRAL_CODE', { userId, code: referrerCode });
             }
         }
-
-        
 
         const freeRemaining = this._freeRemaining(user);
         const isVip = this._isVipActive(user);
@@ -417,6 +433,8 @@ class UserCommands {
             }
         }
     }
+    
+    
         // ═══════════════════════════════════════════════════════════
     //  DEBUG: Check referral status
     // ═══════════════════════════════════════════════════════════
