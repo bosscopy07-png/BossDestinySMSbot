@@ -211,8 +211,9 @@ class SMSProviderManager {
     /**
      * Get number for CHEAP tier — uses CheapPanelProvider (5SIM) ONLY
      * NO fallback to FREE. If 5SIM fails, this tier fails.
+     * FIXED: Accepts preferredOperator to preserve tier selection
      */
-    async getCheapNumber(country, service) {
+    async getCheapNumber(country, service, preferredOperator = null) {
         if (!this.isInitialized) await this.initialize();
 
         if (!country || typeof country !== 'string' || country.length !== 2) {
@@ -230,7 +231,8 @@ class SMSProviderManager {
         }
 
         try {
-            const result = await provider.getNumber(country, service);
+            // FIXED: Pass preferredOperator through to provider
+            const result = await provider.getNumber(country, service, preferredOperator);
 
             if (!result) {
                 throw new Error('CHEAP_NO_NUMBERS: No numbers available from 5SIM');
@@ -245,12 +247,13 @@ class SMSProviderManager {
                 tier: 'CHEAP',
                 acquisitionMethod: 'CHEAP_PANEL',
                 cost: result.cost || 0,
-                displayCost: result.displayCost || result.cost || 0
+                displayCost: result.displayCost || result.cost || 0,
+                operator: result.operator || preferredOperator || 'any'
             };
 
         } catch (error) {
             logger.error('CHEAP number acquisition failed', {
-                country, service, error: error.message
+                country, service, preferredOperator, error: error.message
             });
             throw error; // NO fallback — let caller handle
         }
@@ -398,14 +401,15 @@ class SMSProviderManager {
 
     // ═══════════════════════════════════════════════════════════════════════
     //  LEGACY getNumber — DEPRECATED, redirects to strict getters
+    //  FIXED: Accepts preferredOperator and passes to CHEAP tier
     // ═══════════════════════════════════════════════════════════════════════
 
     /**
      * LEGACY: Old getNumber with failover.
      * NOW STRICT: Routes to tier-specific getter, NO failover between tiers.
      */
-    async getNumber(tier, country, service, preferredProvider = null, userId = null) {
-        logger.warn('LEGACY getNumber() called — use tier-specific getters', { tier, country });
+    async getNumber(tier, country, service, preferredProvider = null, userId = null, preferredOperator = null) {
+        logger.warn('LEGACY getNumber() called — use tier-specific getters', { tier, country, preferredOperator });
 
         switch (tier?.toUpperCase()) {
             case 'VIP':
@@ -413,7 +417,8 @@ class SMSProviderManager {
                 return this.getVipNumber(country, service, userId, preferredProvider);
 
             case 'CHEAP':
-                return this.getCheapNumber(country, service);
+                // FIXED: Pass preferredOperator to preserve tier selection
+                return this.getCheapNumber(country, service, preferredOperator);
 
             case 'FREE':
                 return this.getFreeNumber(country, service, userId);
@@ -541,11 +546,12 @@ class SMSProviderManager {
             available: providerBalance.balance,
             currency: providerBalance.currency
         };
-    }
-        // ═══════════════════════════════════════════════════════════════════════════════
+                                                               }
+            // ═══════════════════════════════════════════════════════════════════════════════
 // SMSProviderManager.js — Part 2/3
 // SMS Checking, Free Tier Polling & Number Release/Cancellation
 // ═══════════════════════════════════════════════════════════════════════════════
+
     // ═══════════════════════════════════════════════════════════════════════
     //  SMS CHECKING — Complete tier coverage
     // ═══════════════════════════════════════════════════════════════════════
@@ -596,7 +602,6 @@ class SMSProviderManager {
 
     /**
      * Check SMS for VIP direct number (Twilio/Telnyx NOT in pool).
-     * FIXED: Added missing VIP direct checker
      */
     async checkVipSMS(providerName, messageIdOrSid) {
         if (!this.isInitialized) await this.initialize();
@@ -728,9 +733,8 @@ class SMSProviderManager {
         }
 
         return checkMethod.call(provider, identifier);
-                    }
-            
-     
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     //  FREE TIER POLLING (For OTPCommands.startFreePolling)
     // ═══════════════════════════════════════════════════════════════════════
