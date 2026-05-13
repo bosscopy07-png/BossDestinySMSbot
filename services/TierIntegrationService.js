@@ -106,7 +106,6 @@ class TierIntegrationService {
             });
 
         } catch (error) {
-            logger {
             logger.error('TierIntegrationService initialization failed', { error: error.message });
             this._enabled = false;
             if (!this._legacyFallback) {
@@ -242,8 +241,8 @@ class TierIntegrationService {
                     description: tier.description,
                     badge: tier.badge,
                     priceMultiplier: tier.priceMultiplier,
-                    baselinePrice: markedUpPrice,  // FIXED: was raw price
-                    rawPrice: rawPrice,            // Keep raw for reference
+                    baselinePrice: markedUpPrice,
+                    rawPrice: rawPrice,
                     baselineStock: baseline?.stock || 0,
                     operatorCount: tier.operatorCount
                 });
@@ -384,7 +383,7 @@ class TierIntegrationService {
             const purchasePayload = {
                 country, 
                 service, 
-                operator: selection.operator  // EXACT operator from selector
+                operator: selection.operator
             };
 
             // VALIDATION: Ensure selected operator is used
@@ -410,7 +409,7 @@ class TierIntegrationService {
             const purchaseResult = await this._cheapProvider.getNumber(
                 purchasePayload.country, 
                 purchasePayload.service, 
-                purchasePayload.operator  // EXACT operator passed
+                purchasePayload.operator
             );
 
             this._metrics.tierPurchases++;
@@ -432,8 +431,8 @@ class TierIntegrationService {
                 tier: tierKey,
                 country,
                 service,
-                operator: selection.operator,           // What we selected
-                purchasedOperator: purchaseResult.operator || selection.operator,  // What provider used
+                operator: selection.operator,
+                purchasedOperator: purchaseResult.operator || selection.operator,
                 price: finalPrice,
                 displayPrice: finalDisplayPrice,
                 rawPrice: selection.price,
@@ -444,8 +443,8 @@ class TierIntegrationService {
                 success: true,
                 phoneNumber: purchaseResult.phoneNumber,
                 providerNumberId: purchaseResult.providerNumberId,
-                operator: selection.operator,           // EXACT selected operator
-                purchasedOperator: purchaseResult.operator || selection.operator,  // Actual provider operator
+                operator: selection.operator,
+                purchasedOperator: purchaseResult.operator || selection.operator,
                 price: finalPrice,
                 displayPrice: finalDisplayPrice,
                 rawPrice: selection.price,
@@ -463,7 +462,6 @@ class TierIntegrationService {
             this._metrics.errors++;
 
             // CRITICAL FIX: Add INVALID_RESPONSE and PROVIDER_ERROR to fallback triggers
-            // Empty response from 5SIM usually means operator/country combo doesn't work
             const shouldFallback = error.message?.includes('NO_NUMBERS') || 
                  error.message?.includes('NOT_AVAILABLE') ||
                  error.message?.includes('TIMEOUT') ||
@@ -498,6 +496,7 @@ class TierIntegrationService {
     /**
      * Attempt fallback purchase with next-best operator in same tier
      */
+    
     async _attemptFallbackPurchase(tierKey, country, service, options, originalError) {
         this._metrics.tierFallbacks++;
 
@@ -590,12 +589,7 @@ class TierIntegrationService {
     async getFallbackOperators(tierKey, country, service, excludeOperator = null) {
         if (!this.isAvailable()) return [];
         return this._tierSelector.getFallbackOperators(tierKey, country, service, excludeOperator);
-                        }
-
-    // ═══════════════════════════════════════════════════════════════════════════════
-//  TierIntegrationService.js — Part 2/2
-//  Legacy Compatibility, Error Handling, Metrics & Health
-// ═══════════════════════════════════════════════════════════════════════════════
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  LEGACY COMPATIBILITY
@@ -626,8 +620,6 @@ class TierIntegrationService {
         return this.providerManager.getCheapCountries(service);
     }
 
-    
-    
     // ═══════════════════════════════════════════════════════════════════════
     //  ERROR HANDLING
     // ═══════════════════════════════════════════════════════════════════════
@@ -693,7 +685,6 @@ class TierIntegrationService {
         this._serviceCatalog?.clearCache();
         logger.info('TierIntegrationService caches cleared');
     }
+}
 
-}
-}
 export default TierIntegrationService;
