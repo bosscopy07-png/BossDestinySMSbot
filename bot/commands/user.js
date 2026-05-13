@@ -276,115 +276,19 @@ class UserCommands {
     //  HANDLE START — Fixed: Session-aware referral tracking
     // ═══════════════════════════════════════════════════════════
     async handleStart(ctx) {
-        const userId = ctx.from.id.toString();
-        let user = await this._ensureUserFresh(ctx);
+    const userId = ctx.from.id.toString();
+    let user = await this._ensureUserFresh(ctx);
 
-        let referralNotice = '';
-        let isNewReferral = false;
+    const referralResult = ctx.state?.referralResult || { processed: false };
+    let referralNotice = '';
+    let isNewReferral = false;
 
-        // ─── REFERRAL TRACKING ───
-        // Only process if user hasn't been referred yet
-        if (!user.referredBy) {
-            let referrerCode = null;
-            
-            // Source 1: Deep link payload (t.me/bot?start=CODE)
-            // This only works on the FIRST /start command before verification
-            if (ctx.startPayload) {
-                referrerCode = ctx.startPayload.toUpperCase().trim();
-                logger.info('REFERRAL_SOURCE_PAYLOAD', { userId, referrerCode });
-            }
-            
-            // Source 2: Message text (user typed /start CODE manually)
-            const text = ctx.message?.text || '';
-            const startMatch = text.match(/^\/start\s+([A-Z0-9]+)/i);
-            if (!referrerCode && startMatch) {
-                referrerCode = startMatch[1].toUpperCase().trim();
-                logger.info('REFERRAL_SOURCE_TEXT', { userId, referrerCode });
-            }
-            
-            // Source 3: Session fallback (preserved by StartVerification during CAPTCHA/channel flow)
-            // This is the CRITICAL path for users who complete verification
-            if (!referrerCode && ctx.session?.pendingReferralCode) {
-                referrerCode = ctx.session.pendingReferralCode;
-                delete ctx.session.pendingReferralCode; // Clear after use to prevent reuse
-                logger.info('REFERRAL_SOURCE_SESSION', { userId, referrerCode });
-            }
+    if (referralResult.processed) {
+        referralNotice = `🎉 <b>You were referred by ${referralResult.referrerName}!</b>\n💰 You will receive a <b>bonus</b> on your first deposit.\n\n`;
+        isNewReferral = true;
+        user = await User.findOne({ userId }).lean();
+    }
 
-            if (referrerCode) {
-                const referrer = await User.findOne({ referralCode: referrerCode });
-
-                if (referrer && referrer.userId !== userId) {
-                    // Set referredBy on new user
-                    await User.updateOne(
-                        { userId },
-                        { $set: { referredBy: referrerCode } }
-                    );
-
-                    // Track via ReferralService
-                    let referralRecord = null;
-                    if (this.referralService) {
-                        try {
-                            referralRecord = await this.referralService.trackReferral(userId, referrerCode);
-                            logger.info('REFERRAL_TRACKED', {
-                                referralId: referralRecord?.referralId,
-                                referrerId: referrer.userId,
-                                referredId: userId
-                            });
-                        } catch (err) {
-                            logger.error('REFERRAL_TRACK_FAILED', { 
-                                userId, 
-                                referrerCode,
-                                error: err.message,
-                                code: err.code
-                            });
-                        }
-                    } else {
-                        logger.error('REFERRAL_SERVICE_MISSING', { userId, referrerCode });
-                        // Fallback: increment referrer count manually
-                        await User.updateOne(
-                            { userId: referrer.userId },
-                            { $inc: { referralCount: 1 } }
-                        );
-                    }
-
-                    // Notify referrer
-                    if (this.notificationService && referrer.userId) {
-                        try {
-                            const percentage = ((config.referral?.percentage || 0.05) * 100).toFixed(0);
-                            await this.notificationService.send(referrer.userId, {
-                                type: 'REFERRAL_JOINED',
-                                title: '🎉 New Referral!',
-                                message: `A new user just joined using your code! You'll earn ${percentage}% of their first deposit.`,
-                                telegramChatId: referrer.userId,
-                                immediate: true
-                            });
-                        } catch (notifyErr) {
-                            logger.error('REFERRAL_NOTIFY_FAILED', { referrerId: referrer.userId, error: notifyErr.message });
-                        }
-                    }
-
-                    const referrerName = referrer.username
-                        ? '@' + referrer.username
-                        : (referrer.firstName || 'a friend');
-
-                    referralNotice =
-                        '🎉 <b>You were referred by ' + referrerName + '!</b>\n' +
-                        '💰 You will receive a <b>bonus</b> on your first deposit.\n\n';
-
-                    isNewReferral = true;
-                    user = await User.findOne({ userId }).lean();
-                } else if (referrer && referrer.userId === userId) {
-                    logger.warn('REFERRAL_SELF_REFERRAL_BLOCKED', { userId, referrerCode });
-                } else {
-                    logger.warn('REFERRAL_INVALID_CODE', { userId, referrerCode });
-                }
-            } else {
-                logger.info('NO_REFERRAL_CODE', { userId });
-            }
-        } else {
-            logger.debug('USER_ALREADY_REFERRED', { userId, referredBy: user.referredBy });
-        }
-    
         
         const freeRemaining = this._freeRemaining(user);
         const isVip = this._isVipActive(user);
