@@ -101,17 +101,18 @@ class SessionManager {
     /**
      * Create session with pre-assigned number (VIP/CHEAP/FREE flow)
      *
-     * FIXED: Now accepts providerNumberId and cost as separate params
-     * Previously: (userId, mode, service, country, phoneNumber, provider) — providerNumberId was LOST
-     * Now: (userId, mode, service, country, phoneNumber, provider, providerNumberId, cost)
+     * FIXED: Now accepts providerNumberId, cost, AND operator as separate params
+     * Previously: operator was LOST
+     * Now: (userId, mode, service, country, phoneNumber, provider, providerNumberId, cost, operator)
      */
-    async createSessionWithNumber(userId, mode, service, country, phoneNumber, provider, providerNumberId = null, cost = 0) {
+    async createSessionWithNumber(userId, mode, service, country, phoneNumber, provider, providerNumberId = null, cost = 0, operator = null) {
         const numberData = {
             phoneNumber,
             provider,
-            providerNumberId: providerNumberId,  // FIXED: Now properly captured
+            providerNumberId: providerNumberId,
             providerInstance: null,
-            cost: parseFloat(cost) || 0  // FIXED: Pass actual cost from 5SIM
+            cost: parseFloat(cost) || 0,
+            operator: operator || 'any'  // FIXED: Preserve operator from tier selection
         };
         return this._createSessionInternal(userId, mode, service, country, numberData);
     }
@@ -404,7 +405,7 @@ class SessionManager {
                 await Transaction.create({
                     txId: generateId(),
                     userId: session.userId,
-                    type: 'OTP_PURCHASE',  // ← FIXED: Use valid enum value
+                    type: 'OTP_PURCHASE',
                     amount: -session.cost,
                     currency: 'USD',
                     status: 'COMPLETED',
@@ -415,6 +416,7 @@ class SessionManager {
                         number: session.number,
                         provider: session.provider,
                         providerNumberId: session.providerNumberId,
+                        operator: session.operator || 'any',
                         otpDeliveredAt: new Date()
                     }
                 });
@@ -449,11 +451,12 @@ class SessionManager {
         });
 
         return updated;
-    }
-    // ═══════════════════════════════════════════════════════════════════════════════
+                }
+                        // ═══════════════════════════════════════════════════════════════════════════════
 // SessionManager.js — Part 2/3
 // Timeout Handling, Provider Failure, Queries, Internal Session Creation & Finances
 // ═══════════════════════════════════════════════════════════════════════════════
+
     /**
      * Handle session timeout
      * FIXED: 
@@ -551,7 +554,6 @@ class SessionManager {
 
         return { retried: false };
     }
-    
 
     /**
      * Handle provider-side failure
@@ -673,12 +675,15 @@ class SessionManager {
                 numberData = preAssignedNumber;
             } else if (mode === 'VIP' && this.numberPoolManager) {
                 numberData = await this.numberPoolManager.acquireNumber(country, service, userId);
+            } else if (mode === 'CHEAP' && preAssignedNumber?.operator && preAssignedNumber.operator !== 'any') {
+                // FIXED: If operator was pre-selected (from tier flow), pass it to providerManager
+                numberData = await this.providerManager.getNumber(mode, country, service, null, userId, preAssignedNumber.operator);
             } else {
                 numberData = await this.providerManager.getNumber(mode, country, service);
             }
         } catch (error) {
             logger.error('Number acquisition failed', {
-                userId, mode, service, country, error: error.message
+                userId, mode, service, country, operator: preAssignedNumber?.operator, error: error.message
             });
             throw new Error('NUMBER_UNAVAILABLE: ' + error.message);
         }
@@ -703,7 +708,7 @@ class SessionManager {
         const timeoutAt = new Date(Date.now() + timeoutSeconds * 1000);
 
         // Create session
-        // FIXED: Store providerNumberId from numberData (activation ID for 5SIM)
+        // FIXED: Store providerNumberId and operator from numberData
         const session = await Session.create({
             sessionId: generateId(),
             userId,
@@ -712,7 +717,8 @@ class SessionManager {
             country,
             number: numberData.phoneNumber,
             provider: numberData.provider,
-            providerNumberId: numberData.providerNumberId || null,  // FIXED: Now stores activation ID
+            providerNumberId: numberData.providerNumberId || null,
+            operator: numberData.operator || preAssignedNumber?.operator || 'any',
             status: 'WAITING',
             startTime: new Date(),
             timeoutAt,
@@ -731,7 +737,8 @@ class SessionManager {
             service,
             number: this.maskPhone(session.number),
             provider: numberData.provider,
-            providerNumberId: numberData.providerNumberId,  // Log activation ID for debugging
+            providerNumberId: numberData.providerNumberId,
+            operator: session.operator,
             cost,
             timeoutAt
         });
@@ -847,7 +854,7 @@ class SessionManager {
                 // NEVER use session.number (phone number like "+4915511298251") for 5SIM cancel
                 await this.providerManager.cancelNumber(
                     session.provider,
-                    session.providerNumberId  // Activation ID, not phone number
+                    session.providerNumberId
                 );
             } else if (this.providerManager) {
                 // For other modes or if providerNumberId is missing, use number as fallback
@@ -866,8 +873,8 @@ class SessionManager {
                 error: error.message
             });
         }
-    }
-        // ═══════════════════════════════════════════════════════════════════════════════
+             }
+    // ═══════════════════════════════════════════════════════════════════════════════
 // SessionManager.js — Part 3/3
 // Validation, Monitoring, Cleanup, Shutdown & Utilities
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -922,6 +929,7 @@ class SessionManager {
     // ═══════════════════════════════════════════════════════════
     //  INTERNAL - Monitoring
     // ═══════════════════════════════════════════════════════════
+
     _startMonitoring(session, providerInstance) {
         const sessionId = session.sessionId;
 
@@ -934,15 +942,11 @@ class SessionManager {
             pollCount: 0
         });
 
-        // ========== NO TIMEOUT SCHEDULED HERE ==========
-        // The controller's _scheduleTimeoutNotification handles timeout
-        // SessionManager only handles polling
-
         // Start polling
         const pollInterval = this.config.pollIntervals[session.mode] || 5000;
         this._schedulePoll(sessionId, pollInterval);
     }
-    
+
     _schedulePoll(sessionId, interval) {
         const timer = setTimeout(async () => {
             await this._pollProvider(sessionId, interval);
@@ -951,7 +955,7 @@ class SessionManager {
         this.pollTimers.set(sessionId, timer);
     }
 
-        async _pollProvider(sessionId, interval) {
+    async _pollProvider(sessionId, interval) {
         const sessionData = this.activeSessions.get(sessionId);
         if (!sessionData) return;
 
@@ -977,10 +981,7 @@ class SessionManager {
                 );
             }
 
-            // ═════════════════════════════════════════════════════════════════
-            //  FIXED: Use tier-specific methods instead of legacy checkSMS()
-            //  This eliminates the "LEGACY checkSMS() called" spam
-            // ═════════════════════════════════════════════════════════════════
+            // FIXED: Use tier-specific methods instead of legacy checkSMS()
             let result;
             switch (current.mode) {
                 case 'FREE':
@@ -1031,8 +1032,7 @@ class SessionManager {
 
             this._schedulePoll(sessionId, interval);
         }
-        }
-    
+    }
 
     // ═══════════════════════════════════════════════════════════
     //  INTERNAL - Cleanup
@@ -1115,4 +1115,4 @@ class SessionManager {
 }
 
 export default SessionManager;
-                
+            
