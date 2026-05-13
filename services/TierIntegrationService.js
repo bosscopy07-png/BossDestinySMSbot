@@ -693,6 +693,7 @@ class TierIntegrationService {
         this._serviceCatalog?.clearCache();
         logger.info('TierIntegrationService caches cleared');
     }
-}
 
+}
+}
 export default TierIntegrationService;
