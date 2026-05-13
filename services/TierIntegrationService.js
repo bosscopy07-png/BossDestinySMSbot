@@ -106,6 +106,7 @@ class TierIntegrationService {
             });
 
         } catch (error) {
+            logger {
             logger.error('TierIntegrationService initialization failed', { error: error.message });
             this._enabled = false;
             if (!this._legacyFallback) {
@@ -333,6 +334,9 @@ class TierIntegrationService {
      * Select best operator and purchase number
      * This is the MAIN entry point for automatic provider selection + purchase
      * 
+     * FIXED: Validates operator selection before purchase, logs operator mismatch,
+     * ensures exact selected operator is passed to provider.
+     * 
      * @returns {Promise<{
      *   success: boolean,
      *   phoneNumber: string,
@@ -369,12 +373,56 @@ class TierIntegrationService {
                 }
             );
 
-            // Step 2: Purchase via CheapPanelProvider with selected operator
+            // CRITICAL FIX: Validate operator selection
+            if (!selection.operator || selection.operator === 'any') {
+                logger.warn('Tier selector returned "any" or empty operator', {
+                    tier: tierKey, country, service, selection
+                });
+            }
+
+            // Step 2: Build purchase payload with EXACT selected operator
+            const purchasePayload = {
+                country, 
+                service, 
+                operator: selection.operator  // EXACT operator from selector
+            };
+
+            // VALIDATION: Ensure selected operator is used
+            if (selection.operator !== purchasePayload.operator) {
+                logger.error('OPERATOR MISMATCH DETECTED', {
+                    selectedOperator: selection.operator,
+                    purchaseOperator: purchasePayload.operator
+                });
+                throw new Error('OPERATOR_MISMATCH: Selected operator does not match purchase payload');
+            }
+
+            logger.info('Purchasing with selected operator', {
+                selectedOperator: selection.operator,
+                purchaseOperator: purchasePayload.operator,
+                tier: tierKey,
+                country,
+                service,
+                expectedPrice: selection.price,
+                expectedDisplayPrice: selection.displayPrice
+            });
+
+            // Step 3: Purchase via CheapPanelProvider with selected operator
             const purchaseResult = await this._cheapProvider.getNumber(
-                country, service, selection.operator
+                purchasePayload.country, 
+                purchasePayload.service, 
+                purchasePayload.operator  // EXACT operator passed
             );
 
             this._metrics.tierPurchases++;
+
+            // VALIDATION: Verify purchased operator matches selected
+            if (purchaseResult.operator && purchaseResult.operator !== selection.operator) {
+                logger.warn('Provider returned different operator than requested', {
+                    requestedOperator: selection.operator,
+                    returnedOperator: purchaseResult.operator,
+                    providerNumberId: purchaseResult.providerNumberId
+                });
+            }
 
             // FIXED: Apply profit margin to prices
             const finalPrice = applyProfitMargin(selection.price);
@@ -384,10 +432,11 @@ class TierIntegrationService {
                 tier: tierKey,
                 country,
                 service,
-                operator: selection.operator,
-                price: finalPrice,           // FIXED: was selection.price
-                displayPrice: finalDisplayPrice, // FIXED: was selection.displayPrice
-                rawPrice: selection.price,   // Keep for accounting
+                operator: selection.operator,           // What we selected
+                purchasedOperator: purchaseResult.operator || selection.operator,  // What provider used
+                price: finalPrice,
+                displayPrice: finalDisplayPrice,
+                rawPrice: selection.price,
                 duration: Date.now() - startTime
             });
 
@@ -395,10 +444,11 @@ class TierIntegrationService {
                 success: true,
                 phoneNumber: purchaseResult.phoneNumber,
                 providerNumberId: purchaseResult.providerNumberId,
-                operator: selection.operator,
-                price: finalPrice,              // FIXED
-                displayPrice: finalDisplayPrice, // FIXED
-                rawPrice: selection.price,      // Provider cost
+                operator: selection.operator,           // EXACT selected operator
+                purchasedOperator: purchaseResult.operator || selection.operator,  // Actual provider operator
+                price: finalPrice,
+                displayPrice: finalDisplayPrice,
+                rawPrice: selection.price,
                 rawDisplayPrice: selection.displayPrice,
                 stock: selection.stock,
                 score: selection.score,
@@ -482,7 +532,7 @@ class TierIntegrationService {
                         tier: tierKey,
                         country,
                         service,
-                        originalOperator: originalError?.operator || 'unknown',  // FIXED: was hardcoded 'unknown'
+                        originalOperator: originalError?.operator || 'unknown',
                         fallbackOperator: fallback.operator,
                         score: fallback.score,
                         price: finalPrice,
@@ -494,8 +544,8 @@ class TierIntegrationService {
                         phoneNumber: purchaseResult.phoneNumber,
                         providerNumberId: purchaseResult.providerNumberId,
                         operator: fallback.operator,
-                        price: finalPrice,              // FIXED
-                        displayPrice: finalDisplayPrice, // FIXED
+                        price: finalPrice,
+                        displayPrice: finalDisplayPrice,
                         rawPrice: fallback.price,
                         rawDisplayPrice: fallback.displayPrice,
                         stock: fallback.stock,
@@ -540,11 +590,16 @@ class TierIntegrationService {
     async getFallbackOperators(tierKey, country, service, excludeOperator = null) {
         if (!this.isAvailable()) return [];
         return this._tierSelector.getFallbackOperators(tierKey, country, service, excludeOperator);
-    }
+                        }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+//  TierIntegrationService.js — Part 2/2
+//  Legacy Compatibility, Error Handling, Metrics & Health
+// ═══════════════════════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════════════════
     //  LEGACY COMPATIBILITY
-    // ══════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
 
     /**
      * Get legacy CHEAP price (for non-tier fallback)
@@ -571,15 +626,19 @@ class TierIntegrationService {
         return this.providerManager.getCheapCountries(service);
     }
 
+    // ═══════════════════════════════════════════════════════════════════════);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     //  ERROR HANDLING
     // ═══════════════════════════════════════════════════════════════════════
+
     _normalizeError(error) {
         const message = error?.message || error?.toString() || 'Unknown error';
         
         if (message.includes('TIER_NO_STOCK')) return 'NO_NUMBERS';
         if (message.includes('NO_BALANCE')) return 'NO_BALANCE';
-        if (message.includes('INSUFFICIENT_FUNDS')) return 'NO_BALANCE';  // ADD THIS
+        if (message.includes('INSUFFICIENT_FUNDS')) return 'NO_BALANCE';
         if (message.includes('NOT_AVAILABLE')) return 'NOT_AVAILABLE';
         if (message.includes('TIMEOUT')) return 'TIMEOUT';
         if (message.includes('INVALID_TIER')) return 'INVALID_TIER';
@@ -591,9 +650,8 @@ class TierIntegrationService {
         if (message.includes('PROVIDER_ERROR')) return 'NOT_AVAILABLE';
         
         return 'PROVIDER_ERROR';
-            }
-    
-    
+    }
+
     _isRecoverable(error) {
         const message = error?.message || '';
         const recoverableCodes = ['NO_NUMBERS', 'NOT_AVAILABLE', 'TIMEOUT', 'CONNECTION_ERROR'];
