@@ -271,10 +271,10 @@ class UserCommands {
         }
     }
 
+
+                            // ═══════════════════════════════════════════════════════════
+    //  HANDLE START — Fixed: Session-aware referral tracking
     // ═══════════════════════════════════════════════════════════
-    //  HANDLE START — Fixed: Added notification to referrer on new signup
-    // ═══════════════════════════════════════════════════════════
-                    
     async handleStart(ctx) {
         const userId = ctx.from.id.toString();
         let user = await this._ensureUserFresh(ctx);
@@ -287,7 +287,8 @@ class UserCommands {
         if (!user.referredBy) {
             let referrerCode = null;
             
-            // Source 1: Deep link payload (t.me/bot?start=CODE) — set by Telegram on first /start
+            // Source 1: Deep link payload (t.me/bot?start=CODE)
+            // This only works on the FIRST /start command before verification
             if (ctx.startPayload) {
                 referrerCode = ctx.startPayload.toUpperCase().trim();
                 logger.info('REFERRAL_SOURCE_PAYLOAD', { userId, referrerCode });
@@ -301,10 +302,11 @@ class UserCommands {
                 logger.info('REFERRAL_SOURCE_TEXT', { userId, referrerCode });
             }
             
-            // Source 3: Session fallback (preserved by StartVerification after CAPTCHA/channel verification)
+            // Source 3: Session fallback (preserved by StartVerification during CAPTCHA/channel flow)
+            // This is the CRITICAL path for users who complete verification
             if (!referrerCode && ctx.session?.pendingReferralCode) {
                 referrerCode = ctx.session.pendingReferralCode;
-                delete ctx.session.pendingReferralCode; // Clear after use
+                delete ctx.session.pendingReferralCode; // Clear after use to prevent reuse
                 logger.info('REFERRAL_SOURCE_SESSION', { userId, referrerCode });
             }
 
@@ -382,9 +384,8 @@ class UserCommands {
         } else {
             logger.debug('USER_ALREADY_REFERRED', { userId, referredBy: user.referredBy });
         }
+    
         
-      
-
         const freeRemaining = this._freeRemaining(user);
         const isVip = this._isVipActive(user);
         const vipRemaining = isVip ? this._vipRemaining(user) : 0;
