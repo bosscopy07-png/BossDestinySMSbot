@@ -420,7 +420,7 @@ class UserCommands {
         // ═══════════════════════════════════════════════════════════
     //  DEBUG: Check referral status
     // ═══════════════════════════════════════════════════════════
-    async handleRefDebug(ctx) {
+        async handleRefDebug(ctx) {
         const userId = ctx.from.id.toString();
         
         try {
@@ -428,7 +428,7 @@ class UserCommands {
             const referrals = await Referral.find({ referrerId: userId }).lean();
             const referredUsers = await User.find({ referredBy: user.referralCode }).lean();
 
-            const message =
+            let message = // ← MUST be let, not const
                 '🔍 <b>Referral Debug</b>\n\n' +
                 '<b>Your Info:</b>\n' +
                 `• User ID: <code>${userId}</code>\n` +
@@ -459,7 +459,8 @@ class UserCommands {
             logger.error('refdebug error', { userId, error: error.message });
             await ctx.reply('❌ Debug failed: ' + error.message);
         }
-    }
+        }
+    
     
 
     async handleMenu(ctx) {
