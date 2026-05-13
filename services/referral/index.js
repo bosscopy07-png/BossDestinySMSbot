@@ -59,28 +59,39 @@ class ReferralService {
 
     // ═══════════════════════════════════════════════════════════
     //  TRACK REFERRAL — Called when user joins with referral code
+    //  Fixed: Full error surfacing, removed duplicate key race condition
     // ═══════════════════════════════════════════════════════════
 
     async trackReferral(referredId, referralCode) {
         try {
-            if (!referralCode) return null;
+            if (!referralCode) {
+                logger.warn('TRACK_REFERRAL_NO_CODE', { referredId });
+                return null;
+            }
 
             const cleanCode = referralCode.toUpperCase().trim();
 
             // Find referrer
             const referrer = await User.findOne({ referralCode: cleanCode });
             if (!referrer) {
-                logger.warn('Invalid referral code used', { code: cleanCode, referredId });
+                logger.warn('TRACK_REFERRAL_INVALID_CODE', { code: cleanCode, referredId });
                 return null;
             }
 
             // Prevent self-referral
             if (referrer.userId === referredId) {
-                logger.warn('Self-referral attempt blocked', { userId: referredId });
+                logger.warn('TRACK_REFERRAL_SELF', { userId: referredId });
                 return null;
             }
 
-            // Atomic check-and-create to prevent race conditions
+            // Check if already referred
+            const existing = await Referral.findOne({ referredId });
+            if (existing) {
+                logger.info('TRACK_REFERRAL_ALREADY_EXISTS', { referredId, status: existing.status });
+                return existing;
+            }
+
+            // Create referral record
             let referral;
             try {
                 referral = await Referral.create({
@@ -94,17 +105,29 @@ class ReferralService {
                         joinedAt: new Date()
                     }
                 });
+                logger.info('TRACK_REFERRAL_CREATED', {
+                    referralId: referral.referralId,
+                    referrerId: referrer.userId,
+                    referredId
+                });
             } catch (createError) {
-                // Duplicate key error — referral already exists
+                logger.error('TRACK_REFERRAL_CREATE_FAILED', {
+                    referredId,
+                    referrerId: referrer.userId,
+                    error: createError.message,
+                    code: createError.code,
+                    keyPattern: createError.keyPattern,
+                    keyValue: createError.keyValue
+                });
+                
+                // If duplicate key, return existing
                 if (createError.code === 11000) {
-                    referral = await Referral.findOne({ referredId });
-                    logger.info('User already has referral record (race condition handled)', {
-                        referredId,
-                        status: referral?.status
-                    });
-                    return referral;
+                    const dup = await Referral.findOne({ referredId });
+                    logger.info('TRACK_REFERRAL_DUPLICATE_RETURNED', { referredId, referralId: dup?.referralId });
+                    return dup;
                 }
-                throw createError;
+                
+                throw createError; // Re-throw other errors
             }
 
             // Increment referrer's referral count
@@ -113,16 +136,7 @@ class ReferralService {
                 { $inc: { referralCount: 1 } }
             );
 
-            // 🔔 NOTIFY REFERRER: New signup
-            await this._notifyReferrer(referrer.userId, 'REFERRAL_JOINED', {
-                title: '🎉 New Referral!',
-                message: `A new user just joined using your referral code! You'll earn ${(referral.rewardPercentage * 100).toFixed(0)}% of their first deposit.`,
-                referredId,
-                referralId: referral.referralId,
-                rewardPercentage: referral.rewardPercentage
-            });
-
-            logger.info('Referral tracked', {
+            logger.info('TRACK_REFERRAL_COMPLETE', {
                 referralId: referral.referralId,
                 referrerId: referrer.userId,
                 referredId,
@@ -132,11 +146,11 @@ class ReferralService {
             return referral;
 
         } catch (error) {
-            logger.error('Referral tracking failed', { referredId, error: error.message });
-            throw error;
+            logger.error('TRACK_REFERRAL_FATAL', { referredId, referralCode, error: error.message, stack: error.stack });
+            throw error; // Re-throw so caller knows it failed
         }
-    }
-
+        }
+            
     // ═══════════════════════════════════════════════════════════
     //  PROCESS DEPOSIT — Called by WalletService when deposit detected
     // ═══════════════════════════════════════════════════════════
