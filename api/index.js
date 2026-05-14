@@ -1,22 +1,16 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// api/index.js — Express Server Factory
-// ═══════════════════════════════════════════════════════════════════════════════
-
+// api/index.js — MUST export createServer as default or named
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import webhookRoutes from '../routes/webhook.js';
 import logger from '../utils/logger.js';
-import config from '../config/env.js';
 
 export default function createServer() {
     const app = express();
     
-    // Security middleware
     app.use(helmet());
     app.use(cors());
     
-    // Body parsing for webhooks
     app.use(express.json({ 
         verify: (req, res, buf) => { req.rawBody = buf; } 
     }));
@@ -25,10 +19,8 @@ export default function createServer() {
         verify: (req, res, buf) => { req.rawBody = buf; } 
     }));
     
-    // Mount webhook routes — CRITICAL for ad redirects
     app.use('/webhooks', webhookRoutes);
     
-    // Health check
     app.get('/health', (req, res) => {
         res.json({
             status: 'healthy',
@@ -39,7 +31,6 @@ export default function createServer() {
         });
     });
     
-    // 404 handler
     app.use((req, res) => {
         res.status(404).json({ 
             error: 'Not found',
@@ -48,15 +39,13 @@ export default function createServer() {
         });
     });
     
-    // Error handler
     app.use((err, req, res, next) => {
         logger.error('Express error', { 
             path: req.path, 
-            error: err.message,
-            stack: err.stack 
+            error: err.message 
         });
         res.status(500).json({ error: 'Internal server error' });
     });
     
     return app;
-}
+    }
