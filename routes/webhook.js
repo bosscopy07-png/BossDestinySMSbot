@@ -304,7 +304,7 @@ router.get('/ad/redirect', async (req, res) => {
 
     try {
         // Import and instantiate directly
-        const { default: SMSProviderManager } = await import('../services/sms/SMSProviderManager.js');
+        const { default: SMSProviderManager } = await import('../../services/sms/SMSProviderManager.js');
         const providerManager = new SMSProviderManager();
         await providerManager.initialize();
         
