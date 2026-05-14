@@ -174,21 +174,41 @@ const KEYBOARDS = {
     // ═══════════════════════════════════════════════════════════════════════
     
     _canUseFree(user) {
-        if (!user || typeof user !== 'object') return false;
-        if (user.isAdmin === true) return true;
-        const limit = config.limits?.freeDaily || 3;
-        const used = Number.isFinite(user.freeUsedToday) ? user.freeUsedToday : 0;
-        return used < limit;
-    }
+    if (!user || typeof user !== 'object') return false;
 
-    _freeRemaining(user) {
-        if (!user || typeof user !== 'object') return 0;
-        if (user.isAdmin === true) return '∞';
-        const limit = config.limits?.freeDaily || 3;
-        const used = Number.isFinite(user.freeUsedToday) ? user.freeUsedToday : 0;
-        return Math.max(0, limit - used);
-    }
-    
+    if (user.isAdmin === true) return true;
+
+    const limit = config.limits?.freeDaily || 3;
+
+    const used = Number.isFinite(user.freeUsedToday)
+        ? user.freeUsedToday
+        : 0;
+
+    // FIX 15: Add debug logging for every limit check
+    logger.info('FREE LIMIT CHECK', {
+        userId: user.userId,
+        used: used,
+        limit: limit,
+        canUse: used < limit
+    });
+
+    return used < limit;
+}
+
+_freeRemaining(user) {
+    if (!user || typeof user !== 'object') return 0;
+
+    if (user.isAdmin === true) return '∞';
+
+    const limit = config.limits?.freeDaily || 3;
+
+    const used = Number.isFinite(user.freeUsedToday)
+        ? user.freeUsedToday
+        : 0;
+
+    return Math.max(0, limit - used);
+}
+        
     _canUseVip(user) {
         if (!this._isVipActive(user)) return false;
         const limit = config.limits?.vipDaily || 50;
@@ -1221,6 +1241,9 @@ setupTextHandlers() {
         // ═══════════════════════════════════════════════════════════════════════
 //  FREE MODE — Check credits, show ad if needed, otherwise proceed
 // ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
+//  FREE MODE — Check credits, show ad if needed, otherwise proceed
+// ═══════════════════════════════════════════════════════════════════════
 
 async handleFreeMode(ctx) {
     const user = ctx.state.user;
@@ -1230,21 +1253,29 @@ async handleFreeMode(ctx) {
         return ctx.reply('⚠️ Session expired. Please send /start to continue.', { parse_mode: 'HTML' });
     }
 
+    // FIX 1: Check daily limit FIRST before anything else
+    // If exhausted, hard block immediately — no ads, no bypass
+    if (!this._canUseFree(user)) {
+        return this._showFreeExhausted(ctx, user);
+    }
+
     const freeProvider = this.smsProviderManager.getProvider('FREE_PUBLIC');
 
-    // Check ad system credits
+    // FIX 2: Only check ad credits if user still has free requests remaining
     if (freeProvider && freeProvider.adSystem) {
         try {
             const creditCheck = await freeProvider.canRequestNumber(userId);
 
             // NO credits → MUST watch ad FIRST before anything
             if (!creditCheck.allowed && creditCheck.reason === 'INSUFFICIENT_CREDITS') {
-                return this._showAdPrompt(ctx, creditCheck, freeProvider);
+                return this._showAdPrompt(ctx, creditCheck, freeProvider, user);
             }
 
-            // Daily limit reached via ad system
-            if (!creditCheck.allowed && creditCheck.reason === 'DAILY_LIMIT_REACHED') {
-                return this._showFreeExhausted(ctx, user, creditCheck);
+            // FIX 3: Remove DAILY_LIMIT_REACHED from ad system — we control limits centrally
+            // The ad system should NOT enforce daily limits, only credit balances
+            // If any other error, treat as exhausted
+            if (!creditCheck.allowed) {
+                return this._showFreeExhausted(ctx, user);
             }
 
             // Has credits → hold them for when user actually requests number
@@ -1261,10 +1292,9 @@ async handleFreeMode(ctx) {
         }
     }
 
-    // Show free mode warning (user passed credit check)
-    const dailyUsed = user.freeUsedToday || 0;
-    const dailyLimit = 3;
-    const remainingFree = dailyLimit - dailyUsed;
+    // Show free mode warning (user passed all checks)
+    // FIX 4: Use centralized helper instead of manual calculation
+    const remainingFree = this._freeRemaining(user);
 
     const warningMessage = [
         '⚠️ <b>Free Mode Notice</b>\n\n',
@@ -1294,17 +1324,24 @@ async handleFreeMode(ctx) {
 // ═══════════════════════════════════════════════════════════════════════
 //  FREE EXHAUSTED — Daily limit reached, NO ads allowed
 // ═══════════════════════════════════════════════════════════════════════
+
 async _showFreeExhausted(ctx, user) {
+    // FIX 5: Remove ALL manual daily limit calculations
+    // Use centralized helper for remaining count
+    const remaining = this._freeRemaining(user);
+    const isExhausted = remaining === 0 || remaining === '∞' ? false : remaining <= 0;
+
+    // FIX 6: Use user's actual data instead of creditCheck fallbacks
+    const dailyUsed = Number.isFinite(user?.freeUsedToday) ? user.freeUsedToday : 0;
+    const dailyLimit = config.limits?.freeDaily || 3;
+
     const pricing = await getPricing();
     const formatted = formatPrice(pricing);
 
     const message = [
-        '❌ <b>Free OTP Limit Reached</b>\n\n',
-
-        'You have used all free OTP requests for today.\n\n',
-
-        '⏳ Please come back tomorrow.\n\n',
-
+        '❌ <b>Free OTPs Used Up</b>\n\n',
+        'You\'ve used ' + dailyUsed + '/' + dailyLimit + ' free OTPs today.\n\n',
+        '⏳ <b>Come back tomorrow</b> for more free OTPs.\n\n',
         '💡 Upgrade for instant access:\n',
         '• 💰 CHEAP — ' + formatted.cheap + '\n',
         '• 📦 BUNDLE — ' + formatted.bundle + '\n',
@@ -1318,20 +1355,16 @@ async _showFreeExhausted(ctx, user) {
         [Markup.button.callback('🔙 Main Menu', 'menu')]
     ]);
 
-    return this.sendPhotoWithCaption(
-        ctx,
-        IMAGES.freeMode,
-        message,
-        keyboard,
-        'HTML'
-    );
+    return this.sendPhotoWithCaption(ctx, IMAGES.freeMode, message, keyboard, 'HTML');
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 //  AD PROMPT — Force ad watch BEFORE any free OTP access
 // ═══════════════════════════════════════════════════════════════════════
+
 async _showAdPrompt(ctx, creditCheck, freeProvider, user) {
-    // HARD BLOCK
+    // FIX 7: MUST verify user still has free requests before showing ads
+    // If limit exhausted while ad prompt was pending, block immediately
     if (!this._canUseFree(user)) {
         return this._showFreeExhausted(ctx, user);
     }
@@ -1339,37 +1372,23 @@ async _showAdPrompt(ctx, creditCheck, freeProvider, user) {
     const pricing = await getPricing();
     const formatted = formatPrice(pricing);
 
-    const networks = freeProvider
-        .getAvailableNetworks()
-        .filter(function(n) {
-            return n.configured;
-        });
-
+    // FIX 8: Remove all manual dailyLimit/dailyUsed calculations
+    // Use centralized helper for remaining count
     const remainingFree = this._freeRemaining(user);
 
-    const minWatchTimeMs =
-        (freeProvider.adSystem &&
-        freeProvider.adSystem.minWatchTime)
-            ? freeProvider.adSystem.minWatchTime
-            : 30000;
+    const shortfall = creditCheck.shortfall || (creditCheck.required - creditCheck.credits);
+    const networks = freeProvider.getAvailableNetworks().filter(function(n) { return n.configured; });
 
+    const minWatchTimeMs = (freeProvider.adSystem && freeProvider.adSystem.minWatchTime) ? freeProvider.adSystem.minWatchTime : 30000;
     const minWatchTimeSec = Math.floor(minWatchTimeMs / 1000);
 
     const message = [
         '🎁 <b>Watch Ad to Get Free OTP</b>\n\n',
-
-        '✅ Free OTPs remaining today: <b>' +
-            remainingFree +
-            '</b>\n\n',
-
+        'Free OTPs remaining today: <b>' + remainingFree + '</b>\n\n',
         '📺 Watch 1 ad = <b>+2 credits</b>\n',
         '💳 1 credit = <b>1 free OTP</b>\n',
-        '⏱ Required watch time: <b>' +
-            minWatchTimeSec +
-            ' seconds</b>\n\n',
-
+        '⏱ Required watch time: <b>' + minWatchTimeSec + ' seconds</b>\n\n',
         '<i>Watch the full ad to earn credits instantly.</i>\n\n',
-
         'Or upgrade for guaranteed delivery:\n',
         '• 💰 ' + formatted.cheap + '\n',
         '• 📦 ' + formatted.bundle
@@ -1394,9 +1413,7 @@ async _showAdPrompt(ctx, creditCheck, freeProvider, user) {
         parse_mode: 'HTML',
         reply_markup: Markup.inlineKeyboard(buttons).reply_markup
     });
-        }
-
-        
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 //  CONFIRM FREE MODE — Commit hold and proceed to service selection
@@ -1404,9 +1421,26 @@ async _showAdPrompt(ctx, creditCheck, freeProvider, user) {
 
 async handleConfirmFreeMode(ctx) {
     const userId = String(ctx.from.id);
+    const user = ctx.state.user || await User.findOne({ userId: userId });
 
     ctx.session = ctx.session || {};
     ctx.session.otpMode = 'FREE';
+
+    // FIX 9: Re-check daily limit before committing — safety against race conditions
+    if (!this._canUseFree(user)) {
+        // Release any held credits before showing exhausted
+        if (ctx.session.freeHoldId) {
+            try {
+                const freeProvider = this.smsProviderManager.getProvider('FREE_PUBLIC');
+                if (freeProvider && freeProvider.adSystem) {
+                    await freeProvider.adSystem.releaseHold(ctx.session.freeHoldId).catch(function() {});
+                }
+            } catch (e) { /* ignore release errors */ }
+            delete ctx.session.freeHoldId;
+            delete ctx.session.freeCreditsDeducted;
+        }
+        return this._showFreeExhausted(ctx, user);
+    }
 
     // Commit hold from handleFreeMode
     if (ctx.session.freeHoldId) {
@@ -1419,7 +1453,7 @@ async handleConfirmFreeMode(ctx) {
         } catch (error) {
             logger.error('Hold commit failed', { userId: userId, error: error.message });
             delete ctx.session.freeHoldId;
-            return this._showFreeExhausted(ctx, ctx.state.user);
+            return this._showFreeExhausted(ctx, user);
         }
     } else if (!ctx.session.freeCreditsDeducted) {
         // Safety fallback — no hold exists, check and deduct directly
@@ -1430,9 +1464,9 @@ async handleConfirmFreeMode(ctx) {
 
                 if (!creditCheck.allowed) {
                     if (creditCheck.reason === 'INSUFFICIENT_CREDITS') {
-                        return this._showAdPrompt(ctx, creditCheck, freeProvider);
+                        return this._showAdPrompt(ctx, creditCheck, freeProvider, user);
                     }
-                    return this._showFreeExhausted(ctx, null, creditCheck);
+                    return this._showFreeExhausted(ctx, user);
                 }
 
                 const holdId = await freeProvider.adSystem.holdCredits(userId);
@@ -1441,7 +1475,7 @@ async handleConfirmFreeMode(ctx) {
             }
         } catch (error) {
             logger.error('Credit deduction in confirm failed', { userId: userId, error: error.message });
-            return this._showFreeExhausted(ctx, ctx.state.user);
+            return this._showFreeExhausted(ctx, user);
         }
     }
 
@@ -1455,6 +1489,14 @@ async handleConfirmFreeMode(ctx) {
 
 async handleWatchAd(ctx, networkId) {
     const userId = String(ctx.from.id);
+    const user = ctx.state.user || await User.findOne({ userId: userId });
+
+    // FIX 10: Block ad watch if daily limit already exhausted
+    // No point watching ads if no free requests remain
+    if (!this._canUseFree(user)) {
+        return ctx.answerCbQuery('❌ Free limit reached. No more free OTPs today.', { show_alert: true })
+            .catch(function() {});
+    }
 
     try {
         const freeProvider = this.smsProviderManager.getProvider('FREE_PUBLIC');
@@ -1496,27 +1538,23 @@ async handleWatchAd(ctx, networkId) {
         logger.error('handleWatchAd error', { userId: userId, error: error.message });
         return ctx.answerCbQuery('❌ Ad unavailable. Try another.').catch(function() {});
     }
-            }
-        
-        // ═══════════════════════════════════════════════════════════════════════
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 //  CHECK CREDITS HANDLER — Claim after watching ad
 // ═══════════════════════════════════════════════════════════════════════
 
 async handleCheckCredits(ctx) {
     const userId = String(ctx.from.id);
+    const user = ctx.state.user || await User.findOne({ userId: userId });
 
     try {
         const freeProvider = this.smsProviderManager.getProvider('FREE_PUBLIC');
-
         if (!freeProvider || !freeProvider.adSystem) {
-            return ctx.answerCbQuery(
-                '❌ Service unavailable'
-            ).catch(function() {});
+            return ctx.answerCbQuery('❌ Service unavailable').catch(function() {});
         }
 
-        ctx.session = ctx.session || {};
-
-        const verificationId = ctx.session.pendingAdVerification || null;
+        const verificationId = ctx.session && ctx.session.pendingAdVerification ? ctx.session.pendingAdVerification : null;
 
         if (!verificationId) {
             return ctx.answerCbQuery(
@@ -1525,220 +1563,98 @@ async handleCheckCredits(ctx) {
             );
         }
 
-        // Fetch user
-        const user = ctx.state.user ||
-            await User.findOne({ userId: userId });
+        const claimResult = await freeProvider.adSystem.claimCredits(verificationId, userId, {
+            userAgent: (ctx.callbackQuery && ctx.callbackQuery.from && ctx.callbackQuery.from.username) ? ctx.callbackQuery.from.username : 'unknown'
+        });
 
-        // HARD BLOCK — free limit exhausted
-        if (!this._canUseFree(user)) {
-            delete ctx.session.pendingAdVerification;
-
-            await ctx.answerCbQuery(
-                '❌ Daily free limit reached',
-                { show_alert: true }
-            ).catch(function() {});
-
-            return this._showFreeExhausted(ctx, user);
-        }
-
-        // Claim ad credits
-        const claimResult = await freeProvider.adSystem.claimCredits(
-            verificationId,
-            userId,
-            {
-                userAgent:
-                    (
-                        ctx.callbackQuery &&
-                        ctx.callbackQuery.from &&
-                        ctx.callbackQuery.from.username
-                    )
-                        ? ctx.callbackQuery.from.username
-                        : 'unknown'
-            }
-        );
-
-        // SUCCESS
         if (claimResult.success) {
-
             delete ctx.session.pendingAdVerification;
             delete ctx.session.adStartTime;
 
-            // Recheck free access AFTER claim
-            const updatedUser = await User.findOne({ userId: userId });
-
-            if (!this._canUseFree(updatedUser)) {
-
-                await ctx.answerCbQuery(
-                    '❌ Daily free limit reached',
-                    { show_alert: true }
-                ).catch(function() {});
-
-                return this._showFreeExhausted(ctx, updatedUser);
+            // FIX 11: After successful ad claim, re-check if user still has free requests
+            // If they exhausted limit while watching ad, show exhausted screen
+            if (!this._canUseFree(user)) {
+                await ctx.answerCbQuery('✅ Credits added, but free limit reached!');
+                return this._showFreeExhausted(ctx, user);
             }
 
-            const remainingFree = this._freeRemaining(updatedUser);
-
-            await ctx.answerCbQuery(
-                '✅ Credits added!'
-            ).catch(function() {});
+            await ctx.answerCbQuery('✅ Credits added!');
 
             return ctx.editMessageText(
                 [
                     '✅ <b>Credits Added!</b>\n\n',
-
-                    '💳 Credits earned: <code>+' +
-                        claimResult.creditsAdded +
-                        '</code>\n',
-
-                    '💳 Total credits: <code>' +
-                        claimResult.totalCredits +
-                        '</code>\n',
-
-                    '⏱ Watch time: <code>' +
-                        Math.floor(claimResult.watchDuration / 1000) +
-                        's</code>\n\n',
-
-                    '🆓 Free OTPs remaining today: <b>' +
-                        remainingFree +
-                        '</b>\n\n',
-
+                    '💳 Credits earned: <code>+' + claimResult.creditsAdded + '</code>\n',
+                    '💳 Total credits: <code>' + claimResult.totalCredits + '</code>\n',
+                    '⏱ Watch time: ' + Math.floor(claimResult.watchDuration / 1000) + 's\n\n',
                     '✅ You can now request a free OTP!'
                 ].join(''),
                 {
                     parse_mode: 'HTML',
                     reply_markup: Markup.inlineKeyboard([
-                        [
-                            Markup.button.callback(
-                                '📱 Get Free OTP',
-                                'mode_free'
-                            )
-                        ],
-                        [
-                            Markup.button.callback(
-                                '🔙 Menu',
-                                'menu'
-                            )
-                        ]
+                        [Markup.button.callback('📱 Get Free OTP', 'mode_free')],
+                        [Markup.button.callback('🔙 Menu', 'menu')]
                     ]).reply_markup
                 }
             );
-        }
 
-        // WATCH TIME NOT COMPLETE
-        else if (claimResult.error === 'TIME_NOT_ELAPSED') {
-
-            const progress = Math.floor(
-                (claimResult.elapsed / claimResult.required) * 100
-            );
-
+        } else if (claimResult.error === 'TIME_NOT_ELAPSED') {
             await ctx.answerCbQuery(
                 '⏳ Wait ' + claimResult.remaining + 's more...',
                 { show_alert: true }
-            ).catch(function() {});
+            );
+
+            const progress = Math.floor((claimResult.elapsed / claimResult.required) * 100);
 
             return ctx.editMessageText(
                 [
                     '📺 <b>Watching Ad...</b>\n\n',
-
-                    '⏳ Progress: <code>' +
-                        claimResult.elapsed +
-                        '/' +
-                        claimResult.required +
-                        's</code>\n',
-
-                    '📊 Completion: <code>' +
-                        progress +
-                        '%</code>\n',
-
-                    '⏳ Remaining: <code>' +
-                        claimResult.remaining +
-                        's</code>\n\n',
-
-                    '<i>Keep the ad page open until the timer completes.</i>'
+                    '⏳ Progress: <code>' + claimResult.elapsed + '/' + claimResult.required + 's</code> (' + progress + '%)\n',
+                    '⏳ Remaining: <code>' + claimResult.remaining + 's</code>\n\n',
+                    '<i>Keep the ad page open. Do not close it.</i>'
                 ].join(''),
                 {
                     parse_mode: 'HTML',
                     reply_markup: Markup.inlineKeyboard([
-                        [
-                            Markup.button.callback(
-                                '🔄 Check Again',
-                                'check_credits'
-                            )
-                        ],
-                        [
-                            Markup.button.callback(
-                                '🔙 Cancel',
-                                'menu'
-                            )
-                        ]
+                        [Markup.button.callback('🔄 Check Again', 'check_credits')],
+                        [Markup.button.callback('🔙 Give Up', 'menu')]
                     ]).reply_markup
                 }
             );
-        }
 
-        // USER NEVER OPENED AD
-        else if (claimResult.error === 'WATCH_NOT_STARTED') {
-
+        } else if (claimResult.error === 'WATCH_NOT_STARTED') {
             return ctx.answerCbQuery(
-                '❌ Please open the ad first',
+                '❌ Please open the ad first by tapping "📺 Open Ad"',
                 { show_alert: true }
             );
-        }
 
-        // EXPIRED / FAILED
-        else {
-
+        } else {
             delete ctx.session.pendingAdVerification;
-            delete ctx.session.adStartTime;
 
             await ctx.answerCbQuery(
-                '❌ ' + (
-                    claimResult.message ||
-                    'Failed to claim credits'
-                ),
+                '❌ ' + (claimResult.message || 'Failed to claim credits'),
                 { show_alert: true }
-            ).catch(function() {});
+            );
 
             return ctx.editMessageText(
                 [
                     '❌ <b>Ad Session Expired</b>\n\n',
-
-                    'Please watch a new ad to continue.'
+                    'Please watch a new ad to earn credits.'
                 ].join(''),
                 {
                     parse_mode: 'HTML',
                     reply_markup: Markup.inlineKeyboard([
-                        [
-                            Markup.button.callback(
-                                '📺 Watch New Ad',
-                                'mode_free'
-                            )
-                        ],
-                        [
-                            Markup.button.callback(
-                                '🔙 Menu',
-                                'menu'
-                            )
-                        ]
+                        [Markup.button.callback('📺 Watch New Ad', 'mode_free')],
+                        [Markup.button.callback('🔙 Menu', 'menu')]
                     ]).reply_markup
                 }
             );
         }
 
     } catch (error) {
-
-        logger.error('handleCheckCredits error', {
-            userId: userId,
-            error: error.message
-        });
-
-        return ctx.answerCbQuery(
-            '❌ Credit check failed'
-        ).catch(function() {});
+        logger.error('handleCheckCredits error', { userId: userId, error: error.message });
+        return ctx.answerCbQuery('❌ Check failed').catch(function() {});
     }
-            }
-
-        
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 //  FREE SERVICE SELECTED
@@ -1746,6 +1662,7 @@ async handleCheckCredits(ctx) {
 
 async handleFreeServiceSelected(ctx) {
     const userId = String(ctx.from.id);
+    const user = ctx.state.user || await User.findOne({ userId: userId });
     const serviceId = ctx.match && ctx.match[1] ? ctx.match[1] : null;
 
     try {
@@ -1788,26 +1705,11 @@ async handleFreeServiceSelected(ctx) {
         const buttons = [];
         for (let i = 0; i < countries.length; i += 3) {
             const row = countries.slice(i, i + 3).map(function(c) {
-                return Markup.button.callback(c.flag + ' ' + c.code, 'free_country_' + c.code + '_' + serviceId);
-            });
-            buttons.push(row);
-        }
+                return Markup.button.callback(c.flag + ' ' + c.code, 'free_country_' + c.code + '_'
 
-        buttons.push([Markup.button.callback('🔙 Back', 'confirm_free_mode')]);
-        buttons.push([Markup.button.callback('🏠 Menu', 'menu')]);
 
-        return this.sendPhotoWithCaption(ctx, IMAGES.freeMode || IMAGES.default, message, Markup.inlineKeyboard(buttons), 'HTML');
 
-    } catch (error) {
-        logger.error('handleFreeServiceSelected error', { userId: userId, serviceId: serviceId, error: error.message });
-        return ctx.answerCbQuery('❌ Error').catch(function() {});
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-//  FREE COUNTRY SELECTED — HARD BLOCK: Check daily limit, then credits, then assign number
-// ═══════════════════════════════════════════════════════════════════════
-
+                 
 async handleFreeCountrySelected(ctx) {
     const userId = String(ctx.from.id);
     const countryCode = ctx.match && ctx.match[1] ? ctx.match[1] : null;
@@ -1823,26 +1725,28 @@ async handleFreeCountrySelected(ctx) {
 
         const user = ctx.state.user || await User.findOne({ userId: userId });
 
+        // FIX 12: Replace HARDCODED limit check with centralized helper
         // HARD BLOCK 1: Daily limit reached → Block completely, no ads
         if (!this._canUseFree(user)) {
-    return this._showFreeExhausted(ctx, user);
+            return this._showFreeExhausted(ctx, user);
         }
 
         const freeProvider = this.smsProviderManager.getProvider('FREE_PUBLIC');
         let holdId = null;
 
-        // HARD BLOCK 2: Check ad credits
+        // HARD BLOCK 2: Check ad credits ONLY — ad system controls credits, NOT daily limits
         if (freeProvider && freeProvider.adSystem) {
             const creditCheck = await freeProvider.canRequestNumber(userId);
 
             // NO credits → back to ad prompt (must watch ad first)
             if (!creditCheck.allowed && creditCheck.reason === 'INSUFFICIENT_CREDITS') {
-                return this._showAdPrompt(ctx, creditCheck, freeProvider);
+                return this._showAdPrompt(ctx, creditCheck, freeProvider, user);
             }
 
-            // Daily limit reached via ad system
-            if (!creditCheck.allowed && creditCheck.reason === 'DAILY_LIMIT_REACHED') {
-                return this._showFreeExhausted(ctx, user, creditCheck);
+            // FIX 13: Remove DAILY_LIMIT_REACHED from ad system check
+            // Daily limits are controlled centrally by _canUseFree(), not the ad system
+            if (!creditCheck.allowed) {
+                return this._showFreeExhausted(ctx, user);
             }
 
             // Hold credits for this number request
@@ -1858,7 +1762,8 @@ async handleFreeCountrySelected(ctx) {
                     await freeProvider.adSystem.commitHold(holdId);
                 }
 
-                // Increment free usage count
+                // FIX 14: THIS IS THE ONLY PLACE freeUsedToday IS INCREMENTED
+                // ONLY increment AFTER a real number is successfully assigned
                 await User.updateOne({ userId: userId }, { $inc: { freeUsedToday: 1 } });
 
                 const message = [
@@ -1939,8 +1844,7 @@ async handleCheckFree(ctx, sessionId) {
         logger.error('handleCheckFree error', { sessionId: sessionId, error: error.message });
         return ctx.answerCbQuery('❌ Check failed').catch(function() {});
     }
-             }
-                                             
+}                             
         
     // ═══════════════════════════════════════════════════════════════════════
     //  CHEAP MODE — NEW TIER-BASED FLOW
