@@ -1,4 +1,3 @@
-
 // ═══════════════════════════════════════════════════════════════════════════════
 //  models/index.js — Centralized Model Registry (FIXED)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -17,6 +16,7 @@ import AdminLog from './AdminLog.js';
 import Settings from './Settings.js';
 import { OrphanSMS } from './OrphanSMS.js';
 import Notification from './Notification.js';
+import CreditTransaction from './CreditTransaction.js';  // ← ADDED
 
 const modelRegistry = {
     User,
@@ -29,7 +29,8 @@ const modelRegistry = {
     AdminLog,
     Settings,
     OrphanSMS,
-    Notification
+    Notification,
+    CreditTransaction  // ← ADDED
 };
 
 function validateModels() {
@@ -119,7 +120,8 @@ export {
     AdminLog,
     Settings,
     OrphanSMS,
-    Notification
+    Notification,
+    CreditTransaction  // ← ADDED
 };
 
 export default modelRegistry;
