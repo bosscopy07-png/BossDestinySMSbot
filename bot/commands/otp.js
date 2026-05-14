@@ -1705,10 +1705,25 @@ async handleFreeServiceSelected(ctx) {
         const buttons = [];
         for (let i = 0; i < countries.length; i += 3) {
             const row = countries.slice(i, i + 3).map(function(c) {
-                return Markup.button.callback(c.flag + ' ' + c.code, 'free_country_' + c.code + '_'
+                return Markup.button.callback(c.flag + ' ' + c.code, 'free_country_' + c.code + '_' + serviceId);
+            });
+            buttons.push(row);
+        }
 
+        buttons.push([Markup.button.callback('🔙 Back', 'confirm_free_mode')]);
+        buttons.push([Markup.button.callback('🏠 Menu', 'menu')]);
 
+        return this.sendPhotoWithCaption(ctx, IMAGES.freeMode || IMAGES.default, message, Markup.inlineKeyboard(buttons), 'HTML');
 
+    } catch (error) {
+        logger.error('handleFreeServiceSelected error', { userId: userId, serviceId: serviceId, error: error.message });
+        return ctx.answerCbQuery('❌ Error').catch(function() {});
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  FREE COUNTRY SELECTED — HARD BLOCK: Check daily limit, then credits, then assign number
+// ═══════════════════════════════════════════════════════════════════════
                  
 async handleFreeCountrySelected(ctx) {
     const userId = String(ctx.from.id);
