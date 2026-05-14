@@ -3,6 +3,10 @@
 // Mode: bot | server | both (set via APP_MODE env var)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════════
+//  GLOBAL ERROR HANDLING (must be first)
+// ═══════════════════════════════════════════════════════════════════════
+
 process.on('uncaughtException', (err) => {
     console.error('💥 UNCAUGHT EXCEPTION:', err.message);
     console.error(err.stack);
@@ -20,8 +24,8 @@ process.on('unhandledRejection', (reason, promise) => {
 // ═══════════════════════════════════════════════════════════════════════
 
 const MODE = process.env.APP_MODE || 'bot';
-
 const VALID_MODES = ['bot', 'server', 'both'];
+
 if (!VALID_MODES.includes(MODE)) {
     console.error(`❌ Invalid APP_MODE: "${MODE}"`);
     console.error(`   Valid modes: ${VALID_MODES.join(' | ')}`);
@@ -46,15 +50,7 @@ async function startBot() {
     global.telegramBot = bot;
     
     await bot.launch();
-    console.log('✅ Bot started (polling mode)');
-    
-    // Graceful shutdown
-    const stopBot = () => {
-        console.log('\n🛑 Stopping bot...');
-        bot.stop();
-    };
-    process.once('SIGINT', stopBot);
-    process.once('SIGTERM', stopBot);
+    console.log('✅ Bot started');
     
     return bot;
 }
@@ -62,25 +58,8 @@ async function startBot() {
 async function startServer() {
     console.log('\n🌐 Initializing Web Server...');
     
-    const { default: createServer } = await import('./api/index.js');
-    const app = createServer();
-    
-    const PORT = process.env.PORT || 3000;
-    const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
-    
-    const server = app.listen(PORT, () => {
-        console.log(`✅ Server listening on port ${PORT}`);
-        console.log(`   Health: ${BASE_URL}/health`);
-        console.log(`   Webhooks: ${BASE_URL}/webhooks`);
-    });
-    
-    // Graceful shutdown
-    const stopServer = () => {
-        console.log('\n🛑 Stopping server...');
-        server.close();
-    };
-    process.once('SIGINT', stopServer);
-    process.once('SIGTERM', stopServer);
+    const { startServer } = await import('./api/index.js');
+    const server = await startServer();
     
     return server;
 }
@@ -97,6 +76,64 @@ async function startCron() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+//  GRACEFUL SHUTDOWN (centralized)
+// ═══════════════════════════════════════════════════════════════════════
+
+let shutdownInProgress = false;
+const activeServices = new Map();
+
+async function shutdown(signal) {
+    if (shutdownInProgress) {
+        console.log('\n⚠️  Shutdown already in progress...');
+        return;
+    }
+    shutdownInProgress = true;
+    
+    console.log(`\n🛑 ${signal} received. Shutting down gracefully...`);
+    
+    const timeouts = [];
+    
+    // Stop bot
+    if (activeServices.has('bot')) {
+        const bot = activeServices.get('bot');
+        timeouts.push(
+            Promise.race([
+                bot.stop(),
+                new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error('Bot stop timeout')), 5000)
+                )
+            ]).catch(err => console.error('Bot stop error:', err.message))
+        );
+    }
+    
+    // Stop server
+    if (activeServices.has('server')) {
+        const server = activeServices.get('server');
+        timeouts.push(
+            new Promise((resolve) => {
+                server.close(resolve);
+                setTimeout(resolve, 5000); // Force resolve after 5s
+            })
+        );
+    }
+    
+    // Stop cron
+    if (activeServices.has('cron')) {
+        const cron = activeServices.get('cron');
+        if (typeof cron.stop === 'function') {
+            cron.stop();
+        }
+    }
+    
+    await Promise.all(timeouts);
+    console.log('✅ All services stopped');
+    process.exit(0);
+}
+
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+
+// ═══════════════════════════════════════════════════════════════════════
 //  MAIN STARTUP
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -104,28 +141,26 @@ async function main() {
     try {
         // 1. Load config and connect database (always needed)
         console.log('\n📦 Loading configuration...');
-        const { config, connectDatabase } = await import('./config/index.js');
-        const { default: logger } = await import('./utils/logger.js');
+        const { connectDatabase } = await import('./config/index.js');
         
         await connectDatabase();
         console.log('✅ Database connected');
         
         // 2. Start services based on mode
-        const services = [];
-        
         if (MODE === 'bot' || MODE === 'both') {
-            services.push(startBot());
+            const bot = await startBot();
+            activeServices.set('bot', bot);
         }
         
         if (MODE === 'server' || MODE === 'both') {
-            services.push(startServer());
+            const server = await startServer();
+            activeServices.set('server', server);
         }
         
         if (MODE === 'both') {
-            services.push(startCron());
+            const cron = await startCron();
+            activeServices.set('cron', cron);
         }
-        
-        await Promise.all(services);
         
         console.log('\n🎉 All services started successfully');
         console.log(`   Mode: ${MODE}`);
@@ -134,7 +169,9 @@ async function main() {
     } catch (error) {
         console.error('\n💥 FATAL STARTUP ERROR:');
         console.error(`   ${error.message}`);
-        console.error(error.stack);
+        if (config.server.env !== 'production') {
+            console.error(error.stack);
+        }
         process.exit(1);
     }
 }
