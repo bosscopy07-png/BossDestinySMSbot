@@ -6,118 +6,47 @@
 /**
  * Tier Operator Configuration
  * 
- * Reorganized so each tier has DISTINCT operators with clear quality progression:
- *   Budget:    "any" + oldest/cheapest virtual operators (lowest 5SIM cost)
- *   Standard:  Mid-range virtual operators (moderate 5SIM cost)
- *   Premium:   Newest/most expensive virtual operators (highest 5SIM cost)
+ * Structure:
+ *   tierKey: {
+ *     label: 'Display Label',
+ *     emoji: '🔥',
+ *     description: 'User-facing description',
+ *     operators: ['operator1', 'operator2'], // 5SIM operator names
+ *     fallbackWithinTier: true, // Auto-fallback to next operator in same tier
+ *     sortPriority: 'price' | 'balanced' | 'quality', // Selection priority
+ *     priceMultiplier: 1.0, // Display price markup
+ *     minStock: 1 // Minimum stock to be considered available
+ *   }
  * 
- * NO operator overlap between tiers. Each operator belongs to exactly one tier.
- * This ensures:
- *   - Budget cannot accidentally get "premium" operators
- *   - Premium always gets highest-quality (most expensive) operators
- *   - Clear user expectation: paying same price, getting different quality tiers
+ * Operators are 5SIM-specific values like: 'any', 'virtual2', 'virtual4', etc.
+ * Add/remove operators here without touching business logic.
  */
-
 export const TIER_CONFIG = {
     budget: {
         label: 'Budget',
         emoji: '💸',
         description: 'Cheapest available providers. Lower consistency.',
-        detail: 'Random allocation ("any") or oldest virtual operators. Best for low-priority use.',
-        // FIXED: Only "any" + lowest virtual numbers (oldest, cheapest on 5SIM)
+        detail: 'Mostly "any" operator or random allocation. Best for low-priority use.',
         operators: [
-            'any',           // Random = cheapest but least consistent
+            'any',
             'virtual2',
             'virtual4',
             'virtual5',
-            'virtual7',
-            'virtual8',
-            'virtual9',
-            'virtual10',
-            'virtual11',
             'virtual12',
-            'virtual13',
-            'virtual14',
             'virtual15',
-            'virtual16',
-            'virtual17',
             'virtual18',
-            'virtual19',
             'virtual20',
-            'virtual21',
-            'virtual22',
             'virtual23',
             'virtual24',
-            'virtual25'
-        ],
-        fallbackWithinTier: true,
-        sortPriority: 'price',      // Always pick cheapest
-        priceMultiplier: 1.0,
-        minStock: 1,
-        badge: null
-    },
-    standard: {
-        label: 'Standard',
-        emoji: '⚡',
-        description: 'Balanced pricing and reliability.',
-        detail: 'Mid-range virtual operators. Recommended for everyday use.',
-        // FIXED: Mid-range virtual numbers only (no overlap with budget or premium)
-        operators: [
-            'virtual26',
-            'virtual27',
+            'virtual25',
             'virtual28',
             'virtual29',
-            'virtual30',
             'virtual31',
-            'virtual32',
-            'virtual33',
-            'virtual34',
-            'virtual35',
             'virtual36',
-            'virtual37',
-            'virtual38',
-            'virtual39',
-            'virtual40',
             'virtual41',
-            'virtual42',
             'virtual43',
-            'virtual44',
-            'virtual45',
-            'virtual46',
             'virtual47',
-            'virtual48',
-            'virtual49',
-            'virtual50'
-        ],
-        fallbackWithinTier: true,
-        sortPriority: 'balanced',   // Balance price vs stock
-        priceMultiplier: 1.0,
-        minStock: 1,
-        badge: 'recommended'
-    },
-    premium: {
-        label: 'Premium',
-        emoji: '🔥',
-        description: 'Highest-quality operators. Best success rate.',
-        detail: 'Newest, most expensive virtual operators. Highest 5SIM cost = best delivery.',
-        // FIXED: Highest virtual numbers only (newest, most expensive on 5SIM)
-        // These cost more on 5SIM but you charge same flat price = better user value
-        operators: [
-            'virtual51',
-            'virtual52',
-            'virtual53',
-            'virtual54',
-            'virtual55',
-            'virtual56',
-            'virtual57',
-            'virtual58',
-            'virtual59',
-            'virtual60',
-            'virtual61',
-            'virtual62',
-            'virtual63',
-            'virtual64',
-            'virtual65',
+            'virtual50',
             'virtual66',
             'virtual67',
             'virtual68',
@@ -132,7 +61,44 @@ export const TIER_CONFIG = {
             'virtual77',
             'virtual78',
             'virtual79',
-            'virtual80',
+            'virtual80'
+        ],
+        fallbackWithinTier: true,
+        sortPriority: 'price',
+        priceMultiplier: 1.0,
+        minStock: 1,
+        badge: null
+    },
+    standard: {
+        label: 'Standard',
+        emoji: '⚡',
+        description: 'Balanced pricing and reliability.',
+        detail: 'Moderate-quality providers. Recommended for everyday use.',
+        operators: [
+            'virtual7',
+            'virtual8',
+            'virtual9',
+            'virtual10',
+            'virtual11',
+            'virtual13',
+            'virtual14',
+            'virtual16',
+            'virtual17',
+            'virtual19',
+            'virtual21',
+            'virtual22',
+            'virtual26',
+            'virtual27',
+            'virtual30',
+            'virtual33',
+            'virtual35',
+            'virtual37',
+            'virtual39',
+            'virtual42',
+            'virtual44',
+            'virtual46',
+            'virtual48',
+            'virtual52',
             'virtual81',
             'virtual82',
             'virtual83',
@@ -147,7 +113,39 @@ export const TIER_CONFIG = {
             'virtual92',
             'virtual93',
             'virtual94',
-            'virtual95',
+            'virtual95'
+        ],
+        fallbackWithinTier: true,
+        sortPriority: 'balanced',
+        priceMultiplier: 1.0,
+        minStock: 1,
+        badge: 'recommended'
+    },
+    premium: {
+        label: 'Premium',
+        emoji: '🔥',
+        description: 'Highest-quality operators. Best success rate.',
+        detail: 'Cleaner, faster numbers. Higher pricing. For important accounts.',
+        operators: [
+            'virtual32',
+            'virtual38',
+            'virtual40',
+            'virtual45',
+            'virtual49',
+            'virtual51',
+            'virtual53',
+            'virtual54',
+            'virtual55',
+            'virtual56',
+            'virtual57',
+            'virtual58',
+            'virtual59',
+            'virtual60',
+            'virtual61',
+            'virtual62',
+            'virtual63',
+            'virtual64',
+            'virtual65',
             'virtual96',
             'virtual97',
             'virtual98',
@@ -165,7 +163,7 @@ export const TIER_CONFIG = {
             'virtual110'
         ],
         fallbackWithinTier: true,
-        sortPriority: 'quality',    // Prioritize best operators (highest price = best)
+        sortPriority: 'quality',
         priceMultiplier: 1.0,
         minStock: 1,
         badge: 'best'
@@ -174,6 +172,7 @@ export const TIER_CONFIG = {
 
 /**
  * Popular services — displayed first in service selection
+ * Array of service names matching your SERVICES constant
  */
 export const POPULAR_SERVICES = [
     'WhatsApp',
@@ -212,6 +211,7 @@ export const SERVICE_CATEGORIES = {
 
 /**
  * Top countries — displayed first in country selection
+ * ISO 2-letter codes
  */
 export const TOP_COUNTRIES = [
     'US', 'UK', 'CA', 'RU', 'CN', 'IN', 'NG', 'DE', 'FR', 'BR',
@@ -220,7 +220,7 @@ export const TOP_COUNTRIES = [
 ];
 
 /**
- * Country search aliases
+ * Country search aliases — map common names to ISO codes
  */
 export const COUNTRY_ALIASES = {
     'usa': 'US',
@@ -272,10 +272,10 @@ export const PAGINATION = {
  * Cache TTLs (milliseconds)
  */
 export const CACHE_TTL = {
-    tierPrices: 30 * 1000,
-    countryStock: 60 * 1000,
-    serviceList: 5 * 60 * 1000,
-    providerHealth: 2 * 60 * 1000
+    tierPrices: 30 * 1000,      // 30s — tier prices change with stock
+    countryStock: 60 * 1000,   // 1m — stock changes frequently
+    serviceList: 5 * 60 * 1000, // 5m — service list is stable
+    providerHealth: 2 * 60 * 1000 // 2m — health scores
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -315,17 +315,22 @@ export function normalizeService(serviceName) {
 //  HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/**
+ * Get tier config safely
+ */
 export function getTierConfig(tierKey = 'budget') {
     return TIER_CONFIG[tierKey] || TIER_CONFIG.budget;
 }
 
+/**
+ * Get operators for tier
+ */
 export function getTierOperators(tierKey = 'budget') {
     return getTierConfig(tierKey).operators || [];
 }
 
 /**
- * FIXED: applyTierPricing now just returns basePrice since all multipliers are 1.0
- * Kept for backward compatibility
+ * Apply tier markup
  */
 export function applyTierPricing(basePrice, tierKey = 'budget') {
     const tier = getTierConfig(tierKey);
@@ -333,3 +338,4 @@ export function applyTierPricing(basePrice, tierKey = 'budget') {
         (basePrice * tier.priceMultiplier).toFixed(2)
     );
     }
+    
