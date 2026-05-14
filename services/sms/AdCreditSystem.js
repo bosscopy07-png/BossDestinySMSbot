@@ -526,6 +526,7 @@ class AdCreditSystem {
     //  INTERNAL HELPERS
     // ═══════════════════════════════════════════════════════════════════════
 
+    
     async _logTransaction({ userId, type, amount, holdId = null, balanceAfter = null, reason, metadata = {} }) {
         try {
             await CreditTransaction.create({ 
@@ -551,4 +552,70 @@ class AdCreditSystem {
             if (hold && !hold.released && !hold.committed && hold.expiresAt > Date.now()) count++;
         }
         return count;
-   
+    }
+
+    _trackUserHold(userId, holdId) {
+        if (!this.userHoldHistory.has(userId)) this.userHoldHistory.set(userId, new Set());
+        this.userHoldHistory.get(userId).add(holdId);
+    }
+
+    _cleanupExpiredHolds() {
+        const now = Date.now();
+        let cleaned = 0;
+        for (const [holdId, hold] of this.activeHolds) {
+            if (hold.expiresAt < now && !hold.released && !hold.committed) {
+                this.releaseHold(holdId).catch(() => {});
+                cleaned++;
+            }
+        }
+        return cleaned;
+    }
+
+    _recordClaim(userId) {
+        if (!this.userClaimHistory.has(userId)) this.userClaimHistory.set(userId, []);
+        const history = this.userClaimHistory.get(userId);
+        history.push(Date.now());
+        if (history.length > this.MAX_CLAIM_HISTORY_PER_USER) history.shift();
+    }
+
+    _getLastClaimTime(userId) {
+        const history = this.userClaimHistory.get(userId);
+        return history?.length > 0 ? history[history.length - 1] : null;
+    }
+
+    _getRecentClaimsCount(userId, windowMs) {
+        const history = this.userClaimHistory.get(userId);
+        return history ? history.filter(t => t > Date.now() - windowMs).length : 0;
+    }
+
+    _recordAdGeneration(userId) {
+        if (!this.userClaimHistory.has(userId)) this.userClaimHistory.set(userId, []);
+        this.userClaimHistory.get(userId).push(-Date.now());
+    }
+
+    _getRecentAdGenerations(userId, windowMs) {
+        const history = this.userClaimHistory.get(userId);
+        return history ? history.filter(t => t < 0 && Math.abs(t) > Date.now() - windowMs).length : 0;
+    }
+
+    _startCleanupInterval() {
+        setInterval(() => {
+            const holdsCleaned = this._cleanupExpiredHolds();
+            if (holdsCleaned > 0) logger.debug('Cleanup completed', { holdsCleaned });
+        }, 300000);
+    }
+
+    getAvailableNetworks() {
+        return [
+            { id: 'primary', name: 'Watch Ad', creditValue: 2, configured: !!this.PRIMARY_URL, minWatchTime: Math.floor(this.MIN_WATCH_TIME / 1000) },
+            { id: 'fallback', name: 'Watch Ad (Alt)', creditValue: 2, configured: !!this.FALLBACK_URL, minWatchTime: Math.floor(this.MIN_WATCH_TIME / 1000) }
+        ].filter(n => n.configured);
+    }
+
+    _maskUrl(url) {
+        if (!url) return 'none';
+        try { const u = new URL(url); return `${u.protocol}//${u.hostname}/...`; } catch { return 'invalid'; }
+    }
+}
+
+export default AdCreditSystem;
