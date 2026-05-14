@@ -1434,6 +1434,10 @@ async handleWatchAd(ctx, networkId) {
 
         const adView = await freeProvider.adSystem.generateAdView(userId, networkId);
 
+        // Build tracked redirect URL instead of direct ad URL
+        const baseUrl = config.baseUrl || process.env.BASE_URL || 'https://yourbot.com';
+        const trackedAdUrl = `${baseUrl}/webhooks/ad/redirect?vid=${adView.verificationId}&uid=${userId}`;
+
         const message = (
             `📺 <b>Watch Ad to Earn Credits</b>\n\n` +
             `Reward: <b>+${adView.creditValue} credits</b>\n` +
@@ -1451,7 +1455,7 @@ async handleWatchAd(ctx, networkId) {
         return ctx.editMessageText(message, {
             parse_mode: 'HTML',
             reply_markup: Markup.inlineKeyboard([
-                [Markup.button.url('📺 Open Ad', adView.adUrl)],
+                [Markup.button.url('📺 Open Ad', trackedAdUrl)],  // ← Uses tracked URL
                 [Markup.button.callback('✅ Check My Credits', 'check_credits')],
                 [Markup.button.callback('🔙 Back', 'menu')]
             ]).reply_markup
@@ -1462,7 +1466,7 @@ async handleWatchAd(ctx, networkId) {
         return ctx.answerCbQuery('❌ Ad unavailable. Try another.').catch(() => {});
     }
 }
-
+        
 // ═══════════════════════════════════════════════════════════════════════
 //  CHECK CREDITS HANDLER — Passes userId, proper flow
 // ═══════════════════════════════════════════════════════════════════════
