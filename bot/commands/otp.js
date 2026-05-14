@@ -1428,34 +1428,33 @@ async handleWatchAd(ctx, networkId) {
 
     try {
         const freeProvider = this.smsProviderManager?.getProvider('FREE_PUBLIC');
-        if (!freeProvider || !freeProvider.adSystem) {
-            return ctx.answerCbQuery('❌ Free service unavailable').catch(() => {});
+        if (!freeProvider?.adSystem) {
+            return ctx.answerCbQuery('❌ Service unavailable').catch(() => {});
         }
 
+        // generateAdView now creates MongoDB document
         const adView = await freeProvider.adSystem.generateAdView(userId, networkId);
+        
+        if (!adView.success) {
+            return ctx.answerCbQuery(adView.message || '❌ Ad unavailable').catch(() => {});
+        }
 
-        // Build tracked redirect URL instead of direct ad URL
-        const baseUrl = config.baseUrl || process.env.BASE_URL || 'https://yourbot.com';
-        const trackedAdUrl = `${baseUrl}/webhooks/ad/redirect?vid=${adView.verificationId}&uid=${userId}`;
+        ctx.session = ctx.session || {};
+        ctx.session.pendingAdVerification = adView.verificationId;
 
         const message = (
             `📺 <b>Watch Ad to Earn Credits</b>\n\n` +
             `Reward: <b>+${adView.creditValue} credits</b>\n` +
-            `Required watch time: <b>${Math.floor(adView.minWatchTime / 1000)} seconds</b>\n\n` +
-            `1️⃣ Click "📺 Open Ad" below\n` +
-            `2️⃣ Stay on the page for <b>${Math.floor(adView.minWatchTime / 1000)} seconds</b>\n` +
-            `3️⃣ Return and tap "✅ Check My Credits"\n\n` +
-            `<i>Do not close the ad before time is up or credits will not be awarded.</i>`
+            `Required: <b>${adView.minWatchTime} seconds</b>\n\n` +
+            `1️⃣ Click "📺 Open Ad"\n` +
+            `2️⃣ Wait ${adView.minWatchTime} seconds\n` +
+            `3️⃣ Tap "✅ Check My Credits"`
         );
-
-        ctx.session = ctx.session || {};
-        ctx.session.pendingAdVerification = adView.verificationId;
-        ctx.session.adStartTime = null;
 
         return ctx.editMessageText(message, {
             parse_mode: 'HTML',
             reply_markup: Markup.inlineKeyboard([
-                [Markup.button.url('📺 Open Ad', trackedAdUrl)],  // ← Uses tracked URL
+                [Markup.button.url('📺 Open Ad', adView.adUrl)],  // Uses /webhooks/ad/redirect
                 [Markup.button.callback('✅ Check My Credits', 'check_credits')],
                 [Markup.button.callback('🔙 Back', 'menu')]
             ]).reply_markup
@@ -1463,7 +1462,7 @@ async handleWatchAd(ctx, networkId) {
 
     } catch (error) {
         logger.error('handleWatchAd error', { userId, error: error.message });
-        return ctx.answerCbQuery('❌ Ad unavailable. Try another.').catch(() => {});
+        return ctx.answerCbQuery('❌ Failed').catch(() => {});
     }
 }
         
