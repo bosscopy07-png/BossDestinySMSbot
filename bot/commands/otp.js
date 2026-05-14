@@ -1218,14 +1218,6 @@ setupTextHandlers() {
     async handleMyNumberCommand(ctx) {
         return this.handleViewMyNumber(ctx);
     }
-// ═══════════════════════════════════════════════════════════════════════
-//  MODE HANDLERS — FIXED v2
-// ═══════════════════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════════════
-//  MODE HANDLERS — FIXED v2 (Syntax Corrected)
-// ═══════════════════════════════════════════════════════════════════════
-
-import { getPricing, formatPrice } from '../../utils/pricing.js';
 
 // ═══════════════════════════════════════════════════════════════════════
 //  FREE MODE — Ad-gated before daily limit, blocked after
@@ -1667,6 +1659,7 @@ async handleFreeServiceSelected(ctx) {
 //  FREE COUNTRY SELECTED — Credit-safe with hold pattern
 // ═══════════════════════════════════════════════════════════════════════
 
+
 async handleFreeCountrySelected(ctx) {
     const userId = String(ctx.from?.id);
     const countryCode = ctx.match?.[1];
@@ -1710,10 +1703,91 @@ async handleFreeCountrySelected(ctx) {
 
                 if (!holdId || (await freeProvider.adSystem.getCredits(userId)).credits === 0) {
                     await User.updateOne({ userId }, { $inc: { freeUsedToday: 1 } });
-       
+                }
 
-            
-                    
+                const message = (
+                    '📱 <b>Free Number Assigned</b>\n\n' +
+                    `📞 Number: <code>${result.phoneNumber}</code>\n` +
+                    `🌍 Country: ${result.country || countryCode}\n` +
+                    `🔢 Service: ${serviceId}\n\n` +
+                    `⏳ Waiting for OTP...\n` +
+                    `<i>Free numbers expire in 10 minutes.</i>`
+                );
+
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Check OTP', `check_free_${result.sessionId}`)],
+                    [Markup.button.callback('❌ Cancel', `cancel_free_${result.sessionId}`)],
+                    [Markup.button.callback('🔙 Menu', 'menu')]
+                ]);
+
+                return this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
+
+            } else {
+                throw new Error(result?.error || 'Failed to get free number');
+            }
+
+        } catch (numberError) {
+            if (holdId) {
+                await freeProvider.adSystem.releaseHold(holdId).catch(() => {});
+            }
+            throw numberError;
+        }
+
+    } catch (error) {
+        logger.error('handleFreeCountrySelected error', { 
+            userId, 
+            countryCode, 
+            serviceId, 
+            error: error.message 
+        });
+        await ctx.answerCbQuery('❌ Error').catch(() => {});
+
+        const pricing = await getPricing();
+        const formatted = formatPrice(pricing);
+
+        const errorMessage = (
+            '❌ <b>Free Number Error</b>\n\n' +
+            `Error: ${error.message}\n\n` +
+            'Try again or use CHEAP mode for guaranteed delivery.\n\n' +
+            `💰 CHEAP: ${formatted.cheap}`
+        );
+
+        const errorKeyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔄 Try Again', `free_country_${countryCode}_${serviceId}`)],
+            [Markup.button.callback('💰 CHEAP Mode', 'mode_cheap')],
+            [Markup.button.callback('🔙 Menu', 'menu')]
+        ]);
+
+        return this.sendPhotoWithCaption(ctx, IMAGES.otpFailed, errorMessage, errorKeyboard, 'HTML');
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  FREE CHECK NOW — Manual poll for SMS
+// ═══════════════════════════════════════════════════════════════════════
+
+async handleCheckFree(ctx, sessionId) {
+    try {
+        const freeProvider = this.smsProviderManager?.getProvider('FREE_PUBLIC');
+        if (!freeProvider) {
+            return ctx.answerCbQuery('❌ Service unavailable').catch(() => {});
+        }
+
+        const result = await freeProvider.checkFreeSMS(sessionId);
+
+        if (result.success && result.otp) {
+            await ctx.answerCbQuery('✅ OTP received! Updating...');
+        } else if (result.status === 'EXPIRED' || result.status === 'CANCELLED') {
+            await ctx.answerCbQuery('❌ Session expired', { show_alert: true });
+        } else {
+            await ctx.answerCbQuery(`⏳ ${result.message || 'Still waiting...'}`);
+        }
+
+    } catch (error) {
+        logger.error('handleCheckFree error', { sessionId, error: error.message });
+        return ctx.answerCbQuery('❌ Check failed').catch(() => {});
+    }
+}
          
     // ═══════════════════════════════════════════════════════════════════════
     //  CHEAP MODE — NEW TIER-BASED FLOW
