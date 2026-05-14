@@ -117,7 +117,7 @@ export const TIER_CONFIG = {
         ],
         fallbackWithinTier: true,
         sortPriority: 'balanced',
-        priceMultiplier: 1.15,
+        priceMultiplier: 1.0,
         minStock: 1,
         badge: 'recommended'
     },
@@ -164,7 +164,7 @@ export const TIER_CONFIG = {
         ],
         fallbackWithinTier: true,
         sortPriority: 'quality',
-        priceMultiplier: 1.35,
+        priceMultiplier: 1.0,
         minStock: 1,
         badge: 'best'
     }
