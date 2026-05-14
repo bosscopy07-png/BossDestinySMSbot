@@ -6,7 +6,7 @@ let priceCache = null;
 let priceCacheTime = 0;
 const CACHE_TTL = 30000; // 30 seconds
 
-export async function GetPricing() {
+export async function getPricing() {
     const now = Date.now();
     if (priceCache && (now - priceCacheTime < CACHE_TTL)) {
         return priceCache;
@@ -39,7 +39,7 @@ export function clearPriceCache() {
     priceCacheTime = 0;
 }
 
-export function FormatPrice(pricing) {
+export function formatPrice(pricing) {
     return {
         cheap: `$${pricing.cheap.price.toFixed(2)}/${pricing.cheap.description}`,
         bundle: `$${pricing.bundle.price.toFixed(2)} ${pricing.bundle.description}`,
