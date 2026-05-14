@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // routes/webhooks.js — Production Webhook Handlers
-// SMS (Twilio/Telnyx) + Ad Network Postbacks
+// SMS (Twilio/Telnyx) + Ad Network Postbacks + Ad User Redirect
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import express from 'express';
@@ -16,9 +16,6 @@ const router = express.Router();
 //  TWILIO SMS WEBHOOK
 // ═══════════════════════════════════════════════════════════════════════
 
-/**
- * Validates Twilio request signature to prevent spoofing
- */
 function validateTwilioRequest(req) {
     const authToken = config.twilio?.authToken;
     const webhookUrl = `${config.baseUrl}/webhooks/twilio`;
@@ -45,7 +42,6 @@ function validateTwilioRequest(req) {
 router.post('/twilio', 
     express.urlencoded({ extended: false, verify: (req, res, buf) => { req.rawBody = buf; } }),
     async (req, res) => {
-        // Always respond immediately — Twilio retries on timeout
         res.type('text/xml').send('<Response/>');
 
         try {
@@ -159,10 +155,6 @@ router.post('/twilio',
 //  TELNYX SMS WEBHOOK
 // ═══════════════════════════════════════════════════════════════════════
 
-/**
- * Validates Telnyx webhook signature using Ed25519
- * FIXED: Corrected from RSA-SHA256 to Ed25519 verification
- */
 function validateTelnyxRequest(req) {
     const publicKey = config.telnyx?.webhookPublicKey;
     
@@ -188,7 +180,6 @@ function validateTelnyxRequest(req) {
 
         const payload = `${timestamp}|${req.rawBody}`;
         
-        // FIXED: Use crypto.verify for Ed25519 instead of createVerify(RSA-SHA256)
         return crypto.verify(
             null,
             Buffer.from(payload),
@@ -300,7 +291,77 @@ router.post('/telnyx',
 );
 
 // ═══════════════════════════════════════════════════════════════════════
-//  AD NETWORK POSTBACKS
+//  AD USER REDIRECT — Records when user actually opens ad
+//  This is called when user taps "Open Ad" button in Telegram
+// ═══════════════════════════════════════════════════════════════════════
+
+router.get('/ad/redirect', async (req, res) => {
+    const { vid, uid } = req.query;
+    
+    if (!vid || !uid) {
+        return res.status(400).send('Invalid ad link: missing parameters');
+    }
+
+    try {
+        const { SMSProviderManager } = await import('../services/sms/index.js');
+        const providerManager = SMSProviderManager.getInstance?.() || global.smsProviderManager;
+        
+        if (!providerManager) {
+            logger.error('SMSProviderManager not available for ad redirect');
+            return res.status(503).send('Service temporarily unavailable');
+        }
+
+        const freeProvider = providerManager.getProvider('FREE_PUBLIC');
+        const adSystem = freeProvider?.adSystem;
+        
+        if (!adSystem) {
+            logger.error('AdCreditSystem not available on FreeProvider');
+            return res.status(503).send('Ad system unavailable');
+        }
+
+        // Normalize userId to string for consistent comparison
+        const userIdStr = String(uid);
+
+        // Record that user actually opened the ad
+        const result = adSystem.recordAdStart(vid, userIdStr);
+        
+        if (!result.success) {
+            logger.warn('Ad redirect: recordAdStart failed', { 
+                verificationId: vid, 
+                userId: userIdStr, 
+                error: result.error 
+            });
+            
+            // Still redirect even if recording fails — don't block user
+            // But log for debugging
+        } else {
+            logger.info('Ad redirect: watch started', { 
+                verificationId: vid, 
+                userId: userIdStr,
+                canClaimAt: result.canClaimAt
+            });
+        }
+
+        // Determine target URL based on verification network type
+        const verification = adSystem.activeVerifications?.get(vid);
+        const isFallback = verification?.urlType === 'profitablecpm';
+        const targetUrl = isFallback ? adSystem.FALLBACK_URL : adSystem.PRIMARY_URL;
+
+        if (!targetUrl) {
+            return res.status(503).send('Ad URL not configured');
+        }
+
+        // Redirect to actual ad network
+        res.redirect(targetUrl);
+
+    } catch (error) {
+        logger.error('Ad redirect error', { vid, uid, error: error.message, stack: error.stack });
+        res.status(500).send('Error processing ad link');
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+//  AD NETWORK POSTBACKS — Server-to-server notifications from ad networks
 // ═══════════════════════════════════════════════════════════════════════
 
 const postbackLimits = new Map();
@@ -324,7 +385,6 @@ function checkPostbackRateLimit(key) {
     return true;
 }
 
-// FIXED: Corrected postback handler to match AdCreditSystem.handlePostback signature
 router.get('/ad/:network', async (req, res) => {
     res.status(200).send('OK');
 
@@ -354,7 +414,6 @@ router.get('/ad/:network', async (req, res) => {
             ip: clientIp
         });
 
-        // FIXED: Properly resolve adSystem with fallback checks
         const { SMSProviderManager } = await import('../services/sms/index.js');
         const providerManager = SMSProviderManager.getInstance?.() || global.smsProviderManager;
         
@@ -364,18 +423,17 @@ router.get('/ad/:network', async (req, res) => {
         }
 
         const freeProvider = providerManager.getProvider('FREE_PUBLIC');
-        const adSystem = freeProvider?.adSystem || freeProvider?.adCreditSystem;
+        const adSystem = freeProvider?.adSystem;
         
         if (!adSystem || typeof adSystem.handlePostback !== 'function') {
             logger.warn('AdCreditSystem not available on FreeProvider', {
                 hasFreeProvider: !!freeProvider,
-                hasAdSystem: !!(freeProvider?.adSystem || freeProvider?.adCreditSystem),
+                hasAdSystem: !!adSystem,
                 hasHandlePostback: typeof adSystem?.handlePostback === 'function'
             });
             return;
         }
 
-        // FIXED: Pass (network, req.query) to match corrected handlePostback signature
         const result = await adSystem.handlePostback(network, req.query);
 
         if (!result.success) {
@@ -483,7 +541,6 @@ async function storeOrphanSMS(data) {
     }
 }
 
-// FIXED: Guard against null OTP in callback_data
 async function notifyUser(userId, data) {
     try {
         const bot = global.telegramBot || global.bot;
@@ -547,4 +604,3 @@ router.get('/health', (req, res) => {
 });
 
 export default router;
-                        
