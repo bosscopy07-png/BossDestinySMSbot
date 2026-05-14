@@ -1294,18 +1294,17 @@ async handleFreeMode(ctx) {
 // ═══════════════════════════════════════════════════════════════════════
 //  FREE EXHAUSTED — Daily limit reached, NO ads allowed
 // ═══════════════════════════════════════════════════════════════════════
-
-async _showFreeExhausted(ctx, user, creditCheck) {
-    creditCheck = creditCheck || null;
+async _showFreeExhausted(ctx, user) {
     const pricing = await getPricing();
     const formatted = formatPrice(pricing);
-    const dailyUsed = (creditCheck && creditCheck.dailyUsed) ? creditCheck.dailyUsed : (user ? user.freeUsedToday : 0);
-    const dailyLimit = (creditCheck && creditCheck.dailyLimit) ? creditCheck.dailyLimit : 3;
 
     const message = [
-        '❌ <b>Free OTPs Used Up</b>\n\n',
-        'You\'ve used ' + dailyUsed + '/' + dailyLimit + ' free OTPs today.\n\n',
-        '⏳ <b>Come back tomorrow</b> for more free OTPs.\n\n',
+        '❌ <b>Free OTP Limit Reached</b>\n\n',
+
+        'You have used all free OTP requests for today.\n\n',
+
+        '⏳ Please come back tomorrow.\n\n',
+
         '💡 Upgrade for instant access:\n',
         '• 💰 CHEAP — ' + formatted.cheap + '\n',
         '• 📦 BUNDLE — ' + formatted.bundle + '\n',
@@ -1319,32 +1318,58 @@ async _showFreeExhausted(ctx, user, creditCheck) {
         [Markup.button.callback('🔙 Main Menu', 'menu')]
     ]);
 
-    return this.sendPhotoWithCaption(ctx, IMAGES.freeMode, message, keyboard, 'HTML');
+    return this.sendPhotoWithCaption(
+        ctx,
+        IMAGES.freeMode,
+        message,
+        keyboard,
+        'HTML'
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 //  AD PROMPT — Force ad watch BEFORE any free OTP access
 // ═══════════════════════════════════════════════════════════════════════
+async _showAdPrompt(ctx, creditCheck, freeProvider, user) {
+    // HARD BLOCK
+    if (!this._canUseFree(user)) {
+        return this._showFreeExhausted(ctx, user);
+    }
 
-async _showAdPrompt(ctx, creditCheck, freeProvider) {
     const pricing = await getPricing();
     const formatted = formatPrice(pricing);
-    const shortfall = creditCheck.shortfall || (creditCheck.required - creditCheck.credits);
-    const networks = freeProvider.getAvailableNetworks().filter(function(n) { return n.configured; });
-    const dailyUsed = creditCheck.dailyUsed || 0;
-    const dailyLimit = creditCheck.dailyLimit || 3;
-    const remainingFree = dailyLimit - dailyUsed;
 
-    const minWatchTimeMs = (freeProvider.adSystem && freeProvider.adSystem.minWatchTime) ? freeProvider.adSystem.minWatchTime : 30000;
+    const networks = freeProvider
+        .getAvailableNetworks()
+        .filter(function(n) {
+            return n.configured;
+        });
+
+    const remainingFree = this._freeRemaining(user);
+
+    const minWatchTimeMs =
+        (freeProvider.adSystem &&
+        freeProvider.adSystem.minWatchTime)
+            ? freeProvider.adSystem.minWatchTime
+            : 30000;
+
     const minWatchTimeSec = Math.floor(minWatchTimeMs / 1000);
 
     const message = [
         '🎁 <b>Watch Ad to Get Free OTP</b>\n\n',
-        'Free OTPs remaining today: <b>' + remainingFree + '/' + dailyLimit + '</b>\n\n',
+
+        '✅ Free OTPs remaining today: <b>' +
+            remainingFree +
+            '</b>\n\n',
+
         '📺 Watch 1 ad = <b>+2 credits</b>\n',
         '💳 1 credit = <b>1 free OTP</b>\n',
-        '⏱ Required watch time: <b>' + minWatchTimeSec + ' seconds</b>\n\n',
+        '⏱ Required watch time: <b>' +
+            minWatchTimeSec +
+            ' seconds</b>\n\n',
+
         '<i>Watch the full ad to earn credits instantly.</i>\n\n',
+
         'Or upgrade for guaranteed delivery:\n',
         '• 💰 ' + formatted.cheap + '\n',
         '• 📦 ' + formatted.bundle
@@ -1369,7 +1394,9 @@ async _showAdPrompt(ctx, creditCheck, freeProvider) {
         parse_mode: 'HTML',
         reply_markup: Markup.inlineKeyboard(buttons).reply_markup
     });
-}
+        }
+
+        
 
 // ═══════════════════════════════════════════════════════════════════════
 //  CONFIRM FREE MODE — Commit hold and proceed to service selection
@@ -1480,11 +1507,16 @@ async handleCheckCredits(ctx) {
 
     try {
         const freeProvider = this.smsProviderManager.getProvider('FREE_PUBLIC');
+
         if (!freeProvider || !freeProvider.adSystem) {
-            return ctx.answerCbQuery('❌ Service unavailable').catch(function() {});
+            return ctx.answerCbQuery(
+                '❌ Service unavailable'
+            ).catch(function() {});
         }
 
-        const verificationId = ctx.session && ctx.session.pendingAdVerification ? ctx.session.pendingAdVerification : null;
+        ctx.session = ctx.session || {};
+
+        const verificationId = ctx.session.pendingAdVerification || null;
 
         if (!verificationId) {
             return ctx.answerCbQuery(
@@ -1493,91 +1525,220 @@ async handleCheckCredits(ctx) {
             );
         }
 
-        const claimResult = await freeProvider.adSystem.claimCredits(verificationId, userId, {
-            userAgent: (ctx.callbackQuery && ctx.callbackQuery.from && ctx.callbackQuery.from.username) ? ctx.callbackQuery.from.username : 'unknown'
-        });
+        // Fetch user
+        const user = ctx.state.user ||
+            await User.findOne({ userId: userId });
 
+        // HARD BLOCK — free limit exhausted
+        if (!this._canUseFree(user)) {
+            delete ctx.session.pendingAdVerification;
+
+            await ctx.answerCbQuery(
+                '❌ Daily free limit reached',
+                { show_alert: true }
+            ).catch(function() {});
+
+            return this._showFreeExhausted(ctx, user);
+        }
+
+        // Claim ad credits
+        const claimResult = await freeProvider.adSystem.claimCredits(
+            verificationId,
+            userId,
+            {
+                userAgent:
+                    (
+                        ctx.callbackQuery &&
+                        ctx.callbackQuery.from &&
+                        ctx.callbackQuery.from.username
+                    )
+                        ? ctx.callbackQuery.from.username
+                        : 'unknown'
+            }
+        );
+
+        // SUCCESS
         if (claimResult.success) {
+
             delete ctx.session.pendingAdVerification;
             delete ctx.session.adStartTime;
 
-            await ctx.answerCbQuery('✅ Credits added!');
+            // Recheck free access AFTER claim
+            const updatedUser = await User.findOne({ userId: userId });
+
+            if (!this._canUseFree(updatedUser)) {
+
+                await ctx.answerCbQuery(
+                    '❌ Daily free limit reached',
+                    { show_alert: true }
+                ).catch(function() {});
+
+                return this._showFreeExhausted(ctx, updatedUser);
+            }
+
+            const remainingFree = this._freeRemaining(updatedUser);
+
+            await ctx.answerCbQuery(
+                '✅ Credits added!'
+            ).catch(function() {});
 
             return ctx.editMessageText(
                 [
                     '✅ <b>Credits Added!</b>\n\n',
-                    '💳 Credits earned: <code>+' + claimResult.creditsAdded + '</code>\n',
-                    '💳 Total credits: <code>' + claimResult.totalCredits + '</code>\n',
-                    '⏱ Watch time: ' + Math.floor(claimResult.watchDuration / 1000) + 's\n\n',
+
+                    '💳 Credits earned: <code>+' +
+                        claimResult.creditsAdded +
+                        '</code>\n',
+
+                    '💳 Total credits: <code>' +
+                        claimResult.totalCredits +
+                        '</code>\n',
+
+                    '⏱ Watch time: <code>' +
+                        Math.floor(claimResult.watchDuration / 1000) +
+                        's</code>\n\n',
+
+                    '🆓 Free OTPs remaining today: <b>' +
+                        remainingFree +
+                        '</b>\n\n',
+
                     '✅ You can now request a free OTP!'
                 ].join(''),
                 {
                     parse_mode: 'HTML',
                     reply_markup: Markup.inlineKeyboard([
-                        [Markup.button.callback('📱 Get Free OTP', 'mode_free')],
-                        [Markup.button.callback('🔙 Menu', 'menu')]
+                        [
+                            Markup.button.callback(
+                                '📱 Get Free OTP',
+                                'mode_free'
+                            )
+                        ],
+                        [
+                            Markup.button.callback(
+                                '🔙 Menu',
+                                'menu'
+                            )
+                        ]
                     ]).reply_markup
                 }
             );
+        }
 
-        } else if (claimResult.error === 'TIME_NOT_ELAPSED') {
+        // WATCH TIME NOT COMPLETE
+        else if (claimResult.error === 'TIME_NOT_ELAPSED') {
+
+            const progress = Math.floor(
+                (claimResult.elapsed / claimResult.required) * 100
+            );
+
             await ctx.answerCbQuery(
                 '⏳ Wait ' + claimResult.remaining + 's more...',
                 { show_alert: true }
-            );
-
-            const progress = Math.floor((claimResult.elapsed / claimResult.required) * 100);
+            ).catch(function() {});
 
             return ctx.editMessageText(
                 [
                     '📺 <b>Watching Ad...</b>\n\n',
-                    '⏳ Progress: <code>' + claimResult.elapsed + '/' + claimResult.required + 's</code> (' + progress + '%)\n',
-                    '⏳ Remaining: <code>' + claimResult.remaining + 's</code>\n\n',
-                    '<i>Keep the ad page open. Do not close it.</i>'
+
+                    '⏳ Progress: <code>' +
+                        claimResult.elapsed +
+                        '/' +
+                        claimResult.required +
+                        's</code>\n',
+
+                    '📊 Completion: <code>' +
+                        progress +
+                        '%</code>\n',
+
+                    '⏳ Remaining: <code>' +
+                        claimResult.remaining +
+                        's</code>\n\n',
+
+                    '<i>Keep the ad page open until the timer completes.</i>'
                 ].join(''),
                 {
                     parse_mode: 'HTML',
                     reply_markup: Markup.inlineKeyboard([
-                        [Markup.button.callback('🔄 Check Again', 'check_credits')],
-                        [Markup.button.callback('🔙 Give Up', 'menu')]
+                        [
+                            Markup.button.callback(
+                                '🔄 Check Again',
+                                'check_credits'
+                            )
+                        ],
+                        [
+                            Markup.button.callback(
+                                '🔙 Cancel',
+                                'menu'
+                            )
+                        ]
                     ]).reply_markup
                 }
             );
+        }
 
-        } else if (claimResult.error === 'WATCH_NOT_STARTED') {
+        // USER NEVER OPENED AD
+        else if (claimResult.error === 'WATCH_NOT_STARTED') {
+
             return ctx.answerCbQuery(
-                '❌ Please open the ad first by tapping "📺 Open Ad"',
+                '❌ Please open the ad first',
                 { show_alert: true }
             );
+        }
 
-        } else {
+        // EXPIRED / FAILED
+        else {
+
             delete ctx.session.pendingAdVerification;
+            delete ctx.session.adStartTime;
 
             await ctx.answerCbQuery(
-                '❌ ' + (claimResult.message || 'Failed to claim credits'),
+                '❌ ' + (
+                    claimResult.message ||
+                    'Failed to claim credits'
+                ),
                 { show_alert: true }
-            );
+            ).catch(function() {});
 
             return ctx.editMessageText(
                 [
                     '❌ <b>Ad Session Expired</b>\n\n',
-                    'Please watch a new ad to earn credits.'
+
+                    'Please watch a new ad to continue.'
                 ].join(''),
                 {
                     parse_mode: 'HTML',
                     reply_markup: Markup.inlineKeyboard([
-                        [Markup.button.callback('📺 Watch New Ad', 'mode_free')],
-                        [Markup.button.callback('🔙 Menu', 'menu')]
+                        [
+                            Markup.button.callback(
+                                '📺 Watch New Ad',
+                                'mode_free'
+                            )
+                        ],
+                        [
+                            Markup.button.callback(
+                                '🔙 Menu',
+                                'menu'
+                            )
+                        ]
                     ]).reply_markup
                 }
             );
         }
 
     } catch (error) {
-        logger.error('handleCheckCredits error', { userId: userId, error: error.message });
-        return ctx.answerCbQuery('❌ Check failed').catch(function() {});
+
+        logger.error('handleCheckCredits error', {
+            userId: userId,
+            error: error.message
+        });
+
+        return ctx.answerCbQuery(
+            '❌ Credit check failed'
+        ).catch(function() {});
     }
-}
+            }
+
+        
 
 // ═══════════════════════════════════════════════════════════════════════
 //  FREE SERVICE SELECTED
@@ -1663,8 +1824,8 @@ async handleFreeCountrySelected(ctx) {
         const user = ctx.state.user || await User.findOne({ userId: userId });
 
         // HARD BLOCK 1: Daily limit reached → Block completely, no ads
-        if (user && user.freeUsedToday >= 3) {
-            return this._showFreeExhausted(ctx, user);
+        if (!this._canUseFree(user)) {
+    return this._showFreeExhausted(ctx, user);
         }
 
         const freeProvider = this.smsProviderManager.getProvider('FREE_PUBLIC');
