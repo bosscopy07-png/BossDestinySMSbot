@@ -4,13 +4,13 @@
 //  Zero breaking changes to existing architecture.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-import { TIER_CONFIG, CACHE_TTL } from '../config/tierConfig.js';
+import { TIER_CONFIG, CACHE_TTL, getTierConfig } from '../config/tierConfig.js';
 import logger from '../utils/logger.js';
 
-const PROFIT_MARGIN = 0.20; // $0.20 profit per number
+const PROFIT_MARGIN = 0.20; // $0.20 base profit per number
 
 /**
- * Apply profit margin to a raw provider price
+ * Apply base profit margin to a raw provider price
  */
 function applyProfitMargin(rawPrice) {
     if (rawPrice === null || rawPrice === undefined || isNaN(rawPrice)) return null;
@@ -19,6 +19,12 @@ function applyProfitMargin(rawPrice) {
 
 /**
  * TierIntegrationService — Central orchestrator for the 3-tier CHEAP flow
+ * 
+ * Pricing Model:
+ *   - Base $0.20 profit on EVERY tier
+ *   - Budget:  no extra markup (1.0×) = raw + $0.20
+ *   - Standard: +15% markup (1.15×) = (raw + $0.20) × 1.15
+ *   - Premium: +35% markup (1.35×) = (raw + $0.20) × 1.35
  * 
  * Responsibilities:
  *   - Initializes and wires all tier components
@@ -209,7 +215,13 @@ class TierIntegrationService {
 
     /**
      * Get tier baseline prices for a service (for UI display)
-     * Caches results to avoid hammering the API
+     * 
+     * Pricing Model:
+     *   - providerCost = raw + $0.20 (base profit)
+     *   - finalPrice = providerCost × tier.priceMultiplier
+     *   - Budget: 1.0× = no extra markup
+     *   - Standard: 1.15× = +15% extra profit
+     *   - Premium: 1.35× = +35% extra profit
      */
     async getTierBaselinePrices(service, country = 'US') {
         if (!this.isAvailable()) return null;
@@ -230,9 +242,13 @@ class TierIntegrationService {
                     tier.key, country, service, { timeoutMs: 8000 }
                 ).catch(() => null);
 
-                // FIXED: Apply profit margin to display price
-                const rawPrice = baseline?.displayPrice || baseline?.price || null;
-                const markedUpPrice = applyProfitMargin(rawPrice);
+                // Base cost: raw price + $0.20 profit
+                const rawPrice = baseline?.price || 0;
+                const providerCost = applyProfitMargin(rawPrice);
+                
+                // Final price: base cost × tier multiplier
+                // Budget: 1.0× (no extra), Standard: 1.15×, Premium: 1.35×
+                const finalPrice = Number((providerCost * tier.priceMultiplier).toFixed(2));
 
                 results.push({
                     tierKey: tier.key,
@@ -241,8 +257,11 @@ class TierIntegrationService {
                     description: tier.description,
                     badge: tier.badge,
                     priceMultiplier: tier.priceMultiplier,
-                    baselinePrice: markedUpPrice,
-                    rawPrice: rawPrice,
+                    baselinePrice: finalPrice,        // What user pays
+                    providerCost: providerCost,       // Raw + $0.20 base profit
+                    rawPrice: rawPrice,              // 5SIM raw price
+                    baseProfit: PROFIT_MARGIN,        // Always $0.20
+                    extraProfit: Number(((providerCost * tier.priceMultiplier) - providerCost).toFixed(2)), // Tier markup amount
                     baselineStock: baseline?.stock || 0,
                     operatorCount: tier.operatorCount
                 });
@@ -255,7 +274,10 @@ class TierIntegrationService {
                     badge: tier.badge,
                     priceMultiplier: tier.priceMultiplier,
                     baselinePrice: null,
+                    providerCost: null,
                     rawPrice: null,
+                    baseProfit: PROFIT_MARGIN,
+                    extraProfit: 0,
                     baselineStock: 0,
                     operatorCount: tier.operatorCount,
                     error: error.message
@@ -331,25 +353,15 @@ class TierIntegrationService {
 
     /**
      * Select best operator and purchase number
-     * This is the MAIN entry point for automatic provider selection + purchase
      * 
-     * FIXED: Validates operator selection before purchase, logs operator mismatch,
-     * ensures exact selected operator is passed to provider.
+     * Pricing Model:
+     *   - providerCost = raw + $0.20 (base profit)
+     *   - finalPrice = providerCost × tier.priceMultiplier
      * 
-     * @returns {Promise<{
-     *   success: boolean,
-     *   phoneNumber: string,
-     *   providerNumberId: string,
-     *   operator: string,
-     *   price: number,
-     *   displayPrice: number,
-     *   stock: number,
-     *   score: number,
-     *   tier: string,
-     *   country: string,
-     *   service: string,
-     *   error: string
-     * }>}
+     * FIXED: Validates operator selection before purchase
+     * FIXED: Logs operator mismatch
+     * FIXED: Ensures exact selected operator is passed to provider
+     * FIXED: Excludes failed operator from fallback
      */
     async purchaseNumber(tierKey, country, service, options = {}) {
         if (!this.isAvailable()) {
@@ -372,7 +384,7 @@ class TierIntegrationService {
                 }
             );
 
-            // CRITICAL FIX: Validate operator selection
+            // Validate operator selection
             if (!selection.operator || selection.operator === 'any') {
                 logger.warn('Tier selector returned "any" or empty operator', {
                     tier: tierKey, country, service, selection
@@ -423,9 +435,11 @@ class TierIntegrationService {
                 });
             }
 
-            // FIXED: Apply profit margin to prices
-            const finalPrice = applyProfitMargin(selection.price);
-            const finalDisplayPrice = applyProfitMargin(selection.displayPrice);
+            // Pricing: Base $0.20 profit + tier markup
+            const rawPrice = purchaseResult.cost || selection.price || 0;
+            const providerCost = applyProfitMargin(rawPrice);  // raw + $0.20
+            const tier = getTierConfig(tierKey);
+            const finalPrice = Number((providerCost * tier.priceMultiplier).toFixed(2));
 
             logger.info('Tier purchase successful', {
                 tier: tierKey,
@@ -433,9 +447,11 @@ class TierIntegrationService {
                 service,
                 operator: selection.operator,
                 purchasedOperator: purchaseResult.operator || selection.operator,
-                price: finalPrice,
-                displayPrice: finalDisplayPrice,
-                rawPrice: selection.price,
+                rawPrice,
+                providerCost,
+                finalPrice,
+                baseProfit: PROFIT_MARGIN,
+                extraProfit: Number((finalPrice - providerCost).toFixed(2)),
                 duration: Date.now() - startTime
             });
 
@@ -445,23 +461,22 @@ class TierIntegrationService {
                 providerNumberId: purchaseResult.providerNumberId,
                 operator: selection.operator,
                 purchasedOperator: purchaseResult.operator || selection.operator,
-                price: finalPrice,
-                displayPrice: finalDisplayPrice,
-                rawPrice: selection.price,
-                rawDisplayPrice: selection.displayPrice,
+                price: finalPrice,              // User pays this
+                displayPrice: finalPrice,       // Same as price
+                providerCost: providerCost,     // Raw + $0.20
+                rawPrice: rawPrice,             // 5SIM raw
+                baseProfit: PROFIT_MARGIN,      // Always $0.20
+                extraProfit: Number((finalPrice - providerCost).toFixed(2)), // Tier markup
                 stock: selection.stock,
                 score: selection.score,
                 tier: tierKey,
                 country,
-                service,
-                providerCost: purchaseResult.cost,
-                providerDisplayCost: purchaseResult.displayCost
+                service
             };
 
         } catch (error) {
             this._metrics.errors++;
 
-            // CRITICAL FIX: Add INVALID_RESPONSE and PROVIDER_ERROR to fallback triggers
             const shouldFallback = error.message?.includes('NO_NUMBERS') || 
                  error.message?.includes('NOT_AVAILABLE') ||
                  error.message?.includes('TIMEOUT') ||
@@ -473,9 +488,13 @@ class TierIntegrationService {
                     tier: tierKey,
                     country,
                     service,
-                    error: error.message
+                    error: error.message,
+                    failedOperator: selection?.operator
                 });
-                return this._attemptFallbackPurchase(tierKey, country, service, options, error);
+                // FIXED: Pass failed operator to exclude from fallback
+                return this._attemptFallbackPurchase(
+                    tierKey, country, service, options, error, selection?.operator
+                );
             }
 
             logger.error('Tier purchase failed', {
@@ -495,14 +514,15 @@ class TierIntegrationService {
 
     /**
      * Attempt fallback purchase with next-best operator in same tier
+     * FIXED: Excludes the failed operator from fallback candidates
      */
-    
-    async _attemptFallbackPurchase(tierKey, country, service, options, originalError) {
+    async _attemptFallbackPurchase(tierKey, country, service, options, originalError, failedOperator = null) {
         this._metrics.tierFallbacks++;
 
         try {
+            // FIXED: Pass failedOperator to exclude from fallback candidates
             const fallbackOps = await this._tierSelector.getFallbackOperators(
-                tierKey, country, service, null
+                tierKey, country, service, failedOperator
             );
 
             if (!fallbackOps || fallbackOps.length === 0) {
@@ -523,19 +543,24 @@ class TierIntegrationService {
 
                     this._metrics.tierPurchases++;
 
-                    // FIXED: Apply profit margin
-                    const finalPrice = applyProfitMargin(fallback.price);
-                    const finalDisplayPrice = applyProfitMargin(fallback.displayPrice);
+                    // Pricing: Same model as main purchase
+                    const rawPrice = purchaseResult.cost || fallback.price || 0;
+                    const providerCost = applyProfitMargin(rawPrice);
+                    const tier = getTierConfig(tierKey);
+                    const finalPrice = Number((providerCost * tier.priceMultiplier).toFixed(2));
 
                     logger.info('Fallback purchase successful', {
                         tier: tierKey,
                         country,
                         service,
-                        originalOperator: originalError?.operator || 'unknown',
+                        failedOperator: failedOperator || 'unknown',
                         fallbackOperator: fallback.operator,
                         score: fallback.score,
-                        price: finalPrice,
-                        displayPrice: finalDisplayPrice
+                        rawPrice,
+                        providerCost,
+                        finalPrice,
+                        baseProfit: PROFIT_MARGIN,
+                        extraProfit: Number((finalPrice - providerCost).toFixed(2))
                     });
 
                     return {
@@ -544,9 +569,11 @@ class TierIntegrationService {
                         providerNumberId: purchaseResult.providerNumberId,
                         operator: fallback.operator,
                         price: finalPrice,
-                        displayPrice: finalDisplayPrice,
-                        rawPrice: fallback.price,
-                        rawDisplayPrice: fallback.displayPrice,
+                        displayPrice: finalPrice,
+                        providerCost: providerCost,
+                        rawPrice: rawPrice,
+                        baseProfit: PROFIT_MARGIN,
+                        extraProfit: Number((finalPrice - providerCost).toFixed(2)),
                         stock: fallback.stock,
                         score: fallback.score,
                         tier: tierKey,
@@ -590,6 +617,10 @@ class TierIntegrationService {
         if (!this.isAvailable()) return [];
         return this._tierSelector.getFallbackOperators(tierKey, country, service, excludeOperator);
     }
+    // ═══════════════════════════════════════════════════════════════════════════════
+//  TierIntegrationService.js — Part 2/2
+//  Legacy Compatibility, Error Handling, Metrics & Health
+// ═══════════════════════════════════════════════════════════════════════════════
 
     // ═══════════════════════════════════════════════════════════════════════
     //  LEGACY COMPATIBILITY
