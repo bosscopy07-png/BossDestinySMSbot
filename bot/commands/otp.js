@@ -1727,7 +1727,58 @@ async handleFreeCountrySelected(ctx) {
                 await freeProvider.adSystem.releaseHold(holdId).catch(() => {});
             }
             throw numberError;
-       
+        }
+
+    } catch (error) {
+        logger.error('handleFreeCountrySelected error', { userId, countryCode, serviceId, error: error.message });
+        await ctx.answerCbQuery('❌ Error').catch(() => {});
+
+        const pricing = await getPricing();
+        const formatted = formatPrice(pricing);
+
+        const errorMessage = (
+            '❌ <b>Free Number Error</b>\n\n' +
+            `Error: ${error.message}\n\n` +
+            'Try again or use CHEAP mode for guaranteed delivery.\n\n' +
+            `💰 CHEAP: ${formatted.cheap}`
+        );
+
+        const errorKeyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔄 Try Again', `free_country_${countryCode}_${serviceId}`)],
+            [Markup.button.callback('💰 CHEAP Mode', 'mode_cheap')],
+            [Markup.button.callback('🔙 Menu', 'menu')]
+        ]);
+
+        return this.sendPhotoWithCaption(ctx, IMAGES.otpFailed, errorMessage, errorKeyboard, 'HTML');
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  FREE CHECK NOW — Manual poll for SMS
+// ═══════════════════════════════════════════════════════════════════════
+
+async handleCheckFree(ctx, sessionId) {
+    try {
+        const freeProvider = this.smsProviderManager?.getProvider('FREE_PUBLIC');
+        if (!freeProvider) {
+            return ctx.answerCbQuery('❌ Service unavailable').catch(() => {});
+        }
+
+        const result = await freeProvider.checkFreeSMS(sessionId);
+
+        if (result.success && result.otp) {
+            await ctx.answerCbQuery('✅ OTP received! Updating...');
+        } else if (result.status === 'EXPIRED' || result.status === 'CANCELLED') {
+            await ctx.answerCbQuery('❌ Session expired', { show_alert: true });
+        } else {
+            await ctx.answerCbQuery(`⏳ ${result.message || 'Still waiting...'}`);
+        }
+
+    } catch (error) {
+        logger.error('handleCheckFree error', { sessionId, error: error.message });
+        return ctx.answerCbQuery('❌ Check failed').catch(() => {});
+    }
+}
          
     // ═══════════════════════════════════════════════════════════════════════
     //  CHEAP MODE — NEW TIER-BASED FLOW
