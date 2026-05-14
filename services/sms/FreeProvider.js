@@ -1750,7 +1750,24 @@ class FreeProvider {
 
         return true;
     }
-
+// In FreeProvider.js — startCleanupJob
+startCleanupJob() {
+    if (this.cleanupInterval) clearInterval(this.cleanupInterval);
+    this.cleanupInterval = setInterval(async () => {
+        this.cleanupStaleSessions();
+        this._clearStaleCache();
+        
+        // Fix: await the async cleanup
+        if (this.adSystem?.cleanupOldVerifications) {
+            try {
+                await this.adSystem.cleanupOldVerifications();
+            } catch (e) {
+                logger.debug('Ad cleanup failed', { error: e.message });
+            }
+        }
+    }, 120000);
+}
+    
     // ═══════════════════════════════════════════════════════════════════════
     //  AD SYSTEM PROXY METHODS
     // ═══════════════════════════════════════════════════════════════════════
