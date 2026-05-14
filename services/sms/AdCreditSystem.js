@@ -1,5 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // AdCreditSystem.js — MongoDB-backed, cross-process safe
+// FIXED: Removed all freeUsedToday mutations — bot controls daily limits
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { User, AdView, CreditTransaction, AdVerification } from '../../models/index.js';
@@ -12,9 +13,9 @@ class AdCreditSystem {
         this.PRIMARY_URL = config.adSystem?.primaryUrl || process.env.AD_PRIMARY_URL || 'https://omg10.com/4/10967769';
         this.FALLBACK_URL = config.adSystem?.fallbackUrl || process.env.AD_FALLBACK_URL || 'https://www.profitablecpmratenetwork.com/zs5wg1ki?key=cb472c48fad6246f544094483b9f9bcc';
 
+        // FIX: Removed DAILY_FREE_LIMIT from COSTS — bot controls this, not ad system
         this.COSTS = {
-            NUMBER_REQUEST: config.adSystem?.creditsPerRequest || 2,
-            DAILY_FREE_LIMIT: config.limits?.freeDaily || 3
+            NUMBER_REQUEST: config.adSystem?.creditsPerRequest || 2
         };
 
         this.MIN_WATCH_TIME = 30000;
@@ -34,10 +35,9 @@ class AdCreditSystem {
 
         this._startCleanupInterval();
 
-        logger.info('AdCreditSystem v3 initialized', {
+        logger.info('AdCreditSystem v3-FIXED initialized', {
             primaryUrl: this._maskUrl(this.PRIMARY_URL),
-            costPerRequest: this.COSTS.NUMBER_REQUEST,
-            dailyFreeLimit: this.COSTS.DAILY_FREE_LIMIT
+            costPerRequest: this.COSTS.NUMBER_REQUEST
         });
     }
 
@@ -80,28 +80,21 @@ class AdCreditSystem {
             { new: true }
         ).lean();
     }
-    // Add to AdCreditSystem class
 
-/**
- * Cleanup old verifications from MongoDB
- * Called by FreeProvider's cleanup job
- */
-async cleanupOldVerifications() {
-    // MongoDB TTL handles automatic deletion, but we can force cleanup
-    const cutoff = new Date(Date.now() - 3600000); // 1 hour old
-    
-    const result = await AdVerification.deleteMany({
-        createdAt: { $lt: cutoff },
-        status: { $in: ['PENDING', 'STARTED'] } // Don't delete COMPLETED (keep for records)
-    });
-    
-    if (result.deletedCount > 0) {
-        logger.debug('Cleaned old ad verifications', { count: result.deletedCount });
+    async cleanupOldVerifications() {
+        const cutoff = new Date(Date.now() - 3600000);
+        
+        const result = await AdVerification.deleteMany({
+            createdAt: { $lt: cutoff },
+            status: { $in: ['PENDING', 'STARTED'] }
+        });
+        
+        if (result.deletedCount > 0) {
+            logger.debug('Cleaned old ad verifications', { count: result.deletedCount });
+        }
+        
+        return result.deletedCount;
     }
-    
-    return result.deletedCount;
-}
-    
 
     // ═══════════════════════════════════════════════════════════════════════
     //  AD VIEW GENERATION
@@ -132,7 +125,7 @@ async cleanupOldVerifications() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  RECORD AD START — Now MongoDB-backed
+    //  RECORD AD START — MongoDB-backed
     // ═══════════════════════════════════════════════════════════════════════
 
     async recordAdStart(verificationId, requestingUserId) {
@@ -352,60 +345,75 @@ async cleanupOldVerifications() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  CREDIT INQUIRY & TRANSACTIONS (unchanged from v2)
+    //  CREDIT INQUIRY — FIXED: Removed all freeUsedToday logic
     // ═══════════════════════════════════════════════════════════════════════
 
     async getCredits(userId) {
-        const now = new Date();
-        const todayUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
-
         const user = await User.findOne({ userId: String(userId) }).lean();
         if (!user) {
-            return { credits: 0, dailyUsed: 0, dailyLimit: this.COSTS.DAILY_FREE_LIMIT, holds: 0, effectiveAvailable: this.COSTS.DAILY_FREE_LIMIT };
+            return { 
+                credits: 0, 
+                holds: 0
+            };
         }
 
-        const lastReset = user.adCreditReset ? new Date(user.adCreditReset).getTime() : 0;
-        const shouldReset = lastReset < todayUTC;
-
-        if (shouldReset) {
-            await User.updateOne(
-                { userId: String(userId) },
-                { $set: { adCredits: 0, adCreditReset: now, freeUsedToday: 0 } }
-            );
-            return { credits: 0, dailyUsed: 0, dailyLimit: this.COSTS.DAILY_FREE_LIMIT, holds: 0, effectiveAvailable: this.COSTS.DAILY_FREE_LIMIT };
-        }
-
-        const freeRemaining = Math.max(0, this.COSTS.DAILY_FREE_LIMIT - (user.freeUsedToday || 0));
         const creditBalance = user.adCredits || 0;
         const activeHoldCount = await this._countActiveHolds(userId);
 
         return {
             credits: creditBalance,
-            dailyUsed: user.freeUsedToday || 0,
-            dailyLimit: this.COSTS.DAILY_FREE_LIMIT,
             holds: activeHoldCount,
-            effectiveAvailable: freeRemaining + Math.max(0, creditBalance - (activeHoldCount * this.COSTS.NUMBER_REQUEST))
+            // effectiveAvailable = credits minus held credits
+            effectiveAvailable: Math.max(0, creditBalance - (activeHoldCount * this.COSTS.NUMBER_REQUEST))
         };
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  CAN REQUEST NUMBER — FIXED: Only checks credit balance, NOT daily limits
+    // ═══════════════════════════════════════════════════════════════════════
 
     async canRequestNumber(userId) {
         const credits = await this.getCredits(userId);
 
+        // FIX: Only check hold limits and credit balance
+        // Daily free limits are checked by the bot via _canUseFree()
         if (credits.holds >= this.MAX_HOLDS_PER_USER) {
-            return { allowed: false, reason: 'TOO_MANY_HOLDS', message: `You have ${credits.holds} pending requests.`, credits: credits.credits, required: this.COSTS.NUMBER_REQUEST };
+            return { 
+                allowed: false, 
+                reason: 'TOO_MANY_HOLDS', 
+                message: `You have ${credits.holds} pending requests.`, 
+                credits: credits.credits, 
+                required: this.COSTS.NUMBER_REQUEST 
+            };
         }
 
-        if (credits.dailyUsed < credits.dailyLimit) {
-            return { allowed: true, reason: 'DAILY_FREE', credits: credits.credits, required: 0, remainingAfter: credits.credits, freeRemaining: credits.dailyLimit - credits.dailyUsed - 1, usingCredits: false };
-        }
-
+        // FIX: Removed DAILY_FREE branch — bot handles free allowance separately
+        // Only check if user has enough CREDITS (not free allowance)
         const requiredWithHolds = this.COSTS.NUMBER_REQUEST * (credits.holds + 1);
+        
         if (credits.credits >= requiredWithHolds) {
-            return { allowed: true, reason: 'CREDITS_SUFFICIENT', credits: credits.credits, required: this.COSTS.NUMBER_REQUEST, remainingAfter: credits.credits - requiredWithHolds, freeRemaining: 0, usingCredits: true };
+            return { 
+                allowed: true, 
+                reason: 'CREDITS_SUFFICIENT', 
+                credits: credits.credits, 
+                required: this.COSTS.NUMBER_REQUEST, 
+                remainingAfter: credits.credits - requiredWithHolds
+            };
         }
 
-        return { allowed: false, reason: 'INSUFFICIENT_CREDITS', message: `Need ${this.COSTS.NUMBER_REQUEST} credits. You have ${credits.credits}.`, credits: credits.credits, required: this.COSTS.NUMBER_REQUEST, shortfall: requiredWithHolds - credits.credits, freeRemaining: 0 };
+        return { 
+            allowed: false, 
+            reason: 'INSUFFICIENT_CREDITS', 
+            message: `Need ${this.COSTS.NUMBER_REQUEST} credits. You have ${credits.credits}.`, 
+            credits: credits.credits, 
+            required: this.COSTS.NUMBER_REQUEST, 
+            shortfall: requiredWithHolds - credits.credits 
+        };
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  HOLD CREDITS — FIXED: Always deducts credits, no "free" holds
+    // ═══════════════════════════════════════════════════════════════════════
 
     async holdCredits(userId) {
         const check = await this.canRequestNumber(userId);
@@ -417,60 +425,101 @@ async cleanupOldVerifications() {
         }
 
         const holdId = `hold_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-        const isFree = !check.usingCredits;
-        const cost = isFree ? 0 : this.COSTS.NUMBER_REQUEST;
+        const cost = this.COSTS.NUMBER_REQUEST;  // FIX: Always costs credits
 
-        if (!isFree) {
-            const result = await User.findOneAndUpdate(
-                { userId: String(userId), adCredits: { $gte: cost } },
-                { $inc: { adCredits: -cost } },
-                { new: true }
-            );
-            if (!result) throw new Error('CREDIT_RACE_CONDITION');
-        }
+        // Deduct credits immediately
+        const result = await User.findOneAndUpdate(
+            { userId: String(userId), adCredits: { $gte: cost } },
+            { $inc: { adCredits: -cost } },
+            { new: true }
+        );
+        
+        if (!result) throw new Error('CREDIT_RACE_CONDITION');
 
-        const holdData = { holdId, userId: String(userId), cost, isFree, createdAt: Date.now(), expiresAt: Date.now() + this.HOLD_EXPIRY_MS, status: 'HELD', committed: false, released: false };
+        const holdData = { 
+            holdId, 
+            userId: String(userId), 
+            cost, 
+            createdAt: Date.now(), 
+            expiresAt: Date.now() + this.HOLD_EXPIRY_MS, 
+            status: 'HELD', 
+            committed: false, 
+            released: false 
+        };
+        
         this.activeHolds.set(holdId, holdData);
         this._trackUserHold(userId, holdId);
 
-        await this._logTransaction({ userId: String(userId), type: 'HOLD', amount: -cost, holdId, balanceAfter: isFree ? check.credits : check.credits - cost, reason: isFree ? 'FREE_NUMBER_HOLD' : 'CREDIT_NUMBER_HOLD' });
+        await this._logTransaction({ 
+            userId: String(userId), 
+            type: 'HOLD', 
+            amount: -cost, 
+            holdId, 
+            balanceAfter: result.adCredits, 
+            reason: 'CREDIT_NUMBER_HOLD' 
+        });
 
         return holdId;
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  RELEASE HOLD — FIXED: Refunds credits, does NOT touch freeUsedToday
+    // ═══════════════════════════════════════════════════════════════════════
 
     async releaseHold(holdId) {
         const hold = this.activeHolds.get(holdId);
         if (!hold) return { success: false, error: 'HOLD_NOT_FOUND' };
         if (hold.released || hold.committed) return { success: false, error: 'HOLD_ALREADY_FINALIZED' };
 
-        if (!hold.isFree && hold.cost > 0) {
-            await User.updateOne({ userId: hold.userId }, { $inc: { adCredits: hold.cost } });
-        }
-        if (hold.isFree) {
-            await User.updateOne({ userId: hold.userId }, { $inc: { freeUsedToday: -1 } });
+        // FIX: Always refund credits (no special "free" case)
+        if (hold.cost > 0) {
+            await User.updateOne(
+                { userId: hold.userId }, 
+                { $inc: { adCredits: hold.cost } }
+            );
         }
 
-        hold.status = 'RELEASED'; hold.released = true; hold.releasedAt = Date.now();
+        hold.status = 'RELEASED'; 
+        hold.released = true; 
+        hold.releasedAt = Date.now();
         this.activeHolds.set(holdId, hold);
 
-        await this._logTransaction({ userId: hold.userId, type: 'RELEASE', amount: hold.cost, holdId, reason: hold.isFree ? 'FREE_NUMBER_RELEASED' : 'CREDIT_NUMBER_RELEASED' });
-        return { success: true, refunded: hold.cost, isFree: hold.isFree };
+        await this._logTransaction({ 
+            userId: hold.userId, 
+            type: 'RELEASE', 
+            amount: hold.cost, 
+            holdId, 
+            reason: 'CREDIT_NUMBER_RELEASED' 
+        });
+        
+        return { success: true, refunded: hold.cost };
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  COMMIT HOLD — FIXED: Does NOT touch freeUsedToday
+    // ═══════════════════════════════════════════════════════════════════════
 
     async commitHold(holdId) {
         const hold = this.activeHolds.get(holdId);
         if (!hold) return { success: false, error: 'HOLD_NOT_FOUND' };
         if (hold.released || hold.committed) return { success: false, error: 'HOLD_ALREADY_FINALIZED' };
 
-        if (hold.isFree) {
-            await User.updateOne({ userId: hold.userId }, { $inc: { freeUsedToday: 1 } });
-        }
+        // FIX: Removed all freeUsedToday logic — bot handles this
 
-        hold.status = 'COMMITTED'; hold.committed = true; hold.committedAt = Date.now();
+        hold.status = 'COMMITTED'; 
+        hold.committed = true; 
+        hold.committedAt = Date.now();
         this.activeHolds.set(holdId, hold);
 
-        await this._logTransaction({ userId: hold.userId, type: 'COMMIT', amount: -hold.cost, holdId, reason: hold.isFree ? 'FREE_NUMBER_ASSIGNED' : 'CREDIT_NUMBER_ASSIGNED' });
-        return { success: true, cost: hold.cost, isFree: hold.isFree };
+        await this._logTransaction({ 
+            userId: hold.userId, 
+            type: 'COMMIT', 
+            amount: -hold.cost, 
+            holdId, 
+            reason: 'CREDIT_NUMBER_ASSIGNED' 
+        });
+        
+        return { success: true, cost: hold.cost };
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -479,7 +528,15 @@ async cleanupOldVerifications() {
 
     async _logTransaction({ userId, type, amount, holdId = null, balanceAfter = null, reason, metadata = {} }) {
         try {
-            await CreditTransaction.create({ userId: String(userId), type, amount, holdId, balanceAfter, reason, metadata: { ...metadata, timestamp: new Date() } });
+            await CreditTransaction.create({ 
+                userId: String(userId), 
+                type, 
+                amount, 
+                holdId, 
+                balanceAfter, 
+                reason, 
+                metadata: { ...metadata, timestamp: new Date() } 
+            });
         } catch (error) {
             logger.error('Credit transaction log failed', { userId, type, error: error.message });
         }
@@ -494,70 +551,4 @@ async cleanupOldVerifications() {
             if (hold && !hold.released && !hold.committed && hold.expiresAt > Date.now()) count++;
         }
         return count;
-    }
-
-    _trackUserHold(userId, holdId) {
-        if (!this.userHoldHistory.has(userId)) this.userHoldHistory.set(userId, new Set());
-        this.userHoldHistory.get(userId).add(holdId);
-    }
-
-    _cleanupExpiredHolds() {
-        const now = Date.now();
-        let cleaned = 0;
-        for (const [holdId, hold] of this.activeHolds) {
-            if (hold.expiresAt < now && !hold.released && !hold.committed) {
-                this.releaseHold(holdId).catch(() => {});
-                cleaned++;
-            }
-        }
-        return cleaned;
-    }
-
-    _recordClaim(userId) {
-        if (!this.userClaimHistory.has(userId)) this.userClaimHistory.set(userId, []);
-        const history = this.userClaimHistory.get(userId);
-        history.push(Date.now());
-        if (history.length > this.MAX_CLAIM_HISTORY_PER_USER) history.shift();
-    }
-
-    _getLastClaimTime(userId) {
-        const history = this.userClaimHistory.get(userId);
-        return history?.length > 0 ? history[history.length - 1] : null;
-    }
-
-    _getRecentClaimsCount(userId, windowMs) {
-        const history = this.userClaimHistory.get(userId);
-        return history ? history.filter(t => t > Date.now() - windowMs).length : 0;
-    }
-
-    _recordAdGeneration(userId) {
-        if (!this.userClaimHistory.has(userId)) this.userClaimHistory.set(userId, []);
-        this.userClaimHistory.get(userId).push(-Date.now());
-    }
-
-    _getRecentAdGenerations(userId, windowMs) {
-        const history = this.userClaimHistory.get(userId);
-        return history ? history.filter(t => t < 0 && Math.abs(t) > Date.now() - windowMs).length : 0;
-    }
-
-    _startCleanupInterval() {
-        setInterval(() => {
-            const holdsCleaned = this._cleanupExpiredHolds();
-            if (holdsCleaned > 0) logger.debug('Cleanup completed', { holdsCleaned });
-        }, 300000);
-    }
-
-    getAvailableNetworks() {
-        return [
-            { id: 'primary', name: 'Watch Ad', creditValue: 2, configured: !!this.PRIMARY_URL, minWatchTime: Math.floor(this.MIN_WATCH_TIME / 1000) },
-            { id: 'fallback', name: 'Watch Ad (Alt)', creditValue: 2, configured: !!this.FALLBACK_URL, minWatchTime: Math.floor(this.MIN_WATCH_TIME / 1000) }
-        ].filter(n => n.configured);
-    }
-
-    _maskUrl(url) {
-        if (!url) return 'none';
-        try { const u = new URL(url); return `${u.protocol}//${u.hostname}/...`; } catch { return 'invalid'; }
-    }
-}
-
-export default AdCreditSystem;
+   
