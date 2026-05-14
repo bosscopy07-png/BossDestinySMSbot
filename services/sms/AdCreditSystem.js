@@ -80,6 +80,28 @@ class AdCreditSystem {
             { new: true }
         ).lean();
     }
+    // Add to AdCreditSystem class
+
+/**
+ * Cleanup old verifications from MongoDB
+ * Called by FreeProvider's cleanup job
+ */
+async cleanupOldVerifications() {
+    // MongoDB TTL handles automatic deletion, but we can force cleanup
+    const cutoff = new Date(Date.now() - 3600000); // 1 hour old
+    
+    const result = await AdVerification.deleteMany({
+        createdAt: { $lt: cutoff },
+        status: { $in: ['PENDING', 'STARTED'] } // Don't delete COMPLETED (keep for records)
+    });
+    
+    if (result.deletedCount > 0) {
+        logger.debug('Cleaned old ad verifications', { count: result.deletedCount });
+    }
+    
+    return result.deletedCount;
+}
+    
 
     // ═══════════════════════════════════════════════════════════════════════
     //  AD VIEW GENERATION
