@@ -299,49 +299,37 @@ router.get('/ad/redirect', async (req, res) => {
     const { vid, uid } = req.query;
     
     if (!vid || !uid) {
-        return res.status(400).send('Invalid ad link: missing parameters');
+        return res.status(400).send('Invalid ad link');
     }
 
     try {
-        // Import and instantiate directly
-        const { default: SMSProviderManager } = await import('../services/sms/index.js');
-        const providerManager = new SMSProviderManager();
-        await providerManager.initialize();
+        // Direct import — no SMSProviderManager needed
+        const { default: AdCreditSystem } = await import('../services/AdCreditSystem.js');
+        const adSystem = new AdCreditSystem();
         
-        const freeProvider = providerManager.getProvider('FREE_PUBLIC');
-        
-        if (!freeProvider?.adSystem) {
-            console.error('Ad system not found on FREE_PUBLIC provider');
-            return res.status(503).send('Ad system unavailable');
-        }
-
-        // Record ad start
-        const result = freeProvider.adSystem.recordAdStart(vid, String(uid));
+        const result = await adSystem.recordAdStart(vid, String(uid));
         
         if (!result.success) {
-            console.warn('recordAdStart failed:', result.error);
-            // Continue to redirect anyway — don't block user
+            logger.warn('recordAdStart failed', { error: result.error, vid, uid });
         }
 
-        // Determine target URL
-        const verification = freeProvider.adSystem.activeVerifications?.get(vid);
+        // Get target URL from verification
+        const verification = await adSystem.getVerification(vid);
         const isFallback = verification?.urlType === 'profitablecpm';
-        const targetUrl = isFallback 
-            ? freeProvider.adSystem.FALLBACK_URL 
-            : freeProvider.adSystem.PRIMARY_URL;
+        const targetUrl = isFallback ? adSystem.FALLBACK_URL : adSystem.PRIMARY_URL;
 
         if (!targetUrl) {
             return res.status(503).send('Ad URL not configured');
         }
 
-        console.log('Ad redirect success:', { vid: vid.slice(0, 20), uid, target: targetUrl.slice(0, 40) });
         res.redirect(targetUrl);
 
     } catch (error) {
-        console.error('Ad redirect error:', error.message, error.stack);
-        res.status(500).send(`Error: ${error.message}`);
+        logger.error('Ad redirect error', { error: error.message, vid, uid });
+        res.status(500).send('Error processing ad link');
     }
 });
+                
 
 
 // ═══════════════════════════════════════════════════════════════════════
