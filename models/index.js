@@ -16,6 +16,7 @@ import AdminLog from './AdminLog.js';
 import Settings from './Settings.js';
 import { OrphanSMS } from './OrphanSMS.js';
 import Notification from './Notification.js';
+import AdVerification from './AdVerification.js';
 import CreditTransaction from './CreditTransaction.js';  // ← ADDED
 
 const modelRegistry = {
@@ -26,6 +27,7 @@ const modelRegistry = {
     Number: NumberModel,
     Referral,
     ApiKey,
+    AdVerification,
     AdminLog,
     Settings,
     OrphanSMS,
@@ -120,6 +122,7 @@ export {
     AdminLog,
     Settings,
     OrphanSMS,
+    AdVerification,
     Notification,
     CreditTransaction  // ← ADDED
 };
