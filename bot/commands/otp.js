@@ -1445,12 +1445,13 @@ async handleWatchAd(ctx, networkId) {
         const message = (
             `📺 <b>Watch Ad to Earn Credits</b>\n\n` +
             `Reward: <b>+${adView.creditValue} credits</b>\n` +
-            `Required: <b>${adView.minWatchTime} seconds</b>\n\n` +
+            `Required: <b>${Math.floor(adView.minWatchTime / 1000)} seconds</b>\n\n` +
             `1️⃣ Click "📺 Open Ad"\n` +
-            `2️⃣ Wait ${adView.minWatchTime} seconds\n` +
-            `3️⃣ Tap "✅ Check My Credits"`
+            `2️⃣ Wait ${Math.floor(adView.minWatchTime / 1000)} seconds\n` +
+            `3️⃣ Tap "✅ Check My Credits"\n\n` +
+            `<i>Don't close the ad early!</i>`
         );
-
+        
         return ctx.editMessageText(message, {
             parse_mode: 'HTML',
             reply_markup: Markup.inlineKeyboard([
