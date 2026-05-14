@@ -304,7 +304,7 @@ router.get('/ad/redirect', async (req, res) => {
 
     try {
         // Direct import — no SMSProviderManager needed
-        const { default: AdCreditSystem } = await import('../services/AdCreditSystem.js');
+        const { default: AdCreditSystem } = await import('../services/sms/AdCreditSystem.js');
         const adSystem = new AdCreditSystem();
         
         const result = await adSystem.recordAdStart(vid, String(uid));
