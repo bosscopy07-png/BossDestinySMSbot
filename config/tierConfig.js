@@ -42,7 +42,6 @@ export const TIER_CONFIG = {
             'virtual28',
             'virtual29',
             'virtual31',
-            'virtual34',
             'virtual36',
             'virtual41',
             'virtual43',
