@@ -4,7 +4,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 
-import { getPricing, formatPrice } from '../../utils/pricing.js';
+import { GetPricing, FormatPrice } from '../../utils/pricing.js';
 import ServiceCatalog from '../../services/ServiceCatalog.js';
 import TierOperatorSelector from '../../services/TierOperatorSelector.js';
 import CountryCatalog from '../../services/CountryCatalog.js';
