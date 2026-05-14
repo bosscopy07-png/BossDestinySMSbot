@@ -828,7 +828,8 @@ class TelegramBot {
         }
     }
 
-    async launch() {
+    
+                async launch() {
         try {
             logger.info('Initializing database...');
             await initModels();
@@ -838,16 +839,28 @@ class TelegramBot {
 
             this.startDepositScanner();
 
-            await this.bot.telegram.deleteWebhook({ drop_pending_updates: true });
-            await this.bot.launch();
-
-            this.isReady = true;
-            logger.info('Bot launched successfully');
+            // Webhook or polling mode
+            const webhookUrl = config.webhookUrl || process.env.WEBHOOK_URL;
+            
+            if (webhookUrl) {
+                logger.info('Setting up webhook...', { webhookUrl });
+                await this.bot.telegram.deleteWebhook({ drop_pending_updates: true });
+                await this.bot.telegram.setWebhook(webhookUrl);
+                this.isReady = true;
+                logger.info('Bot webhook set successfully');
+            } else {
+                logger.info('Starting polling mode...');
+                await this.bot.telegram.deleteWebhook({ drop_pending_updates: true });
+                await this.bot.launch();
+                this.isReady = true;
+                logger.info('Bot launched in polling mode');
+            }
 
             process.once('SIGINT', () => this.gracefulShutdown('SIGINT'));
             process.once('SIGTERM', () => this.gracefulShutdown('SIGTERM'));
 
             setInterval(() => this.logMetrics(), 300000);
+            
         } catch (error) {
             logger.error('Launch failed', { error: error.message });
             await this.alertAdmins(error, {
@@ -901,6 +914,14 @@ class TelegramBot {
         setTimeout(() => process.exit(0), 2000);
     }
 
+    stop(signal) {
+        return this.gracefulShutdown(signal || 'SIGTERM');
+    }
+
+    get telegram() {
+        return this.bot.telegram;
+    }
+
     updateMetrics(duration) {
         this.metrics.requestsHandled++;
         this.metrics.avgResponseTime =
@@ -948,3 +969,4 @@ class TelegramBot {
 }
 
 export default TelegramBot;
+                        
