@@ -298,87 +298,51 @@ router.post('/telnyx',
 router.get('/ad/redirect', async (req, res) => {
     const { vid, uid } = req.query;
     
-    console.log('🔍 AD REDIRECT HIT:', { vid: vid?.slice(0, 20), uid: uid?.slice(0, 15) });
-    
     if (!vid || !uid) {
-        console.log('❌ Missing params');
-        return res.status(400).send('Invalid ad link: missing vid or uid');
+        return res.status(400).send('Invalid ad link: missing parameters');
     }
 
     try {
-        // Step 1: Import SMSProviderManager
-        console.log('📦 Step 1: Importing SMSProviderManager...');
-        const smsModule = await import('../services/sms/index.js');
-        console.log('   SMS module keys:', Object.keys(smsModule));
+        // Import and instantiate directly
+        const { default: SMSProviderManager } = await import('../services/sms/SMSProviderManager.js');
+        const providerManager = new SMSProviderManager();
+        await providerManager.initialize();
         
-        const SMSProviderManager = smsModule.SMSProviderManager || smsModule.default;
-        console.log('   SMSProviderManager type:', typeof SMSProviderManager);
+        const freeProvider = providerManager.getProvider('FREE_PUBLIC');
         
-        // Step 2: Get instance
-        console.log('📦 Step 2: Getting instance...');
-        const providerManager = SMSProviderManager?.getInstance?.() || global.smsProviderManager;
-        console.log('   providerManager exists:', !!providerManager);
-        console.log('   providerManager type:', typeof providerManager);
-        
-        if (!providerManager) {
-            console.error('❌ providerManager is null/undefined');
-            return res.status(503).send('Service unavailable: no provider manager');
+        if (!freeProvider?.adSystem) {
+            console.error('Ad system not found on FREE_PUBLIC provider');
+            return res.status(503).send('Ad system unavailable');
         }
 
-        // Step 3: Get FREE_PUBLIC provider
-        console.log('📦 Step 3: Getting FREE_PUBLIC provider...');
-        const freeProvider = providerManager.getProvider?.('FREE_PUBLIC');
-        console.log('   freeProvider exists:', !!freeProvider);
-        console.log('   freeProvider keys:', freeProvider ? Object.keys(freeProvider) : 'N/A');
+        // Record ad start
+        const result = freeProvider.adSystem.recordAdStart(vid, String(uid));
         
-        if (!freeProvider) {
-            console.error('❌ FREE_PUBLIC provider not found');
-            return res.status(503).send('Service unavailable: no free provider');
+        if (!result.success) {
+            console.warn('recordAdStart failed:', result.error);
+            // Continue to redirect anyway — don't block user
         }
 
-        // Step 4: Get adSystem
-        console.log('📦 Step 4: Getting adSystem...');
-        const adSystem = freeProvider.adSystem || freeProvider.adCreditSystem;
-        console.log('   adSystem exists:', !!adSystem);
-        console.log('   adSystem type:', typeof adSystem);
-        console.log('   adSystem methods:', adSystem ? Object.getOwnPropertyNames(Object.getPrototypeOf(adSystem)) : 'N/A');
-        
-        if (!adSystem) {
-            console.error('❌ adSystem not found on provider');
-            console.error('   freeProvider has:', Object.keys(freeProvider));
-            return res.status(503).send('Service unavailable: no ad system');
-        }
-
-        // Step 5: Record start
-        console.log('📦 Step 5: Recording ad start...');
-        const userIdStr = String(uid);
-        const result = adSystem.recordAdStart(vid, userIdStr);
-        console.log('   recordAdStart result:', result);
-
-        // Step 6: Get target URL
-        console.log('📦 Step 6: Getting target URL...');
-        const verification = adSystem.activeVerifications?.get(vid);
-        console.log('   verification exists:', !!verification);
-        
+        // Determine target URL
+        const verification = freeProvider.adSystem.activeVerifications?.get(vid);
         const isFallback = verification?.urlType === 'profitablecpm';
-        const targetUrl = isFallback ? adSystem.FALLBACK_URL : adSystem.PRIMARY_URL;
-        console.log('   targetUrl:', targetUrl?.substring(0, 50));
+        const targetUrl = isFallback 
+            ? freeProvider.adSystem.FALLBACK_URL 
+            : freeProvider.adSystem.PRIMARY_URL;
 
         if (!targetUrl) {
-            console.error('❌ No target URL configured');
             return res.status(503).send('Ad URL not configured');
         }
 
-        console.log('✅ SUCCESS: Redirecting to ad');
+        console.log('Ad redirect success:', { vid: vid.slice(0, 20), uid, target: targetUrl.slice(0, 40) });
         res.redirect(targetUrl);
 
     } catch (error) {
-        console.error('💥 AD REDIRECT ERROR:', error.message);
-        console.error('Stack:', error.stack);
-        res.status(500).send(`Error processing ad link: ${error.message}`);
+        console.error('Ad redirect error:', error.message, error.stack);
+        res.status(500).send(`Error: ${error.message}`);
     }
 });
-                    
+
 
 // ═══════════════════════════════════════════════════════════════════════
 //  AD NETWORK POSTBACKS — Server-to-server notifications from ad networks
