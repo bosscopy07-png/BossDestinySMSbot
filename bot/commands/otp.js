@@ -1244,6 +1244,9 @@ setupTextHandlers() {
 // ═══════════════════════════════════════════════════════════════════════
 //  FREE MODE — Check credits, show ad if needed, otherwise proceed
 // ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
+//  FREE MODE — Check credits, show ad if needed, otherwise proceed
+// ═══════════════════════════════════════════════════════════════════════
 
 async handleFreeMode(ctx) {
     const user = ctx.state.user;
@@ -1253,38 +1256,33 @@ async handleFreeMode(ctx) {
         return ctx.reply('⚠️ Session expired. Please send /start to continue.', { parse_mode: 'HTML' });
     }
 
-    // FIX 1: Check daily limit FIRST before anything else
-    // If exhausted, hard block immediately — no ads, no bypass
+    // Check daily limit FIRST
     if (!this._canUseFree(user)) {
         return this._showFreeExhausted(ctx, user);
     }
 
     const freeProvider = this.smsProviderManager.getProvider('FREE_PUBLIC');
 
-    // FIX 2: Only check ad credits if user still has free requests remaining
+    // Check ad credits
     if (freeProvider && freeProvider.adSystem) {
         try {
             const creditCheck = await freeProvider.canRequestNumber(userId);
 
-            // NO credits → MUST watch ad FIRST before anything
+            // NO credits → MUST watch ad FIRST
             if (!creditCheck.allowed && creditCheck.reason === 'INSUFFICIENT_CREDITS') {
                 return this._showAdPrompt(ctx, creditCheck, freeProvider, user);
             }
 
-            // FIX 3: Remove DAILY_LIMIT_REACHED from ad system — we control limits centrally
-            // The ad system should NOT enforce daily limits, only credit balances
-            // If any other error, treat as exhausted
+            // Any other block
             if (!creditCheck.allowed) {
                 return this._showFreeExhausted(ctx, user);
             }
 
-            // Has credits → hold them for when user actually requests number
-            if (creditCheck.allowed) {
-                const holdId = await freeProvider.adSystem.holdCredits(userId);
-                ctx.session = ctx.session || {};
-                ctx.session.freeHoldId = holdId;
-                ctx.session.freeCreditsDeducted = true;
-            }
+            // FIX: Don't hold credits here — hold them when number is requested
+            // Just mark that user has sufficient credits
+            ctx.session = ctx.session || {};
+            ctx.session.freeCreditsAvailable = creditCheck.credits;
+            ctx.session.freeCreditsDeducted = false; // Not deducted yet
 
         } catch (creditError) {
             logger.error('Ad credit check failed', { userId: userId, error: creditError.message });
@@ -1292,8 +1290,6 @@ async handleFreeMode(ctx) {
         }
     }
 
-    // Show free mode warning (user passed all checks)
-    // FIX 4: Use centralized helper instead of manual calculation
     const remainingFree = this._freeRemaining(user);
 
     const warningMessage = [
@@ -1320,6 +1316,7 @@ async handleFreeMode(ctx) {
 
     return this.sendPhotoWithCaption(ctx, IMAGES.freeMode, warningMessage, warningKeyboard, 'HTML');
 }
+
 
 // ═══════════════════════════════════════════════════════════════════════
 //  FREE EXHAUSTED — Daily limit reached, NO ads allowed
@@ -1414,9 +1411,8 @@ async _showAdPrompt(ctx, creditCheck, freeProvider, user) {
         reply_markup: Markup.inlineKeyboard(buttons).reply_markup
     });
 }
-
 // ═══════════════════════════════════════════════════════════════════════
-//  CONFIRM FREE MODE — Commit hold and proceed to service selection
+//  CONFIRM FREE MODE — Just proceed to service selection, don't deduct credits
 // ═══════════════════════════════════════════════════════════════════════
 
 async handleConfirmFreeMode(ctx) {
@@ -1426,62 +1422,19 @@ async handleConfirmFreeMode(ctx) {
     ctx.session = ctx.session || {};
     ctx.session.otpMode = 'FREE';
 
-    // FIX 9: Re-check daily limit before committing — safety against race conditions
+    // Re-check daily limit
     if (!this._canUseFree(user)) {
-        // Release any held credits before showing exhausted
-        if (ctx.session.freeHoldId) {
-            try {
-                const freeProvider = this.smsProviderManager.getProvider('FREE_PUBLIC');
-                if (freeProvider && freeProvider.adSystem) {
-                    await freeProvider.adSystem.releaseHold(ctx.session.freeHoldId).catch(function() {});
-                }
-            } catch (e) { /* ignore release errors */ }
-            delete ctx.session.freeHoldId;
-            delete ctx.session.freeCreditsDeducted;
-        }
         return this._showFreeExhausted(ctx, user);
     }
 
-    // Commit hold from handleFreeMode
-    if (ctx.session.freeHoldId) {
-        try {
-            const freeProvider = this.smsProviderManager.getProvider('FREE_PUBLIC');
-            if (freeProvider && freeProvider.adSystem) {
-                await freeProvider.adSystem.commitHold(ctx.session.freeHoldId);
-                ctx.session.freeHoldId = null;
-            }
-        } catch (error) {
-            logger.error('Hold commit failed', { userId: userId, error: error.message });
-            delete ctx.session.freeHoldId;
-            return this._showFreeExhausted(ctx, user);
-        }
-    } else if (!ctx.session.freeCreditsDeducted) {
-        // Safety fallback — no hold exists, check and deduct directly
-        try {
-            const freeProvider = this.smsProviderManager.getProvider('FREE_PUBLIC');
-            if (freeProvider && freeProvider.adSystem) {
-                const creditCheck = await freeProvider.canRequestNumber(userId);
-
-                if (!creditCheck.allowed) {
-                    if (creditCheck.reason === 'INSUFFICIENT_CREDITS') {
-                        return this._showAdPrompt(ctx, creditCheck, freeProvider, user);
-                    }
-                    return this._showFreeExhausted(ctx, user);
-                }
-
-                const holdId = await freeProvider.adSystem.holdCredits(userId);
-                await freeProvider.adSystem.commitHold(holdId);
-                ctx.session.freeCreditsDeducted = true;
-            }
-        } catch (error) {
-            logger.error('Credit deduction in confirm failed', { userId: userId, error: error.message });
-            return this._showFreeExhausted(ctx, user);
-        }
-    }
-
+    // FIX: Don't commit any hold here — credits haven't been held yet
+    // Just clear any stale session data
+    delete ctx.session.freeHoldId;
+    
     await ctx.editMessageCaption('⏳ <b>Loading Free Mode...</b>', { parse_mode: 'HTML' });
     return this._showLegacyServiceSelection(ctx, 'FREE', IMAGES.freeMode);
 }
+
 
 // ═══════════════════════════════════════════════════════════════════════
 //  WATCH AD HANDLER — Generate ad, show tracked URL
@@ -1720,11 +1673,10 @@ async handleFreeServiceSelected(ctx) {
         return ctx.answerCbQuery('❌ Error').catch(function() {});
     }
 }
+// ═══════════════════════════════════════════════════════════════════════
+//  FREE COUNTRY SELECTED — Hold credits HERE, then assign number
+// ═══════════════════════════════════════════════════════════════════════
 
-// ═══════════════════════════════════════════════════════════════════════
-//  FREE COUNTRY SELECTED — HARD BLOCK: Check daily limit, then credits, then assign number
-// ═══════════════════════════════════════════════════════════════════════
-                 
 async handleFreeCountrySelected(ctx) {
     const userId = String(ctx.from.id);
     const countryCode = ctx.match && ctx.match[1] ? ctx.match[1] : null;
@@ -1740,8 +1692,7 @@ async handleFreeCountrySelected(ctx) {
 
         const user = ctx.state.user || await User.findOne({ userId: userId });
 
-        // FIX 12: Replace HARDCODED limit check with centralized helper
-        // HARD BLOCK 1: Daily limit reached → Block completely, no ads
+        // HARD BLOCK 1: Daily limit
         if (!this._canUseFree(user)) {
             return this._showFreeExhausted(ctx, user);
         }
@@ -1749,22 +1700,20 @@ async handleFreeCountrySelected(ctx) {
         const freeProvider = this.smsProviderManager.getProvider('FREE_PUBLIC');
         let holdId = null;
 
-        // HARD BLOCK 2: Check ad credits ONLY — ad system controls credits, NOT daily limits
+        // HARD BLOCK 2: Check and HOLD credits NOW (at number request time)
         if (freeProvider && freeProvider.adSystem) {
             const creditCheck = await freeProvider.canRequestNumber(userId);
 
-            // NO credits → back to ad prompt (must watch ad first)
+            // NO credits → back to ad prompt
             if (!creditCheck.allowed && creditCheck.reason === 'INSUFFICIENT_CREDITS') {
                 return this._showAdPrompt(ctx, creditCheck, freeProvider, user);
             }
 
-            // FIX 13: Remove DAILY_LIMIT_REACHED from ad system check
-            // Daily limits are controlled centrally by _canUseFree(), not the ad system
             if (!creditCheck.allowed) {
                 return this._showFreeExhausted(ctx, user);
             }
 
-            // Hold credits for this number request
+            // FIX: Hold credits NOW, right before getting the number
             holdId = await freeProvider.adSystem.holdCredits(userId);
         }
 
@@ -1777,8 +1726,7 @@ async handleFreeCountrySelected(ctx) {
                     await freeProvider.adSystem.commitHold(holdId);
                 }
 
-                // FIX 14: THIS IS THE ONLY PLACE freeUsedToday IS INCREMENTED
-                // ONLY increment AFTER a real number is successfully assigned
+                // Increment free usage count — ONLY PLACE
                 await User.updateOne({ userId: userId }, { $inc: { freeUsedToday: 1 } });
 
                 const message = [
@@ -1832,7 +1780,8 @@ async handleFreeCountrySelected(ctx) {
 
         return this.sendPhotoWithCaption(ctx, IMAGES.otpFailed, errorMessage, errorKeyboard, 'HTML');
     }
-}
+                                                                 }
+       
 
 // ═══════════════════════════════════════════════════════════════════════
 //  FREE CHECK NOW — Manual poll for SMS
