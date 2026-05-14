@@ -5,7 +5,7 @@
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import webhookRoutes from '../routes/webhooks.js';
+import webhookRoutes from '../routes/webhook.js';
 import logger from '../utils/logger.js';
 import config from '../config/env.js';
 
