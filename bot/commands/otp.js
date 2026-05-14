@@ -4,7 +4,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 
-
+import { getPricing, formatPrice } from '../../utils/pricing.js';
 import ServiceCatalog from '../../services/ServiceCatalog.js';
 import TierOperatorSelector from '../../services/TierOperatorSelector.js';
 import CountryCatalog from '../../services/CountryCatalog.js';
@@ -1222,7 +1222,6 @@ setupTextHandlers() {
 //  MODE HANDLERS — FIXED v2
 // ═══════════════════════════════════════════════════════════════════════
 
-import { getPricing, formatPrice } from '../../utils/pricing.js';
 
 // ═══════════════════════════════════════════════════════════════════════
 //  FREE MODE — Ad-gated before daily limit, blocked after
@@ -1696,8 +1695,127 @@ async handleFreeCountrySelected(ctx) {
 
         ctx.session = ctx.session || {};
         ctx.session.selectedCountry = countryCode;
-        ctx.s
-                        
+        ctx.session.selectedService = serviceId;
+        ctx.session.otpMode = 'FREE';
+
+        const user = ctx.state.user || await User.findOne({ userId });
+
+        // Check free limit again
+        if (!this._canUseFree(user)) {
+            return this._showFreeExhausted(ctx, user);
+        }
+
+        // Use hold/commit pattern for number assignment
+        const freeProvider = this.smsProviderManager?.getProvider('FREE_PUBLIC');
+        let holdId = null;
+        
+        if (freeProvider?.adSystem) {
+            const creditCheck = await freeProvider.canRequestNumber(userId);
+            if (!creditCheck.allowed) {
+                if (creditCheck.reason === 'INSUFFICIENT_CREDITS') {
+                    return this._showAdPrompt(ctx, creditCheck, freeProvider);
+                }
+                return this._showFreeExhausted(ctx, user, creditCheck);
+            }
+            holdId = await freeProvider.adSystem.holdCredits(userId);
+        }
+
+        try {
+            const result = await this.smsProviderManager.getFreeNumber(countryCode, serviceId, userId);
+
+            if (result && result.phoneNumber) {
+                // Commit hold on success
+                if (holdId) {
+                    await freeProvider.adSystem.commitHold(holdId);
+                }
+
+                // Increment free usage only for non-credit users
+                if (!holdId || (await freeProvider.adSystem.getCredits(userId)).credits === 0) {
+                    await User.updateOne({ userId }, { $inc: { freeUsedToday: 1 } });
+                }
+
+                const message =
+                    '📱 <b>Free Number Assigned</b>\n\n' +
+                    `📞 Number: <code>${result.phoneNumber}</code>\n` +
+                    `🌍 Country: ${result.country || countryCode}\n` +
+                    `🔢 Service: ${serviceId}\n\n` +
+                    `⏳ Waiting for OTP...\n` +
+                    `<i>Free numbers expire in 10 minutes.</i>`;
+
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Check OTP', `check_free_${result.sessionId}`)],
+                    [Markup.button.callback('❌ Cancel', `cancel_free_${result.sessionId}`)],
+                    [Markup.button.callback('🔙 Menu', 'menu')]
+                ]);
+
+                await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
+
+            } else {
+                throw new Error(result?.error || 'Failed to get free number');
+            }
+
+        } catch (numberError) {
+            // Release hold on failure
+            if (holdId) {
+                await freeProvider.adSystem.releaseHold(holdId).catch(() => {});
+            }
+            throw numberError;
+        }
+
+    } catch (error) {
+        logger.error('handleFreeCountrySelected error', { 
+            userId, 
+            countryCode, 
+            serviceId, 
+            error: error.message 
+        });
+        await ctx.answerCbQuery('❌ Error').catch(() => {});
+
+        const pricing = await getPricing();
+        const formatted = formatPrice(pricing);
+
+        const errorMessage =
+            '❌ <b>Free Number Error</b>\n\n' +
+            `Error: ${error.message}\n\n` +
+            'Try again or use CHEAP mode for guaranteed delivery.\n\n' +
+            `💰 CHEAP: ${formatted.cheap}`;
+
+        const errorKeyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔄 Try Again', `free_country_${countryCode}_${serviceId}`)],
+            [Markup.button.callback('💰 CHEAP Mode', 'mode_cheap')],
+            [Markup.button.callback('🔙 Menu', 'menu')]
+        ]);
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.otpFailed, errorMessage, errorKeyboard, 'HTML');
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  FREE CHECK NOW — Manual poll for SMS
+// ═══════════════════════════════════════════════════════════════════════
+
+async handleCheckFree(ctx, sessionId) {
+    try {
+        const freeProvider = this.smsProviderManager?.getProvider('FREE_PUBLIC');
+        if (!freeProvider) {
+            return ctx.answerCbQuery('❌ Service unavailable').catch(() => {});
+        }
+
+        const result = await freeProvider.checkFreeSMS(sessionId);
+
+        if (result.success && result.otp) {
+            await ctx.answerCbQuery('✅ OTP received! Updating...');
+        } else if (result.status === 'EXPIRED' || result.status === 'CANCELLED') {
+            await ctx.answerCbQuery('❌ Session expired', { show_alert: true });
+        } else {
+            await ctx.answerCbQuery(`⏳ ${result.message || 'Still waiting...'}`);
+        }
+
+    } catch (error) {
+        logger.error('handleCheckFree error', { sessionId, error: error.message });
+        ctx.answerCbQuery('❌ Check failed').catch(() => {});
+    }
+    }
     // ═══════════════════════════════════════════════════════════════════════
     //  CHEAP MODE — NEW TIER-BASED FLOW
     //  Steps: Service Selection → Tier Selection → Country Selection → Auto Purchase
