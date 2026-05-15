@@ -120,6 +120,45 @@ async function startServer() {
         console.log(`   Webhooks: ${BASE_URL}/webhooks`);
     });
     
+    // ═══════════════════════════════════════════════════════════════════════
+    //  KEEP-ALIVE: Prevent Render free tier spin-down
+    //  Only runs in production when server mode is active
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    if (process.env.NODE_ENV === 'production') {
+        const KEEP_ALIVE_URL = process.env.KEEP_ALIVE_URL || `${BASE_URL}/health`;
+        const PING_INTERVAL = 10 * 60 * 1000; // 10 minutes
+        
+        console.log(`\n🔄 Keep-alive enabled`);
+        console.log(`   URL: ${KEEP_ALIVE_URL}`);
+        console.log(`   Interval: ${PING_INTERVAL / 1000 / 60} minutes`);
+        
+        // Ping immediately on startup
+        fetch(KEEP_ALIVE_URL)
+            .then(res => {
+                if (res.ok) {
+                    console.log('✅ Keep-alive: initial ping OK');
+                } else {
+                    console.warn(`⚠️ Keep-alive: initial ping returned ${res.status}`);
+                }
+            })
+            .catch(err => console.error('❌ Keep-alive: initial ping failed:', err.message));
+        
+        // Then every 10 minutes
+        setInterval(() => {
+            const pingTime = new Date().toISOString();
+            fetch(KEEP_ALIVE_URL)
+                .then(res => {
+                    if (res.ok) {
+                        console.log(`🔄 Keep-alive ping sent at ${pingTime}`);
+                    } else {
+                        console.warn(`⚠️ Keep-alive ping returned ${res.status} at ${pingTime}`);
+                    }
+                })
+                .catch(err => console.error(`❌ Keep-alive failed at ${pingTime}:`, err.message));
+        }, PING_INTERVAL);
+    }
+    
     process.once('SIGINT', () => server.close());
     process.once('SIGTERM', () => server.close());
     
@@ -138,3 +177,4 @@ async function startCron() {
 }
 
 main();
+    
