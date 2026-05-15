@@ -7,7 +7,7 @@
 import { TIER_CONFIG, CACHE_TTL, getTierConfig } from '../config/tierConfig.js';
 import logger from '../utils/logger.js';
 
-const PROFIT_MARGIN = 0.20; // $0.20 base profit per number
+const PROFIT_MARGIN = 0.00; // $0.20 base profit per number
 
 /**
  * Apply base profit margin to a raw provider price
