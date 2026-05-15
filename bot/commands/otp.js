@@ -1782,24 +1782,48 @@ async handleFreeCountrySelected(ctx) {
     }
                                                                  }
        
-
 // ═══════════════════════════════════════════════════════════════════════
 //  FREE CHECK NOW — Manual poll for SMS
 // ═══════════════════════════════════════════════════════════════════════
 
 async handleCheckFree(ctx, sessionId) {
     try {
-        const freeProvider = this.smsProviderManager.getProvider('FREE_PUBLIC');
-        if (!freeProvider) {
-            return ctx.answerCbQuery('❌ Service unavailable').catch(function() {});
-        }
+        // FIX: Use smsProviderManager.checkFreeSMS(), not freeProvider.checkFreeSMS()
+        // The manager has the unified checkFreeSMS method, not the individual provider
+        const result = await this.smsProviderManager.checkFreeSMS(sessionId);
 
-        const result = await freeProvider.checkFreeSMS(sessionId);
+        if (!result) {
+            return ctx.answerCbQuery('❌ Session not found').catch(function() {});
+        }
 
         if (result.success && result.otp) {
             await ctx.answerCbQuery('✅ OTP received! Updating...');
+            
+            // Update the message to show the OTP
+            const message = [
+                '📱 <b>Free Number — OTP Received!</b>\n\n',
+                '🔢 OTP: <code>' + result.otp + '</code>\n\n',
+                '⏳ This number has expired.'
+            ].join('');
+
+            await ctx.editMessageCaption(message, {
+                parse_mode: 'HTML',
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔙 Menu', 'menu')]
+                ]).reply_markup
+            });
+
         } else if (result.status === 'EXPIRED' || result.status === 'CANCELLED') {
             await ctx.answerCbQuery('❌ Session expired', { show_alert: true });
+            
+            await ctx.editMessageCaption('❌ <b>Session Expired</b>\n\nThe free number has expired. Please request a new one.', {
+                parse_mode: 'HTML',
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 Get Free OTP', 'mode_free')],
+                    [Markup.button.callback('🔙 Menu', 'menu')]
+                ]).reply_markup
+            });
+
         } else {
             await ctx.answerCbQuery('⏳ ' + (result.message || 'Still waiting...'));
         }
@@ -1808,7 +1832,8 @@ async handleCheckFree(ctx, sessionId) {
         logger.error('handleCheckFree error', { sessionId: sessionId, error: error.message });
         return ctx.answerCbQuery('❌ Check failed').catch(function() {});
     }
-}                             
+}
+        
         
     // ═══════════════════════════════════════════════════════════════════════
     //  CHEAP MODE — NEW TIER-BASED FLOW
