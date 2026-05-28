@@ -101,18 +101,19 @@ class SessionManager {
     /**
      * Create session with pre-assigned number (VIP/CHEAP/FREE flow)
      *
-     * FIXED: Now accepts providerNumberId, cost, AND operator as separate params
-     * Previously: operator was LOST
-     * Now: (userId, mode, service, country, phoneNumber, provider, providerNumberId, cost, operator)
+     * FIXED: Now accepts providerNumberId, cost, operator, AND routedProvider as separate params
+     * Previously: operator and routedProvider were LOST
      */
-    async createSessionWithNumber(userId, mode, service, country, phoneNumber, provider, providerNumberId = null, cost = 0, operator = null) {
+    async createSessionWithNumber(userId, mode, service, country, phoneNumber, provider, providerNumberId = null, cost = 0, operator = null, routedProvider = null) {
         const numberData = {
             phoneNumber,
             provider,
             providerNumberId: providerNumberId,
             providerInstance: null,
             cost: parseFloat(cost) || 0,
-            operator: operator || 'any'  // FIXED: Preserve operator from tier selection
+            displayCost: parseFloat(cost) || 0, // FIXED: Preserve displayCost from TierIntegrationService
+            operator: operator || 'any',        // FIXED: Preserve operator from tier selection
+            routedProvider: routedProvider || null // FIXED: Preserve which cheap provider was used
         };
         return this._createSessionInternal(userId, mode, service, country, numberData);
     }
@@ -133,9 +134,11 @@ class SessionManager {
         // If still waiting, poll provider for latest status
         if (['WAITING', 'CHECKING'].includes(session.status)) {
             try {
+                // FIXED: Pass routedProvider for CHEAP mode multi-provider support
                 const providerResult = await this.providerManager.checkSMS(
                     session.provider,
-                    session.providerNumberId || session.number
+                    session.providerNumberId || session.number,
+                    { providerKey: session.routedProvider }
                 );
 
                 if (providerResult.success && providerResult.otp) {
@@ -201,6 +204,7 @@ class SessionManager {
      * - Prevents double-refund by checking tx status first
      * - Returns detailed cancel result
      * - Cleans up memory timers properly
+     * - Routes cancel to correct provider via routedProvider
      */
     async cancelSession(sessionId, userId) {
         const session = await Session.findOne({ sessionId, userId });
@@ -319,7 +323,7 @@ class SessionManager {
      * Deliver OTP to session (called by webhook or polling)
      * FIXED:
      * - Removes duplicate totalSpent increment (now handled in captureFunds)
-     * - Calls finishNumber on 5SIM after OTP delivery
+     * - Calls finishNumber on correct provider after OTP delivery
      * - Uses generateId() for transaction txId instead of hardcoded
      * - Wraps Transaction.create in try/catch with proper logging
      * - Validates providerNumberId before calling finish
@@ -376,26 +380,29 @@ class SessionManager {
             }
         }
 
-        // FIXED: Call finishNumber on 5SIM to mark activation as complete
-        // This prevents 5SIM from keeping the number reserved
+        // FIXED: Call finishNumber on correct provider to mark activation as complete
+        // This prevents provider from keeping the number reserved
         if (session.mode === 'CHEAP' && session.providerNumberId && this.providerManager) {
             try {
                 const finishResult = await this.providerManager.finishNumber(
                     session.provider,
-                    session.providerNumberId
+                    session.providerNumberId,
+                    session.routedProvider // FIXED: Pass routedProvider for multi-provider routing
                 );
-                logger.info('5SIM activation finished', {
+                logger.info('Provider activation finished', {
                     sessionId,
                     activationId: session.providerNumberId,
+                    routedProvider: session.routedProvider,
                     result: finishResult
                 });
             } catch (finishError) {
-                logger.warn('5SIM finish failed (non-critical)', {
+                logger.warn('Provider finish failed (non-critical)', {
                     sessionId,
                     activationId: session.providerNumberId,
+                    routedProvider: session.routedProvider,
                     error: finishError.message
                 });
-                // Non-critical — OTP already delivered, 5SIM will auto-expire
+                // Non-critical — OTP already delivered, provider will auto-expire
             }
         }
 
@@ -415,6 +422,7 @@ class SessionManager {
                         mode: session.mode,
                         number: session.number,
                         provider: session.provider,
+                        routedProvider: session.routedProvider,
                         providerNumberId: session.providerNumberId,
                         operator: session.operator || 'any',
                         otpDeliveredAt: new Date()
@@ -451,16 +459,11 @@ class SessionManager {
         });
 
         return updated;
-                }
-                        // ═══════════════════════════════════════════════════════════════════════════════
-// SessionManager.js — Part 2/3
-// Timeout Handling, Provider Failure, Queries, Internal Session Creation & Finances
-// ═══════════════════════════════════════════════════════════════════════════════
-
-    /**
+    }
+        /**
      * Handle session timeout
      * FIXED: 
-     * - Cancels on 5SIM using activation ID directly
+     * - Cancels on correct provider using activation ID and routedProvider
      * - NO auto-retry — user must request manually after timeout
      * - Single source of truth for refunds
      */
@@ -478,24 +481,29 @@ class SessionManager {
             return null;
         }
 
-        // FIXED: Cancel on 5SIM FIRST using activation ID
+        // FIXED: Cancel on correct provider FIRST using activation ID and routedProvider
         if (session.mode === 'CHEAP' && session.providerNumberId) {
             try {
-                // Use cancelCheapNumber (activation ID) not cancelNumber
-                await this.providerManager.cancelCheapNumber(session.providerNumberId);
-                logger.info('5SIM cancelled on timeout', {
+                await this.providerManager.cancelNumber(
+                    session.provider,
+                    session.providerNumberId,
+                    session.routedProvider // FIXED: Pass routedProvider for multi-provider routing
+                );
+                logger.info('Provider cancelled on timeout', {
                     sessionId,
-                    activationId: session.providerNumberId
+                    activationId: session.providerNumberId,
+                    routedProvider: session.routedProvider
                 });
             } catch (cancelError) {
                 // Already cancelled = OK
                 if (cancelError.response?.data === 'order not found' || 
                     cancelError.message?.includes('order not found')) {
-                    logger.info('5SIM already cancelled (order not found)', { sessionId });
+                    logger.info('Provider already cancelled (order not found)', { sessionId });
                 } else {
-                    logger.warn('5SIM cancel on timeout failed', {
+                    logger.warn('Provider cancel on timeout failed', {
                         sessionId,
                         activationId: session.providerNumberId,
+                        routedProvider: session.routedProvider,
                         error: cancelError.message
                     });
                 }
@@ -700,7 +708,7 @@ class SessionManager {
         }
 
         // Handle finances
-        // FIXED: Pass numberData.cost so CHEAP uses actual 5SIM display price, not hardcoded $0.05
+        // FIXED: Use displayCost from numberData (already includes $0.10 profit from provider)
         const { cost, lockTxId } = await this._handleFinances(user, userId, mode, numberData, service);
 
         // Calculate timeout
@@ -708,7 +716,7 @@ class SessionManager {
         const timeoutAt = new Date(Date.now() + timeoutSeconds * 1000);
 
         // Create session
-        // FIXED: Store providerNumberId and operator from numberData
+        // FIXED: Store providerNumberId, operator, and routedProvider from numberData
         const session = await Session.create({
             sessionId: generateId(),
             userId,
@@ -719,6 +727,7 @@ class SessionManager {
             provider: numberData.provider,
             providerNumberId: numberData.providerNumberId || null,
             operator: numberData.operator || preAssignedNumber?.operator || 'any',
+            routedProvider: numberData.routedProvider || null, // FIXED: Store which cheap provider was used
             status: 'WAITING',
             startTime: new Date(),
             timeoutAt,
@@ -737,6 +746,7 @@ class SessionManager {
             service,
             number: this.maskPhone(session.number),
             provider: numberData.provider,
+            routedProvider: numberData.routedProvider,
             providerNumberId: numberData.providerNumberId,
             operator: session.operator,
             cost,
@@ -751,9 +761,9 @@ class SessionManager {
     // ═══════════════════════════════════════════════════════════
 
     /**
-     * FIXED: Now uses actual cost from numberData for CHEAP mode
+     * FIXED: Now uses displayCost from numberData for CHEAP mode
      * Previously: Always used config.pricing?.cheapOtp || 0.05
-     * Now: Uses numberData.displayCost or numberData.cost for CHEAP
+     * Now: Uses numberData.displayCost (raw + $0.10 from provider)
      */
     async _handleFinances(user, userId, mode, numberData, service) {
         let cost = 0;
@@ -761,9 +771,9 @@ class SessionManager {
 
         switch (mode) {
             case 'CHEAP': {
-                // FIXED: Use display price from 5SIM (with profit margin), not hardcoded $0.05
-                // numberData.displayCost = what user pays (e.g. $0.57)
-                // numberData.cost = what 5SIM charges (e.g. $0.37)
+                // FIXED: Use displayCost from provider (already includes $0.10 profit)
+                // numberData.displayCost = what user pays (e.g. $0.60 = $0.50 raw + $0.10)
+                // numberData.cost = what provider charges (e.g. $0.50)
                 cost = parseFloat(numberData.displayCost) || parseFloat(numberData.cost) || config.pricing?.cheapOtp || 0.05;
 
                 // Ensure cost is valid
@@ -841,9 +851,9 @@ class SessionManager {
     // ═══════════════════════════════════════════════════════════
 
     /**
-     * FIXED: Properly uses providerNumberId for CHEAP mode (5SIM activation ID)
+     * FIXED: Properly uses providerNumberId for CHEAP mode with routedProvider support
      * Previously: Used session.providerNumberId || session.number — fell back to phone number
-     * Now: For CHEAP, uses session.providerNumberId (activation ID). Only falls back for other modes.
+     * Now: For CHEAP, uses session.providerNumberId (activation ID). Passes routedProvider for multi-provider.
      */
     async _releaseProviderNumber(session, reason) {
         try {
@@ -851,16 +861,19 @@ class SessionManager {
                 await this.numberPoolManager.releaseNumber(session.providerNumberId, reason);
             } else if (session.mode === 'CHEAP' && session.providerNumberId) {
                 // FIXED: CHEAP mode MUST use providerNumberId (activation ID like "1001025384")
-                // NEVER use session.number (phone number like "+4915511298251") for 5SIM cancel
+                // NEVER use session.number (phone number like "+4915511298251") for cancel
+                // FIXED: Pass routedProvider for correct provider routing
                 await this.providerManager.cancelNumber(
                     session.provider,
-                    session.providerNumberId
+                    session.providerNumberId,
+                    session.routedProvider
                 );
             } else if (this.providerManager) {
                 // For other modes or if providerNumberId is missing, use number as fallback
                 await this.providerManager.cancelNumber(
                     session.provider,
-                    session.providerNumberId || session.number
+                    session.providerNumberId || session.number,
+                    session.routedProvider
                 );
             }
         } catch (error) {
@@ -868,18 +881,14 @@ class SessionManager {
                 sessionId: session.sessionId || 'unknown',
                 mode: session.mode,
                 providerNumberId: session.providerNumberId,
+                routedProvider: session.routedProvider,
                 number: session.number,
                 reason,
                 error: error.message
             });
         }
-             }
-    // ═══════════════════════════════════════════════════════════════════════════════
-// SessionManager.js — Part 3/3
-// Validation, Monitoring, Cleanup, Shutdown & Utilities
-// ═══════════════════════════════════════════════════════════════════════════════
-
-    // ═══════════════════════════════════════════════════════════
+    }
+        // ═══════════════════════════════════════════════════════════
     //  INTERNAL - Validation
     // ═══════════════════════════════════════════════════════════
 
@@ -892,8 +901,7 @@ class SessionManager {
             },
             CHEAP: () => {
                 // FIXED: Use dynamic minimum balance check instead of hardcoded $0.05
-                // We can't know exact price yet, so check if they have at least $0.05
-                // The actual price check happens in _handleFinances after number acquisition
+                // We can only check minimum entry threshold here; actual price check happens in _handleFinances
                 const minBalance = 0.05; // Minimum to enter CHEAP flow
                 const available = typeof user.getAvailableBalance === 'function'
                     ? user.getAvailableBalance()
@@ -981,7 +989,7 @@ class SessionManager {
                 );
             }
 
-            // FIXED: Use tier-specific methods instead of legacy checkSMS()
+            // FIXED: Use tier-specific methods with routedProvider for CHEAP
             let result;
             switch (current.mode) {
                 case 'FREE':
@@ -991,8 +999,10 @@ class SessionManager {
                     break;
 
                 case 'CHEAP':
+                    // FIXED: Pass routedProvider for multi-provider SMS checking
                     result = await this.providerManager.checkCheapSMS(
-                        current.providerNumberId || current.number
+                        current.providerNumberId || current.number,
+                        current.routedProvider
                     );
                     break;
 
@@ -1007,7 +1017,8 @@ class SessionManager {
                     // Fallback to legacy only for unknown modes
                     result = await this.providerManager.checkSMS(
                         current.provider,
-                        current.providerNumberId || current.number
+                        current.providerNumberId || current.number,
+                        { providerKey: current.routedProvider }
                     );
             }
 
@@ -1115,4 +1126,3 @@ class SessionManager {
 }
 
 export default SessionManager;
-            
