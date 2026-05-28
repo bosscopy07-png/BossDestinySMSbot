@@ -4,7 +4,7 @@
 //  Falls back automatically if one provider has no stock
 // ═══════════════════════════════════════════════════════════════════════════════
 
-import logger from '../utils/logger.js';
+import logger from '../../utils/logger.js';
 
 /**
  * ProviderRouter — Routes CHEAP tier requests to the best available provider
