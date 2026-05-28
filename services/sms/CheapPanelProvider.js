@@ -1,20 +1,16 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 //  services/CheapPanelProvider.js — 5SIM API Integration
 // 
-//  CRITICAL FIXES:
-//  - extractOTP: Proper type guards before string operations
-//  - checkSMS: Correctly handles 5SIM response structure (sms field, not text)
-//  - getNumber: Returns actual cost vs display price separately, preserves operator
-//  - cancelNumber: Validates activation ID is numeric, not phone number
-//  - request: Proper error logging without crashing
-//  - FIXED: Detects empty/HTML responses, throws meaningful errors for fallback
-//  - FIXED: Returns exact operator used in response to prevent mismatch
-//  - FIXED: mapOperator no longer uses stale hardcoded whitelist
+//  FIXED: Profit is now $0.10 flat (not $0.20/$0.30 tiered)
+//  FIXED: Returns displayCost as raw + $0.10 (single source of truth for profit)
+//  FIXED: getDisplayPrice simplified to flat $0.10 profit
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import axios from 'axios';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
+
+const BASE_PROFIT = 0.10; // $0.10 flat profit per number
 
 /**
  * CheapPanelProvider — 5SIM API Integration
@@ -23,6 +19,7 @@ class CheapPanelProvider {
     constructor() {
         this.name = 'CHEAP_PANEL';
         this.tier = 'CHEAP';
+        this.providerKey = '5sim'; // For provider router identification
         
         this.baseUrl = config.cheapPanel?.baseUrl || 'https://5sim.net/v1';
         this.apiKey = config.cheapPanel?.apiKey;
@@ -140,7 +137,7 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  REQUEST HELPER — No rate limiting
+    //  REQUEST HELPER
     // ═══════════════════════════════════════════════════════════
 
     async request(method, endpoint, data = null, timeout = 10000) {
@@ -157,7 +154,6 @@ class CheapPanelProvider {
         
         const response = await axios(axiosConfig);
         
-        // CRITICAL FIX: Handle string error responses in HTTP 200 (5SIM quirk)
         if (typeof response.data === 'string') {
             const text = response.data.trim().toLowerCase();
             
@@ -177,7 +173,6 @@ class CheapPanelProvider {
             }
         }
         
-        // CRITICAL FIX: Detect empty/HTML responses that indicate real errors
         if (response.status >= 400 || !response.data || typeof response.data !== 'object') {
             const errorData = response.data;
             const isHtmlError = typeof errorData === 'string' && errorData.includes('<');
@@ -192,7 +187,6 @@ class CheapPanelProvider {
                 dataPreview: isHtmlError ? 'HTML_ERROR_PAGE' : (isEmpty ? 'EMPTY_BODY' : errorData)
             });
 
-            // Throw with meaningful error so getNumber() can categorize it
             if (response.status === 404) {
                 throw new Error(`NOT_AVAILABLE: 5SIM returned 404 for ${url}`);
             }
@@ -214,17 +208,22 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  DYNAMIC PRICING
+    //  PRICING — FIXED: Flat $0.10 profit
     // ═══════════════════════════════════════════════════════════
 
-    getDisplayPrice(simPrice) {
-        const price = parseFloat(simPrice) || 0;
-        if (price <= 0.50) {
-            return parseFloat((price + 0.20).toFixed(2));
-        }
-        return parseFloat((price + 0.30).toFixed(2));
+    /**
+     * FIXED: Returns raw price + $0.10 flat profit
+     * No more tiered $0.20/$0.30 — single consistent profit margin
+     */
+    getDisplayPrice(rawPrice) {
+        const price = parseFloat(rawPrice) || 0;
+        if (price <= 0) return null;
+        return parseFloat((price + BASE_PROFIT).toFixed(4));
     }
 
+    /**
+     * Get price for country/service — returns both raw and display price
+     */
     async getPrice(country = 'US', service = 'Any') {
         try {
             const providerCountry = this.mapCountry(country);
@@ -305,7 +304,7 @@ class CheapPanelProvider {
             success: true,
             simPrice: minPrice,
             displayPrice: displayPrice,
-            profit: parseFloat((displayPrice - minPrice).toFixed(2)),
+            profit: BASE_PROFIT,
             operator: cheapestOperator,
             stock: totalStock,
             available: true
@@ -447,7 +446,6 @@ class CheapPanelProvider {
     //  PRE-FLIGHT AVAILABILITY CHECK
     // ═══════════════════════════════════════════════════════════
 
-    
     async checkAvailability(country, service) {
         try {
             const providerCountry = this.mapCountry(country);
@@ -471,609 +469,4 @@ class CheapPanelProvider {
                 return this._checkAvailabilityFromProducts(products, providerCountry, providerService);
             }
 
-            if (response.status >= 400) {
-                const products = await this.getProducts();
-                if (!products) {
-                    return { available: false, error: `Failed to fetch product catalog. HTTP ${response.status}` };
-                }
-                return this._checkAvailabilityFromProducts(products, providerCountry, providerService);
-            }
-
-            const data = response.data;
-            if (!data || typeof data !== 'object' || Object.keys(data).length === 0) {
-                return { available: false, error: `No data returned for ${providerCountry}/${providerService}` };
-            }
-
-            return this._checkAvailabilityFromProducts(data, providerCountry, providerService);
-
-        } catch (error) {
-            return { available: false, error: error.message };
-        }
-    }
-
-    _checkAvailabilityFromProducts(products, providerCountry, providerService) {
-        const countryData = products[providerCountry];
-        if (!countryData) {
-            return { available: false, error: `Country ${providerCountry} not available` };
-        }
-
-        const serviceData = countryData[providerService];
-        if (!serviceData) {
-            return { available: false, error: `Service ${providerService} not available in ${providerCountry}` };
-        }
-
-        const operators = serviceData;
-        const operatorNames = Object.keys(operators);
-        
-        const hasStock = operatorNames.some(opName => {
-            const op = operators[opName];
-            const count = typeof op === 'object' ? (op.count ?? 0) : (typeof op === 'number' ? op : 0);
-            return count > 0;
-        });
-
-        return { 
-            available: hasStock, 
-            operators: operatorNames,
-            data: serviceData 
-        };
-                                            }
- // ═══════════════════════════════════════════════════════════════════════════════
-//  CheapPanelProvider.js — Part 2/3
-//  Number Acquisition, SMS Checking & OTP Extraction
-// ═══════════════════════════════════════════════════════════════════════════════
-
-    // ═══════════════════════════════════════════════════════════
-    //  NUMBER ACQUISITION
-    // ═══════════════════════════════════════════════════════════
-
-    /**
-     * FIXED: Preserves exact operator passed from tier selection.
-     * No longer uses stale hardcoded operatorMap whitelist.
-     * TierOperatorSelector already validated operator via 5SIM API.
-     */
-    async getNumber(country = 'US', service = 'Any', preferredOperator = 'any') {
-        const startTime = Date.now();
-
-        try {
-            if (!this.isActive) {
-                throw new Error('PROVIDER_NOT_CONFIGURED');
-            }
-
-            const balanceResult = await this.checkBalance();
-            if (!balanceResult.success || balanceResult.balance <= 0) {
-                logger.error('5SIM balance insufficient or check failed', { 
-                    balance: balanceResult.balance,
-                    error: balanceResult.error 
-                });
-                throw new Error('NO_BALANCE: Insufficient 5SIM balance. Fund wallet at 5sim.net');
-            }
-
-            const availability = await this.checkAvailability(country, service);
-            if (!availability.available) {
-                throw new Error(`NOT_AVAILABLE: ${service} not available in ${country}. ${availability.error || ''}`);
-            }
-
-            const providerCountry = this.mapCountry(country);
-            const providerService = this.mapService(service);
-            
-            // FIXED: Trust the operator from tier selection. No stale whitelist.
-            const operator = this.mapOperator(providerCountry, preferredOperator);
-
-            logger.info('Requesting number from 5SIM', {
-                country: providerCountry,
-                service: providerService,
-                operator,
-                originalCountry: country,
-                originalService: service,
-                preferredOperator,
-                usingPreferred: operator === preferredOperator,
-                balance: balanceResult.balance
-            });
-
-            const endpoint = `${this.endpoints.getNumber}/${providerCountry}/${operator}/${providerService}`;
-            
-            const response = await this.request('get', endpoint, null, 30000);
-            const data = response.data;
-            const statusCode = response.status;
-
-            logger.debug('5SIM raw response', {
-                statusCode,
-                hasId: !!data?.id,
-                hasPhone: !!data?.phone,
-                phone: data?.phone,
-                error: data?.error,
-                message: data?.message
-            });
-
-            // CRITICAL FIX: Handle empty/invalid responses before checking data fields
-            if (statusCode >= 400 || !data || typeof data !== 'object') {
-                const errorMsg = data?.error || data?.message || (typeof data === 'string' ? data : null) || `HTTP ${statusCode}`;
-                const isEmptyResponse = !data || (typeof data === 'string' && data.trim() === '');
-                
-                // Check balance errors first
-                const lowerMsg = (errorMsg || '').toLowerCase();
-                if (lowerMsg.includes('not enough user balance') || 
-                    lowerMsg.includes('no balance') ||
-                    lowerMsg.includes('insufficient funds')) {
-                    throw new Error(`NO_BALANCE: ${errorMsg}`);
-                }
-
-                // 404 = not available (country/service/operator combo doesn't work)
-                if (statusCode === 404 || isEmptyResponse) {
-                    throw new Error(`NOT_AVAILABLE: ${service} not available in ${country} with operator ${operator}. Try another country or operator.`);
-                }
-
-                // 400 = bad request (often means operator doesn't support this combo)
-                if (statusCode === 400) {
-                    throw new Error(`NOT_AVAILABLE: Invalid combination: ${operator} for ${service} in ${country}. Try another operator.`);
-                }
-                
-                throw new Error(`PROVIDER_ERROR: ${errorMsg}`);
-            }
-
-            if (!data.id) {
-                throw new Error(`INVALID_RESPONSE: Missing id. Response: ${JSON.stringify(data)}`);
-            }
-
-            if (!data.phone) {
-                throw new Error(`INVALID_RESPONSE: Missing phone. Response: ${JSON.stringify(data)}`);
-            }
-
-            const phoneStr = data.phone.toString().trim();
-            const activationId = data.id.toString().trim();
-
-            if (this.isFakeNumber(phoneStr)) {
-                logger.error('5SIM returned fake number', { phone: phoneStr, activationId });
-                await this.cancelNumber(activationId).catch(() => {});
-                throw new Error(`FAKE_NUMBER_REJECTED: ${phoneStr}`);
-            }
-
-            if (phoneStr.length < 7 || phoneStr.length > 15) {
-                logger.error('5SIM returned invalid phone length', { phone: phoneStr, length: phoneStr.length });
-                await this.cancelNumber(activationId).catch(() => {});
-                throw new Error(`INVALID_PHONE_LENGTH: ${phoneStr} (${phoneStr.length} digits)`);
-            }
-
-            if (!/^\d+$/.test(activationId)) {
-                throw new Error(`INVALID_ACTIVATION_ID: ${activationId}`);
-            }
-
-            const duration = Date.now() - startTime;
-            const simPrice = parseFloat(data.price) || 0;
-            const displayPrice = this.getDisplayPrice(simPrice);
-            
-            this.updateStats(true, duration, simPrice);
-
-            logger.info('Number acquired from 5SIM', {
-                activationId,
-                phone: this.maskPhone(phoneStr),
-                country: providerCountry,
-                service: providerService,
-                operator,
-                simPrice,
-                displayPrice,
-                duration
-            });
-
-            // FIXED: Return exact operator used in the request
-            return {
-                phoneNumber: phoneStr,
-                provider: this.name,
-                providerNumberId: activationId,
-                country,
-                service,
-                cost: simPrice,
-                displayCost: displayPrice,
-                operator: operator,
-                expiresAt: new Date(Date.now() + 20 * 60 * 1000),
-                isVirtual: true
-            };
-
-        } catch (error) {
-            const duration = Date.now() - startTime;
-            this.updateStats(false, duration, 0);
-
-            logger.error('5SIM number acquisition failed', {
-                country,
-                service,
-                preferredOperator,
-                error: error.message
-            });
-
-            throw this.handleError(error);
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  SMS CHECKING — CRITICAL FIX FOR text.match CRASH
-    // ═══════════════════════════════════════════════════════════
-
-    async checkSMS(activationId) {
-        try {
-            if (!this.isActive) {
-                return { success: false, error: 'PROVIDER_NOT_CONFIGURED' };
-            }
-
-            if (!activationId || !/^\d+$/.test(activationId.toString())) {
-                return { success: false, error: 'INVALID_ACTIVATION_ID' };
-            }
-
-            const endpoint = `${this.endpoints.checkStatus}/${activationId}`;
-            const response = await this.request('get', endpoint, null, 15000);
-            const data = response.data;
-
-            if (response.status >= 400) {
-                return {
-                    success: false,
-                    error: data?.error || `HTTP ${response.status}`,
-                    status: 'ERROR'
-                };
-            }
-
-            logger.debug('SMS status check', {
-                activationId,
-                status: data?.status,
-                hasCode: !!data?.code,
-                hasSms: !!data?.sms,
-                smsType: typeof data?.sms,
-                isArray: Array.isArray(data?.sms),
-                codeType: typeof data?.code
-            });
-
-            const status = (data?.status || '').toUpperCase();
-
-            if (status === 'RECEIVED' || status === 'FINISHED') {
-                const otp = this.extractOTP(data.code, data.sms);
-                
-                if (otp) {
-                    let fullText = null;
-                    if (Array.isArray(data.sms)) {
-                        fullText = data.sms[0]?.text || data.sms[0]?.sms || JSON.stringify(data.sms);
-                    } else if (typeof data.sms === 'string') {
-                        fullText = data.sms;
-                    } else if (typeof data.sms === 'object' && data.sms !== null) {
-                        fullText = data.sms.text || data.sms.sms || JSON.stringify(data.sms);
-                    }
-
-                    return {
-                        success: true,
-                        otp,
-                        status: 'RECEIVED',
-                        fullText: fullText,
-                        receivedAt: new Date()
-                    };
-                }
-
-                return {
-                    success: false,
-                    status: 'CHECKING',
-                    rawText: Array.isArray(data.sms) ? JSON.stringify(data.sms) : data.sms,
-                    message: 'SMS received but OTP extraction failed'
-                };
-            }
-
-            if (status === 'CANCELED' || status === 'CANCELLED') {
-                return { success: false, status: 'CANCELLED', message: 'Number was cancelled' };
-            }
-
-            if (status === 'EXPIRED') {
-                return { success: false, status: 'TIMEOUT', message: 'Activation expired' };
-            }
-
-            return { success: false, status: 'WAITING', message: `Status: ${data.status}` };
-
-        } catch (error) {
-            logger.error('5SMS check failed', { activationId, error: error.message });
-            return { success: false, error: error.message, status: 'ERROR' };
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  OTP EXTRACTION
-    // ═══════════════════════════════════════════════════════════
-
-    extractOTP(code, text) {
-        if (code !== null && code !== undefined) {
-            const codeStr = code.toString().trim();
-            const cleanCode = codeStr.replace(/[\s\-]/g, '');
-            if (/^\d{4,8}$/.test(cleanCode)) {
-                return cleanCode;
-            }
-            logger.debug('5SIM code field present but invalid format', { code, cleanCode });
-        }
-
-        if (text === null || text === undefined) {
-            logger.debug('No SMS text provided', { text });
-            return null;
-        }
-
-        let textStr;
-        
-        if (Array.isArray(text)) {
-            const firstMessage = text[0];
-            if (firstMessage && typeof firstMessage === 'object') {
-                if (firstMessage.text && typeof firstMessage.text === 'string') {
-                    textStr = firstMessage.text;
-                } else if (firstMessage.sms && typeof firstMessage.sms === 'string') {
-                    textStr = firstMessage.sms;
-                } else {
-                    const values = Object.values(firstMessage).filter(v => typeof v === 'string');
-                    if (values.length > 0) {
-                        textStr = values.join(' ');
-                    } else {
-                        logger.warn('SMS array element has no recognizable text field', { firstMessage });
-                        return null;
-                    }
-                }
-                
-                if (firstMessage.code && (!code || code === null)) {
-                    const arrayCode = firstMessage.code.toString().trim().replace(/[\s\-]/g, '');
-                    if (/^\d{4,8}$/.test(arrayCode)) {
-                        return arrayCode;
-                    }
-                }
-            } else if (typeof firstMessage === 'string') {
-                textStr = firstMessage;
-            } else {
-                logger.warn('SMS array first element is not object or string', { firstMessage });
-                return null;
-            }
-        } else if (typeof text === 'string') {
-            textStr = text;
-        } else if (typeof text === 'number') {
-            textStr = text.toString();
-        } else if (typeof text === 'object') {
-            if (text.text && typeof text.text === 'string') {
-                textStr = text.text;
-            } else if (text.sms && typeof text.sms === 'string') {
-                textStr = text.sms;
-            } else {
-                logger.warn('SMS text is object with no recognizable text field', { text });
-                return null;
-            }
-        } else {
-            logger.error('SMS text is unexpected type', { textType: typeof text, textValue: text });
-            return null;
-        }
-
-        const patterns = [
-            /\b\d{4,8}\b/,
-            /code[:\s]+(\d{4,8})/i,
-            /otp[:\s]+(\d{4,8})/i,
-            /verification[:\s]+(\d{4,8})/i,
-            /(\d{4,8})[:\s]*is your/i,
-            /(\d{4,8})[:\s]*is the/i,
-            /验证码[:\s]*(\d{4,8})/i,
-            /код[:\s]+(\d{4,8})/i,
-            /code[:\s]*(\d{4,8})/i,
-            /(\d{4,8})[:\s]*код/i,
-            /pin[:\s]+(\d{4,8})/i,
-            /password[:\s]+(\d{4,8})/i,
-            /(\d{4,8})[:\s]*验证码/i,
-            /your[:\s]+code[:\s]+is[:\s]+(\d{4,8})/i,
-            /security[:\s]+code[:\s]+(\d{4,8})/i
-        ];
-
-        for (const pattern of patterns) {
-            const match = textStr.match(pattern);
-            if (match) {
-                const otp = match[1] || match[0];
-                const cleanOtp = otp.toString().replace(/\D/g, '');
-                if (/^\d{4,8}$/.test(cleanOtp)) return cleanOtp;
-            }
-        }
-
-        const digits = textStr.match(/\b\d{4,8}\b/g);
-        if (digits?.length > 0) return digits[digits.length - 1];
-
-        return null;
-                    }
-            // ═══════════════════════════════════════════════════════════════════════════════
-//  CheapPanelProvider.js — Part 3/3
-//  Number Management, Mapping Helpers, Stats
-// ═══════════════════════════════════════════════════════════════════════════════
-
-    // ═══════════════════════════════════════════════════════════
-    //  NUMBER MANAGEMENT
-    // ═══════════════════════════════════════════════════════════
-
-    async cancelNumber(activationId) {
-        try {
-            if (!this.isActive) {
-                return { success: false, error: 'PROVIDER_NOT_CONFIGURED' };
-            }
-
-            if (!activationId) {
-                return { success: false, error: 'MISSING_ACTIVATION_ID' };
-            }
-
-            const cleanId = activationId.toString().trim();
-            if (!/^\d+$/.test(cleanId)) {
-                logger.error('Cancel called with non-numeric ID (likely phone number)', { activationId: cleanId });
-                return { success: false, error: 'INVALID_ACTIVATION_ID: Expected numeric ID, got phone number' };
-            }
-
-            const endpoint = `${this.endpoints.cancel}/${cleanId}`;
-            const response = await this.request('get', endpoint);
-
-            logger.info('Number cancelled successfully', { 
-                activationId: cleanId, 
-                provider: this.name,
-                status: response.status 
-            });
-
-            return { success: true, status: 'CANCELLED', data: response.data };
-
-        } catch (error) {
-            if (error.response?.status === 404 || error.message?.includes('not found')) {
-                logger.info('Number already released or not found', { activationId });
-                return { success: true, status: 'ALREADY_RELEASED' };
-            }
-            if (error.response?.status === 400) {
-                logger.warn('Cancel request returned 400', { 
-                    activationId, 
-                    error: error.message,
-                    data: error.response?.data 
-                });
-                return { success: false, error: error.message, status: 'ERROR' };
-            }
-            logger.warn('Cancel request failed', { activationId, error: error.message });
-            return { success: false, error: error.message, status: 'ERROR' };
-        }
-    }
-
-    async finishNumber(activationId) {
-        try {
-            if (!activationId) {
-                return { success: false, error: 'MISSING_ACTIVATION_ID' };
-            }
-
-            const cleanId = activationId.toString().trim();
-            if (!/^\d+$/.test(cleanId)) {
-                return { success: false, error: 'INVALID_ACTIVATION_ID' };
-            }
-            
-            const endpoint = `${this.endpoints.finish}/${cleanId}`;
-            await this.request('get', endpoint);
-
-            logger.info('Activation marked as finished', { activationId: cleanId });
-            return { success: true, status: 'FINISHED' };
-
-        } catch (error) {
-            logger.warn('Finish request failed', { activationId, error: error.message });
-            return { success: false, error: error.message };
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  LEGACY PRICING METHOD
-    // ═══════════════════════════════════════════════════════════
-
-    async getPrices(country = 'US', service = 'Any') {
-        return this.getPrice(country, service);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  MAPPING HELPERS
-    // ═══════════════════════════════════════════════════════════
-
-    mapService(service) {
-        if (!service || service === 'Any') return 'other';
-        return this.serviceMap[service] || 'other';
-    }
-
-    mapCountry(country) {
-        if (!country) throw new Error('BAD_COUNTRY: Country required');
-        const mapped = this.countryMap[country.toUpperCase()];
-        if (!mapped) throw new Error(`BAD_COUNTRY: ${country} not supported`);
-        return mapped;
-    }
-
-    /**
-     * FIXED: No longer uses hardcoded operator whitelist.
-     * The tier system already validates operators via 5SIM API.
-     * Trust the selected operator unless it's truly invalid.
-     */
-    mapOperator(country, preferred) {
-        // If no preference or explicitly 'any', use 'any'
-        if (!preferred || preferred === 'any') {
-            return 'any';
-        }
-
-        // FIXED: Trust the tier system's operator selection.
-        // The TierOperatorSelector already verified this operator exists 
-        // and has stock via 5SIM's /guest/prices API.
-        return preferred;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  VALIDATION HELPERS
-    // ═══════════════════════════════════════════════════════════
-
-    isFakeNumber(phone) {
-        if (!phone) return true;
-        const clean = phone.toString().replace(/\D/g, '');
-        return this.fakeNumbers.has(clean) || this.fakeNumbers.has(phone);
-    }
-
-    getHeaders() {
-        return {
-            'Authorization': `Bearer ${this.apiKey}`,
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
-        };
-    }
-
-    maskPhone(phone) {
-        if (!phone) return '****';
-        const str = phone.toString();
-        if (str.length < 4) return '****';
-        return str.slice(0, -4).replace(/./g, '*') + str.slice(-4);
-    }
-
-    handleError(error) {
-        const message = error.message || '';
-
-        for (const [key, value] of Object.entries(this.errorMap)) {
-            if (message.includes(key)) {
-                return new Error(`${value.message} (${key})`);
-            }
-        }
-
-        return new Error(`PROVIDER_ERROR: ${message}`);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  STATS
-    // ═══════════════════════════════════════════════════════════
-
-    updateStats(success, duration, cost = 0) {
-        this.stats.totalSent++;
-        this.stats.totalCost += cost;
-        if (success) this.stats.totalSuccess++;
-        else this.stats.totalFailed++;
-        this.stats.avgResponseTime = (
-            (this.stats.avgResponseTime * (this.stats.totalSent - 1) + duration)
-            / this.stats.totalSent
-        );
-    }
-
-    getStats() {
-        const { totalSent, totalSuccess, totalFailed, avgResponseTime, totalCost } = this.stats;
-        
-        return {
-            name: this.name,
-            tier: this.tier,
-            isActive: this.isActive,
-            baseUrl: this.baseUrl,
-            totalSent,
-            totalSuccess,
-            totalFailed,
-            successRate: totalSent > 0
-                ? Number((totalSuccess / totalSent * 100).toFixed(2))
-                : 100,
-            failureRate: totalSent > 0
-                ? Number((totalFailed / totalSent * 100).toFixed(2))
-                : 0,
-            avgResponseTime: Math.round(avgResponseTime),
-            totalCost: Number(totalCost.toFixed(4)),
-            avgCost: totalSent > 0
-                ? Number((totalCost / totalSent).toFixed(4))
-                : 0
-        };
-    }
-
-    resetStats() {
-        this.stats = {
-            totalSent: 0,
-            totalSuccess: 0,
-            totalFailed: 0,
-            avgResponseTime: 0,
-            totalCost: 0
-        };
-        return this.getStats();
-    }
-}
-
-export default CheapPanelProvider;
-            
+            if (response.status >= 400)
