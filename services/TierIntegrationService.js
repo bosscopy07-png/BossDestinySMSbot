@@ -91,8 +91,8 @@ class TierIntegrationService {
             const { default: ServiceCatalog } = await import('./ServiceCatalog.js');
             const { default: TierOperatorSelector } = await import('./TierOperatorSelector.js');
             const { default: CountryCatalog } = await import('./CountryCatalog.js');
-            const { default: ProviderRouter } = await import('../ProviderRouter.js');
-
+            const { default: ProviderRouter } = await import('./sms/ProviderRouter.js');
+            
             // FIXED: Pass cheapPanelProvider to ServiceCatalog for dynamic catalog loading
             this._serviceCatalog = new ServiceCatalog(this._cheapProvider);
             this._tierSelector = new TierOperatorSelector(this._cheapProvider);
