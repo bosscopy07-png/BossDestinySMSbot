@@ -552,7 +552,19 @@ class TelegramBot {
         this.commandModules.set('otp', otpCommands);
         this.commandModules.set('admin', adminCommands);
         this.commandModules.set('advancedAdmin', advancedAdmin);
-
+        
+        // ═══════════════════════════════════════════════════════════
+    //  DEBUG LINES GO HERE — after both are initialized
+    // ═══════════════════════════════════════════════════════════
+    console.log('=== TIER DEBUG ===');
+    console.log('CHEAP_PANEL provider:', smsProviderManager.getProvider('CHEAP_PANEL')?.name);
+    console.log('CHEAP_PANEL isActive:', smsProviderManager.getProvider('CHEAP_PANEL')?.isActive);
+    console.log('ProviderRouter hasAvailable:', smsProviderManager.getProviderRouter()?.hasAvailableProvider());
+    console.log('TierIntegrationService._cheapProvider:', tierIntegrationService._cheapProvider?.name);
+    console.log('TierIntegrationService._enabled:', tierIntegrationService._enabled);
+    console.log('TierIntegrationService.isAvailable():', tierIntegrationService.isAvailable());
+    console.log('==================');
+    
         // ═══════════════════════════════════════════════════════════════════════
         //  StartVerification — FIXED: Injected with all required services
         // ═══════════════════════════════════════════════════════════════════════
