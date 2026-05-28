@@ -2,6 +2,7 @@
 //  services/TierOperatorSelector.js — Intelligent Tier-Based Provider Selection
 //  Core engine: selects best operator within tier using cached product data
 //  FIXED: Uses provider's product cache instead of per-operator API calls
+//  FIXED: Removed double profit application — uses displayPrice as base
 //  Eliminates 429 errors by reading from cached catalog
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -79,6 +80,9 @@ class TierOperatorSelector {
         scored.sort((a, b) => b.score - a.score);
 
         const selected = scored[0];
+        
+        // FIXED: displayPrice = price (already includes $0.10 profit from CheapPanelProvider)
+        // Then apply tier multiplier ONLY
         const displayPrice = selected.price ? parseFloat((selected.price * tier.priceMultiplier).toFixed(2)) : null;
 
         logger.info('Operator selected', {
@@ -251,8 +255,13 @@ class TierOperatorSelector {
             const opData = serviceData?.[operator];
             
             if (opData && typeof opData === 'object') {
-                const price = opData.cost ?? opData.price ?? null;
+                const rawPrice = opData.cost ?? opData.price ?? null;
                 const stock = opData.count ?? 0;
+                
+                // FIXED: Use provider's getDisplayPrice to add $0.10 profit consistently
+                const price = rawPrice !== null 
+                    ? (this.provider.getDisplayPrice ? this.provider.getDisplayPrice(rawPrice) : parseFloat(rawPrice) + 0.10)
+                    : null;
                 
                 this._updateOperatorStats(operator, true, 0);
 
