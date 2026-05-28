@@ -495,17 +495,17 @@ class TelegramBot {
         }
     }
 
-    async setupCommands() {
+        async setupCommands() {
         try {
             this.smsProviderManager = new SMSProviderManager();
             await this.smsProviderManager.initialize();
             logger.info('SMS Provider Manager initialized');
         } catch (error) {
             logger.error('Failed to initialize SMS Provider Manager', { error: error.message });
-            this.smsProviderManager = null;
+            // Keep instance alive for inspection — don't null it out
             await this.alertAdmins(error, {
                 source: 'setup.setupCommands',
-                note: 'SMS Provider Manager init failed'
+                note: 'SMS Provider Manager init failed — bot continues with degraded SMS'
             });
         }
 
@@ -515,15 +515,30 @@ class TelegramBot {
             logger.info('Tier Integration Service initialized');
         } catch (error) {
             logger.error('Failed to initialize Tier Integration Service', { error: error.message });
-            this.tierIntegrationService = null;
+            // Keep instance alive for inspection — don't null it out
             await this.alertAdmins(error, {
                 source: 'setup.tierIntegration',
-                note: 'Tier Integration Service init failed'
+                note: 'Tier Integration Service init failed — legacy CHEAP flow will be used'
             });
         }
 
         // ═══════════════════════════════════════════════════════════════════════
-        //  COMMAND MODULES — Fixed: Pass notificationService to UserCommands
+        //  DEBUG — Check tier system health (REMOVE AFTER FIXING)
+        // ═══════════════════════════════════════════════════════════════════════
+        console.log('=== TIER DEBUG ===');
+        console.log('smsProviderManager exists:', !!this.smsProviderManager);
+        console.log('smsProviderManager.isInitialized:', this.smsProviderManager?.isInitialized);
+        console.log('CHEAP_PANEL provider:', this.smsProviderManager?.getProvider('CHEAP_PANEL')?.name);
+        console.log('CHEAP_PANEL isActive:', this.smsProviderManager?.getProvider('CHEAP_PANEL')?.isActive);
+        console.log('ProviderRouter hasAvailable:', this.smsProviderManager?.getProviderRouter()?.hasAvailableProvider());
+        console.log('tierIntegrationService exists:', !!this.tierIntegrationService);
+        console.log('tierIntegrationService._enabled:', this.tierIntegrationService?._enabled);
+        console.log('tierIntegrationService._cheapProvider:', this.tierIntegrationService?._cheapProvider?.name);
+        console.log('tierIntegrationService.isAvailable():', this.tierIntegrationService?.isAvailable());
+        console.log('==================');
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  COMMAND MODULES
         // ═══════════════════════════════════════════════════════════════════════
         const userCommands = new UserCommands(
             this.bot, 
@@ -540,32 +555,22 @@ class TelegramBot {
             this.smsProviderManager
         );
 
-        if (this.tierIntegrationService) {
+        if (this.tierIntegrationService?.isAvailable()) {
             otpCommands.tierService = this.tierIntegrationService;
             otpCommands.tierSelector = this.tierIntegrationService._tierSelector;
             otpCommands.serviceCatalog = this.tierIntegrationService._serviceCatalog;
             otpCommands.countryCatalog = this.tierIntegrationService._countryCatalog;
             logger.info('Tier services injected into OTPCommands');
+        } else {
+            logger.warn('Tier system not available, OTPCommands will use legacy flow');
         }
 
         this.commandModules.set('user', userCommands);
         this.commandModules.set('otp', otpCommands);
         this.commandModules.set('admin', adminCommands);
         this.commandModules.set('advancedAdmin', advancedAdmin);
-        
-        // ═══════════════════════════════════════════════════════════
-    //  DEBUG LINES GO HERE — after both are initialized
-    // ═══════════════════════════════════════════════════════════
-    console.log('=== TIER DEBUG ===');
-    console.log('CHEAP_PANEL provider:', smsProviderManager.getProvider('CHEAP_PANEL')?.name);
-    console.log('CHEAP_PANEL isActive:', smsProviderManager.getProvider('CHEAP_PANEL')?.isActive);
-    console.log('ProviderRouter hasAvailable:', smsProviderManager.getProviderRouter()?.hasAvailableProvider());
-    console.log('TierIntegrationService._cheapProvider:', tierIntegrationService._cheapProvider?.name);
-    console.log('TierIntegrationService._enabled:', tierIntegrationService._enabled);
-    console.log('TierIntegrationService.isAvailable():', tierIntegrationService.isAvailable());
-    console.log('==================');
-    
-        // ═══════════════════════════════════════════════════════════════════════
+            
+       // ═══════════════════════════════════════════════════════════════════════
         //  StartVerification — FIXED: Injected with all required services
         // ═══════════════════════════════════════════════════════════════════════
         this.startVerification = new StartVerification(
