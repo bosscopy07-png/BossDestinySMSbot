@@ -21,7 +21,7 @@ import config from '../../config/env.js';
 // ═══════════════════════════════════════════════════════════════════════════════
 //  NEW TIER SYSTEM IMPORTS
 // ═══════════════════════════════════════════════════════════════════════════════
-const PROFIT_MARGIN = 0.10;
+const PROFIT_MARGIN = 0.00;
 function applyProfitMargin(rawPrice) {
     if (rawPrice === null || rawPrice === undefined || isNaN(rawPrice)) return null;
     return parseFloat((rawPrice + PROFIT_MARGIN).toFixed(4));
