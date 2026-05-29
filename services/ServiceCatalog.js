@@ -2,6 +2,7 @@
 //  services/ServiceCatalog.js — Service Discovery with Dynamic 5SIM Catalog
 //  Handles 1100+ services from live API without loading all at once
 //  NO hardcoded SERVICES import. All data from CheapPanelProvider.
+//  FIXED: Proper cache invalidation, stable indexing, robust error handling
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { POPULAR_SERVICES, SERVICE_CATEGORIES, PAGINATION, CACHE_TTL } from '../config/tierConfig.js';
@@ -17,7 +18,7 @@ import logger from '../utils/logger.js';
  */
 function buildReverseServiceMap(providerServiceMap) {
     const reverse = new Map();
-    for (const [display, internal] of Object.entries(providerServiceMap)) {
+    for (const [display, internal] of Object.entries(providerServiceMap || {})) {
         // Handle duplicates: prefer shorter/cleaner display name
         if (!reverse.has(internal) || display.length < reverse.get(internal).length) {
             reverse.set(internal, display);
@@ -30,6 +31,7 @@ function buildReverseServiceMap(providerServiceMap) {
  * Clean service display name from 5SIM raw key
  */
 function cleanServiceName(rawName) {
+    if (!rawName || typeof rawName !== 'string') return 'Unknown';
     return rawName
         .replace(/[_-]/g, ' ')
         .replace(/\b\w/g, c => c.toUpperCase())
@@ -55,7 +57,7 @@ class ServiceCatalog {
         this._allServices = new Set();       // All display names
 
         // Reverse mapping: 5SIM internal -> display
-        this._reverseServiceMap = buildReverseServiceMap(cheapPanelProvider.serviceMap || {});
+        this._reverseServiceMap = buildReverseServiceMap(cheapPanelProvider.serviceMap);
 
         // Cache
         this._servicesCache = null;
@@ -74,8 +76,8 @@ class ServiceCatalog {
 
     _buildCategoryIndex() {
         // SERVICE_CATEGORIES contains display names -> we validate against dynamic catalog later
-        for (const [category, services] of Object.entries(SERVICE_CATEGORIES)) {
-            this._categoryMap.set(category, new Set(services));
+        for (const [category, services] of Object.entries(SERVICE_CATEGORIES || {})) {
+            this._categoryMap.set(category, new Set(services || []));
         }
     }
 
@@ -100,7 +102,10 @@ class ServiceCatalog {
             const products = await this.provider.getProducts();
 
             if (!products || typeof products !== 'object') {
-                logger.error('Failed to load services: invalid products data');
+                logger.error('Failed to load services: invalid products data', { 
+                    type: typeof products,
+                    isNull: products === null
+                });
                 return;
             }
 
@@ -123,7 +128,7 @@ class ServiceCatalog {
             for (const serviceKey of serviceSet) {
                 // Map to display name
                 const displayName = this._reverseServiceMap.get(serviceKey) || cleanServiceName(serviceKey);
-                const normalized = displayName.toLowerCase();
+                const normalized = displayName.toLowerCase().trim();
 
                 this._serviceMap.set(normalized, displayName);
                 this._allServices.add(displayName);
@@ -148,8 +153,9 @@ class ServiceCatalog {
             for (const [category, services] of this._categoryMap) {
                 const valid = new Set();
                 for (const s of services) {
-                    if (this._serviceMap.has(s.toLowerCase())) {
-                        valid.add(this._serviceMap.get(s.toLowerCase()));
+                    const normalized = s.toLowerCase().trim();
+                    if (this._serviceMap.has(normalized)) {
+                        valid.add(this._serviceMap.get(normalized));
                     }
                 }
                 this._categoryMap.set(category, valid);
@@ -180,8 +186,9 @@ class ServiceCatalog {
         if (!this._servicesCache) {
             await this._loadServices();
         }
-        }
-                // ═══════════════════════════════════════════════════════════════════════
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     //  PUBLIC API — Popular Services with Backfill
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -199,8 +206,8 @@ class ServiceCatalog {
         const result = [];
         const added = new Set();
 
-        for (const name of POPULAR_SERVICES) {
-            const normalized = name.toLowerCase();
+        for (const name of POPULAR_SERVICES || []) {
+            const normalized = name.toLowerCase().trim();
             if (this._serviceMap.has(normalized)) {
                 const displayName = this._serviceMap.get(normalized);
                 if (!added.has(displayName)) {
@@ -220,7 +227,7 @@ class ServiceCatalog {
             // Get services not already added, sorted alphabetically for stability
             const remaining = Array.from(this._allServices)
                 .filter(s => !added.has(s))
-                .sort();
+                .sort((a, b) => a.localeCompare(b));
 
             for (const name of remaining.slice(0, needed)) {
                 result.push({
@@ -253,7 +260,7 @@ class ServiceCatalog {
             .map(name => ({
                 name,
                 category: categoryName,
-                isPopular: POPULAR_SERVICES.map(s => s.toLowerCase()).includes(name.toLowerCase())
+                isPopular: (POPULAR_SERVICES || []).map(s => s.toLowerCase().trim()).includes(name.toLowerCase())
             }));
     }
 
@@ -280,7 +287,7 @@ class ServiceCatalog {
     /**
      * Search services by query string against FULL dynamic catalog
      */
-    async searchServices(query, limit = PAGINATION.searchResultsLimit) {
+    async searchServices(query, limit = PAGINATION?.searchResultsLimit || 30) {
         await this._ensureLoaded();
 
         if (!query || query.trim().length < 1) {
@@ -326,7 +333,7 @@ class ServiceCatalog {
                 name,
                 category: this._getServiceCategory(name),
                 matchScore: score,
-                isPopular: POPULAR_SERVICES.map(s => s.toLowerCase()).includes(name.toLowerCase())
+                isPopular: (POPULAR_SERVICES || []).map(s => s.toLowerCase().trim()).includes(name.toLowerCase())
             }))
             .sort((a, b) => b.matchScore - a.matchScore)
             .slice(0, limit);
@@ -335,13 +342,13 @@ class ServiceCatalog {
     /**
      * Get paginated service list from FULL dynamic catalog
      */
-    async getServicesPage(page = 1, perPage = PAGINATION.servicesPerPage, filter = null) {
+    async getServicesPage(page = 1, perPage = PAGINATION?.servicesPerPage || 20, filter = null) {
         await this._ensureLoaded();
 
-        let services = Array.from(this._allServices).sort();
+        let services = Array.from(this._allServices).sort((a, b) => a.localeCompare(b));
 
         if (filter) {
-            const normalized = filter.toLowerCase();
+            const normalized = filter.toLowerCase().trim();
             services = services.filter(s => s.toLowerCase().includes(normalized));
         }
 
@@ -354,7 +361,7 @@ class ServiceCatalog {
             services: pageServices.map(name => ({
                 name,
                 category: this._getServiceCategory(name),
-                isPopular: POPULAR_SERVICES.map(s => s.toLowerCase()).includes(name.toLowerCase())
+                isPopular: (POPULAR_SERVICES || []).map(s => s.toLowerCase().trim()).includes(name.toLowerCase())
             })),
             pagination: {
                 page,
@@ -370,13 +377,13 @@ class ServiceCatalog {
     /**
      * Get services starting from a specific letter
      */
-    async getServicesByLetter(letter, page = 1, perPage = PAGINATION.servicesPerPage) {
+    async getServicesByLetter(letter, page = 1, perPage = PAGINATION?.servicesPerPage || 20) {
         await this._ensureLoaded();
 
         const normalizedLetter = letter.toUpperCase();
         const services = Array.from(this._allServices)
             .filter(s => s.toUpperCase().startsWith(normalizedLetter))
-            .sort();
+            .sort((a, b) => a.localeCompare(b));
 
         const total = services.length;
         const start = (page - 1) * perPage;
@@ -387,7 +394,7 @@ class ServiceCatalog {
             services: pageServices.map(name => ({
                 name,
                 category: this._getServiceCategory(name),
-                isPopular: POPULAR_SERVICES.map(s => s.toLowerCase()).includes(name.toLowerCase())
+                isPopular: (POPULAR_SERVICES || []).map(s => s.toLowerCase().trim()).includes(name.toLowerCase())
             })),
             pagination: {
                 page,
@@ -398,13 +405,15 @@ class ServiceCatalog {
                 hasPrev: page > 1
             }
         };
-        }
-                            /**
+    }
+
+    /**
      * Check if a service exists in dynamic catalog
      */
     async hasService(serviceName) {
         await this._ensureLoaded();
-        return this._serviceMap.has(serviceName.toLowerCase());
+        if (!serviceName || typeof serviceName !== 'string') return false;
+        return this._serviceMap.has(serviceName.toLowerCase().trim());
     }
 
     /**
@@ -412,7 +421,8 @@ class ServiceCatalog {
      */
     async getServiceName(serviceName) {
         await this._ensureLoaded();
-        return this._serviceMap.get(serviceName.toLowerCase()) || serviceName;
+        if (!serviceName || typeof serviceName !== 'string') return serviceName;
+        return this._serviceMap.get(serviceName.toLowerCase().trim()) || serviceName;
     }
 
     /**
@@ -428,10 +438,11 @@ class ServiceCatalog {
     // ═══════════════════════════════════════════════════════════════════════
 
     _getServiceCategory(serviceName) {
-        const lower = serviceName.toLowerCase();
+        if (!serviceName || typeof serviceName !== 'string') return 'Other';
+        const lower = serviceName.toLowerCase().trim();
         for (const [category, services] of this._categoryMap) {
             for (const s of services) {
-                if (s.toLowerCase() === lower) return category;
+                if (s.toLowerCase().trim() === lower) return category;
             }
         }
         return 'Other';
