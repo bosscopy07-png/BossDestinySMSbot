@@ -7,15 +7,24 @@
 import { TIER_CONFIG, CACHE_TTL, getTierConfig } from '../config/tierConfig.js';
 import logger from '../utils/logger.js';
 
+const PROFIT_MARGIN = 0.10; // $0.10 base profit per number
+
+/**
+ * Apply base profit margin to a raw provider price
+ */
+function applyProfitMargin(rawPrice) {
+    if (rawPrice === null || rawPrice === undefined || isNaN(rawPrice)) return null;
+    return parseFloat((rawPrice + PROFIT_MARGIN).toFixed(4));
+}
+
 /**
  * TierIntegrationService — Central orchestrator for the 3-tier CHEAP flow
  * 
- * Pricing Model (FIXED):
- *   - displayCost = raw provider price + $0.10 (from CheapPanelProvider.getDisplayPrice)
- *   - finalPrice = displayCost × tier.priceMultiplier
- *   - Budget:  1.0× = no extra markup
- *   - Standard: 1.15× = +15% extra profit
- *   - Premium: 1.35× = +35% extra profit
+ * Pricing Model:
+ *   - Base $0.10 profit on EVERY tier
+ *   - Budget:  no extra markup (1.0×) = raw + $0.10
+ *   - Standard: +15% markup (1.15×) = (raw + $0.10) × 1.15
+ *   - Premium: +35% markup (1.35×) = (raw + $0.10) × 1.35
  * 
  * Responsibilities:
  *   - Initializes and wires all tier components
@@ -33,6 +42,7 @@ class TierIntegrationService {
         this._tierSelector = null;
         this._countryCatalog = null;
         this._cheapProvider = null;
+        this._onlineSimProvider = null;
         this._providerRouter = null;
         
         // Cache for tier baseline prices (used in tier selection UI)
@@ -72,8 +82,9 @@ class TierIntegrationService {
         }
 
         try {
-            // Get CheapPanelProvider instance from manager
+            // Get provider instances from manager
             this._cheapProvider = this.providerManager?.getProvider('CHEAP_PANEL');
+            this._onlineSimProvider = this.providerManager?.getProvider('ONLINE_SIM');
             
             if (!this._cheapProvider) {
                 logger.warn('CHEAP_PANEL provider not found in manager, tier flow unavailable');
@@ -92,10 +103,16 @@ class TierIntegrationService {
             const { default: TierOperatorSelector } = await import('./TierOperatorSelector.js');
             const { default: CountryCatalog } = await import('./CountryCatalog.js');
             const { default: ProviderRouter } = await import('./sms/ProviderRouter.js');
-            
+
             // FIXED: Pass cheapPanelProvider to ServiceCatalog for dynamic catalog loading
             this._serviceCatalog = new ServiceCatalog(this._cheapProvider);
-            this._tierSelector = new TierOperatorSelector(this._cheapProvider);
+            
+            // FIXED: Collect all active cheap providers for tier selection
+            const tierProviders = [];
+            if (this._cheapProvider?.isActive) tierProviders.push(this._cheapProvider);
+            if (this._onlineSimProvider?.isActive) tierProviders.push(this._onlineSimProvider);
+            
+            this._tierSelector = new TierOperatorSelector(tierProviders);
             this._countryCatalog = new CountryCatalog(this._cheapProvider, this._tierSelector);
 
             // FIXED: Initialize ProviderRouter with all cheap providers
@@ -112,7 +129,8 @@ class TierIntegrationService {
                 servicesIndexed: this._serviceCatalog ? 'yes' : 'no',
                 countriesIndexed: this._countryCatalog ? 'yes' : 'no',
                 tiersConfigured: Object.keys(TIER_CONFIG).length,
-                cheapProviders: cheapProviders.map(p => p.providerKey || p.name)
+                cheapProviders: cheapProviders.map(p => p.providerKey || p.name),
+                tierProviders: tierProviders.map(p => p.providerKey || p.name)
             });
 
         } catch (error) {
@@ -220,9 +238,9 @@ class TierIntegrationService {
     /**
      * Get tier baseline prices for a service (for UI display)
      * 
-     * Pricing Model (FIXED):
-     *   - displayCost = raw + $0.10 (from CheapPanelProvider.getDisplayPrice)
-     *   - finalPrice = displayCost × tier.priceMultiplier
+     * Pricing Model:
+     *   - providerCost = raw + $0.10 (base profit)
+     *   - finalPrice = providerCost × tier.priceMultiplier
      *   - Budget: 1.0× = no extra markup
      *   - Standard: 1.15× = +15% extra profit
      *   - Premium: 1.35× = +35% extra profit
@@ -246,10 +264,13 @@ class TierIntegrationService {
                     tier.key, country, service, { timeoutMs: 8000 }
                 ).catch(() => null);
 
-                // FIXED: displayCost already includes $0.10 profit from provider
-                // Just apply tier multiplier
-                const displayCost = baseline?.price || 0;
-                const finalPrice = Number((displayCost * tier.priceMultiplier).toFixed(2));
+                // Base cost: raw price + $0.10 profit
+                const rawPrice = baseline?.price || 0;
+                const providerCost = applyProfitMargin(rawPrice);
+                
+                // Final price: base cost × tier multiplier
+                // Budget: 1.0× (no extra), Standard: 1.15×, Premium: 1.35×
+                const finalPrice = Number((providerCost * tier.priceMultiplier).toFixed(2));
 
                 results.push({
                     tierKey: tier.key,
@@ -259,12 +280,14 @@ class TierIntegrationService {
                     badge: tier.badge,
                     priceMultiplier: tier.priceMultiplier,
                     baselinePrice: finalPrice,        // What user pays
-                    displayCost: displayCost,         // Raw + $0.10 (from provider)
-                    rawPrice: baseline?.price ? Number((baseline.price - 0.10).toFixed(4)) : 0, // Approximate raw
-                    baseProfit: 0.10,                 // Always $0.10
-                    extraProfit: Number((finalPrice - displayCost).toFixed(2)), // Tier markup amount
+                    providerCost: providerCost,       // Raw + $0.10 base profit
+                    rawPrice: rawPrice,              // 5SIM raw price
+                    baseProfit: PROFIT_MARGIN,        // Always $0.10
+                    extraProfit: Number(((providerCost * tier.priceMultiplier) - providerCost).toFixed(2)), // Tier markup amount
                     baselineStock: baseline?.stock || 0,
-                    operatorCount: tier.operatorCount
+                    operatorCount: tier.operatorCount,
+                    providerKey: baseline?.providerKey || null,
+                    provider: baseline?.provider || null
                 });
             } catch (error) {
                 results.push({
@@ -275,12 +298,14 @@ class TierIntegrationService {
                     badge: tier.badge,
                     priceMultiplier: tier.priceMultiplier,
                     baselinePrice: null,
-                    displayCost: null,
+                    providerCost: null,
                     rawPrice: null,
-                    baseProfit: 0.10,
+                    baseProfit: PROFIT_MARGIN,
                     extraProfit: 0,
                     baselineStock: 0,
                     operatorCount: tier.operatorCount,
+                    providerKey: null,
+                    provider: null,
                     error: error.message
                 });
             }
@@ -347,7 +372,6 @@ class TierIntegrationService {
         if (!this.isAvailable()) return { countries: [], tierInfo: null };
         return this._countryCatalog.getTopCountries(service, tierKey, limit);
     }
-
     // ═══════════════════════════════════════════════════════════════════════
     //  PURCHASE ORCHESTRATION (Step 4)
     // ═══════════════════════════════════════════════════════════════════════
