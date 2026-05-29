@@ -1,8 +1,10 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 //  services/TierOperatorSelector.js — Intelligent Tier-Based Provider Selection
 //  Core engine: selects best operator within tier using cached product data
-//  FIXED: Strict stock filtering (stock > 0 only), no null-price operators
-//  FIXED: Fallback operators verified to have actual stock before returning
+//  FIXED: Uses provider's product cache instead of per-operator API calls
+//  FIXED: Multi-provider support — queries ALL providers for best price
+//  FIXED: Pre-flight stock verification before returning selection
+//  FIXED: Strict stock filtering — no zero-stock operators in fallback
 //  Eliminates 429 errors by reading from cached catalog
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -16,16 +18,20 @@ import logger from '../utils/logger.js';
  *   - NO cross-tier fallback (enforced)
  *   - All provider names come from config only
  *   - Reads from cached product catalog (zero API calls per selection)
+ *   - Queries ALL registered providers for best price/availability
+ *   - Pre-flight stock verification to catch stale cache
  *   - Health scoring for smart selection
- *   - STRICT: Only operators with stock > 0 and valid price are considered
  */
 class TierOperatorSelector {
-    constructor(cheapPanelProvider) {
-        if (!cheapPanelProvider) {
-            throw new Error('TierOperatorSelector requires cheapPanelProvider');
+    constructor(providers = []) {
+        // Accept single provider (backward compat) or array of providers
+        this.providers = Array.isArray(providers) ? providers.filter(Boolean) : [providers].filter(Boolean);
+        
+        if (this.providers.length === 0) {
+            throw new Error('TierOperatorSelector requires at least one provider');
         }
 
-        this.provider = cheapPanelProvider;
+        this.primaryProvider = this.providers[0]; // For backward compat catalog lookups
         
         // In-memory caches
         this._priceCache = new Map();      // key: `${country}:${service}:${tierKey}` -> { operators[], timestamp }
@@ -46,13 +52,11 @@ class TierOperatorSelector {
     /**
      * Select the best operator for a given tier, country, and service
      * 
-     * STRICT: Only operators with stock >= MIN_STOCK_THRESHOLD and valid price are considered
-     * 
      * @param {string} tierKey - 'budget' | 'standard' | 'premium'
      * @param {string} country - ISO country code (e.g., 'US')
      * @param {string} service - Service name (e.g., 'WhatsApp')
      * @param {Object} options - { skipCache: boolean, timeoutMs: number }
-     * @returns {Promise<{operator: string, price: number, stock: number, score: number, displayPrice: number}>}
+     * @returns {Promise<{operator: string, price: number, stock: number, score: number, displayPrice: number, providerKey: string, provider: string}>}
      */
     async selectOperator(tierKey, country, service, options = {}) {
         const tier = TIER_CONFIG[tierKey];
@@ -65,9 +69,9 @@ class TierOperatorSelector {
             throw new Error(`TIER_EMPTY: No operators configured for tier "${tierKey}"`);
         }
 
-        logger.info('Selecting operator', { tier: tierKey, country, service, operators: operators.length });
+        logger.info('Selecting operator', { tier: tierKey, country, service, operators: operators.length, providers: this.providers.length });
 
-        // Read from cached product catalog — ZERO API calls
+        // STEP 1: Get best operator across ALL providers
         const operatorData = await this._fetchTierOperatorData(
             tierKey, country, service, operators, options.timeoutMs || 15000
         );
@@ -81,15 +85,15 @@ class TierOperatorSelector {
         );
         
         if (available.length === 0) {
-            // Log all operators for debugging
+            const bestStock = Math.max(...operatorData.map(op => op.stock), 0);
             const debugInfo = operatorData.map(op => ({
                 operator: op.operator,
                 stock: op.stock,
                 price: op.price,
-                source: op.source
+                source: op.source,
+                provider: op.provider
             }));
             
-            const bestStock = Math.max(...operatorData.map(op => op.stock), 0);
             logger.warn('No operators with sufficient stock', { 
                 tier: tierKey, country, service, 
                 totalOperators: operatorData.length,
@@ -100,7 +104,7 @@ class TierOperatorSelector {
             throw new Error(`TIER_NO_STOCK: No ${tierKey} operators have stock for ${service} in ${country}. Best available: ${bestStock}`);
         }
 
-        // Score and rank available operators
+        // STEP 2: Score and rank available operators
         const scored = available.map(op => ({
             ...op,
             score: this._calculateOperatorScore(op, tier.sortPriority, tierKey)
@@ -111,51 +115,48 @@ class TierOperatorSelector {
 
         const selected = scored[0];
         
-        // displayPrice = price (already includes $0.10 profit from provider) × tier multiplier
-        const displayPrice = selected.price ? parseFloat((selected.price * tier.priceMultiplier).toFixed(2)) : null;
+        // STEP 3: Pre-flight verification — check stock is still valid
+        const verified = await this._verifyStock(selected, country, service);
+        
+        if (!verified) {
+            // Try next best options
+            for (let i = 1; i < scored.length && i < 5; i++) {
+                const altVerified = await this._verifyStock(scored[i], country, service);
+                if (altVerified) {
+                    logger.info('Using verified fallback operator', {
+                        original: selected.operator,
+                        fallback: scored[i].operator,
+                        originalProvider: selected.provider,
+                        fallbackProvider: scored[i].provider,
+                        reason: 'original_failed_preflight'
+                    });
+                    return this._formatSelection(scored[i], tier);
+                }
+            }
+            
+            logger.error('All operators failed pre-flight verification', {
+                tier: tierKey, country, service,
+                checked: scored.length
+            });
+            throw new Error(`TIER_NO_STOCK: All operators failed stock verification for ${service} in ${country}`);
+        }
 
-        logger.info('Operator selected', {
-            tier: tierKey,
-            country,
-            service,
-            operator: selected.operator,
-            price: selected.price,
-            displayPrice,
-            stock: selected.stock,
-            score: selected.score.toFixed(2),
-            rank: 1,
-            totalConsidered: scored.length,
-            totalRejected: operatorData.length - available.length
-        });
-
-        return {
-            operator: selected.operator,
-            price: selected.price,
-            displayPrice,
-            stock: selected.stock,
-            score: selected.score,
-            allOptions: scored.slice(0, 5), // Top 5 for debugging/admin
-            tier: tierKey
-        };
+        return this._formatSelection(selected, tier);
     }
 
     /**
      * Get fallback operators within the SAME tier (ordered by preference)
-     * STRICT: Only operators with confirmed stock > 0 and valid price
      * Used when primary operator fails during purchase
+     * STRICT: Only operators with confirmed stock and valid price
      */
     async getFallbackOperators(tierKey, country, service, excludeOperator = null) {
         const tier = TIER_CONFIG[tierKey];
         if (!tier || !tier.fallbackWithinTier) {
-            logger.debug('Fallback disabled for tier', { tier: tierKey, fallbackWithinTier: tier?.fallbackWithinTier });
             return [];
         }
 
         const operators = tier.operators.filter(op => op !== excludeOperator);
-        if (operators.length === 0) {
-            logger.debug('No fallback operators after exclusion', { tier: tierKey, excluded: excludeOperator });
-            return [];
-        }
+        if (operators.length === 0) return [];
 
         const operatorData = await this._fetchTierOperatorData(
             tierKey, country, service, operators, 10000
@@ -180,7 +181,19 @@ class TierOperatorSelector {
             return [];
         }
 
-        const scored = available.map(op => ({
+        // Verify each available operator
+        const verified = [];
+        for (const op of available) {
+            const isValid = await this._verifyStock(op, country, service);
+            if (isValid) verified.push(op);
+        }
+
+        if (verified.length === 0) {
+            logger.warn('No verified fallback operators after pre-flight', { tier: tierKey, country, service });
+            return [];
+        }
+
+        const scored = verified.map(op => ({
             ...op,
             score: this._calculateOperatorScore(op, tier.sortPriority, tierKey)
         }));
@@ -194,7 +207,8 @@ class TierOperatorSelector {
             count: scored.length,
             topOperator: scored[0]?.operator,
             topPrice: scored[0]?.price,
-            topStock: scored[0]?.stock
+            topStock: scored[0]?.stock,
+            topProvider: scored[0]?.provider
         });
 
         return scored;
@@ -245,8 +259,8 @@ class TierOperatorSelector {
     // ═══════════════════════════════════════════════════════════════════════
 
     /**
-     * Fetch operator data from cached product catalog
-     * Uses caching and request deduplication — NO API calls
+     * Fetch operator data from cached product catalog across ALL providers
+     * Uses caching and request deduplication — NO API calls per selection
      */
     async _fetchTierOperatorData(tierKey, country, service, operators, timeoutMs) {
         const cacheKey = `${country}:${service}:${tierKey}`;
@@ -264,11 +278,10 @@ class TierOperatorSelector {
         // Deduplication: if another request is already fetching this, wait for it
         const pendingKey = `${cacheKey}:${operators.join(',')}`;
         if (this._pendingChecks.has(pendingKey)) {
-            logger.debug('Waiting for pending fetch', { pendingKey });
             return this._pendingChecks.get(pendingKey);
         }
 
-        const promise = this._fetchOperatorDataFromCache(country, service, operators);
+        const promise = this._fetchFromAllProviders(tierKey, country, service, operators);
         this._pendingChecks.set(pendingKey, promise);
 
         try {
@@ -290,24 +303,91 @@ class TierOperatorSelector {
     }
 
     /**
-     * Read from provider's cached product catalog — ZERO API calls
-     * Returns ALL operators with their actual stock/price from provider cache
+     * Query ALL providers in parallel and merge results
+     * Returns cheapest price per operator across all providers
      */
-    async _fetchOperatorDataFromCache(country, service, operators) {
-        const providerCountry = this.provider.mapCountry(country);
-        const providerService = this.provider.mapService(service);
+    async _fetchFromAllProviders(tierKey, country, service, operators) {
+        const allResults = [];
+        
+        for (const provider of this.providers) {
+            if (!provider.isActive) {
+                logger.debug('Skipping inactive provider', { provider: provider.name });
+                continue;
+            }
+            
+            try {
+                const providerResults = await this._fetchOperatorDataFromCache(provider, country, service, operators);
+                allResults.push(...providerResults);
+            } catch (error) {
+                logger.warn('Provider query failed', { 
+                    provider: provider.name, 
+                    error: error.message 
+                });
+            }
+        }
 
-        // Get products from provider's cache — SINGLE call, already cached
-        const products = await this.provider.getProducts();
-
-        if (!products) {
-            logger.error('Failed to fetch products for tier selection — provider cache empty');
+        if (allResults.length === 0) {
+            logger.error('All providers failed to return data');
             // Return all operators as unavailable
             return operators.map(operator => ({
                 operator,
                 price: null,
                 stock: 0,
                 responseTime: 0,
+                provider: 'none',
+                providerKey: 'none',
+                source: 'error',
+                error: 'All providers failed'
+            }));
+        }
+
+        // Group by operator, pick cheapest provider per operator
+        const byOperator = new Map();
+        for (const result of allResults) {
+            if (!result.price || result.stock <= 0) continue; // Skip invalid
+            
+            const existing = byOperator.get(result.operator);
+            if (!existing || result.price < existing.price) {
+                byOperator.set(result.operator, result);
+            }
+        }
+
+        const unique = Array.from(byOperator.values());
+        
+        // Sort by price ascending, then stock descending
+        unique.sort((a, b) => {
+            if (a.price !== b.price) return a.price - b.price;
+            return b.stock - a.stock;
+        });
+
+        logger.debug('Merged provider results', {
+            totalResults: allResults.length,
+            uniqueOperators: unique.length,
+            providersQueried: this.providers.filter(p => p.isActive).length
+        });
+
+        return unique;
+    }
+
+    /**
+     * Read from a single provider's cached product catalog — ZERO API calls
+     */
+    async _fetchOperatorDataFromCache(provider, country, service, operators) {
+        const providerCountry = provider.mapCountry(country);
+        const providerService = provider.mapService(service);
+
+        // Get products from provider's cache — SINGLE call, already cached
+        const products = await provider.getProducts();
+
+        if (!products) {
+            logger.error('Provider cache empty', { provider: provider.name, country, service });
+            return operators.map(operator => ({
+                operator,
+                price: null,
+                stock: 0,
+                responseTime: 0,
+                provider: provider.name,
+                providerKey: provider.providerKey,
                 source: 'error',
                 error: 'Provider product cache unavailable'
             }));
@@ -326,8 +406,8 @@ class TierOperatorSelector {
                 // Use provider's getDisplayPrice to add $0.10 profit consistently
                 let price = null;
                 if (rawPrice !== null && rawPrice > 0) {
-                    price = this.provider.getDisplayPrice 
-                        ? this.provider.getDisplayPrice(rawPrice)
+                    price = provider.getDisplayPrice 
+                        ? provider.getDisplayPrice(rawPrice)
                         : parseFloat(rawPrice) + 0.10;
                 }
                 
@@ -338,8 +418,10 @@ class TierOperatorSelector {
                     price: price !== null ? parseFloat(price) : null,
                     stock: parseInt(stock) || 0,
                     responseTime: 0,
+                    provider: provider.name,
+                    providerKey: provider.providerKey,
                     source: 'cached',
-                    rawPrice: rawPrice
+                    rawPrice
                 };
             }
 
@@ -349,9 +431,97 @@ class TierOperatorSelector {
                 price: null,
                 stock: 0,
                 responseTime: 0,
+                provider: provider.name,
+                providerKey: provider.providerKey,
                 source: 'unavailable'
             };
         });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  INTERNAL — Pre-flight Stock Verification
+    // ═══════════════════════════════════════════════════════════════════════
+
+
+    /**
+     * Verify operator still has stock by querying provider directly
+     * This catches stale cache issues where stock sold out
+     */
+    async _verifyStock(operatorData, country, service) {
+        if (!operatorData || operatorData.stock <= 0) {
+            logger.debug('Pre-flight reject: zero stock', { operator: operatorData?.operator });
+            return false;
+        }
+
+        // Find the provider that offered this operator
+        const provider = this.providers.find(p => p.providerKey === operatorData.providerKey);
+        if (!provider || !provider.isActive) {
+            logger.debug('Pre-flight reject: provider not found', { 
+                operator: operatorData.operator,
+                providerKey: operatorData.providerKey 
+            });
+            return false;
+        }
+
+        try {
+            // Direct availability check (bypasses cache)
+            const availability = await provider.checkAvailability(country, service);
+            
+            if (!availability.available) {
+                logger.warn('Pre-flight: service not available', {
+                    operator: operatorData.operator,
+                    provider: provider.name,
+                    country,
+                    service
+                });
+                return false;
+            }
+
+            // Check if this specific operator still has stock
+            const hasOperator = availability.operators?.includes(operatorData.operator);
+            if (!hasOperator && availability.operators) {
+                logger.warn('Pre-flight: operator no longer available', {
+                    operator: operatorData.operator,
+                    provider: provider.name,
+                    availableOperators: availability.operators
+                });
+                return false;
+            }
+
+            logger.debug('Pre-flight verified', {
+                operator: operatorData.operator,
+                provider: provider.name,
+                stock: operatorData.stock
+            });
+
+            return true;
+        } catch (error) {
+            logger.warn('Pre-flight verification failed, trusting cache', {
+                operator: operatorData.operator,
+                provider: provider.name,
+                error: error.message
+            });
+            // If verification fails, trust the cache but log it
+            return operatorData.stock > 0;
+        }
+    }
+
+    _formatSelection(operatorData, tier) {
+        const displayPrice = operatorData.price 
+            ? parseFloat((operatorData.price * tier.priceMultiplier).toFixed(2)) 
+            : null;
+
+        return {
+            operator: operatorData.operator,
+            price: operatorData.price,
+            displayPrice,
+            stock: operatorData.stock,
+            score: this._calculateOperatorScore(operatorData, tier.sortPriority, tier.key),
+            providerKey: operatorData.providerKey,
+            provider: operatorData.provider,
+            allOptions: [], // Populated by caller if needed
+            tier: tier.key
+        };
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -425,6 +595,7 @@ class TierOperatorSelector {
      */
     getStats() {
         return {
+            providers: this.providers.map(p => ({ name: p.name, key: p.providerKey, active: p.isActive })),
             cacheSize: {
                 prices: this._priceCache.size,
                 health: this._healthCache.size
@@ -437,4 +608,3 @@ class TierOperatorSelector {
 }
 
 export default TierOperatorSelector;
-                                                         
