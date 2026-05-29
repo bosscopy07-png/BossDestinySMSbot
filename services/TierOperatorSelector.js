@@ -1,8 +1,8 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 //  services/TierOperatorSelector.js — Intelligent Tier-Based Provider Selection
 //  Core engine: selects best operator within tier using cached product data
-//  FIXED: Uses provider's product cache instead of per-operator API calls
-//  FIXED: Removed double profit application — uses displayPrice as base
+//  FIXED: Strict stock filtering (stock > 0 only), no null-price operators
+//  FIXED: Fallback operators verified to have actual stock before returning
 //  Eliminates 429 errors by reading from cached catalog
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -17,9 +17,14 @@ import logger from '../utils/logger.js';
  *   - All provider names come from config only
  *   - Reads from cached product catalog (zero API calls per selection)
  *   - Health scoring for smart selection
+ *   - STRICT: Only operators with stock > 0 and valid price are considered
  */
 class TierOperatorSelector {
     constructor(cheapPanelProvider) {
+        if (!cheapPanelProvider) {
+            throw new Error('TierOperatorSelector requires cheapPanelProvider');
+        }
+
         this.provider = cheapPanelProvider;
         
         // In-memory caches
@@ -29,6 +34,9 @@ class TierOperatorSelector {
         
         // Pending request deduplication
         this._pendingChecks = new Map();   // key -> Promise
+
+        // Minimum stock threshold — operators below this are treated as unavailable
+        this.MIN_STOCK_THRESHOLD = 1;  // Must have at least 1 in stock
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -37,6 +45,8 @@ class TierOperatorSelector {
 
     /**
      * Select the best operator for a given tier, country, and service
+     * 
+     * STRICT: Only operators with stock >= MIN_STOCK_THRESHOLD and valid price are considered
      * 
      * @param {string} tierKey - 'budget' | 'standard' | 'premium'
      * @param {string} country - ISO country code (e.g., 'US')
@@ -57,20 +67,40 @@ class TierOperatorSelector {
 
         logger.info('Selecting operator', { tier: tierKey, country, service, operators: operators.length });
 
-        // FIXED: Read from cached product catalog — ZERO API calls
+        // Read from cached product catalog — ZERO API calls
         const operatorData = await this._fetchTierOperatorData(
             tierKey, country, service, operators, options.timeoutMs || 15000
         );
 
-        // Step 2: Filter operators with sufficient stock
-        const available = operatorData.filter(op => op.stock >= tier.minStock);
+        // STRICT FILTER: Only operators with stock >= threshold AND valid price
+        const available = operatorData.filter(op => 
+            op.stock >= this.MIN_STOCK_THRESHOLD && 
+            op.price !== null && 
+            op.price !== undefined &&
+            op.price > 0
+        );
         
         if (available.length === 0) {
-            const bestStock = Math.max(...operatorData.map(op => op.stock));
+            // Log all operators for debugging
+            const debugInfo = operatorData.map(op => ({
+                operator: op.operator,
+                stock: op.stock,
+                price: op.price,
+                source: op.source
+            }));
+            
+            const bestStock = Math.max(...operatorData.map(op => op.stock), 0);
+            logger.warn('No operators with sufficient stock', { 
+                tier: tierKey, country, service, 
+                totalOperators: operatorData.length,
+                operatorsWithStock: operatorData.filter(op => op.stock > 0).length,
+                debugInfo
+            });
+            
             throw new Error(`TIER_NO_STOCK: No ${tierKey} operators have stock for ${service} in ${country}. Best available: ${bestStock}`);
         }
 
-        // Step 3: Score and rank available operators
+        // Score and rank available operators
         const scored = available.map(op => ({
             ...op,
             score: this._calculateOperatorScore(op, tier.sortPriority, tierKey)
@@ -81,8 +111,7 @@ class TierOperatorSelector {
 
         const selected = scored[0];
         
-        // FIXED: displayPrice = price (already includes $0.10 profit from CheapPanelProvider)
-        // Then apply tier multiplier ONLY
+        // displayPrice = price (already includes $0.10 profit from provider) × tier multiplier
         const displayPrice = selected.price ? parseFloat((selected.price * tier.priceMultiplier).toFixed(2)) : null;
 
         logger.info('Operator selected', {
@@ -95,7 +124,8 @@ class TierOperatorSelector {
             stock: selected.stock,
             score: selected.score.toFixed(2),
             rank: 1,
-            totalConsidered: scored.length
+            totalConsidered: scored.length,
+            totalRejected: operatorData.length - available.length
         });
 
         return {
@@ -111,28 +141,62 @@ class TierOperatorSelector {
 
     /**
      * Get fallback operators within the SAME tier (ordered by preference)
+     * STRICT: Only operators with confirmed stock > 0 and valid price
      * Used when primary operator fails during purchase
      */
     async getFallbackOperators(tierKey, country, service, excludeOperator = null) {
         const tier = TIER_CONFIG[tierKey];
         if (!tier || !tier.fallbackWithinTier) {
+            logger.debug('Fallback disabled for tier', { tier: tierKey, fallbackWithinTier: tier?.fallbackWithinTier });
             return [];
         }
 
         const operators = tier.operators.filter(op => op !== excludeOperator);
-        if (operators.length === 0) return [];
+        if (operators.length === 0) {
+            logger.debug('No fallback operators after exclusion', { tier: tierKey, excluded: excludeOperator });
+            return [];
+        }
 
         const operatorData = await this._fetchTierOperatorData(
             tierKey, country, service, operators, 10000
         );
 
-        const available = operatorData.filter(op => op.stock >= tier.minStock);
+        // STRICT FILTER: Only operators with stock > 0 AND valid price
+        const available = operatorData.filter(op => 
+            op.stock >= this.MIN_STOCK_THRESHOLD && 
+            op.price !== null && 
+            op.price !== undefined &&
+            op.price > 0
+        );
+
+        if (available.length === 0) {
+            logger.warn('No fallback operators with stock', { 
+                tier: tierKey, country, service, 
+                excluded: excludeOperator,
+                totalChecked: operatorData.length,
+                zeroStock: operatorData.filter(op => op.stock === 0).length,
+                noPrice: operatorData.filter(op => op.price === null).length
+            });
+            return [];
+        }
+
         const scored = available.map(op => ({
             ...op,
             score: this._calculateOperatorScore(op, tier.sortPriority, tierKey)
         }));
 
         scored.sort((a, b) => b.score - a.score);
+        
+        logger.info('Fallback operators found', {
+            tier: tierKey,
+            country,
+            service,
+            count: scored.length,
+            topOperator: scored[0]?.operator,
+            topPrice: scored[0]?.price,
+            topStock: scored[0]?.stock
+        });
+
         return scored;
     }
 
@@ -200,6 +264,7 @@ class TierOperatorSelector {
         // Deduplication: if another request is already fetching this, wait for it
         const pendingKey = `${cacheKey}:${operators.join(',')}`;
         if (this._pendingChecks.has(pendingKey)) {
+            logger.debug('Waiting for pending fetch', { pendingKey });
             return this._pendingChecks.get(pendingKey);
         }
 
@@ -225,8 +290,8 @@ class TierOperatorSelector {
     }
 
     /**
-     * FIXED: Read from provider's cached product catalog — ZERO API calls
-     * Previously made individual API calls per operator causing 429s
+     * Read from provider's cached product catalog — ZERO API calls
+     * Returns ALL operators with their actual stock/price from provider cache
      */
     async _fetchOperatorDataFromCache(country, service, operators) {
         const providerCountry = this.provider.mapCountry(country);
@@ -258,10 +323,13 @@ class TierOperatorSelector {
                 const rawPrice = opData.cost ?? opData.price ?? null;
                 const stock = opData.count ?? 0;
                 
-                // FIXED: Use provider's getDisplayPrice to add $0.10 profit consistently
-                const price = rawPrice !== null 
-                    ? (this.provider.getDisplayPrice ? this.provider.getDisplayPrice(rawPrice) : parseFloat(rawPrice) + 0.10)
-                    : null;
+                // Use provider's getDisplayPrice to add $0.10 profit consistently
+                let price = null;
+                if (rawPrice !== null && rawPrice > 0) {
+                    price = this.provider.getDisplayPrice 
+                        ? this.provider.getDisplayPrice(rawPrice)
+                        : parseFloat(rawPrice) + 0.10;
+                }
                 
                 this._updateOperatorStats(operator, true, 0);
 
@@ -270,7 +338,8 @@ class TierOperatorSelector {
                     price: price !== null ? parseFloat(price) : null,
                     stock: parseInt(stock) || 0,
                     responseTime: 0,
-                    source: 'cached'
+                    source: 'cached',
+                    rawPrice: rawPrice
                 };
             }
 
@@ -361,10 +430,11 @@ class TierOperatorSelector {
                 health: this._healthCache.size
             },
             operatorStats: Object.fromEntries(this._operatorStats),
-            pendingChecks: this._pendingChecks.size
+            pendingChecks: this._pendingChecks.size,
+            minStockThreshold: this.MIN_STOCK_THRESHOLD
         };
     }
 }
 
 export default TierOperatorSelector;
-                
+                                                         
