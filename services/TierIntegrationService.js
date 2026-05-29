@@ -7,24 +7,16 @@
 import { TIER_CONFIG, CACHE_TTL, getTierConfig } from '../config/tierConfig.js';
 import logger from '../utils/logger.js';
 
-const PROFIT_MARGIN = 0.10; // $0.10 base profit per number
-
-/**
- * Apply base profit margin to a raw provider price
- */
-function applyProfitMargin(rawPrice) {
-    if (rawPrice === null || rawPrice === undefined || isNaN(rawPrice)) return null;
-    return parseFloat((rawPrice + PROFIT_MARGIN).toFixed(4));
-}
-
 /**
  * TierIntegrationService — Central orchestrator for the 3-tier CHEAP flow
  * 
- * Pricing Model:
- *   - Base $0.10 profit on EVERY tier
- *   - Budget:  no extra markup (1.0×) = raw + $0.10
- *   - Standard: +15% markup (1.15×) = (raw + $0.10) × 1.15
- *   - Premium: +35% markup (1.35×) = (raw + $0.10) × 1.35
+ * Pricing Model (FIXED):
+ *   - rawPrice      = provider's base cost for the number
+ *   - displayCost   = rawPrice + BASE_PROFIT ($0.10) — set by CheapPanelProvider.getDisplayPrice
+ *   - finalPrice    = displayCost × tier.priceMultiplier
+ *   - Budget:   1.00× = no extra markup (profit = $0.10)
+ *   - Standard: 1.15× = +15% extra profit
+ *   - Premium:  1.35× = +35% extra profit
  * 
  * Responsibilities:
  *   - Initializes and wires all tier components
@@ -34,6 +26,11 @@ function applyProfitMargin(rawPrice) {
  *   - Falls back to legacy flow if tier system unavailable
  */
 class TierIntegrationService {
+    // Constants
+    static BASE_PROFIT = 0.10;
+    static BASELINE_CACHE_TTL = 60 * 1000; // 1 minute
+    static FALLBACK_MAX_ATTEMPTS = 3;
+
     constructor(smsProviderManager, options = {}) {
         this.providerManager = smsProviderManager;
         
@@ -47,7 +44,6 @@ class TierIntegrationService {
         
         // Cache for tier baseline prices (used in tier selection UI)
         this._baselinePriceCache = new Map();
-        this._baselineCacheTtl = 60 * 1000; // 1 minute
         
         // Feature flags
         this._enabled = options.enableTierFlow !== false;
@@ -104,10 +100,10 @@ class TierIntegrationService {
             const { default: CountryCatalog } = await import('./CountryCatalog.js');
             const { default: ProviderRouter } = await import('./sms/ProviderRouter.js');
 
-            // FIXED: Pass cheapPanelProvider to ServiceCatalog for dynamic catalog loading
+            // Initialize ServiceCatalog with primary cheap provider
             this._serviceCatalog = new ServiceCatalog(this._cheapProvider);
             
-            // FIXED: Collect all active cheap providers for tier selection
+            // Collect all active cheap providers for tier selection
             const tierProviders = [];
             if (this._cheapProvider?.isActive) tierProviders.push(this._cheapProvider);
             if (this._onlineSimProvider?.isActive) tierProviders.push(this._onlineSimProvider);
@@ -115,19 +111,14 @@ class TierIntegrationService {
             this._tierSelector = new TierOperatorSelector(tierProviders);
             this._countryCatalog = new CountryCatalog(this._cheapProvider, this._tierSelector);
 
-            // FIXED: Initialize ProviderRouter with all cheap providers
-            const cheapProviders = [];
-            const cheapPanel = this.providerManager?.getProvider('CHEAP_PANEL');
-            const onlineSim = this.providerManager?.getProvider('ONLINE_SIM');
-            
-            if (cheapPanel?.isActive) cheapProviders.push(cheapPanel);
-            if (onlineSim?.isActive) cheapProviders.push(onlineSim);
+            // Initialize ProviderRouter with all active cheap providers
+            const cheapProviders = tierProviders.filter(p => p?.isActive);
             
             this._providerRouter = new ProviderRouter(cheapProviders);
 
             logger.info('TierIntegrationService initialized successfully', {
-                servicesIndexed: this._serviceCatalog ? 'yes' : 'no',
-                countriesIndexed: this._countryCatalog ? 'yes' : 'no',
+                servicesIndexed: !!this._serviceCatalog,
+                countriesIndexed: !!this._countryCatalog,
                 tiersConfigured: Object.keys(TIER_CONFIG).length,
                 cheapProviders: cheapProviders.map(p => p.providerKey || p.name),
                 tierProviders: tierProviders.map(p => p.providerKey || p.name)
@@ -160,7 +151,6 @@ class TierIntegrationService {
 
     /**
      * Get popular services for initial display
-     * FIXED: Now async due to dynamic catalog loading
      */
     async getPopularServices() {
         if (!this.isAvailable()) return null;
@@ -169,7 +159,6 @@ class TierIntegrationService {
 
     /**
      * Search services by query
-     * FIXED: Now async due to dynamic catalog loading
      */
     async searchServices(query, limit = 30) {
         if (!this.isAvailable()) return null;
@@ -178,7 +167,6 @@ class TierIntegrationService {
 
     /**
      * Get services by category
-     * FIXED: Now async due to dynamic catalog loading
      */
     async getServicesByCategory(category) {
         if (!this.isAvailable()) return null;
@@ -187,7 +175,6 @@ class TierIntegrationService {
 
     /**
      * Get all categories with counts
-     * FIXED: Now async due to dynamic catalog loading
      */
     async getCategories() {
         if (!this.isAvailable()) return null;
@@ -196,7 +183,6 @@ class TierIntegrationService {
 
     /**
      * Get paginated service list
-     * FIXED: Now async due to dynamic catalog loading
      */
     async getServicesPage(page, perPage, filter = null) {
         if (!this.isAvailable()) return null;
@@ -205,13 +191,10 @@ class TierIntegrationService {
 
     /**
      * Validate service exists
-     * FIXED: Removed hardcoded SERVICES fallback. Dynamic catalog is the only source of truth.
+     * Dynamic catalog is the only source of truth — no hardcoded fallback.
      */
     async isValidService(serviceName) {
-        if (!this.isAvailable()) {
-            // No fallback to hardcoded list — dynamic catalog is the only source of truth
-            return false;
-        }
+        if (!this.isAvailable()) return false;
         return this._serviceCatalog.hasService(serviceName);
     }
 
@@ -239,11 +222,9 @@ class TierIntegrationService {
      * Get tier baseline prices for a service (for UI display)
      * 
      * Pricing Model:
-     *   - providerCost = raw + $0.10 (base profit)
-     *   - finalPrice = providerCost × tier.priceMultiplier
-     *   - Budget: 1.0× = no extra markup
-     *   - Standard: 1.15× = +15% extra profit
-     *   - Premium: 1.35× = +35% extra profit
+     *   - rawPrice    = provider's base cost
+     *   - displayCost = rawPrice + BASE_PROFIT ($0.10)
+     *   - finalPrice  = displayCost × tier.priceMultiplier
      */
     async getTierBaselinePrices(service, country = 'US') {
         if (!this.isAvailable()) return null;
@@ -251,7 +232,7 @@ class TierIntegrationService {
         const cacheKey = `${service}:${country}`;
         const cached = this._baselinePriceCache.get(cacheKey);
         
-        if (cached && (Date.now() - cached.timestamp) < this._baselineCacheTtl) {
+        if (cached && (Date.now() - cached.timestamp) < TierIntegrationService.BASELINE_CACHE_TTL) {
             return cached.data;
         }
 
@@ -264,13 +245,10 @@ class TierIntegrationService {
                     tier.key, country, service, { timeoutMs: 8000 }
                 ).catch(() => null);
 
-                // Base cost: raw price + $0.10 profit
                 const rawPrice = baseline?.price || 0;
-                const providerCost = applyProfitMargin(rawPrice);
-                
-                // Final price: base cost × tier multiplier
-                // Budget: 1.0× (no extra), Standard: 1.15×, Premium: 1.35×
-                const finalPrice = Number((providerCost * tier.priceMultiplier).toFixed(2));
+                const displayCost = Number((rawPrice + TierIntegrationService.BASE_PROFIT).toFixed(4));
+                const finalPrice = Number((displayCost * tier.priceMultiplier).toFixed(2));
+                const extraProfit = Number((finalPrice - displayCost).toFixed(2));
 
                 results.push({
                     tierKey: tier.key,
@@ -280,10 +258,10 @@ class TierIntegrationService {
                     badge: tier.badge,
                     priceMultiplier: tier.priceMultiplier,
                     baselinePrice: finalPrice,        // What user pays
-                    providerCost: providerCost,       // Raw + $0.10 base profit
-                    rawPrice: rawPrice,              // 5SIM raw price
-                    baseProfit: PROFIT_MARGIN,        // Always $0.10
-                    extraProfit: Number(((providerCost * tier.priceMultiplier) - providerCost).toFixed(2)), // Tier markup amount
+                    displayCost: displayCost,         // Raw + $0.10 base profit
+                    rawPrice: rawPrice,               // Provider raw cost
+                    baseProfit: TierIntegrationService.BASE_PROFIT,
+                    extraProfit: extraProfit,         // Tier markup amount
                     baselineStock: baseline?.stock || 0,
                     operatorCount: tier.operatorCount,
                     providerKey: baseline?.providerKey || null,
@@ -298,9 +276,9 @@ class TierIntegrationService {
                     badge: tier.badge,
                     priceMultiplier: tier.priceMultiplier,
                     baselinePrice: null,
-                    providerCost: null,
+                    displayCost: null,
                     rawPrice: null,
-                    baseProfit: PROFIT_MARGIN,
+                    baseProfit: TierIntegrationService.BASE_PROFIT,
                     extraProfit: 0,
                     baselineStock: 0,
                     operatorCount: tier.operatorCount,
@@ -323,7 +301,9 @@ class TierIntegrationService {
      * Check if a tier has ANY stock for service/country (lightweight)
      */
     async hasTierStock(tierKey, country, service) {
-        if (!this.isAvailable()) return { available: false, reason: 'TIER_SYSTEM_UNAVAILABLE' };
+        if (!this.isAvailable()) {
+            return { available: false, reason: 'TIER_SYSTEM_UNAVAILABLE' };
+        }
         return this._tierSelector.hasTierStock(tierKey, country, service);
     }
 
@@ -372,6 +352,7 @@ class TierIntegrationService {
         if (!this.isAvailable()) return { countries: [], tierInfo: null };
         return this._countryCatalog.getTopCountries(service, tierKey, limit);
     }
+
     // ═══════════════════════════════════════════════════════════════════════
     //  PURCHASE ORCHESTRATION (Step 4)
     // ═══════════════════════════════════════════════════════════════════════
@@ -379,18 +360,16 @@ class TierIntegrationService {
     /**
      * Select best operator and purchase number
      * 
-     * Pricing Model (FIXED):
-     *   - displayCost = raw + $0.10 (from provider)
-     *   - finalPrice = displayCost × tier.priceMultiplier
+     * Pricing Model:
+     *   - displayCost = raw + BASE_PROFIT ($0.10) — from provider
+     *   - finalPrice  = displayCost × tier.priceMultiplier
      * 
-     * FIXED: Uses ProviderRouter for multi-provider support
-     * FIXED: Validates operator selection before purchase
-     * FIXED: Logs operator mismatch
-     * FIXED: Ensures exact selected operator is passed to provider
-     * FIXED: Excludes failed operator from fallback
+     * Uses ProviderRouter for multi-provider support.
+     * Validates operator selection before purchase.
+     * Excludes failed operator from fallback.
      */
     
-                async purchaseNumber(tierKey, country, service, options = {}) {
+        async purchaseNumber(tierKey, country, service, options = {}) {
         if (!this.isAvailable()) {
             return { 
                 success: false, 
@@ -402,9 +381,11 @@ class TierIntegrationService {
         const startTime = Date.now();
         this._metrics.tierSelections++;
 
+        let selection = null;
+
         try {
             // Step 1: Select best operator
-            const selection = await this._tierSelector.selectOperator(
+            selection = await this._tierSelector.selectOperator(
                 tierKey, country, service, { 
                     timeoutMs: options.timeoutMs || 15000,
                     skipCache: options.skipCache || false
@@ -425,7 +406,7 @@ class TierIntegrationService {
                 operator: selection.operator
             };
 
-            // VALIDATION: Ensure selected operator is used
+            // Validation: Ensure selected operator is used
             if (selection.operator !== purchasePayload.operator) {
                 logger.error('OPERATOR MISMATCH DETECTED', {
                     selectedOperator: selection.operator,
@@ -444,12 +425,11 @@ class TierIntegrationService {
                 expectedDisplayPrice: selection.displayPrice
             });
 
-            // FIXED: Use ProviderRouter for multi-provider purchase
-            // ProviderRouter selects the cheapest provider with stock
+            // Step 3: Execute purchase via ProviderRouter or direct provider
             let purchaseResult;
             let usedProviderKey = 'CHEAP_PANEL';
             
-            if (this._providerRouter && this._providerRouter.hasAvailableProvider()) {
+            if (this._providerRouter?.hasAvailableProvider()) {
                 purchaseResult = await this._providerRouter.getNumber(
                     purchasePayload.country, 
                     purchasePayload.service, 
@@ -457,7 +437,6 @@ class TierIntegrationService {
                 );
                 usedProviderKey = purchaseResult.routedProvider || 'CHEAP_PANEL';
             } else {
-                // Fallback to direct CheapPanelProvider
                 purchaseResult = await this._cheapProvider.getNumber(
                     purchasePayload.country, 
                     purchasePayload.service, 
@@ -467,7 +446,7 @@ class TierIntegrationService {
 
             this._metrics.tierPurchases++;
 
-            // VALIDATION: Verify purchased operator matches selected
+            // Validation: Verify purchased operator matches selected
             if (purchaseResult.operator && purchaseResult.operator !== selection.operator) {
                 logger.warn('Provider returned different operator than requested', {
                     requestedOperator: selection.operator,
@@ -476,11 +455,11 @@ class TierIntegrationService {
                 });
             }
 
-            // FIXED: Pricing — displayCost already includes $0.10 from provider
-            // Just apply tier multiplier
+            // Calculate pricing
             const displayCost = purchaseResult.displayCost || selection.price || 0;
             const tier = getTierConfig(tierKey);
             const finalPrice = Number((displayCost * tier.priceMultiplier).toFixed(2));
+            const extraProfit = Number((finalPrice - displayCost).toFixed(2));
 
             logger.info('Tier purchase successful', {
                 tier: tierKey,
@@ -491,8 +470,8 @@ class TierIntegrationService {
                 provider: usedProviderKey,
                 displayCost,
                 finalPrice,
-                baseProfit: 0.10,
-                extraProfit: Number((finalPrice - displayCost).toFixed(2)),
+                baseProfit: TierIntegrationService.BASE_PROFIT,
+                extraProfit,
                 duration: Date.now() - startTime
             });
 
@@ -503,12 +482,12 @@ class TierIntegrationService {
                 operator: selection.operator,
                 purchasedOperator: purchaseResult.operator || selection.operator,
                 routedProvider: usedProviderKey,
-                price: finalPrice,              // User pays this
-                displayPrice: finalPrice,       // Same as price
-                displayCost: displayCost,       // Raw + $0.10
-                rawPrice: purchaseResult.cost || 0, // Provider raw cost
-                baseProfit: 0.10,               // Always $0.10
-                extraProfit: Number((finalPrice - displayCost).toFixed(2)), // Tier markup
+                price: finalPrice,
+                displayPrice: finalPrice,
+                displayCost: displayCost,
+                rawPrice: purchaseResult.cost || 0,
+                baseProfit: TierIntegrationService.BASE_PROFIT,
+                extraProfit: extraProfit,
                 stock: selection.stock,
                 score: selection.score,
                 tier: tierKey,
@@ -519,11 +498,13 @@ class TierIntegrationService {
         } catch (error) {
             this._metrics.errors++;
 
-            const shouldFallback = error.message?.includes('NO_NUMBERS') || 
-                 error.message?.includes('NOT_AVAILABLE') ||
-                 error.message?.includes('TIMEOUT') ||
-                 error.message?.includes('INVALID_RESPONSE') ||
-                 error.message?.includes('PROVIDER_ERROR');
+            const shouldFallback = [
+                'NO_NUMBERS',
+                'NOT_AVAILABLE',
+                'TIMEOUT',
+                'INVALID_RESPONSE',
+                'PROVIDER_ERROR'
+            ].some(code => error.message?.includes(code));
 
             if (options.allowFallback !== false && shouldFallback) {
                 logger.warn('Primary operator failed, attempting fallback', {
@@ -533,7 +514,7 @@ class TierIntegrationService {
                     error: error.message,
                     failedOperator: selection?.operator
                 });
-                // FIXED: Pass failed operator to exclude from fallback
+
                 return this._attemptFallbackPurchase(
                     tierKey, country, service, options, error, selection?.operator
                 );
@@ -556,18 +537,17 @@ class TierIntegrationService {
 
     /**
      * Attempt fallback purchase with next-best operator in same tier
-     * FIXED: Excludes the failed operator from fallback candidates
+     * Excludes the failed operator from fallback candidates.
      */
     async _attemptFallbackPurchase(tierKey, country, service, options, originalError, failedOperator = null) {
         this._metrics.tierFallbacks++;
 
         try {
-            // FIXED: Pass failedOperator to exclude from fallback candidates
             const fallbackOps = await this._tierSelector.getFallbackOperators(
                 tierKey, country, service, failedOperator
             );
 
-            if (!fallbackOps || fallbackOps.length === 0) {
+            if (!fallbackOps?.length) {
                 return {
                     success: false,
                     error: `TIER_NO_STOCK: No operators available in ${tierKey} tier`,
@@ -576,13 +556,13 @@ class TierIntegrationService {
                 };
             }
 
-            // Try each fallback operator
-            for (const fallback of fallbackOps.slice(0, 3)) {
+            // Try each fallback operator (up to max attempts)
+            for (const fallback of fallbackOps.slice(0, TierIntegrationService.FALLBACK_MAX_ATTEMPTS)) {
                 try {
                     let purchaseResult;
                     let usedProviderKey = 'CHEAP_PANEL';
 
-                    if (this._providerRouter && this._providerRouter.hasAvailableProvider()) {
+                    if (this._providerRouter?.hasAvailableProvider()) {
                         purchaseResult = await this._providerRouter.getNumber(
                             country, service, fallback.operator
                         );
@@ -595,10 +575,11 @@ class TierIntegrationService {
 
                     this._metrics.tierPurchases++;
 
-                    // FIXED: Pricing — same model as main purchase
+                    // Calculate pricing
                     const displayCost = purchaseResult.displayCost || fallback.price || 0;
                     const tier = getTierConfig(tierKey);
                     const finalPrice = Number((displayCost * tier.priceMultiplier).toFixed(2));
+                    const extraProfit = Number((finalPrice - displayCost).toFixed(2));
 
                     logger.info('Fallback purchase successful', {
                         tier: tierKey,
@@ -610,8 +591,8 @@ class TierIntegrationService {
                         score: fallback.score,
                         displayCost,
                         finalPrice,
-                        baseProfit: 0.10,
-                        extraProfit: Number((finalPrice - displayCost).toFixed(2))
+                        baseProfit: TierIntegrationService.BASE_PROFIT,
+                        extraProfit
                     });
 
                     return {
@@ -624,8 +605,8 @@ class TierIntegrationService {
                         displayPrice: finalPrice,
                         displayCost: displayCost,
                         rawPrice: purchaseResult.cost || 0,
-                        baseProfit: 0.10,
-                        extraProfit: Number((finalPrice - displayCost).toFixed(2)),
+                        baseProfit: TierIntegrationService.BASE_PROFIT,
+                        extraProfit: extraProfit,
                         stock: fallback.stock,
                         score: fallback.score,
                         tier: tierKey,
@@ -706,18 +687,24 @@ class TierIntegrationService {
     _normalizeError(error) {
         const message = error?.message || error?.toString() || 'Unknown error';
         
-        if (message.includes('TIER_NO_STOCK')) return 'NO_NUMBERS';
-        if (message.includes('NO_BALANCE')) return 'NO_BALANCE';
-        if (message.includes('INSUFFICIENT_FUNDS')) return 'NO_BALANCE';
-        if (message.includes('NOT_AVAILABLE')) return 'NOT_AVAILABLE';
-        if (message.includes('TIMEOUT')) return 'TIMEOUT';
-        if (message.includes('INVALID_TIER')) return 'INVALID_TIER';
-        if (message.includes('TIER_EMPTY')) return 'TIER_EMPTY';
-        if (message.includes('BAD_COUNTRY')) return 'BAD_COUNTRY';
-        if (message.includes('BAD_SERVICE')) return 'BAD_SERVICE';
-        if (message.includes('NO_NUMBERS')) return 'NO_NUMBERS';
-        if (message.includes('INVALID_RESPONSE')) return 'NOT_AVAILABLE';
-        if (message.includes('PROVIDER_ERROR')) return 'NOT_AVAILABLE';
+        const errorMap = {
+            'TIER_NO_STOCK': 'NO_NUMBERS',
+            'NO_BALANCE': 'NO_BALANCE',
+            'INSUFFICIENT_FUNDS': 'NO_BALANCE',
+            'NOT_AVAILABLE': 'NOT_AVAILABLE',
+            'TIMEOUT': 'TIMEOUT',
+            'INVALID_TIER': 'INVALID_TIER',
+            'TIER_EMPTY': 'TIER_EMPTY',
+            'BAD_COUNTRY': 'BAD_COUNTRY',
+            'BAD_SERVICE': 'BAD_SERVICE',
+            'NO_NUMBERS': 'NO_NUMBERS',
+            'INVALID_RESPONSE': 'NOT_AVAILABLE',
+            'PROVIDER_ERROR': 'NOT_AVAILABLE'
+        };
+
+        for (const [key, value] of Object.entries(errorMap)) {
+            if (message.includes(key)) return value;
+        }
         
         return 'PROVIDER_ERROR';
     }
