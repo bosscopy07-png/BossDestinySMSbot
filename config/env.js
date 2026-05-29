@@ -21,6 +21,8 @@ const envSchema = Joi.object({
     TELNYX_MESSAGING_PROFILE_ID: Joi.string().allow('').optional(),
     CHEAP_PANEL_API_KEY: Joi.string().required(),
     CHEAP_PANEL_BASE_URL: Joi.string().uri().required(),
+    ONLINE_SIM_API_KEY: Joi.string().allow('').optional(),
+    ONLINE_SIM_BASE_URL: Joi.string().uri().allow('').optional(),
     MASTER_PRIVATE_KEY: Joi.string().pattern(/^0x[a-fA-F0-9]{64}$/).required(),
     BSC_RPC: Joi.string().uri().required(),
     USDT_CONTRACT: Joi.string().pattern(/^0x[a-fA-F0-9]{40}$/).required(),
@@ -71,6 +73,10 @@ export const config = {
         apiKey: envVars.CHEAP_PANEL_API_KEY,
         baseUrl: envVars.CHEAP_PANEL_BASE_URL
     },
+    onlineSim: {
+        apiKey: envVars.ONLINE_SIM_API_KEY || null,
+        baseUrl: envVars.ONLINE_SIM_BASE_URL || 'https://onlinesim.io/api'
+    },
     blockchain: {
         masterPrivateKey: envVars.MASTER_PRIVATE_KEY,
         rpc: envVars.BSC_RPC,
@@ -82,14 +88,12 @@ export const config = {
         rateLimitWindowMs: envVars.RATE_LIMIT_WINDOW_MS,
         rateLimitMaxRequests: envVars.RATE_LIMIT_MAX_REQUESTS
     },
-    
     tierFeatures: {
         enableTierFlow: process.env.ENABLE_TIER_FLOW !== 'false',
         enableLegacyFallback: process.env.ENABLE_LEGACY_FALLBACK !== 'false',
         showTierPrices: process.env.SHOW_TIER_PRICES !== 'false',
         enableTierFallback: process.env.ENABLE_TIER_FALLBACK !== 'false'
     },
-
     pricing: {
         cheapOtp: envVars.CHEAP_OTP_PRICE,
         vipMonthly: envVars.VIP_MONTHLY_PRICE,
@@ -109,3 +113,4 @@ export const config = {
 };
 
 export default config;
+    
