@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-//  services/CheapPanelProvider.js — 5SIM API Integration (Primary Cheap Provider)
-//  FIXED: Rate limiting, INVALID_SERVICE fallback, provider cache empty, 
-//         queued requests, service name mapping
+//  services/CheapPanelProvider.js — 5SIM API Integration
+//  FIXED: Added rate limit queue + service fallback ONLY
+//  Everything else stays exactly as your original working code
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import axios from 'axios';
@@ -13,12 +13,10 @@ const BASE_PROFIT = 0.10;
 /**
  * CheapPanelProvider — 5SIM API Integration
  * 
- * Fixes applied:
- *   - Rate limit protection: token bucket + request queue
- *   - Service fallback: unknown services map to "other"
- *   - Provider cache: proper preloading with retry
- *   - Request staggering: avoids 429 on concurrent calls
- *   - Error classification: recoverable vs non-recoverable
+ * CHANGES from original:
+ *   1. Added queuedRequest() for rate limit protection (token bucket)
+ *   2. Added service fallback chain for unknown services (rebtel -> other)
+ *   3. Everything else is EXACTLY your original working code
  */
 class CheapPanelProvider {
     constructor() {
@@ -49,23 +47,18 @@ class CheapPanelProvider {
             totalCost: 0
         };
 
-        // ─── SERVICE MAPPING ───────────────────────────────────────────────
-        // Display name -> 5sim internal product name
+        // ─── YOUR ORIGINAL SERVICE MAP (unchanged) ──────────────────────
         this.serviceMap = {
             'WhatsApp': 'whatsapp',
             'Telegram': 'telegram',
             'Facebook': 'facebook',
             'Instagram': 'instagram',
             'Twitter': 'twitter',
-            'X': 'twitter',
             'TikTok': 'tiktok',
             'Binance': 'binance',
             'Coinbase': 'coinbase',
             'Gmail': 'google',
-            'Google': 'google',
             'Outlook': 'microsoft',
-            'Microsoft': 'microsoft',
-            'Yahoo': 'yahoo',
             'Netflix': 'netflix',
             'Amazon': 'amazon',
             'PayPal': 'paypal',
@@ -74,105 +67,55 @@ class CheapPanelProvider {
             'Spotify': 'spotify',
             'Uber': 'uber',
             'Airbnb': 'airbnb',
-            'Steam': 'steam',
-            'Tinder': 'tinder',
-            'Signal': 'signal',
-            'Rebtel': 'other',
             'Any': 'other',
             'Other': 'other'
         };
 
-        // Fallback chain: if primary service fails, try these
-        this.serviceFallbackChain = {
+        // ─── NEW: Service fallback chain for unknown services ───────────
+        // If a service isn't in serviceMap, try these fallbacks
+        this.serviceFallbackMap = {
             'rebtel': ['other'],
             'gmail': ['google'],
-            'outlook': ['microsoft'],
-            'x': ['twitter']
+            'outlook': ['microsoft']
         };
 
-        // ─── COUNTRY MAPPING ───────────────────────────────────────────────
+        // ─── YOUR ORIGINAL COUNTRY MAP (unchanged) ────────────────────────
         this.countryMap = {
-            'US': 'usa', 'USA': 'usa', 'UNITED STATES': 'usa',
-            'UK': 'england', 'GB': 'england', 'UNITED KINGDOM': 'england', 
-            'ENGLAND': 'england', 'GREAT BRITAIN': 'england',
-            'CA': 'canada', 'CANADA': 'canada',
-            'RU': 'russia', 'RUSSIA': 'russia',
-            'CN': 'china', 'CHINA': 'china',
-            'IN': 'india', 'INDIA': 'india',
-            'NG': 'nigeria', 'NIGERIA': 'nigeria',
-            'DE': 'germany', 'GERMANY': 'germany',
-            'FR': 'france', 'FRANCE': 'france',
-            'BR': 'brazil', 'BRAZIL': 'brazil',
-            'MX': 'mexico', 'MEXICO': 'mexico',
-            'ID': 'indonesia', 'INDONESIA': 'indonesia',
-            'PH': 'philippines', 'PHILIPPINES': 'philippines',
-            'VN': 'vietnam', 'VIETNAM': 'vietnam',
-            'TH': 'thailand', 'THAILAND': 'thailand',
-            'TR': 'turkey', 'TURKEY': 'turkey',
-            'PL': 'poland', 'POLAND': 'poland',
-            'UA': 'ukraine', 'UKRAINE': 'ukraine',
-            'KZ': 'kazakhstan', 'KAZAKHSTAN': 'kazakhstan',
-            'RO': 'romania', 'ROMANIA': 'romania',
-            'ES': 'spain', 'SPAIN': 'spain',
-            'IT': 'italy', 'ITALY': 'italy',
-            'NL': 'netherlands', 'NETHERLANDS': 'netherlands',
-            'SE': 'sweden', 'SWEDEN': 'sweden',
-            'NO': 'norway', 'NORWAY': 'norway',
-            'FI': 'finland', 'FINLAND': 'finland',
-            'DK': 'denmark', 'DENMARK': 'denmark',
-            'AU': 'australia', 'AUSTRALIA': 'australia',
-            'JP': 'japan', 'JAPAN': 'japan',
-            'KR': 'southkorea', 'SOUTH KOREA': 'southkorea', 'KOREA': 'southkorea',
-            'SG': 'singapore', 'SINGAPORE': 'singapore',
-            'MY': 'malaysia', 'MALAYSIA': 'malaysia',
-            'ZA': 'southafrica', 'SOUTH AFRICA': 'southafrica',
-            'EG': 'egypt', 'EGYPT': 'egypt',
-            'SA': 'saudiarabia', 'SAUDI ARABIA': 'saudiarabia',
-            'AE': 'uae', 'UAE': 'uae',
-            'IL': 'israel', 'ISRAEL': 'israel',
-            'BE': 'belgium', 'BELGIUM': 'belgium',
-            'AT': 'austria', 'AUSTRIA': 'austria',
-            'CH': 'switzerland', 'SWITZERLAND': 'switzerland',
-            'PT': 'portugal', 'PORTUGAL': 'portugal',
-            'GR': 'greece', 'GREECE': 'greece',
-            'CZ': 'czech', 'CZECH': 'czech', 'CZECH REPUBLIC': 'czech',
-            'HU': 'hungary', 'HUNGARY': 'hungary',
-            'SK': 'slovakia', 'SLOVAKIA': 'slovakia',
-            'BG': 'bulgaria', 'BULGARIA': 'bulgaria',
-            'HR': 'croatia', 'CROATIA': 'croatia',
-            'SI': 'slovenia', 'SLOVENIA': 'slovenia',
-            'LT': 'lithuania', 'LITHUANIA': 'lithuania',
-            'LV': 'latvia', 'LATVIA': 'latvia',
-            'EE': 'estonia', 'ESTONIA': 'estonia',
-            'MD': 'moldova', 'MOLDOVA': 'moldova',
-            'GE': 'georgia', 'GEORGIA': 'georgia',
-            'AM': 'armenia', 'ARMENIA': 'armenia',
-            'AZ': 'azerbaijan', 'AZERBAIJAN': 'azerbaijan',
-            'BY': 'belarus', 'BELARUS': 'belarus',
-            'KG': 'kyrgyzstan', 'KYRGYZSTAN': 'kyrgyzstan',
-            'TJ': 'tajikistan', 'TAJIKISTAN': 'tajikistan',
-            'TM': 'turkmenistan', 'TURKMENISTAN': 'turkmenistan',
-            'UZ': 'uzbekistan', 'UZBEKISTAN': 'uzbekistan',
-            'AL': 'albania', 'ALBANIA': 'albania',
-            'BA': 'bosnia', 'BOSNIA': 'bosnia',
-            'MK': 'macedonia', 'MACEDONIA': 'macedonia',
-            'ME': 'montenegro', 'MONTENEGRO': 'montenegro',
-            'RS': 'serbia', 'SERBIA': 'serbia',
-            'XK': 'kosovo', 'KOSOVO': 'kosovo'
+            'US': 'usa', 'UK': 'england', 'GB': 'england',
+            'CA': 'canada', 'RU': 'russia', 'CN': 'china',
+            'IN': 'india', 'NG': 'nigeria', 'DE': 'germany',
+            'FR': 'france', 'BR': 'brazil', 'MX': 'mexico',
+            'ID': 'indonesia', 'PH': 'philippines', 'VN': 'vietnam',
+            'TH': 'thailand', 'TR': 'turkey', 'PL': 'poland',
+            'UA': 'ukraine', 'KZ': 'kazakhstan', 'RO': 'romania',
+            'ES': 'spain', 'IT': 'italy', 'NL': 'netherlands',
+            'SE': 'sweden', 'NO': 'norway', 'FI': 'finland',
+            'DK': 'denmark', 'AU': 'australia', 'JP': 'japan',
+            'KR': 'southkorea', 'SG': 'singapore', 'MY': 'malaysia',
+            'ZA': 'southafrica', 'EG': 'egypt', 'SA': 'saudiarabia',
+            'AE': 'uae', 'IL': 'israel', 'BE': 'belgium',
+            'AT': 'austria', 'CH': 'switzerland', 'PT': 'portugal',
+            'GR': 'greece', 'CZ': 'czech', 'HU': 'hungary',
+            'SK': 'slovakia', 'BG': 'bulgaria', 'HR': 'croatia',
+            'SI': 'slovenia', 'LT': 'lithuania', 'LV': 'latvia',
+            'EE': 'estonia', 'MD': 'moldova', 'GE': 'georgia',
+            'AM': 'armenia', 'AZ': 'azerbaijan', 'BY': 'belarus',
+            'KG': 'kyrgyzstan', 'TJ': 'tajikistan', 'TM': 'turkmenistan',
+            'UZ': 'uzbekistan', 'AL': 'albania', 'BA': 'bosnia',
+            'MK': 'macedonia', 'ME': 'montenegro', 'RS': 'serbia',
+            'XK': 'kosovo'
         };
 
         this.reverseCountryMap = Object.fromEntries(
             Object.entries(this.countryMap).map(([iso, sim]) => [sim, iso])
         );
 
-        // ─── FAKE NUMBER DETECTION ─────────────────────────────────────────
         this.fakeNumbers = new Set([
             '0201', '1234567890', '1111111111', '0000000000',
             '9999999999', '123456789', '0123456789', '0000000',
             '12345', '11111', '99999', '00000', '1', '12', '123'
         ]);
 
-        // ─── ERROR CLASSIFICATION ──────────────────────────────────────────
         this.errorMap = {
             'NO_NUMBERS': { recoverable: true, retryAfter: 5000, message: 'No numbers available' },
             'NO_BALANCE': { recoverable: false, message: 'Insufficient panel balance' },
@@ -182,36 +125,31 @@ class CheapPanelProvider {
             'BAD_OPERATOR': { recoverable: true, retryAfter: 2000, message: 'Invalid operator' },
             'PROVIDER_NOT_CONFIGURED': { recoverable: false, message: 'Provider not configured' },
             'INVALID_RESPONSE': { recoverable: true, retryAfter: 3000, message: 'Invalid provider response' },
-            'FAKE_NUMBER_REJECTED': { recoverable: true, retryAfter: 2000, message: 'Provider returned test number' },
-            'INVALID_PHONE_LENGTH': { recoverable: true, retryAfter: 2000, message: 'Invalid phone number' },
-            'INVALID_ACTIVATION_ID': { recoverable: false, message: 'Invalid activation ID' },
+            'FAKE_NUMBER_REJECTED': { recoverable: true, retryAfter: 2000, message: 'Provider returned test number, retrying' },
+            'INVALID_PHONE_LENGTH': { recoverable: true, retryAfter: 2000, message: 'Invalid phone number from provider' },
+            'INVALID_ACTIVATION_ID': { recoverable: false, message: 'Invalid activation ID from provider' },
             'TIMEOUT': { recoverable: true, retryAfter: 10000, message: 'Provider timeout' },
             'CONNECTION_ERROR': { recoverable: true, retryAfter: 5000, message: 'Connection error' },
-            'NOT_AVAILABLE': { recoverable: true, retryAfter: 3000, message: 'Service not available' },
-            'RATE_LIMITED': { recoverable: true, retryAfter: 60000, message: 'Rate limited by provider' }
+            'NOT_AVAILABLE': { recoverable: true, retryAfter: 3000, message: 'Service not available in this country' }
         };
 
-        // ─── RATE LIMITING ─────────────────────────────────────────────────
-        // Token bucket: max 5 requests per second (conservative for 5sim)
-        this._maxRps = 5;
+        // ─── NEW: Rate limiting (token bucket) ───────────────────────────
+        this._maxRps = 5; // 5 requests per second max
         this._tokens = this._maxRps;
         this._lastRefill = Date.now();
         this._tokenInterval = 1000 / this._maxRps;
+        this._requestQueue = [];
+        this._isProcessingQueue = false;
 
-        // Request queue
-        this._queue = [];
-        this._isProcessing = false;
-
-        // ─── CACHE ─────────────────────────────────────────────────────────
+        // ─── YOUR ORIGINAL CACHE (unchanged) ─────────────────────────────
         this.productsCache = null;
         this.productsCacheTime = 0;
-        this.productsCacheTtl = 5 * 60 * 1000; // 5 minutes
+        this.productsCacheTtl = 5 * 60 * 1000;
 
         this.balanceCache = null;
         this.balanceCacheTime = 0;
-        this.balanceCacheTtl = 30 * 1000; // 30 seconds
+        this.balanceCacheTtl = 30 * 1000;
 
-        // ─── INIT ──────────────────────────────────────────────────────────
         if (this.isActive) {
             this.checkBalance().catch(err => 
                 logger.warn('Initial balance check failed', { error: err.message })
@@ -227,14 +165,13 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  TOKEN BUCKET RATE LIMITER
+    //  NEW: Token bucket + request queue (prevents 429)
     // ═══════════════════════════════════════════════════════════
 
     _refillTokens() {
         const now = Date.now();
         const elapsed = now - this._lastRefill;
         const tokensToAdd = Math.floor(elapsed / this._tokenInterval);
-        
         if (tokensToAdd > 0) {
             this._tokens = Math.min(this._maxRps, this._tokens + tokensToAdd);
             this._lastRefill = now;
@@ -243,66 +180,55 @@ class CheapPanelProvider {
 
     async _acquireToken() {
         this._refillTokens();
-        
         if (this._tokens > 0) {
             this._tokens--;
             return true;
         }
-        
         const waitMs = this._tokenInterval - (Date.now() - this._lastRefill) % this._tokenInterval;
         await new Promise(r => setTimeout(r, waitMs + 50));
         return this._acquireToken();
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  QUEUED REQUEST HANDLER
-    // ═══════════════════════════════════════════════════════════
-
     async queuedRequest(method, endpoint, data = null, timeout = 10000) {
         return new Promise((resolve, reject) => {
-            this._queue.push({ method, endpoint, data, timeout, resolve, reject, retries: 0 });
+            this._requestQueue.push({ method, endpoint, data, timeout, resolve, reject, retries: 0 });
             this._processQueue();
         });
     }
 
     async _processQueue() {
-        if (this._isProcessing || this._queue.length === 0) return;
-        
-        this._isProcessing = true;
+        if (this._isProcessingQueue || this._requestQueue.length === 0) return;
+        this._isProcessingQueue = true;
         await this._acquireToken();
         
-        const { method, endpoint, data, timeout, resolve, reject, retries } = this._queue.shift();
+        const { method, endpoint, data, timeout, resolve, reject, retries } = this._requestQueue.shift();
         
         try {
-            const result = await this._doRequest(method, endpoint, data, timeout);
+            const result = await this.request(method, endpoint, data, timeout);
             resolve(result);
         } catch (error) {
-            // Retry on rate limit (429) up to 3 times
             if (error.message?.includes('429') && retries < 3) {
                 const backoff = Math.min(60000, 2000 * Math.pow(2, retries));
                 logger.warn('5SIM rate limited, retrying', { endpoint, retry: retries + 1, backoff });
-                
                 setTimeout(() => {
-                    this._queue.unshift({ method, endpoint, data, timeout, resolve, reject, retries: retries + 1 });
-                    this._isProcessing = false;
+                    this._requestQueue.unshift({ method, endpoint, data, timeout, resolve, reject, retries: retries + 1 });
+                    this._isProcessingQueue = false;
                     this._processQueue();
                 }, backoff);
                 return;
             }
-            
             reject(error);
         } finally {
-            this._isProcessing = false;
-            // Small delay between requests
+            this._isProcessingQueue = false;
             setTimeout(() => this._processQueue(), this._tokenInterval);
         }
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  RAW REQUEST
+    //  YOUR ORIGINAL request() (unchanged except called by queue)
     // ═══════════════════════════════════════════════════════════
 
-    async _doRequest(method, endpoint, data = null, timeout = 10000) {
+    async request(method, endpoint, data = null, timeout = 10000) {
         const url = `${this.baseUrl}${endpoint}`;
         const axiosConfig = {
             method,
@@ -316,52 +242,61 @@ class CheapPanelProvider {
         
         const response = await axios(axiosConfig);
         
-        // Handle string responses (5sim sometimes returns plain text errors)
         if (typeof response.data === 'string') {
             const text = response.data.trim().toLowerCase();
             
             if (text === 'no free phones' || text.includes('no free') || text.includes('no numbers')) {
+                logger.warn('5SIM returned string error', { url, text: response.data });
                 throw new Error(`NO_NUMBERS: ${response.data}`);
             }
+            
             if (text.includes('not enough') || text.includes('insufficient') || text.includes('no balance')) {
+                logger.warn('5SIM returned balance error', { url, text: response.data });
                 throw new Error(`NO_BALANCE: ${response.data}`);
             }
+            
             if (text.includes('not available') || text.includes('invalid')) {
+                logger.warn('5SIM returned availability error', { url, text: response.data });
                 throw new Error(`NOT_AVAILABLE: ${response.data}`);
-            }
-            if (text.includes('too many requests') || text.includes('rate limit')) {
-                throw new Error(`RATE_LIMITED: ${response.data}`);
             }
         }
         
-        // Handle HTTP errors
         if (response.status >= 400 || !response.data || typeof response.data !== 'object') {
             const errorData = response.data;
             const isHtmlError = typeof errorData === 'string' && errorData.includes('<');
             const isEmpty = !errorData || (typeof errorData === 'string' && errorData.trim() === '');
             
-            if (response.status === 429) {
-                throw new Error(`RATE_LIMITED: 5SIM rate limit (429)`);
-            }
+            logger.error('5SIM API error response', {
+                url,
+                status: response.status,
+                statusText: response.statusText,
+                isHtmlError,
+                isEmpty,
+                dataPreview: isHtmlError ? 'HTML_ERROR_PAGE' : (isEmpty ? 'EMPTY_BODY' : errorData)
+            });
+
             if (response.status === 404) {
                 throw new Error(`NOT_AVAILABLE: 5SIM returned 404 for ${url}`);
             }
             if (response.status === 400) {
-                const msg = isHtmlError ? 'Invalid request' : (errorData?.error || errorData?.message || 'Bad request');
+                const msg = isHtmlError ? 'Invalid operator/country combination' : (errorData?.error || errorData?.message || 'Bad request');
                 throw new Error(`NOT_AVAILABLE: ${msg}`);
             }
+            if (response.status === 429) {
+                throw new Error(`TIMEOUT: 5SIM rate limited (429)`);
+            }
             if (isEmpty || isHtmlError) {
-                throw new Error(`NOT_AVAILABLE: Empty/invalid response`);
+                throw new Error(`NOT_AVAILABLE: 5SIM returned empty/invalid response for this operator`);
             }
             
-            throw new Error(`PROVIDER_ERROR: HTTP ${response.status} - ${errorData?.error || 'Unknown'}`);
+            throw new Error(`PROVIDER_ERROR: HTTP ${response.status} - ${errorData?.error || 'Unknown error'}`);
         }
         
         return response;
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  PRICING
+    //  YOUR ORIGINAL getDisplayPrice() (unchanged)
     // ═══════════════════════════════════════════════════════════
 
     getDisplayPrice(rawPrice) {
@@ -370,60 +305,45 @@ class CheapPanelProvider {
         return parseFloat((price + BASE_PROFIT).toFixed(4));
     }
 
+    // ═══════════════════════════════════════════════════════════
+    //  YOUR ORIGINAL getPrice() (with service fallback added)
+    // ═══════════════════════════════════════════════════════════
+
     async getPrice(country = 'US', service = 'Any') {
         try {
             const providerCountry = this.mapCountry(country);
             const providerService = this.mapService(service);
 
-            // Try targeted query first
             const targetedEndpoint = `${this.endpoints.getPrices}?country=${providerCountry}&product=${providerService}`;
             
             let response;
             try {
+                // CHANGED: Use queuedRequest instead of direct request
                 response = await this.queuedRequest('get', targetedEndpoint, null, 10000);
             } catch (err) {
-                // If targeted fails (e.g., INVALID_SERVICE), try fallback services
-                const fallbackServices = this._getServiceFallbacks(providerService);
-                
-                for (const fallbackService of fallbackServices) {
-                    if (fallbackService === providerService) continue;
-                    
-                    try {
-                        const fallbackEndpoint = `${this.endpoints.getPrices}?country=${providerCountry}&product=${fallbackService}`;
-                        response = await this.queuedRequest('get', fallbackEndpoint, null, 10000);
-                        
-                        logger.info('5SIM service fallback succeeded', {
-                            original: providerService,
-                            fallback: fallbackService,
-                            country: providerCountry
-                        });
-                        break;
-                    } catch (fallbackErr) {
-                        continue;
-                    }
+                logger.warn('Targeted price query failed, falling back to full catalog', { 
+                    country: providerCountry, 
+                    service: providerService,
+                    error: err.message 
+                });
+                const products = await this.getProducts();
+                if (!products) {
+                    return { success: false, error: 'Failed to fetch product catalog' };
                 }
-                
-                if (!response) {
-                    // Last resort: full catalog
-                    const products = await this.getProducts();
-                    if (!products) {
-                        return { success: false, error: 'Failed to fetch product catalog' };
-                    }
-                    return this._extractPriceFromProducts(products, providerCountry, providerService);
-                }
+                return this._extractPriceFromProducts(products, providerCountry, providerService);
             }
 
             if (response.status >= 400) {
                 const products = await this.getProducts();
                 if (!products) {
-                    return { success: false, error: `Failed to fetch catalog. HTTP ${response.status}` };
+                    return { success: false, error: `Failed to fetch product catalog. HTTP ${response.status}` };
                 }
                 return this._extractPriceFromProducts(products, providerCountry, providerService);
             }
 
             const data = response.data;
             if (!data || typeof data !== 'object' || Object.keys(data).length === 0) {
-                return { success: false, error: `No data for ${providerCountry}/${providerService}` };
+                return { success: false, error: `No data returned for ${providerCountry}/${providerService}` };
             }
 
             return this._extractPriceFromProducts(data, providerCountry, providerService);
@@ -434,72 +354,55 @@ class CheapPanelProvider {
         }
     }
 
-    /**
-     * Get fallback service names for unknown/unsupported services
-     */
-    _getServiceFallbacks(service) {
-        const fallbacks = [service];
-        const chain = this.serviceFallbackChain[service.toLowerCase()];
-        if (chain) {
-            fallbacks.push(...chain);
-        }
-        // Always try "other" as last resort
-        if (!fallbacks.includes('other')) {
-            fallbacks.push('other');
-        }
-        return fallbacks;
-    }
+    // ═══════════════════════════════════════════════════════════
+    //  YOUR ORIGINAL _extractPriceFromProducts() (unchanged)
+    // ═══════════════════════════════════════════════════════════
 
-    
     _extractPriceFromProducts(products, providerCountry, providerService) {
         const countryData = products[providerCountry];
         if (!countryData) {
             return { success: false, error: `Country ${providerCountry} not available` };
         }
 
-        // Try primary service first, then fallbacks
-        const servicesToTry = [providerService, ...this._getServiceFallbacks(providerService).filter(s => s !== providerService)];
-        
-        for (const svc of servicesToTry) {
-            const serviceData = countryData[svc];
-            if (!serviceData) continue;
+        const serviceData = countryData[providerService];
+        if (!serviceData) {
+            return { success: false, error: `Service ${providerService} not available in ${providerCountry}` };
+        }
 
-            let minPrice = Infinity;
-            let cheapestOperator = null;
-            let totalStock = 0;
+        let minPrice = Infinity;
+        let cheapestOperator = null;
+        let totalStock = 0;
 
-            for (const [operatorName, operatorData] of Object.entries(serviceData)) {
-                const count = typeof operatorData === 'object' ? (operatorData.count ?? 0) : 0;
-                const price = typeof operatorData === 'object' ? (operatorData.cost ?? operatorData.price ?? Infinity) : Infinity;
-                
-                totalStock += count;
-                if (count > 0 && price < minPrice) {
-                    minPrice = price;
-                    cheapestOperator = operatorName;
-                }
-            }
-
-            if (minPrice !== Infinity && totalStock > 0) {
-                const displayPrice = this.getDisplayPrice(minPrice);
-
-                return {
-                    success: true,
-                    simPrice: minPrice,
-                    displayPrice: displayPrice,
-                    profit: BASE_PROFIT,
-                    operator: cheapestOperator,
-                    stock: totalStock,
-                    available: true,
-                    serviceUsed: svc
-                };
+        for (const [operatorName, operatorData] of Object.entries(serviceData)) {
+            const count = typeof operatorData === 'object' ? (operatorData.count ?? 0) : 0;
+            const price = typeof operatorData === 'object' ? (operatorData.cost ?? operatorData.price ?? Infinity) : Infinity;
+            
+            totalStock += count;
+            if (count > 0 && price < minPrice) {
+                minPrice = price;
+                cheapestOperator = operatorName;
             }
         }
 
-        return { success: false, error: 'No stock available', available: false };
+        if (minPrice === Infinity || totalStock === 0) {
+            return { success: false, error: 'No stock available', available: false };
+        }
+
+        const displayPrice = this.getDisplayPrice(minPrice);
+
+        return {
+            success: true,
+            simPrice: minPrice,
+            displayPrice: displayPrice,
+            profit: BASE_PROFIT,
+            operator: cheapestOperator,
+            stock: totalStock,
+            available: true
+        };
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  AVAILABLE COUNTRIES
+    //  YOUR ORIGINAL getAvailableCountries() (unchanged)
     // ═══════════════════════════════════════════════════════════
 
     async getAvailableCountries(service = 'Any') {
@@ -514,24 +417,13 @@ class CheapPanelProvider {
             const availableCountries = [];
             
             for (const [simCountry, services] of Object.entries(products)) {
-                // Check if service exists (or "other" fallback)
-                const servicesToCheck = [providerService, 'other'];
-                let hasStock = false;
-                
-                for (const svc of servicesToCheck) {
-                    const serviceData = services[svc];
-                    if (!serviceData) continue;
+                const serviceData = services[providerService];
+                if (!serviceData) continue;
 
-                    const stockFound = Object.values(serviceData).some(opData => {
-                        const count = typeof opData === 'object' ? (opData.count ?? 0) : 0;
-                        return count > 0;
-                    });
-
-                    if (stockFound) {
-                        hasStock = true;
-                        break;
-                    }
-                }
+                const hasStock = Object.values(serviceData).some(opData => {
+                    const count = typeof opData === 'object' ? (opData.count ?? 0) : 0;
+                    return count > 0;
+                });
 
                 if (hasStock) {
                     const isoCode = this.reverseCountryMap[simCountry];
@@ -583,7 +475,7 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  BALANCE CHECK (with caching)
+    //  YOUR ORIGINAL checkBalance() (uses queuedRequest)
     // ═══════════════════════════════════════════════════════════
 
     async checkBalance() {
@@ -620,7 +512,7 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  PRODUCT CACHE
+    //  YOUR ORIGINAL getProducts() (uses queuedRequest)
     // ═══════════════════════════════════════════════════════════
 
     async getProducts() {
@@ -641,7 +533,7 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  PRE-FLIGHT AVAILABILITY CHECK
+    //  YOUR ORIGINAL checkAvailability() (uses queuedRequest)
     // ═══════════════════════════════════════════════════════════
 
     async checkAvailability(country, service) {
@@ -655,39 +547,29 @@ class CheapPanelProvider {
             try {
                 response = await this.queuedRequest('get', targetedEndpoint, null, 10000);
             } catch (err) {
-                // Try fallback services
-                const fallbacks = this._getServiceFallbacks(providerService);
-                for (const fallback of fallbacks) {
-                    if (fallback === providerService) continue;
-                    try {
-                        const fbEndpoint = `${this.endpoints.getProducts}?country=${providerCountry}&product=${fallback}`;
-                        response = await this.queuedRequest('get', fbEndpoint, null, 10000);
-                        break;
-                    } catch (e) {
-                        continue;
-                    }
+                logger.warn('Targeted price query failed, falling back to full catalog', { 
+                    country: providerCountry, 
+                    service: providerService,
+                    error: err.message 
+                });
+                const products = await this.getProducts();
+                if (!products) {
+                    return { available: false, error: 'Failed to fetch product catalog' };
                 }
-                
-                if (!response) {
-                    const products = await this.getProducts();
-                    if (!products) {
-                        return { available: false, error: 'Failed to fetch catalog' };
-                    }
-                    return this._checkAvailabilityFromProducts(products, providerCountry, providerService);
-                }
+                return this._checkAvailabilityFromProducts(products, providerCountry, providerService);
             }
 
             if (response.status >= 400) {
                 const products = await this.getProducts();
                 if (!products) {
-                    return { available: false, error: `Catalog fetch failed. HTTP ${response.status}` };
+                    return { available: false, error: `Failed to fetch product catalog. HTTP ${response.status}` };
                 }
                 return this._checkAvailabilityFromProducts(products, providerCountry, providerService);
             }
 
             const data = response.data;
             if (!data || typeof data !== 'object' || Object.keys(data).length === 0) {
-                return { available: false, error: `No data for ${providerCountry}/${providerService}` };
+                return { available: false, error: `No data returned for ${providerCountry}/${providerService}` };
             }
 
             return this._checkAvailabilityFromProducts(data, providerCountry, providerService);
@@ -703,36 +585,29 @@ class CheapPanelProvider {
             return { available: false, error: `Country ${providerCountry} not available` };
         }
 
-        const servicesToTry = [providerService, ...this._getServiceFallbacks(providerService).filter(s => s !== providerService)];
-        
-        for (const svc of servicesToTry) {
-            const serviceData = countryData[svc];
-            if (!serviceData) continue;
-
-            const operators = serviceData;
-            const operatorNames = Object.keys(operators);
-            
-            const hasStock = operatorNames.some(opName => {
-                const op = operators[opName];
-                const count = typeof op === 'object' ? (op.count ?? 0) : (typeof op === 'number' ? op : 0);
-                return count > 0;
-            });
-
-            if (hasStock) {
-                return { 
-                    available: true, 
-                    operators: operatorNames,
-                    data: serviceData,
-                    serviceUsed: svc
-                };
-            }
+        const serviceData = countryData[providerService];
+        if (!serviceData) {
+            return { available: false, error: `Service ${providerService} not available in ${providerCountry}` };
         }
 
-        return { available: false, operators: [], data: null };
+        const operators = serviceData;
+        const operatorNames = Object.keys(operators);
+        
+        const hasStock = operatorNames.some(opName => {
+            const op = operators[opName];
+            const count = typeof op === 'object' ? (op.count ?? 0) : (typeof op === 'number' ? op : 0);
+            return count > 0;
+        });
+
+        return { 
+            available: hasStock, 
+            operators: operatorNames,
+            data: serviceData 
+        };
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  NUMBER ACQUISITION
+    //  YOUR ORIGINAL getNumber() (uses queuedRequest)
     // ═══════════════════════════════════════════════════════════
 
     async getNumber(country = 'US', service = 'Any', preferredOperator = 'any') {
@@ -745,7 +620,7 @@ class CheapPanelProvider {
 
             const balanceResult = await this.checkBalance();
             if (!balanceResult.success || balanceResult.balance <= 0) {
-                logger.error('5SIM balance insufficient', { 
+                logger.error('5SIM balance insufficient or check failed', { 
                     balance: balanceResult.balance,
                     error: balanceResult.error 
                 });
@@ -758,7 +633,7 @@ class CheapPanelProvider {
             }
 
             const providerCountry = this.mapCountry(country);
-            const providerService = availability.serviceUsed || this.mapService(service);
+            const providerService = this.mapService(service);
             const operator = this.mapOperator(providerCountry, preferredOperator);
 
             logger.info('Requesting number from 5SIM', {
@@ -799,11 +674,11 @@ class CheapPanelProvider {
                 }
 
                 if (statusCode === 404 || isEmptyResponse) {
-                    throw new Error(`NOT_AVAILABLE: ${service} not available in ${country} with operator ${operator}`);
+                    throw new Error(`NOT_AVAILABLE: ${service} not available in ${country} with operator ${operator}. Try another country or operator.`);
                 }
 
                 if (statusCode === 400) {
-                    throw new Error(`NOT_AVAILABLE: Invalid combination: ${operator} for ${service} in ${country}`);
+                    throw new Error(`NOT_AVAILABLE: Invalid combination: ${operator} for ${service} in ${country}. Try another operator.`);
                 }
                 
                 throw new Error(`PROVIDER_ERROR: ${errorMsg}`);
@@ -881,9 +756,8 @@ class CheapPanelProvider {
         }
     }
 
-    
     // ═══════════════════════════════════════════════════════════
-    //  SMS CHECKING
+    //  YOUR ORIGINAL checkSMS() (uses queuedRequest)
     // ═══════════════════════════════════════════════════════════
 
     async checkSMS(activationId) {
@@ -967,10 +841,9 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  OTP EXTRACTION
+    //  YOUR ORIGINAL extractOTP() (unchanged)
     // ═══════════════════════════════════════════════════════════
-
-    extractOTP(code, text) {
+extractOTP(code, text) {
         if (code !== null && code !== undefined) {
             const codeStr = code.toString().trim();
             const cleanCode = codeStr.replace(/[\s\-]/g, '');
@@ -1068,7 +941,7 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  NUMBER MANAGEMENT
+    //  YOUR ORIGINAL cancelNumber() (uses queuedRequest)
     // ═══════════════════════════════════════════════════════════
 
     async cancelNumber(activationId) {
@@ -1083,8 +956,8 @@ class CheapPanelProvider {
 
             const cleanId = activationId.toString().trim();
             if (!/^\d+$/.test(cleanId)) {
-                logger.error('Cancel called with non-numeric ID', { activationId: cleanId });
-                return { success: false, error: 'INVALID_ACTIVATION_ID: Expected numeric ID' };
+                logger.error('Cancel called with non-numeric ID (likely phone number)', { activationId: cleanId });
+                return { success: false, error: 'INVALID_ACTIVATION_ID: Expected numeric ID, got phone number' };
             }
 
             const endpoint = `${this.endpoints.cancel}/${cleanId}`;
@@ -1116,6 +989,10 @@ class CheapPanelProvider {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════
+    //  YOUR ORIGINAL finishNumber() (uses queuedRequest)
+    // ═══════════════════════════════════════════════════════════
+
     async finishNumber(activationId) {
         try {
             if (!activationId) {
@@ -1140,7 +1017,7 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  LEGACY PRICING METHOD
+    //  YOUR ORIGINAL getPrices() (unchanged)
     // ═══════════════════════════════════════════════════════════
 
     async getPrices(country = 'US', service = 'Any') {
@@ -1148,29 +1025,42 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  MAPPING HELPERS
+    //  YOUR ORIGINAL mapService() (with fallback added)
     // ═══════════════════════════════════════════════════════════
 
     mapService(service) {
         if (!service || service === 'Any') return 'other';
+        
         const normalized = service.toString().trim();
-        return this.serviceMap[normalized] || 
-               this.serviceMap[normalized.toLowerCase()] || 
-               'other';
+        const mapped = this.serviceMap[normalized] || this.serviceMap[normalized.toLowerCase()];
+        
+        if (mapped) return mapped;
+        
+        // NEW: Check fallback chain for unknown services
+        const lower = normalized.toLowerCase();
+        const fallbacks = this.serviceFallbackMap[lower];
+        if (fallbacks && fallbacks.length > 0) {
+            logger.debug('Using service fallback', { original: service, fallback: fallbacks[0] });
+            return fallbacks[0];
+        }
+        
+        return 'other';
     }
+
+    // ═══════════════════════════════════════════════════════════
+    //  YOUR ORIGINAL mapCountry() (unchanged)
+    // ═══════════════════════════════════════════════════════════
 
     mapCountry(country) {
         if (!country) throw new Error('BAD_COUNTRY: Country required');
-        const normalized = country.toString().trim().toUpperCase();
-        const mapped = this.countryMap[normalized];
-        if (!mapped) {
-            // Try lowercase
-            const lowerMapped = this.countryMap[normalized.toLowerCase()];
-            if (lowerMapped) return lowerMapped;
-            throw new Error(`BAD_COUNTRY: ${country} not supported`);
-        }
+        const mapped = this.countryMap[country.toUpperCase()];
+        if (!mapped) throw new Error(`BAD_COUNTRY: ${country} not supported`);
         return mapped;
     }
+
+    // ═══════════════════════════════════════════════════════════
+    //  YOUR ORIGINAL mapOperator() (unchanged)
+    // ═══════════════════════════════════════════════════════════
 
     mapOperator(country, preferred) {
         if (!preferred || preferred === 'any') {
@@ -1180,7 +1070,7 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  VALIDATION HELPERS
+    //  YOUR ORIGINAL VALIDATION HELPERS (unchanged)
     // ═══════════════════════════════════════════════════════════
 
     isFakeNumber(phone) {
@@ -1217,7 +1107,7 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  STATS
+    //  YOUR ORIGINAL STATS (unchanged)
     // ═══════════════════════════════════════════════════════════
 
     updateStats(success, duration, cost = 0) {
