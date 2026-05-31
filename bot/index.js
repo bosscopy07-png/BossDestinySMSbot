@@ -564,7 +564,13 @@ class TelegramBot {
             this.referralService, 
             this.notificationService
         );
-        const otpCommands = new OTPCommands(this.bot, this.walletService, this.smsProviderManager);
+     const otpCommands = new OTPCommands(
+    this.bot, 
+    this.walletService, 
+    this.smsProviderManager,
+    this.tierIntegrationService,  // tierIntegrationService (or null if unavailable)
+    this.sessionManager           // sessionManager (or null if not yet created)
+); 
         const adminCommands = new AdminCommands(this.bot, this.walletService, this.referralService, this.smsProviderManager);
         const advancedAdmin = new Admin(
             this.bot,
