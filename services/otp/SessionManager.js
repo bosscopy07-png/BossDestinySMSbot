@@ -862,27 +862,7 @@ class SessionManager {
     //  INTERNAL - Monitoring
     // ═══════════════════════════════════════════════════════════
 
-                }
-
-            this._schedulePoll(sessionId, interval);
-
-        } catch (error) {
-            logger.error('Poll error', {
-                sessionId,
-                error: error.message,
-                pollCount: sessionData.pollCount
-            });
-
-            this._schedulePoll(sessionId, interval);
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    //  INTERNAL - Cleanup
-    // ═══════════════════════════════════════════════════════════
-
-    
-_startMonitoring(session, providerInstance) {
+                     _startMonitoring(session, providerInstance) {
         const sessionId = session.sessionId;
 
         this.activeSessions.set(sessionId, {
