@@ -2,6 +2,11 @@
 //  services/ProviderRouter.js — Multi-Provider Selection Engine
 //  Primary: CheapPanelProvider (5sim)
 //  Fallbacks: SMSPoolProvider, HeroSMSProvider, OnlineSimProvider
+//  FIXED:
+//   1. Queries ALL providers in parallel with stagger
+//   2. Returns cheapest price across all providers
+//   3. Cache TTL: 60 minutes
+//   4. Staggered requests to avoid rate limit storms
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import logger from '../../utils/logger.js';
@@ -34,10 +39,10 @@ class ProviderRouter {
 
         // Price comparison cache
         this._priceCache = new Map();
-        this._cacheTtl = 30 * 1000; // 30 seconds
+        this._cacheTtl = 60 * 60 * 1000; // 60 minutes
 
         // Request staggering to avoid rate limit storms
-        this._staggerDelay = 150; // ms between provider queries
+        this._staggerDelay = 200; // ms between provider queries
     }
 
     getProviderKeys() {
@@ -326,3 +331,4 @@ class ProviderRouter {
 }
 
 export default ProviderRouter;
+        
