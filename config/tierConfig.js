@@ -1,8 +1,9 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 //  config/tierConfig.js — Tier Configuration
-//  CHANGED: Operator ranges instead of hardcoded lists
+//  DYNAMIC: Operator ranges instead of hardcoded lists
 //  Budget: virtual1-25, Standard: virtual26-50, Premium: virtual51+
 //  Each tier checks ALL operators in its range, not just a fixed list
+//  Cache TTL increased to 60 minutes to prevent rate limits
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
@@ -11,6 +12,9 @@
  * Each tier has a RANGE of virtual operators.
  * When checking availability, ALL operators in the range are checked.
  * The cheapest operator with stock is selected.
+ * 
+ * Cross-operator fallback: If virtual56 fails, tries virtual57, 58, etc. within same tier
+ * Cross-provider fallback: If 5sim fails, tries SMSPool, then Hero, then OnlineSim for SAME tier
  */
 
 export const TIER_CONFIG = {
@@ -21,7 +25,6 @@ export const TIER_CONFIG = {
         detail: 'Random allocation ("any") or oldest virtual operators. Best for low-priority use.',
         // RANGE: virtual1 to virtual25 (oldest, cheapest)
         operatorRange: { min: 1, max: 25 },
-        operators: ['any'], // 'any' lets 5sim pick cheapest
         fallbackWithinTier: true,
         sortPriority: 'price',      // Always pick cheapest
         priceMultiplier: 1.0,
@@ -35,7 +38,6 @@ export const TIER_CONFIG = {
         detail: 'Mid-range virtual operators. Recommended for everyday use.',
         // RANGE: virtual26 to virtual50 (mid-range)
         operatorRange: { min: 26, max: 50 },
-        operators: ['any'],
         fallbackWithinTier: true,
         sortPriority: 'balanced',   // Balance price vs stock
         priceMultiplier: 1.0,
@@ -49,7 +51,6 @@ export const TIER_CONFIG = {
         detail: 'Newest, most expensive virtual operators. Highest 5SIM cost = best delivery.',
         // RANGE: virtual51+ (newest, most expensive)
         operatorRange: { min: 51, max: 999 },
-        operators: ['any'],
         fallbackWithinTier: true,
         sortPriority: 'quality',    // Prioritize best operators
         priceMultiplier: 1.0,
@@ -63,9 +64,9 @@ export const TIER_CONFIG = {
  */
 export function getTierOperators(tierKey = 'budget') {
     const tier = TIER_CONFIG[tierKey];
-    if (!tier || !tier.operatorRange) return ['any'];
+    if (!tier || !tier.operatorRange) return [];
     
-    const ops = ['any'];
+    const ops = [];
     for (let i = tier.operatorRange.min; i <= tier.operatorRange.max; i++) {
         ops.push(`virtual${i}`);
     }
@@ -103,6 +104,32 @@ export function getOperatorTier(operator) {
 }
 
 /**
+ * Get adjacent operators within same tier for fallback
+ */
+export function getAdjacentOperators(operator, tierKey, maxDistance = 5) {
+    const match = operator.match(/virtual(\d+)/);
+    if (!match) return [];
+    
+    const num = parseInt(match[1]);
+    const tier = TIER_CONFIG[tierKey];
+    if (!tier || !tier.operatorRange) return [];
+    
+    const adjacent = [];
+    for (let i = 1; i <= maxDistance; i++) {
+        const higher = num + i;
+        const lower = num - i;
+        
+        if (higher <= tier.operatorRange.max && higher >= tier.operatorRange.min) {
+            adjacent.push(`virtual${higher}`);
+        }
+        if (lower >= tier.operatorRange.min && lower <= tier.operatorRange.max) {
+            adjacent.push(`virtual${lower}`);
+        }
+    }
+    return adjacent;
+}
+
+/**
  * Popular services — displayed first in service selection
  */
 export const POPULAR_SERVICES = [
@@ -125,18 +152,24 @@ export const POPULAR_SERVICES = [
     'Coinbase',
     'Airbnb',
     'Google',
-    'Microsoft'
+    'Microsoft',
+    'Rebtel',
+    'Signal',
+    'LinkedIn',
+    'WeChat',
+    'Line'
 ];
 
 /**
  * Service categories for grouping
  */
 export const SERVICE_CATEGORIES = {
-    'Social Media': ['WhatsApp', 'Telegram', 'Instagram', 'Facebook', 'Twitter', 'TikTok', 'Snapchat', 'Discord'],
+    'Social Media': ['WhatsApp', 'Telegram', 'Instagram', 'Facebook', 'Twitter', 'TikTok', 'Snapchat', 'Discord', 'LinkedIn', 'Signal'],
     'Finance': ['Binance', 'Coinbase', 'PayPal'],
     'Email': ['Gmail', 'Outlook', 'Google', 'Microsoft', 'Yahoo'],
     'Streaming': ['Netflix', 'Spotify', 'Amazon'],
     'Rides & Travel': ['Uber', 'Airbnb'],
+    'Communication': ['Rebtel', 'WeChat', 'Line'],
     'Other': []
 };
 
@@ -199,13 +232,15 @@ export const PAGINATION = {
 };
 
 /**
- * Cache TTLs (milliseconds)
+ * Cache TTLs (milliseconds) — INCREASED to prevent rate limits
  */
 export const CACHE_TTL = {
-    tierPrices: 30 * 1000,
-    countryStock: 60 * 1000,
-    serviceList: 5 * 60 * 1000,
-    providerHealth: 2 * 60 * 1000
+    tierPrices: 60 * 60 * 1000,        // 60 minutes (was 30 seconds)
+    countryStock: 60 * 60 * 1000,       // 60 minutes
+    serviceList: 60 * 60 * 1000,        // 60 minutes
+    providerHealth: 10 * 60 * 1000,     // 10 minutes
+    productsCatalog: 60 * 60 * 1000,    // 60 minutes
+    balance: 5 * 60 * 1000              // 5 minutes
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -233,7 +268,12 @@ export const SERVICE_SLUGS = {
     Airbnb: 'airbnb',
     Google: 'google',
     Microsoft: 'microsoft',
-    Yahoo: 'yahoo'
+    Yahoo: 'yahoo',
+    Rebtel: 'rebtel',
+    Signal: 'signal',
+    LinkedIn: 'linkedin',
+    WeChat: 'wechat',
+    Line: 'line'
 };
 
 export function normalizeService(serviceName) {
@@ -266,3 +306,4 @@ export function applyTierPricing(basePrice, tierKey = 'budget') {
         (basePrice * tier.priceMultiplier).toFixed(2)
     );
     }
+    
