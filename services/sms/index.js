@@ -1,11 +1,19 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // SMSProviderManager.js — Unified gateway for SMS number acquisition
-// Part 1/3 — Imports, Constructor, Startup Validation & Provider Setup
+// PART 1/3 — Imports, Constructor, Startup Validation, Provider Setup, Lifecycle, Utilities
+//
+// CHANGES:
+//   • Added SMSPoolProvider import
+//   • Added HeroSMSProvider import
+//   • Added SMSPOOL and HERO_SMS to provider registration
+//   • Added SMSPOOL and HERO_SMS to ProviderRouter cheap providers
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import TwilioProvider from './TwilioProvider.js';
 import TelnyxProvider from './TelnyxProvider.js';
 import CheapPanelProvider from './CheapPanelProvider.js';
+import SMSPoolProvider from './SMSPoolProvider.js';
+import HeroSMSProvider from './HeroSMSProvider.js';
 import OnlineSimProvider from './OnlineSimProvider.js';
 import FreeProvider from './FreeProvider.js';
 import NumberPoolManager from './NumberPoolManager.js';
@@ -18,7 +26,7 @@ import logger from '../../utils/logger.js';
  *
  * ARCHITECTURE (STRICT — no cross-tier failover):
  *   VIP/BUNDLE → NumberPool (Twilio + Telnyx) only
- *   CHEAP      → ProviderRouter (5SIM + OnlineSim + others) only
+ *   CHEAP      → ProviderRouter (5SIM + SMSPool + HeroSMS + OnlineSim) only
  *   FREE       → FreeProvider (public/shared numbers) only
  *
  * Each tier stands alone. If a tier's provider fails, that tier fails.
@@ -66,12 +74,16 @@ class SMSProviderManager {
         const twilio = new TwilioProvider();
         const telnyx = new TelnyxProvider();
         const cheapPanel = new CheapPanelProvider();
+        const smspool = new SMSPoolProvider();
+        const heroSMS = new HeroSMSProvider();
         const onlineSim = new OnlineSimProvider();
         const freePublic = new FreeProvider();
 
         this.providers.set('TWILIO', twilio);
         this.providers.set('TELNYX', telnyx);
         this.providers.set('CHEAP_PANEL', cheapPanel);
+        this.providers.set('SMSPOOL', smspool);
+        this.providers.set('HERO_SMS', heroSMS);
         this.providers.set('ONLINE_SIM', onlineSim);
         this.providers.set('FREE_PUBLIC', freePublic);
 
@@ -85,9 +97,11 @@ class SMSProviderManager {
             this.numberBuyer = new NumberBuyer();
         }
 
-        // ProviderRouter gets ALL cheap providers
+        // ProviderRouter gets ALL cheap providers (5sim + SMSPool + HeroSMS + OnlineSim)
         const cheapProviders = [];
         if (cheapPanel.isActive) cheapProviders.push(cheapPanel);
+        if (smspool.isActive) cheapProviders.push(smspool);
+        if (heroSMS.isActive) cheapProviders.push(heroSMS);
         if (onlineSim.isActive) cheapProviders.push(onlineSim);
         
         this.providerRouter = new ProviderRouter(cheapProviders);
@@ -355,6 +369,16 @@ class SMSProviderManager {
     }
 
     /**
+     * Get all provider prices for CHEAP tier (admin/debug)
+     */
+    async getAllCheapPrices(country, service) {
+        if (!this.providerRouter || !this.providerRouter.hasAvailableProvider()) {
+            throw new Error('NO_CHEAP_PROVIDERS');
+        }
+        return this.providerRouter.getAllPrices(country, service);
+    }
+
+    /**
      * Get available countries for CHEAP tier
      * FIXED: Uses ProviderRouter for union of all provider countries
      */
@@ -521,8 +545,7 @@ class SMSProviderManager {
                 throw new Error(`INVALID_TIER: "${tier}". Must be VIP, BUNDLE, CHEAP, or FREE`);
         }
     }
-
-    // ═══════════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
     //  BALANCE CHECKING
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -530,7 +553,6 @@ class SMSProviderManager {
      * Check balances for all active providers
      * Returns { providerName: { balance, currency, success, error } }
      */
-    
     async checkBalances() {
         const results = {};
 
@@ -642,7 +664,8 @@ class SMSProviderManager {
             currency: providerBalance.currency
         };
     }
-        // ═══════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
     //  SMS CHECKING — Complete tier coverage with ProviderRouter support
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -810,13 +833,10 @@ class SMSProviderManager {
             return this.checkFreeSMS(identifier, options.onStatusUpdate);
         }
 
-        if (normalized === 'CHEAP_PANEL' || normalized === 'CHEAP') {
+        if (normalized === 'CHEAP_PANEL' || normalized === 'SMSPOOL' || 
+            normalized === 'HERO_SMS' || normalized === 'ONLINE_SIM' || normalized === 'CHEAP') {
             // FIXED: Pass providerKey if available (from routed purchase)
-            return this.checkCheapSMS(identifier, options.providerKey);
-        }
-
-        if (normalized === 'ONLINE_SIM') {
-            return this.checkCheapSMS(identifier, 'ONLINE_SIM');
+            return this.checkCheapSMS(identifier, options.providerKey || normalized);
         }
 
         if (normalized === 'TWILIO' || normalized === 'TELNYX') {
@@ -926,8 +946,9 @@ class SMSProviderManager {
             return { success: true, status: 'RELEASED' };
         }
 
-        // CheapPanel (5SIM) or OnlineSim — route via ProviderRouter if key known
-        if (providerName === 'CHEAP_PANEL' || providerName === 'CHEAP' || providerName === 'ONLINE_SIM') {
+        // Cheap providers — route via ProviderRouter if key known
+        if (providerName === 'CHEAP_PANEL' || providerName === 'SMSPOOL' || 
+            providerName === 'HERO_SMS' || providerName === 'ONLINE_SIM' || providerName === 'CHEAP') {
             // FIXED: Use ProviderRouter if providerKey is known
             if (providerKey && this.providerRouter) {
                 return this.providerRouter.cancelNumber(providerKey, identifier);
@@ -966,7 +987,8 @@ class SMSProviderManager {
             return { success: true, status: 'FINISHED' };
         }
 
-        if (providerName === 'CHEAP_PANEL' || providerName === 'CHEAP' || providerName === 'ONLINE_SIM') {
+        if (providerName === 'CHEAP_PANEL' || providerName === 'SMSPOOL' || 
+            providerName === 'HERO_SMS' || providerName === 'ONLINE_SIM' || providerName === 'CHEAP') {
             // FIXED: Use ProviderRouter if providerKey is known
             if (providerKey && this.providerRouter) {
                 return this.providerRouter.finishNumber(providerKey, identifier);
@@ -980,8 +1002,8 @@ class SMSProviderManager {
         }
 
         return { success: true, note: 'No finish action required' };
-            }
-                         // ═══════════════════════════════════════════════════════════════════════
+    }
+            // ═══════════════════════════════════════════════════════════════════════
     //  POOL MANAGEMENT
     // ═══════════════════════════════════════════════════════════════════════
 
