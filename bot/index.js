@@ -14,6 +14,8 @@ import UserCommands from './commands/user.js';
 import OTPCommands from './commands/otp.js';
 import AdminCommands from './commands/admin.js';
 import Admin from './commands/extra.js';
+import SessionManager from '../services/otp/SessionManager.js';
+import RetryEngine from '../services/otp/RetryEngine.js'; 
 import ReferralService from '../services/referral/index.js';
 import WalletService from '../services/wallet/index.js';
 import SMSProviderManager from '../services/sms/index.js';
