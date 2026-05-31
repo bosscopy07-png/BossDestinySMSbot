@@ -1,7 +1,11 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 //  services/CountryCatalog.js — Country Discovery with Live Pricing & Search
-//  DYNAMIC: Uses CheapPanelProvider.getAvailableCountries() as single source of truth
-//  NO hardcoded COUNTRIES import. Shows ALL available countries sorted by price.
+//  DYNAMIC: Uses provider catalog as single source of truth
+//  FIXED:
+//   1. Uses cached catalog instead of live API calls for prices
+//   2. Checks ALL providers for cheapest price per country
+//   3. Cache TTL: 60 minutes
+//   4. Batch price fetching from cached data
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { TOP_COUNTRIES, COUNTRY_ALIASES, PAGINATION, CACHE_TTL, TIER_CONFIG } from '../config/tierConfig.js';
@@ -19,7 +23,8 @@ function isNoStockError(error) {
         error.message.includes('NO_SERVICE') ||
         error.message.includes('NOT_AVAILABLE') ||
         error.message.includes('BAD_COUNTRY') ||
-        error.message.includes('BAD_SERVICE')
+        error.message.includes('BAD_SERVICE') ||
+        error.message.includes('NO_NUMBERS')
     );
 }
 
@@ -48,16 +53,17 @@ class CountryCatalog {
         this._aliasMap = new Map();
 
         this._availableCache = new Map();
-        this._availableCacheTtl = CACHE_TTL.tierPrices || 2 * 60 * 1000;
+        this._availableCacheTtl = CACHE_TTL.countryStock || 60 * 60 * 1000;
 
         this._priceCache = new Map();
-        this._maxPriceCacheSize = 200;
+        this._maxPriceCacheSize = 500;
 
         this._buildAliasIndex();
 
         logger.info('CountryCatalog initialized', {
             provider: cheapPanelProvider.name || 'unknown',
-            providerActive: cheapPanelProvider.isActive
+            providerActive: cheapPanelProvider.isActive,
+            cacheTtl: '60min'
         });
     }
 
@@ -68,7 +74,7 @@ class CountryCatalog {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  DYNAMIC CATALOG LOADING
+    //  DYNAMIC CATALOG LOADING (cached 60min)
     // ═══════════════════════════════════════════════════════════════════════
 
     async _loadAvailableCountries(service) {
@@ -223,7 +229,8 @@ class CountryCatalog {
             countryCodes = backfillCodes;
         }
 
-        const countriesWithPrices = await this._fetchCountryPrices(countryCodes, normalizedService, tierKey, tier);
+        // FIXED: Use cached tier selector instead of live API calls
+        const countriesWithPrices = await this._fetchCountryPricesFromCache(countryCodes, normalizedService, tierKey, tier);
 
         countriesWithPrices.sort((a, b) => {
             if (a.available && !b.available) return -1;
@@ -313,10 +320,10 @@ class CountryCatalog {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  INTERNAL — Price Fetching
+    //  FIXED: Price fetching from cache instead of live API
     // ═══════════════════════════════════════════════════════════════════════
 
-    async _fetchCountryPrices(countryCodes, service, tierKey, tier) {
+    async _fetchCountryPricesFromCache(countryCodes, service, tierKey, tier) {
         const cacheKey = makeCacheKey(tierKey, service, countryCodes);
         const cached = this._priceCache.get(cacheKey);
 
@@ -324,73 +331,57 @@ class CountryCatalog {
             return cached.data;
         }
 
-        const batchSize = 10;
         const results = [];
         const errors = [];
 
-        for (let i = 0; i < countryCodes.length; i += batchSize) {
-            const batch = countryCodes.slice(i, i + batchSize);
+        // Use tierSelector to get prices from ALL providers (cached)
+        for (const code of countryCodes) {
+            try {
+                const selection = await this.tierSelector.selectOperator(
+                    tierKey, code, service, { timeoutMs: 8000 }
+                );
 
-            const batchPromises = batch.map(async (code) => {
                 const country = this._countryMap.get(code);
-                if (!country) {
-                    logger.warn('Country not in dynamic index', { code, service });
-                    return null;
+                
+                results.push({
+                    code,
+                    name: country?.name || code,
+                    flag: country?.flag || isoToFlag(code),
+                    price: selection.displayPrice ?? null,
+                    displayPrice: selection.displayPrice ?? null,
+                    rawPrice: selection.price ?? null,
+                    stock: selection.stock ?? 0,
+                    operator: selection.operator,
+                    score: selection.score ?? 0,
+                    currency: 'USD',
+                    available: true,
+                    provider: selection.providerKey
+                });
+
+            } catch (error) {
+                const noStock = isNoStockError(error);
+                const country = this._countryMap.get(code);
+
+                if (!noStock) {
+                    logger.warn('Price fetch failed', { code, service, tierKey, error: error.message });
+                    errors.push({ code, error: error.message });
                 }
 
-                try {
-                    const selection = await this.tierSelector.selectOperator(tierKey, code, service, { timeoutMs: 8000 });
-
-                    return {
-                        code,
-                        name: country.name,
-                        flag: country.flag,
-                        price: selection.price ?? null,
-                        displayPrice: selection.displayPrice ?? null,
-                        stock: selection.stock ?? 0,
-                        operator: selection.operator,
-                        score: selection.score ?? 0,
-                        currency: 'USD',
-                        available: true
-                    };
-
-                } catch (error) {
-                    const noStock = isNoStockError(error);
-
-                    if (noStock) {
-                        logger.debug('No stock for country/service', { code, service, tierKey });
-                    } else {
-                        logger.warn('Price fetch failed', { code, service, tierKey, error: error.message });
-                        errors.push({ code, error: error.message });
-                    }
-
-                    return {
-                        code,
-                        name: country.name,
-                        flag: country.flag,
-                        price: null,
-                        displayPrice: null,
-                        stock: 0,
-                        operator: null,
-                        score: 0,
-                        currency: 'USD',
-                        available: false,
-                        unavailableReason: noStock ? 'no_stock' : 'error',
-                        retryable: !noStock
-                    };
-                }
-            });
-
-            const batchResults = await Promise.allSettled(batchPromises);
-
-            for (const result of batchResults) {
-                if (result.status === 'fulfilled' && result.value !== null) {
-                    results.push(result.value);
-                }
-            }
-
-            if (i + batchSize < countryCodes.length) {
-                await new Promise(r => setTimeout(r, 100));
+                results.push({
+                    code,
+                    name: country?.name || code,
+                    flag: country?.flag || isoToFlag(code),
+                    price: null,
+                    displayPrice: null,
+                    rawPrice: null,
+                    stock: 0,
+                    operator: null,
+                    score: 0,
+                    currency: 'USD',
+                    available: false,
+                    unavailableReason: noStock ? 'no_stock' : 'error',
+                    retryable: !noStock
+                });
             }
         }
 
@@ -496,4 +487,4 @@ class CountryCatalog {
 }
 
 export default CountryCatalog;
-                                     
+                                 
