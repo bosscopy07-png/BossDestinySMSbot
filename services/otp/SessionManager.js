@@ -43,13 +43,14 @@ const CreditRestoreConfig = Object.freeze({
 });
 
 class SessionManager {
-    constructor(providerManager, retryEngine, walletService, notificationService = null, numberPoolManager = null, serviceCatalog = null) {
+    constructor(providerManager, retryEngine, walletService, notificationService = null, numberPoolManager = null, serviceCatalog = null, bot = null) {
         this.providerManager = providerManager;
         this.retryEngine = retryEngine;
         this.walletService = walletService;
         this.notificationService = notificationService;
         this.numberPoolManager = numberPoolManager;
-        this.serviceCatalog = serviceCatalog; // NEW: Dynamic service catalog
+        this.serviceCatalog = serviceCatalog;
+        this.bot = bot; // NEW: Telegram bot instance for auto-delivery
 
         // In-memory session tracking
         this.activeSessions = new Map();
@@ -76,7 +77,6 @@ class SessionManager {
                 BUNDLE: 1,
                 VIP: 0
             }
-            // REMOVED: hardcoded services list
         };
 
         // Graceful shutdown handler
@@ -372,6 +372,16 @@ class SessionManager {
 
         this._cleanupSession(sessionId);
 
+        // ═══════════════════════════════════════════════════════════
+        //  AUTO-DELIVERY: Send OTP to user via Telegram immediately
+        // ═══════════════════════════════════════════════════════════
+        try {
+            await this._autoDeliverOTPToUser(session, otp);
+        } catch (autoDeliverError) {
+            logger.error('Auto-delivery to user failed', { sessionId, error: autoDeliverError.message });
+        }
+
+        // Also notify via notification service if available
         if (this.notificationService) {
             try {
                 await this.notificationService.notifyOTPReceived(session.userId, {
@@ -396,9 +406,40 @@ class SessionManager {
         return updated;
     }
 
-                
-                
-        async handleTimeout(session) {
+    // ═══════════════════════════════════════════════════════════
+    //  AUTO-DELIVERY: Send OTP directly to user's Telegram
+    // ═══════════════════════════════════════════════════════════
+
+    async _autoDeliverOTPToUser(session, otp) {
+        if (!this.bot) {
+            logger.debug('No bot instance available for auto-delivery', { sessionId: session.sessionId });
+            return;
+        }
+
+        const message =
+            `🔓 <b>OTP Received!</b>\n\n` +
+            `📱 Number: <code>${session.number}</code>\n` +
+            `🎯 Service: ${session.service}\n` +
+            `🔢 OTP: <code>${otp}</code>\n` +
+            `🕐 Delivered: ${new Date().toLocaleTimeString()}\n\n` +
+            `⚠️ Do not share this code with anyone.`;
+
+        await this.bot.telegram.sendMessage(session.userId, message, {
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '🔙 Back to Menu', callback_data: 'menu' }]
+                ]
+            }
+        });
+
+        logger.info('OTP auto-delivered to user via Telegram', {
+            sessionId: session.sessionId,
+            userId: session.userId
+        });
+    }
+
+    async handleTimeout(session) {
         const sessionId = session.sessionId || session;
 
         if (typeof session === 'string') {
@@ -580,14 +621,10 @@ class SessionManager {
 
         await this._validateModeAccess(user, mode);
 
-        // FIXED: Removed hardcoded service validation
-        // Service is validated dynamically by ServiceCatalog and provider during acquisition
-        // This allows ALL services from 5sim (Rebtel, Signal, etc.) to work
         if (this.serviceCatalog) {
             const isValid = await this.serviceCatalog.hasService(service);
             if (!isValid) {
                 logger.debug('Service not in dynamic catalog, but provider may still support it', { service });
-                // Don't throw — let provider handle it
             }
         }
 
@@ -825,7 +862,27 @@ class SessionManager {
     //  INTERNAL - Monitoring
     // ═══════════════════════════════════════════════════════════
 
-    _startMonitoring(session, providerInstance) {
+                }
+
+            this._schedulePoll(sessionId, interval);
+
+        } catch (error) {
+            logger.error('Poll error', {
+                sessionId,
+                error: error.message,
+                pollCount: sessionData.pollCount
+            });
+
+            this._schedulePoll(sessionId, interval);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  INTERNAL - Cleanup
+    // ═══════════════════════════════════════════════════════════
+
+    
+_startMonitoring(session, providerInstance) {
         const sessionId = session.sessionId;
 
         this.activeSessions.set(sessionId, {
@@ -927,7 +984,7 @@ class SessionManager {
         }
     }
 
-        // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
     //  INTERNAL - Cleanup
     // ═══════════════════════════════════════════════════════════
 
