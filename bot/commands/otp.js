@@ -111,7 +111,7 @@ const KEYBOARDS = {
         }
     }
 
-    // ─── Legacy Tier System Initialization (fallback) ───────────────────────
+        // ─── Legacy Tier System Initialization (fallback) ───────────────────────
     _initTierSystem() {
         const cheapProvider = this.smsProviderManager?.getProvider('CHEAP_PANEL');
         
@@ -119,10 +119,16 @@ const KEYBOARDS = {
         this.serviceCatalog = new ServiceCatalog(cheapProvider);
         
         if (cheapProvider) {
-            this.tierSelector = new TierOperatorSelector(cheapProvider);
+            // FIXED: Wrap single provider in array for TierOperatorSelector
+            // TierOperatorSelector expects array of providers for multi-provider support
+            this.tierSelector = new TierOperatorSelector([cheapProvider]);
+            
+            // FIXED: CountryCatalog also needs array or properly initialized tierSelector
             this.countryCatalog = new CountryCatalog(cheapProvider, this.tierSelector);
+            
             logger.info('OTPCommands: Tier system initialized internally', { 
                 hasProvider: true,
+                providerKey: cheapProvider.providerKey,
                 tiers: Object.keys(TIER_CONFIG)
             });
         } else {
@@ -130,12 +136,8 @@ const KEYBOARDS = {
             this.tierSelector = null;
             this.countryCatalog = null;
         }
-                }
-    
-    
-
-
-
+    }
+        
         // ─── Auto-bind all handler methods ─────────────────────────────────────
     _bindAllHandlers() {
         const handlerNames = [
