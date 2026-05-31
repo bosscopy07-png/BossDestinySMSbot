@@ -1,6 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // SessionManager.js — Session lifecycle management
 // Part 1/3 — Imports, Constructor, Public API (Session Creation & Queries)
+// FIXED: Removed hardcoded service validation. Now accepts ALL services from provider.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { Session, User, Transaction } from '../../models/index.js';
@@ -42,43 +43,40 @@ const CreditRestoreConfig = Object.freeze({
 });
 
 class SessionManager {
-    constructor(providerManager, retryEngine, walletService, notificationService = null, numberPoolManager = null) {
+    constructor(providerManager, retryEngine, walletService, notificationService = null, numberPoolManager = null, serviceCatalog = null) {
         this.providerManager = providerManager;
         this.retryEngine = retryEngine;
         this.walletService = walletService;
         this.notificationService = notificationService;
         this.numberPoolManager = numberPoolManager;
+        this.serviceCatalog = serviceCatalog; // NEW: Dynamic service catalog
 
         // In-memory session tracking
-        this.activeSessions = new Map();      // sessionId -> sessionData
-        this.sessionTimeouts = new Map();     // sessionId -> timeoutTimer
-        this.pollTimers = new Map();          // sessionId -> pollTimer
+        this.activeSessions = new Map();
+        this.sessionTimeouts = new Map();
+        this.pollTimers = new Map();
 
         // Configuration
         this.config = {
             pollIntervals: {
-                FREE: 10000,      // 10s
-                CHEAP: 5000,      // 5s
-                BUNDLE: 5000,     // 5s
-                VIP: 1000         // 1s
+                FREE: 10000,
+                CHEAP: 5000,
+                BUNDLE: 5000,
+                VIP: 1000
             },
             timeouts: {
-                FREE: 120,        // 2 minutes
-                CHEAP: 180,       // 3 minutes
-                BUNDLE: 180,      // 3 minutes
-                VIP: 60           // 1 minute
+                FREE: 120,
+                CHEAP: 180,
+                BUNDLE: 180,
+                VIP: 60
             },
             maxRetries: {
                 FREE: 0,
                 CHEAP: 2,
                 BUNDLE: 1,
                 VIP: 0
-            },
-            services: config.services || [
-                'WhatsApp', 'Telegram', 'Facebook', 'Instagram', 'Twitter',
-                'TikTok', 'Binance', 'Coinbase', 'Gmail', 'Outlook',
-                'Netflix', 'Amazon', 'PayPal', 'Snapchat', 'Discord'
-            ]
+            }
+            // REMOVED: hardcoded services list
         };
 
         // Graceful shutdown handler
@@ -91,19 +89,10 @@ class SessionManager {
     //  PUBLIC API - Session Creation
     // ═══════════════════════════════════════════════════════════
 
-    /**
-     * Create a new OTP session (standard flow)
-     */
     async createSession(userId, mode, service, country = 'US') {
         return this._createSessionInternal(userId, mode, service, country);
     }
 
-    /**
-     * Create session with pre-assigned number (VIP/CHEAP/FREE flow)
-     *
-     * FIXED: Now accepts providerNumberId, cost, operator, AND routedProvider as separate params
-     * Previously: operator and routedProvider were LOST
-     */
     async createSessionWithNumber(userId, mode, service, country, phoneNumber, provider, providerNumberId = null, cost = 0, operator = null, routedProvider = null) {
         const numberData = {
             phoneNumber,
@@ -111,9 +100,9 @@ class SessionManager {
             providerNumberId: providerNumberId,
             providerInstance: null,
             cost: parseFloat(cost) || 0,
-            displayCost: parseFloat(cost) || 0, // FIXED: Preserve displayCost from TierIntegrationService
-            operator: operator || 'any',        // FIXED: Preserve operator from tier selection
-            routedProvider: routedProvider || null // FIXED: Preserve which cheap provider was used
+            displayCost: parseFloat(cost) || 0,
+            operator: operator || 'any',
+            routedProvider: routedProvider || null
         };
         return this._createSessionInternal(userId, mode, service, country, numberData);
     }
@@ -122,19 +111,14 @@ class SessionManager {
     //  PUBLIC API - Session Queries
     // ═══════════════════════════════════════════════════════════
 
-    /**
-     * Check session status by ID (for Check OTP button)
-     */
     async checkSessionStatus(sessionId) {
         const session = await Session.findOne({ sessionId }).lean();
         if (!session) {
             throw new Error('SESSION_NOT_FOUND');
         }
 
-        // If still waiting, poll provider for latest status
         if (['WAITING', 'CHECKING'].includes(session.status)) {
             try {
-                // FIXED: Pass routedProvider for CHEAP mode multi-provider support
                 const providerResult = await this.providerManager.checkSMS(
                     session.provider,
                     session.providerNumberId || session.number,
@@ -142,7 +126,6 @@ class SessionManager {
                 );
 
                 if (providerResult.success && providerResult.otp) {
-                    // OTP found! Auto-deliver
                     await this.deliverOTP(session, providerResult.otp);
                     return {
                         status: 'RECEIVED',
@@ -153,7 +136,6 @@ class SessionManager {
                     };
                 }
 
-                // Update CHECKING status if we haven't yet
                 if (session.status === 'WAITING') {
                     await Session.updateOne(
                         { sessionId },
@@ -166,7 +148,6 @@ class SessionManager {
             }
         }
 
-        // Return current status
         return {
             sessionId: session.sessionId,
             status: session.status,
@@ -181,9 +162,6 @@ class SessionManager {
         };
     }
 
-    /**
-     * Check session status by user (for manual polling)
-     */
     async checkSessionByUser(userId) {
         const session = await Session.findOne({
             userId,
@@ -197,15 +175,6 @@ class SessionManager {
         return this.checkSessionStatus(session.sessionId);
     }
 
-    /**
-     * Cancel an active session
-     * FIXED:
-     * - Only releases funds if lockTx is still PENDING
-     * - Prevents double-refund by checking tx status first
-     * - Returns detailed cancel result
-     * - Cleans up memory timers properly
-     * - Routes cancel to correct provider via routedProvider
-     */
     async cancelSession(sessionId, userId) {
         const session = await Session.findOne({ sessionId, userId });
         if (!session) {
@@ -220,7 +189,6 @@ class SessionManager {
         let providerReleased = false;
 
         try {
-            // Step 1: Release provider number FIRST
             await this._releaseProviderNumber(session, 'USER_CANCELLED');
             providerReleased = true;
         } catch (providerError) {
@@ -228,10 +196,8 @@ class SessionManager {
                 sessionId,
                 error: providerError.message
             });
-            // Continue — provider release is best-effort
         }
 
-        // Step 2: Restore credits (bundle/vip/free counts)
         try {
             await this._restoreCredits(session);
         } catch (creditError) {
@@ -239,13 +205,10 @@ class SessionManager {
                 sessionId,
                 error: creditError.message
             });
-            // Continue — don't block refund if credits fail
         }
 
-        // Step 3: Release locked funds — ONLY if still PENDING
         if (session.lockTxId) {
             try {
-                // Check if transaction is still PENDING before releasing
                 const lockTx = await Transaction.findOne({
                     txId: session.lockTxId,
                     userId
@@ -264,7 +227,6 @@ class SessionManager {
                         lockTxType: lockTx.type
                     });
                 } else {
-                    // FIXED: Only release if actually PENDING
                     const releaseResult = await this.walletService.releaseFunds(
                         session.lockTxId,
                         userId,
@@ -281,12 +243,9 @@ class SessionManager {
                     lockTxId: session.lockTxId,
                     error: releaseError.message
                 });
-                // Continue — session is still cancelled, but funds may be stuck
-                // Admin should manually review
             }
         }
 
-        // Step 4: Mark session as cancelled
         try {
             await Session.markCancelled(sessionId);
         } catch (dbError) {
@@ -297,7 +256,6 @@ class SessionManager {
             throw new Error('SESSION_CANCEL_DB_FAILED');
         }
 
-        // Step 5: Cleanup memory
         this._cleanupSession(sessionId);
 
         logger.info('Session cancelled by user', {
@@ -319,19 +277,9 @@ class SessionManager {
         };
     }
 
-    /**
-     * Deliver OTP to session (called by webhook or polling)
-     * FIXED:
-     * - Removes duplicate totalSpent increment (now handled in captureFunds)
-     * - Calls finishNumber on correct provider after OTP delivery
-     * - Uses generateId() for transaction txId instead of hardcoded
-     * - Wraps Transaction.create in try/catch with proper logging
-     * - Validates providerNumberId before calling finish
-     */
     async deliverOTP(session, otp) {
         const sessionId = session.sessionId || session;
 
-        // If string passed, look up session
         if (typeof session === 'string') {
             session = await Session.findOne({ sessionId }).lean();
             if (!session) {
@@ -340,7 +288,6 @@ class SessionManager {
             }
         }
 
-        // Idempotency check — already delivered?
         if (session.status === 'RECEIVED') {
             logger.warn('OTP already delivered', { sessionId });
             return session;
@@ -348,7 +295,6 @@ class SessionManager {
 
         const maskedOtp = this.maskOTP(otp);
 
-        // Update session atomically — only if still in deliverable state
         const updated = await Session.findOneAndUpdate(
             { sessionId, status: { $in: ['WAITING', 'CHECKING'] } },
             {
@@ -367,27 +313,20 @@ class SessionManager {
             return null;
         }
 
-        // Capture funds for CHEAP mode
         if (session.mode === 'CHEAP' && session.lockTxId) {
             try {
                 await this.walletService.captureFunds(session.lockTxId, session.userId);
-                // FIXED: Removed duplicate User.updateOne for totalSpent
-                // captureFunds now handles: balance -= amount, lockedBalance -= amount, totalSpent += amount
             } catch (captureError) {
                 logger.error('Fund capture failed', { sessionId, error: captureError.message });
-                // Continue — OTP is delivered, but funds may not be captured
-                // This is a critical error that needs admin attention
             }
         }
 
-        // FIXED: Call finishNumber on correct provider to mark activation as complete
-        // This prevents provider from keeping the number reserved
         if (session.mode === 'CHEAP' && session.providerNumberId && this.providerManager) {
             try {
                 const finishResult = await this.providerManager.finishNumber(
                     session.provider,
                     session.providerNumberId,
-                    session.routedProvider // FIXED: Pass routedProvider for multi-provider routing
+                    session.routedProvider
                 );
                 logger.info('Provider activation finished', {
                     sessionId,
@@ -402,11 +341,9 @@ class SessionManager {
                     routedProvider: session.routedProvider,
                     error: finishError.message
                 });
-                // Non-critical — OTP already delivered, provider will auto-expire
             }
         }
 
-        // Create transaction record for paid modes
         if (session.cost > 0 && session.mode === 'CHEAP') {
             try {
                 await Transaction.create({
@@ -433,10 +370,8 @@ class SessionManager {
             }
         }
 
-        // Cleanup memory timers
         this._cleanupSession(sessionId);
 
-        // Notify via notification service if available
         if (this.notificationService) {
             try {
                 await this.notificationService.notifyOTPReceived(session.userId, {
@@ -460,14 +395,10 @@ class SessionManager {
 
         return updated;
     }
-        /**
-     * Handle session timeout
-     * FIXED: 
-     * - Cancels on correct provider using activation ID and routedProvider
-     * - NO auto-retry — user must request manually after timeout
-     * - Single source of truth for refunds
-     */
-    async handleTimeout(session) {
+
+                
+                
+        async handleTimeout(session) {
         const sessionId = session.sessionId || session;
 
         if (typeof session === 'string') {
@@ -475,19 +406,17 @@ class SessionManager {
             if (!session) return null;
         }
 
-        // Idempotency check — already handled?
         if (!['WAITING', 'CHECKING'].includes(session.status)) {
             logger.info('Timeout: session already handled', { sessionId, status: session.status });
             return null;
         }
 
-        // FIXED: Cancel on correct provider FIRST using activation ID and routedProvider
         if (session.mode === 'CHEAP' && session.providerNumberId) {
             try {
                 await this.providerManager.cancelNumber(
                     session.provider,
                     session.providerNumberId,
-                    session.routedProvider // FIXED: Pass routedProvider for multi-provider routing
+                    session.routedProvider
                 );
                 logger.info('Provider cancelled on timeout', {
                     sessionId,
@@ -495,7 +424,6 @@ class SessionManager {
                     routedProvider: session.routedProvider
                 });
             } catch (cancelError) {
-                // Already cancelled = OK
                 if (cancelError.response?.data === 'order not found' || 
                     cancelError.message?.includes('order not found')) {
                     logger.info('Provider already cancelled (order not found)', { sessionId });
@@ -510,13 +438,9 @@ class SessionManager {
             }
         }
 
-        // Release provider number (for other modes)
         await this._releaseProviderNumber(session, 'TIMEOUT');
-
-        // Restore credits (bundle/vip/free)
         await this._restoreCredits(session);
 
-        // Release locked funds for CHEAP mode
         if (session.lockTxId) {
             try {
                 await this.walletService.releaseFunds(
@@ -530,11 +454,9 @@ class SessionManager {
             }
         }
 
-        // Mark session as timeout
         await Session.markTimeout(sessionId);
         this._cleanupSession(sessionId);
 
-        // Notify user
         if (this.notificationService) {
             try {
                 await this.notificationService.notifyTimeout(session.userId, {
@@ -549,10 +471,6 @@ class SessionManager {
             }
         }
 
-        // ========== NO AUTO-RETRY ==========
-        // User must manually request a new OTP after timeout
-        // The _scheduleTimeoutNotification in your controller sends the timeout message to user
-
         logger.info('Session timed out', {
             sessionId,
             userId: session.userId,
@@ -563,9 +481,6 @@ class SessionManager {
         return { retried: false };
     }
 
-    /**
-     * Handle provider-side failure
-     */
     async handleProviderFailure(session, providerStatus) {
         const sessionId = session.sessionId || session;
 
@@ -576,7 +491,6 @@ class SessionManager {
 
         const finalStatus = ProviderStatusMap[providerStatus] || 'FAILED';
 
-        // Release funds
         if (session.lockTxId) {
             await this.walletService.releaseFunds(
                 session.lockTxId,
@@ -585,10 +499,8 @@ class SessionManager {
             );
         }
 
-        // Restore credits
         await this._restoreCredits(session);
 
-        // Update session
         await Session.updateOne(
             { sessionId },
             { $set: { status: finalStatus, endTime: new Date() } }
@@ -652,7 +564,6 @@ class SessionManager {
     // ═══════════════════════════════════════════════════════════
 
     async _createSessionInternal(userId, mode, service, country, preAssignedNumber = null) {
-        // Check for existing active session
         const existing = await Session.findOne({
             userId,
             status: { $in: ['WAITING', 'CHECKING'] }
@@ -663,20 +574,23 @@ class SessionManager {
             throw new Error('ACTIVE_SESSION_EXISTS');
         }
 
-        // Validate user
         const user = await User.findOne({ userId });
         if (!user) throw new Error('USER_NOT_FOUND');
         if (user.isBlacklisted) throw new Error('USER_BLACKLISTED');
 
-        // Validate mode access
         await this._validateModeAccess(user, mode);
 
-        // Validate service
-        if (!this.config.services.includes(service)) {
-            throw new Error('INVALID_SERVICE');
+        // FIXED: Removed hardcoded service validation
+        // Service is validated dynamically by ServiceCatalog and provider during acquisition
+        // This allows ALL services from 5sim (Rebtel, Signal, etc.) to work
+        if (this.serviceCatalog) {
+            const isValid = await this.serviceCatalog.hasService(service);
+            if (!isValid) {
+                logger.debug('Service not in dynamic catalog, but provider may still support it', { service });
+                // Don't throw — let provider handle it
+            }
         }
 
-        // Acquire number
         let numberData;
         try {
             if (preAssignedNumber) {
@@ -684,7 +598,6 @@ class SessionManager {
             } else if (mode === 'VIP' && this.numberPoolManager) {
                 numberData = await this.numberPoolManager.acquireNumber(country, service, userId);
             } else if (mode === 'CHEAP' && preAssignedNumber?.operator && preAssignedNumber.operator !== 'any') {
-                // FIXED: If operator was pre-selected (from tier flow), pass it to providerManager
                 numberData = await this.providerManager.getNumber(mode, country, service, null, userId, preAssignedNumber.operator);
             } else {
                 numberData = await this.providerManager.getNumber(mode, country, service);
@@ -696,7 +609,6 @@ class SessionManager {
             throw new Error('NUMBER_UNAVAILABLE: ' + error.message);
         }
 
-        // Validate number
         if (!numberData.phoneNumber || numberData.phoneNumber.length < 7) {
             logger.error('Invalid phone number', {
                 userId,
@@ -707,16 +619,11 @@ class SessionManager {
             throw new Error('INVALID_NUMBER_FROM_PROVIDER');
         }
 
-        // Handle finances
-        // FIXED: Use displayCost from numberData (already includes $0.10 profit from provider)
         const { cost, lockTxId } = await this._handleFinances(user, userId, mode, numberData, service);
 
-        // Calculate timeout
         const timeoutSeconds = this.config.timeouts[mode] || 120;
         const timeoutAt = new Date(Date.now() + timeoutSeconds * 1000);
 
-        // Create session
-        // FIXED: Store providerNumberId, operator, and routedProvider from numberData
         const session = await Session.create({
             sessionId: generateId(),
             userId,
@@ -727,7 +634,7 @@ class SessionManager {
             provider: numberData.provider,
             providerNumberId: numberData.providerNumberId || null,
             operator: numberData.operator || preAssignedNumber?.operator || 'any',
-            routedProvider: numberData.routedProvider || null, // FIXED: Store which cheap provider was used
+            routedProvider: numberData.routedProvider || null,
             status: 'WAITING',
             startTime: new Date(),
             timeoutAt,
@@ -736,7 +643,6 @@ class SessionManager {
             maxRetries: this.config.maxRetries[mode] || 0
         });
 
-        // Start monitoring
         this._startMonitoring(session, numberData.providerInstance);
 
         logger.info('Session created', {
@@ -757,26 +663,17 @@ class SessionManager {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  INTERNAL - Finances (FIXED)
+    //  INTERNAL - Finances
     // ═══════════════════════════════════════════════════════════
 
-    /**
-     * FIXED: Now uses displayCost from numberData for CHEAP mode
-     * Previously: Always used config.pricing?.cheapOtp || 0.05
-     * Now: Uses numberData.displayCost (raw + $0.10 from provider)
-     */
     async _handleFinances(user, userId, mode, numberData, service) {
         let cost = 0;
         let lockTxId = null;
 
         switch (mode) {
             case 'CHEAP': {
-                // FIXED: Use displayCost from provider (already includes $0.10 profit)
-                // numberData.displayCost = what user pays (e.g. $0.60 = $0.50 raw + $0.10)
-                // numberData.cost = what provider charges (e.g. $0.50)
                 cost = parseFloat(numberData.displayCost) || parseFloat(numberData.cost) || config.pricing?.cheapOtp || 0.05;
 
-                // Ensure cost is valid
                 if (cost <= 0) {
                     cost = config.pricing?.cheapOtp || 0.05;
                 }
@@ -847,29 +744,20 @@ class SessionManager {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  INTERNAL - Provider Management (FIXED)
+    //  INTERNAL - Provider Management
     // ═══════════════════════════════════════════════════════════
 
-    /**
-     * FIXED: Properly uses providerNumberId for CHEAP mode with routedProvider support
-     * Previously: Used session.providerNumberId || session.number — fell back to phone number
-     * Now: For CHEAP, uses session.providerNumberId (activation ID). Passes routedProvider for multi-provider.
-     */
     async _releaseProviderNumber(session, reason) {
         try {
             if (session.mode === 'VIP' && this.numberPoolManager && session.providerNumberId) {
                 await this.numberPoolManager.releaseNumber(session.providerNumberId, reason);
             } else if (session.mode === 'CHEAP' && session.providerNumberId) {
-                // FIXED: CHEAP mode MUST use providerNumberId (activation ID like "1001025384")
-                // NEVER use session.number (phone number like "+4915511298251") for cancel
-                // FIXED: Pass routedProvider for correct provider routing
                 await this.providerManager.cancelNumber(
                     session.provider,
                     session.providerNumberId,
                     session.routedProvider
                 );
             } else if (this.providerManager) {
-                // For other modes or if providerNumberId is missing, use number as fallback
                 await this.providerManager.cancelNumber(
                     session.provider,
                     session.providerNumberId || session.number,
@@ -888,7 +776,8 @@ class SessionManager {
             });
         }
     }
-        // ═══════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════
     //  INTERNAL - Validation
     // ═══════════════════════════════════════════════════════════
 
@@ -900,14 +789,12 @@ class SessionManager {
                 }
             },
             CHEAP: () => {
-                // FIXED: Use dynamic minimum balance check instead of hardcoded $0.05
-                // We can only check minimum entry threshold here; actual price check happens in _handleFinances
-                const minBalance = 0.05; // Minimum to enter CHEAP flow
+                const minBalance = 0.05;
                 const available = typeof user.getAvailableBalance === 'function'
                     ? user.getAvailableBalance()
                     : (user.balance || 0) - (user.lockedBalance || 0);
                 if (available < minBalance) {
-                    throw new Error('INSUFFICIENT_BALANCE');
+                    throw new Error('INSUFFICIENT_FUNDS');
                 }
             },
             VIP: () => {
@@ -941,7 +828,6 @@ class SessionManager {
     _startMonitoring(session, providerInstance) {
         const sessionId = session.sessionId;
 
-        // Store in memory
         this.activeSessions.set(sessionId, {
             session,
             providerInstance,
@@ -950,7 +836,6 @@ class SessionManager {
             pollCount: 0
         });
 
-        // Start polling
         const pollInterval = this.config.pollIntervals[session.mode] || 5000;
         this._schedulePoll(sessionId, pollInterval);
     }
@@ -989,7 +874,6 @@ class SessionManager {
                 );
             }
 
-            // FIXED: Use tier-specific methods with routedProvider for CHEAP
             let result;
             switch (current.mode) {
                 case 'FREE':
@@ -999,7 +883,6 @@ class SessionManager {
                     break;
 
                 case 'CHEAP':
-                    // FIXED: Pass routedProvider for multi-provider SMS checking
                     result = await this.providerManager.checkCheapSMS(
                         current.providerNumberId || current.number,
                         current.routedProvider
@@ -1014,7 +897,6 @@ class SessionManager {
                     break;
 
                 default:
-                    // Fallback to legacy only for unknown modes
                     result = await this.providerManager.checkSMS(
                         current.provider,
                         current.providerNumberId || current.number,
@@ -1045,26 +927,23 @@ class SessionManager {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════
     //  INTERNAL - Cleanup
     // ═══════════════════════════════════════════════════════════
 
     _cleanupSession(sessionId) {
-        // Clear poll timer
         const pollTimer = this.pollTimers.get(sessionId);
         if (pollTimer) {
             clearTimeout(pollTimer);
             this.pollTimers.delete(sessionId);
         }
 
-        // Clear timeout timer
         const timeoutTimer = this.sessionTimeouts.get(sessionId);
         if (timeoutTimer) {
             clearTimeout(timeoutTimer);
             this.sessionTimeouts.delete(sessionId);
         }
 
-        // Remove from active sessions
         const sessionData = this.activeSessions.get(sessionId);
         if (sessionData) {
             sessionData.state = SessionState.CLEANED;
@@ -1079,7 +958,6 @@ class SessionManager {
             activeSessions: this.activeSessions.size
         });
 
-        // Cancel all active sessions
         const promises = [];
         for (const [sessionId, sessionData] of this.activeSessions) {
             promises.push(
@@ -1091,7 +969,6 @@ class SessionManager {
 
         await Promise.allSettled(promises);
 
-        // Clear all timers
         for (const timer of this.pollTimers.values()) clearTimeout(timer);
         for (const timer of this.sessionTimeouts.values()) clearTimeout(timer);
 
