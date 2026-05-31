@@ -76,9 +76,10 @@ const KEYBOARDS = {
 // ═══════════════════════════════════════════════════════════════════════════════
 
     class OTPCommands {
-    constructor(bot, walletService, smsProviderManager = null, tierIntegrationService = null) {
+    constructor(bot, walletService, sessionManager = null, smsProviderManager = null, tierIntegrationService = null) {
         this.bot = bot;
         this.walletService = walletService;
+        this.sessionManager = sessionManager;
         this.smsProviderManager = smsProviderManager;
         
         // ═════════════════════════════════════════════════════════════════
