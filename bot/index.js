@@ -497,6 +497,7 @@ class TelegramBot {
         }
     }
 
+
         async setupCommands() {
         try {
             this.smsProviderManager = new SMSProviderManager();
@@ -504,7 +505,6 @@ class TelegramBot {
             logger.info('SMS Provider Manager initialized');
         } catch (error) {
             logger.error('Failed to initialize SMS Provider Manager', { error: error.message });
-            // Keep instance alive for inspection — don't null it out
             await this.alertAdmins(error, {
                 source: 'setup.setupCommands',
                 note: 'SMS Provider Manager init failed — bot continues with degraded SMS'
@@ -517,12 +517,28 @@ class TelegramBot {
             logger.info('Tier Integration Service initialized');
         } catch (error) {
             logger.error('Failed to initialize Tier Integration Service', { error: error.message });
-            // Keep instance alive for inspection — don't null it out
             await this.alertAdmins(error, {
                 source: 'setup.tierIntegration',
                 note: 'Tier Integration Service init failed — legacy CHEAP flow will be used'
             });
         }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  SESSION MANAGER — Handles session lifecycle + auto OTP delivery
+        // ═══════════════════════════════════════════════════════════════════════
+        const retryEngine = new RetryEngine(); // replace with your actual import
+        this.sessionManager = new SessionManager(
+            this.smsProviderManager,
+            retryEngine,
+            this.walletService,
+            this.notificationService,
+            null,        // numberPoolManager
+            null,        // serviceCatalog
+            this.bot     // <-- Telegraf bot for auto-delivery
+        );
+        logger.info('Session Manager initialized');
+
+    
 
         // ═══════════════════════════════════════════════════════════════════════
         //  DEBUG — Check tier system health (REMOVE AFTER FIXING)
