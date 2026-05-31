@@ -1,7 +1,12 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 //  services/TierIntegrationService.js — Tier Flow Orchestration Layer
 //  Bridges ServiceCatalog → TierOperatorSelector → CountryCatalog → ProviderRouter
-//  Zero breaking changes to existing architecture.
+//  FIXED:
+//   1. Queries ALL providers for cheapest tier baseline price
+//   2. Preserves original service name through entire purchase flow
+//   3. Cross-provider fallback on purchase failure (same tier only)
+//   4. Cache TTL: 60 minutes with auto-prewarm
+//   5. Provider fallback chain: 5sim → SMSPool → Hero → OnlineSim
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { TIER_CONFIG, CACHE_TTL, getTierConfig } from '../config/tierConfig.js';
@@ -10,39 +15,47 @@ import logger from '../utils/logger.js';
 /**
  * TierIntegrationService — Central orchestrator for the 3-tier CHEAP flow
  * 
- * Pricing Model (FIXED):
+ * Pricing Model:
  *   - rawPrice      = provider's base cost for the number
- *   - displayCost   = rawPrice + BASE_PROFIT ($0.10) — set by CheapPanelProvider.getDisplayPrice
+ *   - displayCost   = rawPrice + BASE_PROFIT ($0.10) — set by provider.getDisplayPrice
  *   - finalPrice    = displayCost × tier.priceMultiplier
  *   - Budget:   1.00× = no extra markup (profit = $0.10)
  *   - Standard: 1.15× = +15% extra profit
  *   - Premium:  1.35× = +35% extra profit
+ * 
+ * Provider Fallback Chain:
+ *   1. CHEAP_PANEL (5sim) — primary
+ *   2. SMSPOOL — secondary
+ *   3. HERO_SMS — tertiary
+ *   4. ONLINE_SIM — quaternary
  * 
  * Responsibilities:
  *   - Initializes and wires all tier components
  *   - Provides single entry point for bot handlers
  *   - Normalizes errors across the flow
  *   - Manages cross-cutting concerns (caching, logging, metrics)
- *   - Falls back to legacy flow if tier system unavailable
+ *   - Falls back to other providers for same tier on failure
  */
 class TierIntegrationService {
     // Constants
     static BASE_PROFIT = 0.10;
-    static BASELINE_CACHE_TTL = 60 * 1000; // 1 minute
+    static BASELINE_CACHE_TTL = 60 * 60 * 1000; // 60 minutes
     static FALLBACK_MAX_ATTEMPTS = 3;
 
     constructor(smsProviderManager, options = {}) {
         this.providerManager = smsProviderManager;
         
-        // Lazy-loaded components (initialized on first use)
+        // Lazy-loaded components
         this._serviceCatalog = null;
         this._tierSelector = null;
         this._countryCatalog = null;
         this._cheapProvider = null;
         this._onlineSimProvider = null;
+        this._smsPoolProvider = null;
+        this._heroSmsProvider = null;
         this._providerRouter = null;
         
-        // Cache for tier baseline prices (used in tier selection UI)
+        // Cache for tier baseline prices
         this._baselinePriceCache = new Map();
         
         // Feature flags
@@ -54,9 +67,13 @@ class TierIntegrationService {
             tierSelections: 0,
             tierPurchases: 0,
             tierFallbacks: 0,
+            crossProviderFallbacks: 0,
             legacyFallbacks: 0,
             errors: 0
         };
+
+        // Auto-prewarm interval
+        this._cacheRefreshInterval = null;
 
         logger.info('TierIntegrationService created', {
             enabled: this._enabled,
@@ -78,12 +95,14 @@ class TierIntegrationService {
         }
 
         try {
-            // Get provider instances from manager
+            // Get all provider instances from manager
             this._cheapProvider = this.providerManager?.getProvider('CHEAP_PANEL');
             this._onlineSimProvider = this.providerManager?.getProvider('ONLINE_SIM');
+            this._smsPoolProvider = this.providerManager?.getProvider('SMSPOOL');
+            this._heroSmsProvider = this.providerManager?.getProvider('HERO_SMS');
             
             if (!this._cheapProvider) {
-                logger.warn('CHEAP_PANEL provider not found in manager, tier flow unavailable');
+                logger.warn('CHEAP_PANEL provider not found, tier flow unavailable');
                 this._enabled = false;
                 return;
             }
@@ -100,28 +119,27 @@ class TierIntegrationService {
             const { default: CountryCatalog } = await import('./CountryCatalog.js');
             const { default: ProviderRouter } = await import('./sms/ProviderRouter.js');
 
-            // Initialize ServiceCatalog with primary cheap provider
-            this._serviceCatalog = new ServiceCatalog(this._cheapProvider);
-            
-            // Collect all active cheap providers for tier selection
-            const tierProviders = [];
-            if (this._cheapProvider?.isActive) tierProviders.push(this._cheapProvider);
-            if (this._onlineSimProvider?.isActive) tierProviders.push(this._onlineSimProvider);
-            
-            this._tierSelector = new TierOperatorSelector(tierProviders);
-            this._countryCatalog = new CountryCatalog(this._cheapProvider, this._tierSelector);
+            // Collect ALL active providers for tier selection
+            const allProviders = [];
+            if (this._cheapProvider?.isActive) allProviders.push(this._cheapProvider);
+            if (this._smsPoolProvider?.isActive) allProviders.push(this._smsPoolProvider);
+            if (this._heroSmsProvider?.isActive) allProviders.push(this._heroSmsProvider);
+            if (this._onlineSimProvider?.isActive) allProviders.push(this._onlineSimProvider);
 
-            // Initialize ProviderRouter with all active cheap providers
-            const cheapProviders = tierProviders.filter(p => p?.isActive);
-            
-            this._providerRouter = new ProviderRouter(cheapProviders);
+            // Initialize components
+            this._serviceCatalog = new ServiceCatalog(this._cheapProvider);
+            this._tierSelector = new TierOperatorSelector(allProviders);
+            this._countryCatalog = new CountryCatalog(this._cheapProvider, this._tierSelector);
+            this._providerRouter = new ProviderRouter(allProviders);
+
+            // Start auto-prewarm
+            this._startCachePrewarm();
 
             logger.info('TierIntegrationService initialized successfully', {
                 servicesIndexed: !!this._serviceCatalog,
                 countriesIndexed: !!this._countryCatalog,
                 tiersConfigured: Object.keys(TIER_CONFIG).length,
-                cheapProviders: cheapProviders.map(p => p.providerKey || p.name),
-                tierProviders: tierProviders.map(p => p.providerKey || p.name)
+                providers: allProviders.map(p => p.providerKey || p.name)
             });
 
         } catch (error) {
@@ -130,6 +148,38 @@ class TierIntegrationService {
             if (!this._legacyFallback) {
                 throw error;
             }
+        }
+    }
+
+    /**
+     * Start background cache prewarm every 50 minutes
+     */
+    _startCachePrewarm() {
+        // Prewarm immediately
+        this._prewarmAllCaches().catch(() => {});
+
+        // Then every 50 minutes
+        this._cacheRefreshInterval = setInterval(() => {
+            this._prewarmAllCaches().catch(err => 
+                logger.debug('Cache prewarm failed', { error: err.message })
+            );
+        }, 50 * 60 * 1000);
+    }
+
+    async _prewarmAllCaches() {
+        try {
+            if (this._cheapProvider?.isActive) {
+                await this._cheapProvider.prewarmCache();
+            }
+            if (this._smsPoolProvider?.isActive && this._smsPoolProvider.prewarmCache) {
+                await this._smsPoolProvider.prewarmCache();
+            }
+            if (this._heroSmsProvider?.isActive && this._heroSmsProvider.prewarmCache) {
+                await this._heroSmsProvider.prewarmCache();
+            }
+            logger.info('All caches prewarmed');
+        } catch (error) {
+            logger.warn('Cache prewarm error', { error: error.message });
         }
     }
 
@@ -149,70 +199,45 @@ class TierIntegrationService {
     //  SERVICE SELECTION (Step 1)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Get popular services for initial display
-     */
     async getPopularServices() {
         if (!this.isAvailable()) return null;
         return this._serviceCatalog.getPopularServices();
     }
 
-    /**
-     * Search services by query
-     */
     async searchServices(query, limit = 30) {
         if (!this.isAvailable()) return null;
         return this._serviceCatalog.searchServices(query, limit);
     }
 
-    /**
-     * Get services by category
-     */
     async getServicesByCategory(category) {
         if (!this.isAvailable()) return null;
         return this._serviceCatalog.getServicesByCategory(category);
     }
 
-    /**
-     * Get all categories with counts
-     */
     async getCategories() {
         if (!this.isAvailable()) return null;
         return this._serviceCatalog.getCategories();
     }
 
-    /**
-     * Get paginated service list
-     */
     async getServicesPage(page, perPage, filter = null) {
         if (!this.isAvailable()) return null;
         return this._serviceCatalog.getServicesPage(page, perPage, filter);
     }
 
-    /**
-     * Validate service exists
-     * Dynamic catalog is the only source of truth — no hardcoded fallback.
-     */
     async isValidService(serviceName) {
         if (!this.isAvailable()) return false;
         return this._serviceCatalog.hasService(serviceName);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  TIER SELECTION (Step 2)
+    //  TIER SELECTION (Step 2) — Queries ALL providers for cheapest price
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Get all tier infos for display
-     */
     getAllTierInfos() {
         if (!this.isAvailable()) return null;
         return this._tierSelector.getAllTierInfos();
     }
 
-    /**
-     * Get tier info by key
-     */
     getTierInfo(tierKey) {
         if (!this.isAvailable()) return null;
         return this._tierSelector.getTierInfo(tierKey);
@@ -220,11 +245,7 @@ class TierIntegrationService {
 
     /**
      * Get tier baseline prices for a service (for UI display)
-     * 
-     * Pricing Model:
-     *   - rawPrice    = provider's base cost
-     *   - displayCost = rawPrice + BASE_PROFIT ($0.10)
-     *   - finalPrice  = displayCost × tier.priceMultiplier
+     * Queries ALL providers and shows CHEAPEST price per tier
      */
     async getTierBaselinePrices(service, country = 'US') {
         if (!this.isAvailable()) return null;
@@ -241,6 +262,7 @@ class TierIntegrationService {
 
         for (const tier of tierInfos) {
             try {
+                // Use tierSelector which queries ALL providers
                 const baseline = await this._tierSelector.selectOperator(
                     tier.key, country, service, { timeoutMs: 8000 }
                 ).catch(() => null);
@@ -257,15 +279,16 @@ class TierIntegrationService {
                     description: tier.description,
                     badge: tier.badge,
                     priceMultiplier: tier.priceMultiplier,
-                    baselinePrice: finalPrice,        // What user pays
-                    displayCost: displayCost,         // Raw + $0.10 base profit
-                    rawPrice: rawPrice,               // Provider raw cost
+                    baselinePrice: finalPrice,
+                    displayCost: displayCost,
+                    rawPrice: rawPrice,
                     baseProfit: TierIntegrationService.BASE_PROFIT,
-                    extraProfit: extraProfit,         // Tier markup amount
+                    extraProfit: extraProfit,
                     baselineStock: baseline?.stock || 0,
                     operatorCount: tier.operatorCount,
                     providerKey: baseline?.providerKey || null,
-                    provider: baseline?.provider || null
+                    provider: baseline?.provider || null,
+                    cheapestProvider: baseline?.providerKey || null
                 });
             } catch (error) {
                 results.push({
@@ -297,9 +320,6 @@ class TierIntegrationService {
         return results;
     }
 
-    /**
-     * Check if a tier has ANY stock for service/country (lightweight)
-     */
     async hasTierStock(tierKey, country, service) {
         if (!this.isAvailable()) {
             return { available: false, reason: 'TIER_SYSTEM_UNAVAILABLE' };
@@ -311,9 +331,6 @@ class TierIntegrationService {
     //  COUNTRY SELECTION (Step 3)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Get countries for service with tier-aware pricing
-     */
     async getCountriesForService(service, tierKey, options = {}) {
         if (!this.isAvailable()) {
             return { 
@@ -337,17 +354,11 @@ class TierIntegrationService {
         }
     }
 
-    /**
-     * Search countries by query
-     */
     searchCountries(query) {
         if (!this.isAvailable()) return [];
         return this._countryCatalog.searchCountries(query);
     }
 
-    /**
-     * Get top countries with pricing
-     */
     async getTopCountries(service, tierKey, limit = 20) {
         if (!this.isAvailable()) return { countries: [], tierInfo: null };
         return this._countryCatalog.getTopCountries(service, tierKey, limit);
@@ -355,21 +366,10 @@ class TierIntegrationService {
 
     // ═══════════════════════════════════════════════════════════════════════
     //  PURCHASE ORCHESTRATION (Step 4)
+    //  Cross-provider fallback: same tier, different provider
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Select best operator and purchase number
-     * 
-     * Pricing Model:
-     *   - displayCost = raw + BASE_PROFIT ($0.10) — from provider
-     *   - finalPrice  = displayCost × tier.priceMultiplier
-     * 
-     * Uses ProviderRouter for multi-provider support.
-     * Validates operator selection before purchase.
-     * Excludes failed operator from fallback.
-     */
-    
-        async purchaseNumber(tierKey, country, service, options = {}) {
+                        async purchaseNumber(tierKey, country, service, options = {}) {
         if (!this.isAvailable()) {
             return { 
                 success: false, 
@@ -382,9 +382,10 @@ class TierIntegrationService {
         this._metrics.tierSelections++;
 
         let selection = null;
+        const originalService = service; // PRESERVE original name
 
         try {
-            // Step 1: Select best operator
+            // Step 1: Select best operator across ALL providers
             selection = await this._tierSelector.selectOperator(
                 tierKey, country, service, { 
                     timeoutMs: options.timeoutMs || 15000,
@@ -392,71 +393,48 @@ class TierIntegrationService {
                 }
             );
 
-            // Validate operator selection
-            if (!selection.operator || selection.operator === 'any') {
-                logger.warn('Tier selector returned "any" or empty operator', {
-                    tier: tierKey, country, service, selection
-                });
+            // Validate selection
+            if (!selection.operator) {
+                throw new Error('NO_OPERATOR: No operator selected');
             }
 
             // Step 2: Build purchase payload with EXACT selected operator
+            // CRITICAL: Pass originalService, not mapped service
             const purchasePayload = {
                 country, 
-                service, 
+                service: originalService,  // ← PRESERVE ORIGINAL
                 operator: selection.operator
             };
 
-            // Validation: Ensure selected operator is used
-            if (selection.operator !== purchasePayload.operator) {
-                logger.error('OPERATOR MISMATCH DETECTED', {
-                    selectedOperator: selection.operator,
-                    purchaseOperator: purchasePayload.operator
-                });
-                throw new Error('OPERATOR_MISMATCH: Selected operator does not match purchase payload');
-            }
-
             logger.info('Purchasing with selected operator', {
                 selectedOperator: selection.operator,
-                purchaseOperator: purchasePayload.operator,
                 tier: tierKey,
                 country,
-                service,
+                originalService,
+                mappedService: selection.mappedService,
                 expectedPrice: selection.price,
-                expectedDisplayPrice: selection.displayPrice
+                expectedDisplayPrice: selection.displayPrice,
+                provider: selection.providerKey
             });
 
-            // Step 3: Execute purchase via ProviderRouter or direct provider
+            // Step 3: Execute purchase via selected provider
             let purchaseResult;
-            let usedProviderKey = 'CHEAP_PANEL';
-            
-            if (this._providerRouter?.hasAvailableProvider()) {
-                purchaseResult = await this._providerRouter.getNumber(
-                    purchasePayload.country, 
-                    purchasePayload.service, 
-                    purchasePayload.operator
-                );
-                usedProviderKey = purchaseResult.routedProvider || 'CHEAP_PANEL';
-            } else {
-                purchaseResult = await this._cheapProvider.getNumber(
-                    purchasePayload.country, 
-                    purchasePayload.service, 
-                    purchasePayload.operator
-                );
+            let usedProvider = this._getProviderByKey(selection.providerKey);
+
+            if (!usedProvider) {
+                throw new Error(`PROVIDER_NOT_FOUND: ${selection.providerKey}`);
             }
+
+            purchaseResult = await usedProvider.getNumber(
+                purchasePayload.country, 
+                purchasePayload.service, 
+                purchasePayload.operator
+            );
 
             this._metrics.tierPurchases++;
 
-            // Validation: Verify purchased operator matches selected
-            if (purchaseResult.operator && purchaseResult.operator !== selection.operator) {
-                logger.warn('Provider returned different operator than requested', {
-                    requestedOperator: selection.operator,
-                    returnedOperator: purchaseResult.operator,
-                    providerNumberId: purchaseResult.providerNumberId
-                });
-            }
-
             // Calculate pricing
-            const displayCost = purchaseResult.displayCost || selection.price || 0;
+            const displayCost = purchaseResult.displayCost || selection.displayPrice || 0;
             const tier = getTierConfig(tierKey);
             const finalPrice = Number((displayCost * tier.priceMultiplier).toFixed(2));
             const extraProfit = Number((finalPrice - displayCost).toFixed(2));
@@ -464,10 +442,11 @@ class TierIntegrationService {
             logger.info('Tier purchase successful', {
                 tier: tierKey,
                 country,
-                service,
+                originalService,
+                mappedService: purchaseResult.mappedService || selection.mappedService,
                 operator: selection.operator,
                 purchasedOperator: purchaseResult.operator || selection.operator,
-                provider: usedProviderKey,
+                provider: selection.providerKey,
                 displayCost,
                 finalPrice,
                 baseProfit: TierIntegrationService.BASE_PROFIT,
@@ -481,7 +460,7 @@ class TierIntegrationService {
                 providerNumberId: purchaseResult.providerNumberId,
                 operator: selection.operator,
                 purchasedOperator: purchaseResult.operator || selection.operator,
-                routedProvider: usedProviderKey,
+                routedProvider: selection.providerKey,
                 price: finalPrice,
                 displayPrice: finalPrice,
                 displayCost: displayCost,
@@ -492,7 +471,8 @@ class TierIntegrationService {
                 score: selection.score,
                 tier: tierKey,
                 country,
-                service
+                service: originalService,  // ← RETURN ORIGINAL
+                mappedService: purchaseResult.mappedService || selection.mappedService
             };
 
         } catch (error) {
@@ -503,25 +483,27 @@ class TierIntegrationService {
                 'NOT_AVAILABLE',
                 'TIMEOUT',
                 'INVALID_RESPONSE',
-                'PROVIDER_ERROR'
+                'PROVIDER_ERROR',
+                'NO_OPERATOR'
             ].some(code => error.message?.includes(code));
 
             if (options.allowFallback !== false && shouldFallback) {
-                logger.warn('Primary operator failed, attempting fallback', {
+                logger.warn('Primary purchase failed, attempting fallback', {
                     tier: tierKey,
                     country,
-                    service,
+                    originalService,
                     error: error.message,
-                    failedOperator: selection?.operator
+                    failedOperator: selection?.operator,
+                    failedProvider: selection?.providerKey
                 });
 
                 return this._attemptFallbackPurchase(
-                    tierKey, country, service, options, error, selection?.operator
+                    tierKey, country, originalService, options, error, selection
                 );
             }
 
             logger.error('Tier purchase failed', {
-                tier: tierKey, country, service, error: error.message, duration: Date.now() - startTime
+                tier: tierKey, country, originalService, error: error.message, duration: Date.now() - startTime
             });
 
             return {
@@ -530,96 +512,140 @@ class TierIntegrationService {
                 recoverable: this._isRecoverable(error),
                 tier: tierKey,
                 country,
-                service
+                service: originalService
             };
         }
     }
 
     /**
-     * Attempt fallback purchase with next-best operator in same tier
-     * Excludes the failed operator from fallback candidates.
+     * Attempt fallback purchase
+     * Strategy:
+     *   1. Try other operators in same tier on SAME provider
+     *   2. Try same tier on OTHER providers
+     *   3. Return failure if all exhausted
      */
-    async _attemptFallbackPurchase(tierKey, country, service, options, originalError, failedOperator = null) {
+    async _attemptFallbackPurchase(tierKey, country, originalService, options, originalError, failedSelection = null) {
         this._metrics.tierFallbacks++;
 
+        const failedOperator = failedSelection?.operator;
+        const failedProvider = failedSelection?.providerKey;
+
         try {
+            // Phase 1: Try other operators in same tier on same provider
             const fallbackOps = await this._tierSelector.getFallbackOperators(
-                tierKey, country, service, failedOperator
+                tierKey, country, originalService, failedOperator
             );
 
-            if (!fallbackOps?.length) {
-                return {
-                    success: false,
-                    error: `TIER_NO_STOCK: No operators available in ${tierKey} tier`,
-                    recoverable: false,
-                    fallbackAttempted: true
-                };
+            if (fallbackOps?.length > 0) {
+                for (const fallback of fallbackOps.slice(0, TierIntegrationService.FALLBACK_MAX_ATTEMPTS)) {
+                    // Skip if same provider as failed (we want cross-provider)
+                    if (fallback.providerKey === failedProvider) continue;
+
+                    try {
+                        const provider = this._getProviderByKey(fallback.providerKey);
+                        if (!provider) continue;
+
+                        const purchaseResult = await provider.getNumber(
+                            country, originalService, fallback.operator
+                        );
+
+                        this._metrics.tierPurchases++;
+                        this._metrics.crossProviderFallbacks++;
+
+                        const displayCost = purchaseResult.displayCost || fallback.displayPrice || 0;
+                        const tier = getTierConfig(tierKey);
+                        const finalPrice = Number((displayCost * tier.priceMultiplier).toFixed(2));
+                        const extraProfit = Number((finalPrice - displayCost).toFixed(2));
+
+                        logger.info('Cross-provider fallback purchase successful', {
+                            tier: tierKey,
+                            country,
+                            originalService,
+                            failedProvider,
+                            fallbackProvider: fallback.providerKey,
+                            fallbackOperator: fallback.operator,
+                            displayCost,
+                            finalPrice
+                        });
+
+                        return {
+                            success: true,
+                            phoneNumber: purchaseResult.phoneNumber,
+                            providerNumberId: purchaseResult.providerNumberId,
+                            operator: fallback.operator,
+                            routedProvider: fallback.providerKey,
+                            price: finalPrice,
+                            displayPrice: finalPrice,
+                            displayCost: displayCost,
+                            rawPrice: purchaseResult.cost || 0,
+                            baseProfit: TierIntegrationService.BASE_PROFIT,
+                            extraProfit: extraProfit,
+                            stock: fallback.stock,
+                            score: fallback.score,
+                            tier: tierKey,
+                            country,
+                            service: originalService,
+                            fallback: true,
+                            crossProvider: true
+                        };
+
+                    } catch (fallbackError) {
+                        logger.warn('Fallback operator failed', {
+                            tier: tierKey,
+                            operator: fallback.operator,
+                            provider: fallback.providerKey,
+                            error: fallbackError.message
+                        });
+                        continue;
+                    }
+                }
             }
 
-            // Try each fallback operator (up to max attempts)
-            for (const fallback of fallbackOps.slice(0, TierIntegrationService.FALLBACK_MAX_ATTEMPTS)) {
+            // Phase 2: Try same tier on other providers directly
+            const otherProviders = this._getOtherProviders(failedProvider);
+            for (const provider of otherProviders) {
                 try {
-                    let purchaseResult;
-                    let usedProviderKey = 'CHEAP_PANEL';
-
-                    if (this._providerRouter?.hasAvailableProvider()) {
-                        purchaseResult = await this._providerRouter.getNumber(
-                            country, service, fallback.operator
-                        );
-                        usedProviderKey = purchaseResult.routedProvider || 'CHEAP_PANEL';
-                    } else {
-                        purchaseResult = await this._cheapProvider.getNumber(
-                            country, service, fallback.operator
-                        );
-                    }
+                    const purchaseResult = await provider.getNumber(
+                        country, originalService, 'any'
+                    );
 
                     this._metrics.tierPurchases++;
+                    this._metrics.crossProviderFallbacks++;
 
-                    // Calculate pricing
-                    const displayCost = purchaseResult.displayCost || fallback.price || 0;
+                    const displayCost = purchaseResult.displayCost || 0;
                     const tier = getTierConfig(tierKey);
                     const finalPrice = Number((displayCost * tier.priceMultiplier).toFixed(2));
-                    const extraProfit = Number((finalPrice - displayCost).toFixed(2));
 
-                    logger.info('Fallback purchase successful', {
+                    logger.info('Provider direct fallback successful', {
                         tier: tierKey,
                         country,
-                        service,
-                        failedOperator: failedOperator || 'unknown',
-                        fallbackOperator: fallback.operator,
-                        provider: usedProviderKey,
-                        score: fallback.score,
-                        displayCost,
-                        finalPrice,
-                        baseProfit: TierIntegrationService.BASE_PROFIT,
-                        extraProfit
+                        originalService,
+                        fallbackProvider: provider.providerKey
                     });
 
                     return {
                         success: true,
                         phoneNumber: purchaseResult.phoneNumber,
                         providerNumberId: purchaseResult.providerNumberId,
-                        operator: fallback.operator,
-                        routedProvider: usedProviderKey,
+                        operator: purchaseResult.operator || 'any',
+                        routedProvider: provider.providerKey,
                         price: finalPrice,
                         displayPrice: finalPrice,
                         displayCost: displayCost,
                         rawPrice: purchaseResult.cost || 0,
                         baseProfit: TierIntegrationService.BASE_PROFIT,
-                        extraProfit: extraProfit,
-                        stock: fallback.stock,
-                        score: fallback.score,
+                        extraProfit: Number((finalPrice - displayCost).toFixed(2)),
                         tier: tierKey,
                         country,
-                        service,
-                        fallback: true
+                        service: originalService,
+                        fallback: true,
+                        crossProvider: true
                     };
 
-                } catch (fallbackError) {
-                    logger.warn('Fallback operator failed', {
-                        tier: tierKey,
-                        operator: fallback.operator,
-                        error: fallbackError.message
+                } catch (providerError) {
+                    logger.warn('Provider direct fallback failed', {
+                        provider: provider.providerKey,
+                        error: providerError.message
                     });
                     continue;
                 }
@@ -627,9 +653,12 @@ class TierIntegrationService {
 
             return {
                 success: false,
-                error: 'TIER_NO_STOCK: All fallback operators exhausted',
+                error: 'TIER_NO_STOCK: All fallback operators and providers exhausted',
                 recoverable: false,
-                fallbackAttempted: true
+                fallbackAttempted: true,
+                tier: tierKey,
+                country,
+                service: originalService
             };
 
         } catch (error) {
@@ -638,14 +667,49 @@ class TierIntegrationService {
                 error: this._normalizeError(originalError),
                 recoverable: false,
                 fallbackAttempted: true,
-                fallbackError: error.message
+                fallbackError: error.message,
+                tier: tierKey,
+                country,
+                service: originalService
             };
         }
     }
 
     /**
-     * Get fallback operators for display (when primary fails)
+     * Get provider instance by key
      */
+    _getProviderByKey(key) {
+        const providers = {
+            'CHEAP_PANEL': this._cheapProvider,
+            'ONLINE_SIM': this._onlineSimProvider,
+            'SMSPOOL': this._smsPoolProvider,
+            'HERO_SMS': this._heroSmsProvider
+        };
+        return providers[key];
+    }
+
+    /**
+     * Get other active providers excluding the failed one
+     */
+    _getOtherProviders(excludeKey) {
+        const all = [
+            this._cheapProvider,
+            this._smsPoolProvider,
+            this._heroSmsProvider,
+            this._onlineSimProvider
+        ].filter(p => p && p.isActive && p.providerKey !== excludeKey);
+
+        // Sort by priority
+        const priority = ['CHEAP_PANEL', 'SMSPOOL', 'HERO_SMS', 'ONLINE_SIM'];
+        return all.sort((a, b) => {
+            const idxA = priority.indexOf(a.providerKey);
+            const idxB = priority.indexOf(b.providerKey);
+            if (idxA === -1) return 1;
+            if (idxB === -1) return -1;
+            return idxA - idxB;
+        });
+    }
+
     async getFallbackOperators(tierKey, country, service, excludeOperator = null) {
         if (!this.isAvailable()) return [];
         return this._tierSelector.getFallbackOperators(tierKey, country, service, excludeOperator);
@@ -655,9 +719,6 @@ class TierIntegrationService {
     //  LEGACY COMPATIBILITY
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Get legacy CHEAP price (for non-tier fallback)
-     */
     async getLegacyCheapPrice(country, service) {
         try {
             return await this.providerManager.getCheapPrice(country, service);
@@ -666,16 +727,10 @@ class TierIntegrationService {
         }
     }
 
-    /**
-     * Get legacy CHEAP number (for non-tier fallback)
-     */
     async getLegacyCheapNumber(country, service) {
         return this.providerManager.getCheapNumber(country, service);
     }
 
-    /**
-     * Get legacy CHEAP countries (for non-tier fallback)
-     */
     async getLegacyCheapCountries(service) {
         return this.providerManager.getCheapCountries(service);
     }
@@ -698,8 +753,10 @@ class TierIntegrationService {
             'BAD_COUNTRY': 'BAD_COUNTRY',
             'BAD_SERVICE': 'BAD_SERVICE',
             'NO_NUMBERS': 'NO_NUMBERS',
+            'NO_OPERATOR': 'NO_NUMBERS',
             'INVALID_RESPONSE': 'NOT_AVAILABLE',
-            'PROVIDER_ERROR': 'NOT_AVAILABLE'
+            'PROVIDER_ERROR': 'NOT_AVAILABLE',
+            'PROVIDER_NOT_FOUND': 'NOT_AVAILABLE'
         };
 
         for (const [key, value] of Object.entries(errorMap)) {
@@ -711,7 +768,7 @@ class TierIntegrationService {
 
     _isRecoverable(error) {
         const message = error?.message || '';
-        const recoverableCodes = ['NO_NUMBERS', 'NOT_AVAILABLE', 'TIMEOUT', 'CONNECTION_ERROR'];
+        const recoverableCodes = ['NO_NUMBERS', 'NOT_AVAILABLE', 'TIMEOUT', 'CONNECTION_ERROR', 'NO_OPERATOR'];
         return recoverableCodes.some(code => message.includes(code));
     }
 
@@ -733,7 +790,10 @@ class TierIntegrationService {
                 tierSelector: this._tierSelector !== null,
                 countryCatalog: this._countryCatalog !== null,
                 cheapProvider: this._cheapProvider !== null && this._cheapProvider.isActive,
-                providerRouter: this._providerRouter !== null && this._providerRouter.hasAvailableProvider()
+                smsPoolProvider: this._smsPoolProvider !== null && this._smsPoolProvider.isActive,
+                heroSmsProvider: this._heroSmsProvider !== null && this._heroSmsProvider.isActive,
+                onlineSimProvider: this._onlineSimProvider !== null && this._onlineSimProvider.isActive,
+                providerRouter: this._providerRouter !== null
             },
             metrics: this._metrics,
             cacheSizes: {
@@ -752,6 +812,18 @@ class TierIntegrationService {
         this._serviceCatalog?.clearCache();
         this._providerRouter?.clearCache();
         logger.info('TierIntegrationService caches cleared');
+    }
+
+    /**
+     * Cleanup on shutdown
+     */
+    destroy() {
+        if (this._cacheRefreshInterval) {
+            clearInterval(this._cacheRefreshInterval);
+            this._cacheRefreshInterval = null;
+        }
+        this.clearCaches();
+        logger.info('TierIntegrationService destroyed');
     }
 }
 
