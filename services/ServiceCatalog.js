@@ -1,8 +1,9 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-//  services/ServiceCatalog.js — Service Discovery with Dynamic 5SIM Catalog
+//  services/ServiceCatalog.js — Service Discovery with Dynamic Catalog
 //  Handles 1100+ services from live API without loading all at once
 //  NO hardcoded SERVICES import. All data from CheapPanelProvider.
 //  FIXED: Proper cache invalidation, stable indexing, robust error handling
+//  Cache TTL: 60 minutes
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { POPULAR_SERVICES, SERVICE_CATEGORIES, PAGINATION, CACHE_TTL } from '../config/tierConfig.js';
@@ -19,7 +20,6 @@ import logger from '../utils/logger.js';
 function buildReverseServiceMap(providerServiceMap) {
     const reverse = new Map();
     for (const [display, internal] of Object.entries(providerServiceMap || {})) {
-        // Handle duplicates: prefer shorter/cleaner display name
         if (!reverse.has(internal) || display.length < reverse.get(internal).length) {
             reverse.set(internal, display);
         }
@@ -51,10 +51,10 @@ class ServiceCatalog {
         this.provider = cheapPanelProvider;
 
         // Dynamic indexes — populated from provider API
-        this._serviceMap = new Map();        // normalized name -> display name
-        this._searchIndex = new Map();       // word -> Set of display names
-        this._categoryMap = new Map();       // category -> Set of display names
-        this._allServices = new Set();       // All display names
+        this._serviceMap = new Map();
+        this._searchIndex = new Map();
+        this._categoryMap = new Map();
+        this._allServices = new Set();
 
         // Reverse mapping: 5SIM internal -> display
         this._reverseServiceMap = buildReverseServiceMap(cheapPanelProvider.serviceMap);
@@ -62,37 +62,32 @@ class ServiceCatalog {
         // Cache
         this._servicesCache = null;
         this._servicesCacheTime = 0;
-        this._cacheTtl = CACHE_TTL.tierPrices || 2 * 60 * 1000; // 2 minutes
+        this._cacheTtl = CACHE_TTL.serviceList || 60 * 60 * 1000;
 
-        // Build static category mapping (categories are config hints)
+        // Build static category mapping
         this._buildCategoryIndex();
 
         logger.info('ServiceCatalog initialized', {
             provider: cheapPanelProvider.name || 'unknown',
             providerActive: cheapPanelProvider.isActive,
-            knownMappings: this._reverseServiceMap.size
+            knownMappings: this._reverseServiceMap.size,
+            cacheTtl: '60min'
         });
     }
 
     _buildCategoryIndex() {
-        // SERVICE_CATEGORIES contains display names -> we validate against dynamic catalog later
         for (const [category, services] of Object.entries(SERVICE_CATEGORIES || {})) {
             this._categoryMap.set(category, new Set(services || []));
         }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  DYNAMIC CATALOG LOADING
+    //  DYNAMIC CATALOG LOADING (cached 60min)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Load all services from 5SIM product catalog
-     * This is the SINGLE SOURCE OF TRUTH for service availability
-     */
     async _loadServices() {
         const now = Date.now();
 
-        // Return cached if fresh
         if (this._servicesCache && (now - this._servicesCacheTime) < this._cacheTtl) {
             logger.debug('Using cached service catalog', { count: this._allServices.size });
             return;
@@ -109,31 +104,26 @@ class ServiceCatalog {
                 return;
             }
 
-            // Extract all unique services across all countries
             const serviceSet = new Set();
 
             for (const [countryCode, services] of Object.entries(products)) {
                 if (!services || typeof services !== 'object') continue;
-
                 for (const serviceKey of Object.keys(services)) {
                     serviceSet.add(serviceKey);
                 }
             }
 
-            // Build display names and indexes
             this._serviceMap.clear();
             this._searchIndex.clear();
             this._allServices.clear();
 
             for (const serviceKey of serviceSet) {
-                // Map to display name
                 const displayName = this._reverseServiceMap.get(serviceKey) || cleanServiceName(serviceKey);
                 const normalized = displayName.toLowerCase().trim();
 
                 this._serviceMap.set(normalized, displayName);
                 this._allServices.add(displayName);
 
-                // Index by words
                 const words = normalized.split(/\s+/).filter(w => w.length >= 2);
                 for (const word of words) {
                     if (!this._searchIndex.has(word)) {
@@ -142,14 +132,12 @@ class ServiceCatalog {
                     this._searchIndex.get(word).add(displayName);
                 }
 
-                // Index full name
                 if (!this._searchIndex.has(normalized)) {
                     this._searchIndex.set(normalized, new Set());
                 }
                 this._searchIndex.get(normalized).add(displayName);
             }
 
-            // Update category mappings with validated services
             for (const [category, services] of this._categoryMap) {
                 const valid = new Set();
                 for (const s of services) {
@@ -172,16 +160,12 @@ class ServiceCatalog {
 
         } catch (error) {
             logger.error('Failed to load services from provider', { error: error.message });
-            // If we have cached data, keep using it even if stale
             if (!this._servicesCache) {
                 logger.warn('No cached services available, catalog is empty');
             }
         }
     }
 
-    /**
-     * Ensure catalog is loaded before operations
-     */
     async _ensureLoaded() {
         if (!this._servicesCache) {
             await this._loadServices();
@@ -192,9 +176,6 @@ class ServiceCatalog {
     //  PUBLIC API — Popular Services with Backfill
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Get popular services, backfilled to minCount (default 25) from dynamic catalog
-     */
     async getPopularServices(minCount = 25) {
         await this._ensureLoaded();
 
@@ -202,7 +183,6 @@ class ServiceCatalog {
             return [];
         }
 
-        // Start with configured popular services that exist in dynamic catalog
         const result = [];
         const added = new Set();
 
@@ -221,10 +201,8 @@ class ServiceCatalog {
             }
         }
 
-        // Backfill: add more services from catalog until minCount reached
         const needed = minCount - result.length;
         if (needed > 0) {
-            // Get services not already added, sorted alphabetically for stability
             const remaining = Array.from(this._allServices)
                 .filter(s => !added.has(s))
                 .sort((a, b) => a.localeCompare(b));
@@ -248,9 +226,6 @@ class ServiceCatalog {
         return result;
     }
 
-    /**
-     * Get services by category
-     */
     async getServicesByCategory(categoryName) {
         await this._ensureLoaded();
 
@@ -264,9 +239,6 @@ class ServiceCatalog {
             }));
     }
 
-    /**
-     * Get all categories with service counts
-     */
     async getCategories() {
         await this._ensureLoaded();
 
@@ -284,9 +256,6 @@ class ServiceCatalog {
     //  PUBLIC API — Search
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Search services by query string against FULL dynamic catalog
-     */
     async searchServices(query, limit = PAGINATION?.searchResultsLimit || 30) {
         await this._ensureLoaded();
 
@@ -301,21 +270,18 @@ class ServiceCatalog {
         const normalizedQuery = query.toLowerCase().trim();
         const queryWords = normalizedQuery.split(/\s+/).filter(w => w.length >= 2);
 
-        const scores = new Map(); // displayName -> score
+        const scores = new Map();
 
-        // Exact match = highest score
         if (this._serviceMap.has(normalizedQuery)) {
             scores.set(this._serviceMap.get(normalizedQuery), 100);
         }
 
-        // Prefix match
         for (const [key, displayName] of this._serviceMap) {
             if (key.startsWith(normalizedQuery)) {
                 scores.set(displayName, (scores.get(displayName) || 0) + 50);
             }
         }
 
-        // Word matches
         for (const word of queryWords) {
             for (const [indexWord, services] of this._searchIndex) {
                 if (indexWord.includes(word) || word.includes(indexWord)) {
@@ -327,7 +293,6 @@ class ServiceCatalog {
             }
         }
 
-        // Sort by score and return top results
         return Array.from(scores.entries())
             .map(([name, score]) => ({
                 name,
@@ -339,9 +304,6 @@ class ServiceCatalog {
             .slice(0, limit);
     }
 
-    /**
-     * Get paginated service list from FULL dynamic catalog
-     */
     async getServicesPage(page = 1, perPage = PAGINATION?.servicesPerPage || 20, filter = null) {
         await this._ensureLoaded();
 
@@ -374,9 +336,6 @@ class ServiceCatalog {
         };
     }
 
-    /**
-     * Get services starting from a specific letter
-     */
     async getServicesByLetter(letter, page = 1, perPage = PAGINATION?.servicesPerPage || 20) {
         await this._ensureLoaded();
 
@@ -407,27 +366,18 @@ class ServiceCatalog {
         };
     }
 
-    /**
-     * Check if a service exists in dynamic catalog
-     */
     async hasService(serviceName) {
         await this._ensureLoaded();
         if (!serviceName || typeof serviceName !== 'string') return false;
         return this._serviceMap.has(serviceName.toLowerCase().trim());
     }
 
-    /**
-     * Get service display name (preserves original casing)
-     */
     async getServiceName(serviceName) {
         await this._ensureLoaded();
         if (!serviceName || typeof serviceName !== 'string') return serviceName;
         return this._serviceMap.get(serviceName.toLowerCase().trim()) || serviceName;
     }
 
-    /**
-     * Get service category
-     */
     async getServiceCategory(serviceName) {
         await this._ensureLoaded();
         return this._getServiceCategory(serviceName);
@@ -472,4 +422,4 @@ class ServiceCatalog {
 }
 
 export default ServiceCatalog;
-    
+                    
