@@ -1,7 +1,11 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 //  services/CheapPanelProvider.js — 5SIM API Integration
-//  FIXED: Added rate limit queue + service fallback ONLY
-//  Everything else stays exactly as your original working code
+//  FIXED: 
+//   1. mapService() preserves original name if 5sim supports it directly
+//   2. Dynamic service discovery — tries exact name first, then fallbacks
+//   3. Cache TTL increased to 60 minutes
+//   4. Rate limit queue prevents 429 errors
+//   5. Service fallback chain for unknown services
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import axios from 'axios';
@@ -13,10 +17,12 @@ const BASE_PROFIT = 0.10;
 /**
  * CheapPanelProvider — 5SIM API Integration
  * 
- * CHANGES from original:
- *   1. Added queuedRequest() for rate limit protection (token bucket)
- *   2. Added service fallback chain for unknown services (rebtel -> other)
- *   3. Everything else is EXACTLY your original working code
+ * CHANGES:
+ *   1. mapService() tries exact lowercase name first, then serviceMap, then fallbacks
+ *   2. Preserves original service name in purchase results to prevent INVALID_SERVICE
+ *   3. Cache TTL: 60 minutes for products, 5 minutes for balance
+ *   4. Token bucket rate limiting prevents 429 errors
+ *   5. Dynamic service fallback chain
  */
 class CheapPanelProvider {
     constructor() {
@@ -47,7 +53,8 @@ class CheapPanelProvider {
             totalCost: 0
         };
 
-        // ─── YOUR ORIGINAL SERVICE MAP (unchanged) ──────────────────────
+        // ─── SERVICE MAP: Display name → 5sim internal name ──────────────────────
+        // For known services, map to 5sim's internal name
         this.serviceMap = {
             'WhatsApp': 'whatsapp',
             'Telegram': 'telegram',
@@ -67,19 +74,34 @@ class CheapPanelProvider {
             'Spotify': 'spotify',
             'Uber': 'uber',
             'Airbnb': 'airbnb',
+            'Google': 'google',
+            'Microsoft': 'microsoft',
+            'Yahoo': 'yahoo',
+            'Rebtel': 'rebtel',
+            'Signal': 'signal',
+            'LinkedIn': 'linkedin',
+            'WeChat': 'wechat',
+            'Line': 'line',
             'Any': 'other',
             'Other': 'other'
         };
 
-        // ─── NEW: Service fallback chain for unknown services ───────────
-        // If a service isn't in serviceMap, try these fallbacks
+        // ─── SERVICE FALLBACK CHAIN: unknown → fallback ───────────────────────────
+        // If exact name not in serviceMap, try these fallbacks
         this.serviceFallbackMap = {
-            'rebtel': ['other'],
-            'gmail': ['google'],
-            'outlook': ['microsoft']
+            'rebtel': ['rebtel', 'other'],
+            'gmail': ['google', 'other'],
+            'outlook': ['microsoft', 'other'],
+            'google': ['google', 'other'],
+            'microsoft': ['microsoft', 'other'],
+            'yahoo': ['yahoo', 'other'],
+            'signal': ['signal', 'other'],
+            'linkedin': ['linkedin', 'other'],
+            'wechat': ['wechat', 'other'],
+            'line': ['line', 'other']
         };
 
-        // ─── YOUR ORIGINAL COUNTRY MAP (unchanged) ────────────────────────
+        // ─── COUNTRY MAP: ISO → 5sim country code ─────────────────────────────────
         this.countryMap = {
             'US': 'usa', 'UK': 'england', 'GB': 'england',
             'CA': 'canada', 'RU': 'russia', 'CN': 'china',
@@ -133,31 +155,35 @@ class CheapPanelProvider {
             'NOT_AVAILABLE': { recoverable: true, retryAfter: 3000, message: 'Service not available in this country' }
         };
 
-        // ─── NEW: Rate limiting (token bucket) ───────────────────────────
-        this._maxRps = 5; // 5 requests per second max
+        // ─── RATE LIMITING: Token bucket (prevents 429) ─────────────────────────
+        this._maxRps = 3; // 3 requests per second max (conservative)
         this._tokens = this._maxRps;
         this._lastRefill = Date.now();
         this._tokenInterval = 1000 / this._maxRps;
         this._requestQueue = [];
         this._isProcessingQueue = false;
 
-        // ─── YOUR ORIGINAL CACHE (unchanged) ─────────────────────────────
+        // ─── CACHE: 60 minutes for products, 5 minutes for balance ───────────────
         this.productsCache = null;
         this.productsCacheTime = 0;
-        this.productsCacheTtl = 5 * 60 * 1000;
+        this.productsCacheTtl = 60 * 60 * 1000; // 60 minutes
 
         this.balanceCache = null;
         this.balanceCacheTime = 0;
-        this.balanceCacheTtl = 30 * 1000;
+        this.balanceCacheTtl = 5 * 60 * 1000; // 5 minutes
 
+        // ─── PREWARM: Background cache refresh ───────────────────────────────────
+        this._prewarmInterval = null;
         if (this.isActive) {
+            this._startPrewarm();
             this.checkBalance().catch(err => 
                 logger.warn('Initial balance check failed', { error: err.message })
             );
             logger.info('CheapPanelProvider initialized', {
                 provider: this.name,
                 baseUrl: this.baseUrl,
-                hasKey: !!this.apiKey
+                hasKey: !!this.apiKey,
+                cacheTtl: '60min'
             });
         } else {
             logger.warn('CheapPanelProvider disabled - no API key configured');
@@ -165,7 +191,45 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  NEW: Token bucket + request queue (prevents 429)
+    //  PREWARM: Background cache refresh every 50 minutes
+    // ═══════════════════════════════════════════════════════════
+
+    _startPrewarm() {
+        // Initial prewarm
+        this.prewarmCache().catch(() => {});
+        
+        // Refresh every 50 minutes (before 60min expiry)
+        this._prewarmInterval = setInterval(() => {
+            if (this.isActive) {
+                this.prewarmCache().catch(err => 
+                    logger.debug('Prewarm failed', { error: err.message })
+                );
+            }
+        }, 50 * 60 * 1000);
+    }
+
+    async prewarmCache() {
+        try {
+            logger.info('Prewarming 5SIM cache...');
+            await this.getProducts();
+            logger.info('5SIM cache prewarmed', { 
+                hasProducts: !!this.productsCache,
+                productCountries: this.productsCache ? Object.keys(this.productsCache).length : 0
+            });
+        } catch (error) {
+            logger.warn('Prewarm failed', { error: error.message });
+        }
+    }
+
+    stopPrewarm() {
+        if (this._prewarmInterval) {
+            clearInterval(this._prewarmInterval);
+            this._prewarmInterval = null;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  TOKEN BUCKET + REQUEST QUEUE (prevents 429)
     // ═══════════════════════════════════════════════════════════
 
     _refillTokens() {
@@ -225,7 +289,7 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL request() (unchanged except called by queue)
+    //  CORE REQUEST (unchanged logic, called by queue)
     // ═══════════════════════════════════════════════════════════
 
     async request(method, endpoint, data = null, timeout = 10000) {
@@ -296,7 +360,7 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL getDisplayPrice() (unchanged)
+    //  DISPLAY PRICE (unchanged)
     // ═══════════════════════════════════════════════════════════
 
     getDisplayPrice(rawPrice) {
@@ -306,31 +370,50 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL getPrice() (with service fallback added)
+    //  GET PRICE (with service fallback chain)
     // ═══════════════════════════════════════════════════════════
 
     async getPrice(country = 'US', service = 'Any') {
         try {
             const providerCountry = this.mapCountry(country);
-            const providerService = this.mapService(service);
+            
+            // Try primary service mapping first
+            let providerService = this.mapService(service);
+            let usedService = providerService;
 
             const targetedEndpoint = `${this.endpoints.getPrices}?country=${providerCountry}&product=${providerService}`;
             
             let response;
             try {
-                // CHANGED: Use queuedRequest instead of direct request
                 response = await this.queuedRequest('get', targetedEndpoint, null, 10000);
             } catch (err) {
-                logger.warn('Targeted price query failed, falling back to full catalog', { 
-                    country: providerCountry, 
-                    service: providerService,
-                    error: err.message 
-                });
-                const products = await this.getProducts();
-                if (!products) {
-                    return { success: false, error: 'Failed to fetch product catalog' };
+                // If failed, try fallback services
+                const fallbacks = this._getServiceFallbacks(service);
+                for (const fallback of fallbacks) {
+                    if (fallback === providerService) continue;
+                    try {
+                        const fbEndpoint = `${this.endpoints.getPrices}?country=${providerCountry}&product=${fallback}`;
+                        response = await this.queuedRequest('get', fbEndpoint, null, 10000);
+                        usedService = fallback;
+                        logger.info('Used service fallback for price', { 
+                            original: service, 
+                            mapped: providerService, 
+                            fallback: fallback 
+                        });
+                        break;
+                    } catch (fbErr) {
+                        continue;
+                    }
                 }
-                return this._extractPriceFromProducts(products, providerCountry, providerService);
+                
+                if (!response) {
+                    // All fallbacks failed, use full catalog
+                    const products = await this.getProducts();
+                    if (!products) {
+                        return { success: false, error: 'Failed to fetch product catalog' };
+                    }
+                    return this._extractPriceFromProducts(products, providerCountry, providerService, service);
+                }
             }
 
             if (response.status >= 400) {
@@ -338,7 +421,7 @@ class CheapPanelProvider {
                 if (!products) {
                     return { success: false, error: `Failed to fetch product catalog. HTTP ${response.status}` };
                 }
-                return this._extractPriceFromProducts(products, providerCountry, providerService);
+                return this._extractPriceFromProducts(products, providerCountry, providerService, service);
             }
 
             const data = response.data;
@@ -346,7 +429,7 @@ class CheapPanelProvider {
                 return { success: false, error: `No data returned for ${providerCountry}/${providerService}` };
             }
 
-            return this._extractPriceFromProducts(data, providerCountry, providerService);
+            return this._extractPriceFromProducts(data, providerCountry, usedService, service);
 
         } catch (error) {
             logger.error('Failed to get price', { country, service, error: error.message });
@@ -354,17 +437,42 @@ class CheapPanelProvider {
         }
     }
 
+    /**
+     * Get fallback services to try
+     */
+    _getServiceFallbacks(service) {
+        const normalized = service.toString().trim().toLowerCase();
+        const fallbacks = this.serviceFallbackMap[normalized] || [];
+        return [...new Set([normalized, ...fallbacks, 'other'])];
+    }
+
     // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL _extractPriceFromProducts() (unchanged)
+    //  EXTRACT PRICE FROM PRODUCTS (preserves original service name)
     // ═══════════════════════════════════════════════════════════
 
-    _extractPriceFromProducts(products, providerCountry, providerService) {
+    _extractPriceFromProducts(products, providerCountry, providerService, originalService = null) {
         const countryData = products[providerCountry];
         if (!countryData) {
             return { success: false, error: `Country ${providerCountry} not available` };
         }
 
-        const serviceData = countryData[providerService];
+        let serviceData = countryData[providerService];
+        
+        // If exact service not found, try fallbacks
+        if (!serviceData && originalService) {
+            const fallbacks = this._getServiceFallbacks(originalService);
+            for (const fb of fallbacks) {
+                if (countryData[fb]) {
+                    serviceData = countryData[fb];
+                    logger.debug('Used service fallback in products', { 
+                        original: originalService, 
+                        fallback: fb 
+                    });
+                    break;
+                }
+            }
+        }
+
         if (!serviceData) {
             return { success: false, error: `Service ${providerService} not available in ${providerCountry}` };
         }
@@ -397,12 +505,14 @@ class CheapPanelProvider {
             profit: BASE_PROFIT,
             operator: cheapestOperator,
             stock: totalStock,
-            available: true
+            available: true,
+            originalService: originalService || providerService,
+            mappedService: providerService
         };
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL getAvailableCountries() (unchanged)
+    //  GET AVAILABLE COUNTRIES (with service fallback)
     // ═══════════════════════════════════════════════════════════
 
     async getAvailableCountries(service = 'Any') {
@@ -415,9 +525,24 @@ class CheapPanelProvider {
             }
 
             const availableCountries = [];
+            const fallbacks = this._getServiceFallbacks(service);
             
             for (const [simCountry, services] of Object.entries(products)) {
-                const serviceData = services[providerService];
+                // Check primary service and all fallbacks
+                let serviceData = services[providerService];
+                let usedFallback = null;
+                
+                if (!serviceData) {
+                    for (const fb of fallbacks) {
+                        if (fb === providerService) continue;
+                        if (services[fb]) {
+                            serviceData = services[fb];
+                            usedFallback = fb;
+                            break;
+                        }
+                    }
+                }
+
                 if (!serviceData) continue;
 
                 const hasStock = Object.values(serviceData).some(opData => {
@@ -431,7 +556,8 @@ class CheapPanelProvider {
                         availableCountries.push({
                             code: isoCode,
                             simCode: simCountry,
-                            name: this._getCountryName(isoCode)
+                            name: this._getCountryName(isoCode),
+                            fallbackService: usedFallback
                         });
                     }
                 }
@@ -442,7 +568,9 @@ class CheapPanelProvider {
             return {
                 success: true,
                 countries: availableCountries,
-                count: availableCountries.length
+                count: availableCountries.length,
+                originalService: service,
+                mappedService: providerService
             };
 
         } catch (error) {
@@ -475,7 +603,7 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL checkBalance() (uses queuedRequest)
+    //  CHECK BALANCE (uses queuedRequest, 5min cache)
     // ═══════════════════════════════════════════════════════════
 
     async checkBalance() {
@@ -512,7 +640,7 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL getProducts() (uses queuedRequest)
+    //  GET PRODUCTS (60min cache)
     // ═══════════════════════════════════════════════════════════
 
     async getProducts() {
@@ -525,38 +653,60 @@ class CheapPanelProvider {
             const response = await this.queuedRequest('get', this.endpoints.getProducts, null, 30000);
             this.productsCache = response.data;
             this.productsCacheTime = now;
+            logger.info('5SIM products fetched', { 
+                countries: Object.keys(this.productsCache).length,
+                cacheExpiry: new Date(now + this.productsCacheTtl).toISOString()
+            });
             return this.productsCache;
         } catch (error) {
             logger.error('Failed to fetch 5SIM products', { error: error.message });
+            // Return stale cache if available
+            if (this.productsCache) {
+                logger.warn('Returning stale product cache');
+                return this.productsCache;
+            }
             return null;
         }
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL checkAvailability() (uses queuedRequest)
+    //  CHECK AVAILABILITY (with service fallback)
     // ═══════════════════════════════════════════════════════════
 
     async checkAvailability(country, service) {
         try {
             const providerCountry = this.mapCountry(country);
             const providerService = this.mapService(service);
+            const fallbacks = this._getServiceFallbacks(service);
 
             const targetedEndpoint = `${this.endpoints.getProducts}?country=${providerCountry}&product=${providerService}`;
             
             let response;
+            let usedService = providerService;
+            
             try {
                 response = await this.queuedRequest('get', targetedEndpoint, null, 10000);
             } catch (err) {
-                logger.warn('Targeted price query failed, falling back to full catalog', { 
-                    country: providerCountry, 
-                    service: providerService,
-                    error: err.message 
-                });
-                const products = await this.getProducts();
-                if (!products) {
-                    return { available: false, error: 'Failed to fetch product catalog' };
+                // Try fallback services
+                for (const fb of fallbacks) {
+                    if (fb === providerService) continue;
+                    try {
+                        const fbEndpoint = `${this.endpoints.getProducts}?country=${providerCountry}&product=${fb}`;
+                        response = await this.queuedRequest('get', fbEndpoint, null, 10000);
+                        usedService = fb;
+                        break;
+                    } catch (fbErr) {
+                        continue;
+                    }
                 }
-                return this._checkAvailabilityFromProducts(products, providerCountry, providerService);
+                
+                if (!response) {
+                    const products = await this.getProducts();
+                    if (!products) {
+                        return { available: false, error: 'Failed to fetch product catalog' };
+                    }
+                    return this._checkAvailabilityFromProducts(products, providerCountry, providerService, service);
+                }
             }
 
             if (response.status >= 400) {
@@ -564,7 +714,7 @@ class CheapPanelProvider {
                 if (!products) {
                     return { available: false, error: `Failed to fetch product catalog. HTTP ${response.status}` };
                 }
-                return this._checkAvailabilityFromProducts(products, providerCountry, providerService);
+                return this._checkAvailabilityFromProducts(products, providerCountry, providerService, service);
             }
 
             const data = response.data;
@@ -572,20 +722,32 @@ class CheapPanelProvider {
                 return { available: false, error: `No data returned for ${providerCountry}/${providerService}` };
             }
 
-            return this._checkAvailabilityFromProducts(data, providerCountry, providerService);
+            return this._checkAvailabilityFromProducts(data, providerCountry, usedService, service);
 
         } catch (error) {
             return { available: false, error: error.message };
         }
     }
 
-    _checkAvailabilityFromProducts(products, providerCountry, providerService) {
+    _checkAvailabilityFromProducts(products, providerCountry, providerService, originalService = null) {
         const countryData = products[providerCountry];
         if (!countryData) {
             return { available: false, error: `Country ${providerCountry} not available` };
         }
 
-        const serviceData = countryData[providerService];
+        let serviceData = countryData[providerService];
+        
+        // Try fallbacks if primary not found
+        if (!serviceData && originalService) {
+            const fallbacks = this._getServiceFallbacks(originalService);
+            for (const fb of fallbacks) {
+                if (countryData[fb]) {
+                    serviceData = countryData[fb];
+                    break;
+                }
+            }
+        }
+
         if (!serviceData) {
             return { available: false, error: `Service ${providerService} not available in ${providerCountry}` };
         }
@@ -607,11 +769,12 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL getNumber() (uses queuedRequest)
+    //  GET NUMBER (preserves original service name in result)
     // ═══════════════════════════════════════════════════════════
 
     async getNumber(country = 'US', service = 'Any', preferredOperator = 'any') {
         const startTime = Date.now();
+        const originalService = service; // PRESERVE original name
 
         try {
             if (!this.isActive) {
@@ -728,12 +891,14 @@ class CheapPanelProvider {
                 duration
             });
 
+            // CRITICAL: Return originalService to prevent INVALID_SERVICE downstream
             return {
                 phoneNumber: phoneStr,
                 provider: this.name,
                 providerNumberId: activationId,
                 country,
-                service,
+                service: originalService,        // ← PRESERVE ORIGINAL
+                mappedService: providerService,  // ← 5sim internal name
                 cost: simPrice,
                 displayCost: displayPrice,
                 operator: operator,
@@ -756,8 +921,8 @@ class CheapPanelProvider {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL checkSMS() (uses queuedRequest)
+        // ═══════════════════════════════════════════════════════════
+    //  CHECK SMS (uses queuedRequest)
     // ═══════════════════════════════════════════════════════════
 
     async checkSMS(activationId) {
@@ -841,9 +1006,10 @@ class CheapPanelProvider {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL extractOTP() (unchanged)
+    //  EXTRACT OTP (unchanged)
     // ═══════════════════════════════════════════════════════════
-extractOTP(code, text) {
+
+    extractOTP(code, text) {
         if (code !== null && code !== undefined) {
             const codeStr = code.toString().trim();
             const cleanCode = codeStr.replace(/[\s\-]/g, '');
@@ -941,7 +1107,7 @@ extractOTP(code, text) {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL cancelNumber() (uses queuedRequest)
+    //  CANCEL NUMBER (uses queuedRequest)
     // ═══════════════════════════════════════════════════════════
 
     async cancelNumber(activationId) {
@@ -990,7 +1156,7 @@ extractOTP(code, text) {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL finishNumber() (uses queuedRequest)
+    //  FINISH NUMBER (uses queuedRequest)
     // ═══════════════════════════════════════════════════════════
 
     async finishNumber(activationId) {
@@ -1017,7 +1183,7 @@ extractOTP(code, text) {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL getPrices() (unchanged)
+    //  GET PRICES (alias for getPrice)
     // ═══════════════════════════════════════════════════════════
 
     async getPrices(country = 'US', service = 'Any') {
@@ -1025,30 +1191,38 @@ extractOTP(code, text) {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL mapService() (with fallback added)
+    //  MAP SERVICE: Try exact name first, then serviceMap, then fallbacks
     // ═══════════════════════════════════════════════════════════
 
     mapService(service) {
         if (!service || service === 'Any') return 'other';
         
         const normalized = service.toString().trim();
-        const mapped = this.serviceMap[normalized] || this.serviceMap[normalized.toLowerCase()];
-        
-        if (mapped) return mapped;
-        
-        // NEW: Check fallback chain for unknown services
         const lower = normalized.toLowerCase();
+        
+        // 1. Try exact match in serviceMap (preserves casing)
+        const exactMapped = this.serviceMap[normalized];
+        if (exactMapped) return exactMapped;
+        
+        // 2. Try lowercase match
+        const lowerMapped = this.serviceMap[normalized.toLowerCase()];
+        if (lowerMapped) return lowerMapped;
+        
+        // 3. Try serviceFallbackMap
         const fallbacks = this.serviceFallbackMap[lower];
         if (fallbacks && fallbacks.length > 0) {
             logger.debug('Using service fallback', { original: service, fallback: fallbacks[0] });
             return fallbacks[0];
         }
         
-        return 'other';
+        // 4. Try lowercase exact (5sim might support it directly)
+        // This fixes "Rebtel" → "rebtel" instead of "other"
+        logger.debug('Using direct lowercase service name', { original: service, mapped: lower });
+        return lower;
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL mapCountry() (unchanged)
+    //  MAP COUNTRY (unchanged)
     // ═══════════════════════════════════════════════════════════
 
     mapCountry(country) {
@@ -1059,7 +1233,7 @@ extractOTP(code, text) {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL mapOperator() (unchanged)
+    //  MAP OPERATOR (unchanged)
     // ═══════════════════════════════════════════════════════════
 
     mapOperator(country, preferred) {
@@ -1070,7 +1244,7 @@ extractOTP(code, text) {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL VALIDATION HELPERS (unchanged)
+    //  VALIDATION HELPERS (unchanged)
     // ═══════════════════════════════════════════════════════════
 
     isFakeNumber(phone) {
@@ -1107,7 +1281,7 @@ extractOTP(code, text) {
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  YOUR ORIGINAL STATS (unchanged)
+    //  STATS (unchanged)
     // ═══════════════════════════════════════════════════════════
 
     updateStats(success, duration, cost = 0) {
