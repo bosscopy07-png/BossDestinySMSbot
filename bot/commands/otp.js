@@ -475,7 +475,6 @@ registerCommands() {
             ctx.answerCbQuery('❌ Error selecting country').catch(() => {});
         }
     });
-
     // Tier fallback operator
     this.bot.action(/tier_fallback_(.+)/, async (ctx) => {
         try {
@@ -488,14 +487,18 @@ registerCommands() {
                 return ctx.answerCbQuery('❌ Session expired', { show_alert: true });
             }
             
+            // Store fallback operator in session
             ctx.session.fallbackOperator = operator;
+            
+            // FIXED: Call handleTierCountrySelect which will use the fallback operator
             await this.handleTierCountrySelect(ctx, country);
         } catch (error) {
             logger.error('tier_fallback action error', { error: error.message });
             ctx.answerCbQuery('❌ Error').catch(() => {});
         }
     });
-
+    
+    
     // Back buttons
     this.bot.action('tier_back_service', async (ctx) => {
         try {
@@ -2495,168 +2498,218 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
                                                                   
                   
     async handleTierCountrySelect(ctx, countryCode) {
-        const userId = ctx.from.id.toString();
-        const service = ctx.session?.otpService;
-        const tierKey = ctx.session?.selectedTier;
+    const userId = ctx.from.id.toString();
+    const service = ctx.session?.otpService;
+    const tierKey = ctx.session?.selectedTier;
+    
+    // FIXED: Check if user selected a fallback operator from the alternatives list
+    const fallbackOperator = ctx.session?.fallbackOperator;
 
-        if (!service || !tierKey) {
-            return ctx.answerCbQuery('❌ Session expired. Start over.', { show_alert: true });
-        }
+    if (!service || !tierKey) {
+        return ctx.answerCbQuery('❌ Session expired. Start over.', { show_alert: true });
+    }
 
-        await ctx.answerCbQuery('⏳ Purchasing number...');
+    await ctx.answerCbQuery('⏳ Purchasing number...');
 
-        let loadingMsg = null;
-        let selection = null;
-        
-        try {
-            loadingMsg = await ctx.reply('⏳ Finding best operator and purchasing number...');
+    let loadingMsg = null;
+    let selection = null;
+    
+    try {
+        loadingMsg = await ctx.reply('⏳ Finding best operator and purchasing number...');
 
+        // FIXED: If fallback operator was selected by user, use it directly
+        // instead of calling selectOperator() again which would return the same failed operator
+        if (fallbackOperator) {
+            logger.info('Using fallback operator from session', {
+                userId,
+                fallbackOperator,
+                tierKey,
+                service,
+                country: countryCode
+            });
+            
+            // Get fallback operators list and find the selected one
+            const fallbackOps = await this.tierSelector.getFallbackOperators(
+                tierKey, countryCode, service, null
+            );
+            
+            selection = fallbackOps.find(op => op.operator === fallbackOperator);
+            
+            if (!selection) {
+                // Fallback operator no longer available, clear and error
+                delete ctx.session.fallbackOperator;
+                throw new Error('FALLBACK_EXPIRED: Selected operator no longer available');
+            }
+        } else {
+            // Normal flow: select best operator from tier
             selection = await this.tierSelector.selectOperator(tierKey, countryCode, service, {
                 timeoutMs: 15000
             });
+        }
 
-            logger.info('Tier operator selected', {
-                userId,
-                tier: tierKey,
-                service,
-                country: countryCode,
-                operator: selection.operator,
-                price: selection.price,
-                displayPrice: selection.displayPrice,
-                stock: selection.stock,
-                score: selection.score
-            });
+        logger.info('Tier operator selected', {
+            userId,
+            tier: tierKey,
+            service,
+            country: countryCode,
+            operator: selection.operator,
+            price: selection.price,
+            displayPrice: selection.displayPrice,
+            stock: selection.stock,
+            score: selection.score,
+            isFallback: !!fallbackOperator
+        });
 
-            const user = ctx.state.user;
-            if (this._getAvailableBalance(user) < selection.displayPrice) {
-                try {
-                    if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
-                } catch (delErr) {}
-
-                const message = 
-                    `💰 <b>Insufficient Balance</b>\n\n` +
-                    `Required: ${formatCurrency(selection.displayPrice)}\n` +
-                    `Available: ${formatCurrency(this._getAvailableBalance(user))}\n\n` +
-                    `Price varies by operator quality. Please deposit more.`;
-                    
-                return this.sendPhotoWithCaption(
-                    ctx, IMAGES.cheapMode, message,
-                    Markup.inlineKeyboard([
-                        [Markup.button.callback('💳 Deposit', 'deposit')],
-                        [Markup.button.callback('🔙 Back', `tier_${tierKey}`)]
-                    ]), 'HTML'
-                );
-            }
-
-            const cheapProvider = this.smsProviderManager?.getProvider('CHEAP_PANEL');
-            if (!cheapProvider) {
-                throw new Error('CHEAP_PROVIDER_NOT_AVAILABLE');
-            }
-
-            const cheapResult = await cheapProvider.getNumber(countryCode, service, selection.operator);
-
-            try {
-                if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
-            } catch (delErr) {
-                logger.debug('Failed to delete loading message', { error: delErr.message });
-            }
-
-            const session = await sessionManager.createSessionWithNumber(
-                userId, 
-                'CHEAP', 
-                service, 
-                countryCode,
-                cheapResult.phoneNumber,
-                cheapResult.provider,
-                cheapResult.providerNumberId,
-                cheapResult.displayCost || selection.displayPrice
-            );
-
-            ctx.session.tierOperator = selection.operator;
-            ctx.session.tierKey = tierKey;
-            ctx.session.selectedCountry = countryCode;
-
-            const message = 
-                `📱 <b>OTP Request Started</b>\n\n` +
-                `🌍 Mode: CHEAP (${tierKey.toUpperCase()})\n` +
-                `📱 Number: <code>${session.number}</code>\n` +
-                `🎯 Service: ${service}\n` +
-                `🏢 Operator: <code>${selection.operator}</code>\n` +
-                `⏳ Status: Waiting for OTP...\n` +
-                `💰 Cost: ${formatCurrency(session.cost)}\n` +
-                `⭐ Quality Score: ${selection.score.toFixed(2)}\n` +
-                `⏱ Timeout: ${Math.floor((session.timeoutAt - new Date()) / 1000)}s\n\n` +
-                `⚠️ Funds locked. Will be deducted on delivery.\n` +
-                `Cancel anytime to get full refund.`;
-
-            const keyboard = KEYBOARDS.otpActions(session.sessionId);
-            const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
-
-            if (sentMessage?.message_id) {
-                await this._scheduleTimeoutNotification(
-                    userId, session.sessionId, sentMessage.message_id, session.timeoutAt
-                );
-            }
-
-        } catch (error) {
+        const user = ctx.state.user;
+        if (this._getAvailableBalance(user) < selection.displayPrice) {
             try {
                 if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
             } catch (delErr) {}
 
-            logger.error('Tier country purchase failed', {
-                userId, tierKey, countryCode, service, error: error.message
-            });
-
-            if (error.message?.includes('NO_NUMBERS') || error.message?.includes('NOT_AVAILABLE')) {
-                try {
-                    const fallbackOps = await this.tierSelector.getFallbackOperators(
-                        tierKey, countryCode, service, selection?.operator
-                    );
-                    
-                    if (fallbackOps && fallbackOps.length > 0) {
-                        const message = 
-                            `⚠️ <b>Primary Operator Unavailable</b>\n\n` +
-                            `Operator <code>${selection?.operator}</code> ran out of stock.\n\n` +
-                            `Available alternatives in ${tierKey} tier:`;
-
-                        const buttons = fallbackOps.slice(0, 3).map(op => [
-                            Markup.button.callback(
-                                `🏢 ${op.operator} — ${formatCurrency(op.displayPrice || op.price)}`,
-                                `tier_fallback_${op.operator}`
-                            )
-                        ]);
-
-                        buttons.push([Markup.button.callback('🔙 Back to Countries', `tier_${tierKey}`)]);
-                        
-                        return this.sendPhotoWithCaption(ctx, IMAGES.otpFailed, message, Markup.inlineKeyboard(buttons), 'HTML');
-                    }
-                } catch (fallbackError) {
-                    // Ignore fallback errors
-                }
-            }
-
-            const errorMessages = {
-                NO_NUMBERS: '❌ No numbers available for this operator. Try another country or tier.',
-                NO_BALANCE: '💰 Provider balance insufficient. Contact support.',
-                NOT_AVAILABLE: '❌ Service not available in this country for selected tier.',
-                TIMEOUT: '⏱ Operator selection timed out. Please try again.',
-                INSUFFICIENT_BALANCE: '💰 Your balance is too low for this selection.'
-            };
-
-            const errorKey = Object.keys(errorMessages).find(key => error.message?.includes(key));
-            const displayMessage = errorMessages[errorKey] || `❌ Error: ${error.message}`;
-
-            await this.sendPhotoWithCaption(
-                ctx, IMAGES.otpFailed, 
-                displayMessage,
+            const message = 
+                `💰 <b>Insufficient Balance</b>\n\n` +
+                `Required: ${formatCurrency(selection.displayPrice)}\n` +
+                `Available: ${formatCurrency(this._getAvailableBalance(user))}\n\n` +
+                `Price varies by operator quality. Please deposit more.`;
+                
+            return this.sendPhotoWithCaption(
+                ctx, IMAGES.cheapMode, message,
                 Markup.inlineKeyboard([
-                    [Markup.button.callback('🔄 Retry', `tier_country_${countryCode}`)],
-                    [Markup.button.callback('🔙 Back to Countries', `tier_${tierKey}`)],
-                    [Markup.button.callback('📞 Support', 'contact_support')]
+                    [Markup.button.callback('💳 Deposit', 'deposit')],
+                    [Markup.button.callback('🔙 Back', `tier_${tierKey}`)]
                 ]), 'HTML'
             );
         }
+
+        const cheapProvider = this.smsProviderManager?.getProvider('CHEAP_PANEL');
+        if (!cheapProvider) {
+            throw new Error('CHEAP_PROVIDER_NOT_AVAILABLE');
+        }
+
+        // FIXED: Use the selected operator (could be fallback) for purchase
+        const cheapResult = await cheapProvider.getNumber(countryCode, service, selection.operator);
+
+        try {
+            if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
+        } catch (delErr) {
+            logger.debug('Failed to delete loading message', { error: delErr.message });
+        }
+
+        // FIXED: Pass operator and routedProvider to session
+        const session = await sessionManager.createSessionWithNumber(
+            userId, 
+            'CHEAP', 
+            service, 
+            countryCode,
+            cheapResult.phoneNumber,
+            cheapResult.provider,
+            cheapResult.providerNumberId,
+            cheapResult.displayCost || selection.displayPrice,
+            selection.operator,           // ← FIXED: Pass selected operator
+            selection.providerKey         // ← FIXED: Pass provider key (5sim/smspool/etc)
+        );
+
+        // FIXED: Store session info for auto-OTP delivery
+        ctx.session.tierOperator = selection.operator;
+        ctx.session.tierKey = tierKey;
+        ctx.session.selectedCountry = countryCode;
+        
+        // FIXED: Clear fallback operator after successful purchase
+        delete ctx.session.fallbackOperator;
+
+        const message = 
+            `📱 <b>OTP Request Started</b>\n\n` +
+            `🌍 Mode: CHEAP (${tierKey.toUpperCase()})\n` +
+            `📱 Number: <code>${session.number}</code>\n` +
+            `🎯 Service: ${service}\n` +
+            `🏢 Operator: <code>${selection.operator}</code>\n` +
+            `⏳ Status: Waiting for OTP...\n` +
+            `💰 Cost: ${formatCurrency(session.cost)}\n` +
+            `⭐ Quality Score: ${selection.score.toFixed(2)}\n` +
+            `⏱ Timeout: ${Math.floor((session.timeoutAt - new Date()) / 1000)}s\n\n` +
+            `⚠️ Funds locked. Will be deducted on delivery.\n` +
+            `Cancel anytime to get full refund.`;
+
+        const keyboard = KEYBOARDS.otpActions(session.sessionId);
+        const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
+
+        // FIXED: Store message info for auto-OTP delivery editing
+        if (sentMessage?.message_id) {
+            ctx.session.lastOtpMessageId = sentMessage.message_id;
+            ctx.session.lastOtpChatId = ctx.chat?.id;
+            
+            await this._scheduleTimeoutNotification(
+                userId, session.sessionId, sentMessage.message_id, session.timeoutAt
+            );
+        }
+
+    } catch (error) {
+        try {
+            if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
+        } catch (delErr) {}
+
+        logger.error('Tier country purchase failed', {
+            userId, tierKey, countryCode, service, error: error.message
+        });
+
+        // FIXED: Clear fallback operator on any error so next attempt starts fresh
+        delete ctx.session.fallbackOperator;
+
+        if (error.message?.includes('NO_NUMBERS') || error.message?.includes('NOT_AVAILABLE') || error.message?.includes('FALLBACK_EXPIRED')) {
+            try {
+                // FIXED: Pass the failed operator to exclude it from fallback suggestions
+                const failedOperator = selection?.operator || fallbackOperator;
+                
+                const fallbackOps = await this.tierSelector.getFallbackOperators(
+                    tierKey, countryCode, service, failedOperator
+                );
+                
+                if (fallbackOps && fallbackOps.length > 0) {
+                    const message = 
+                        `⚠️ <b>Primary Operator Unavailable</b>\n\n` +
+                        `Operator <code>${failedOperator || 'unknown'}</code> ran out of stock.\n\n` +
+                        `Available alternatives in ${tierKey} tier:`;
+
+                    const buttons = fallbackOps.slice(0, 3).map(op => [
+                        Markup.button.callback(
+                            `🏢 ${op.operator} — ${formatCurrency(op.displayPrice || op.price)}`,
+                            `tier_fallback_${op.operator}`
+                        )
+                    ]);
+
+                    buttons.push([Markup.button.callback('🔙 Back to Countries', `tier_${tierKey}`)]);
+                    
+                    return this.sendPhotoWithCaption(ctx, IMAGES.otpFailed, message, Markup.inlineKeyboard(buttons), 'HTML');
+                }
+            } catch (fallbackError) {
+                logger.error('Fallback display failed', { error: fallbackError.message });
+            }
+        }
+
+        const errorMessages = {
+            NO_NUMBERS: '❌ No numbers available for this operator. Try another country or tier.',
+            NO_BALANCE: '💰 Provider balance insufficient. Contact support.',
+            NOT_AVAILABLE: '❌ Service not available in this country for selected tier.',
+            TIMEOUT: '⏱ Operator selection timed out. Please try again.',
+            INSUFFICIENT_BALANCE: '💰 Your balance is too low for this selection.',
+            FALLBACK_EXPIRED: '❌ Selected operator is no longer available. Please try again.'
+        };
+
+        const errorKey = Object.keys(errorMessages).find(key => error.message?.includes(key));
+        const displayMessage = errorMessages[errorKey] || `❌ Error: ${error.message}`;
+
+        await this.sendPhotoWithCaption(
+            ctx, IMAGES.otpFailed, 
+            displayMessage,
+            Markup.inlineKeyboard([
+                [Markup.button.callback('🔄 Retry', `tier_country_${countryCode}`)],
+                [Markup.button.callback('🔙 Back to Countries', `tier_${tierKey}`)],
+                [Markup.button.callback('📞 Support', 'contact_support')]
+            ]), 'HTML'
+        );
     }
+            }
+        
 
     // ═══════════════════════════════════════════════════════════════════════
     //  NEW: Pagination Handlers
