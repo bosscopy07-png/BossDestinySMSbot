@@ -290,141 +290,177 @@ class SessionManager {
     }
 
     async deliverOTP(session, otp) {
-        const sessionId = session.sessionId || session;
+    const sessionId = session.sessionId || session;
 
-        if (typeof session === 'string') {
-            session = await Session.findOne({ sessionId }).lean();
-            if (!session) {
-                logger.error('deliverOTP: Session not found', { sessionId });
-                throw new Error('SESSION_NOT_FOUND');
-            }
+    if (typeof session === 'string') {
+        session = await Session.findOne({ sessionId }).lean();
+        if (!session) {
+            logger.error('deliverOTP: Session not found', { sessionId });
+            throw new Error('SESSION_NOT_FOUND');
         }
-
-        if (session.status === 'RECEIVED') {
-            logger.warn('OTP already delivered', { sessionId });
-            return session;
-        }
-
-        const maskedOtp = this.maskOTP(otp);
-
-        const updated = await Session.findOneAndUpdate(
-            { sessionId, status: { $in: ['WAITING', 'CHECKING'] } },
-            {
-                $set: {
-                    status: 'RECEIVED',
-                    otpCode: otp,
-                    maskedOtp,
-                    endTime: new Date()
-                }
-            },
-            { new: true }
-        );
-
-        if (!updated) {
-            logger.warn('Session not in deliverable state', { sessionId, status: session.status });
-            return null;
-        }
-
-        if (session.mode === 'CHEAP' && session.lockTxId) {
-            try {
-                await this.walletService.captureFunds(session.lockTxId, session.userId);
-            } catch (captureError) {
-                logger.error('Fund capture failed', { sessionId, error: captureError.message });
-            }
-        }
-
-        if (session.mode === 'CHEAP' && session.providerNumberId && this.providerManager) {
-            try {
-                const finishResult = await this.providerManager.finishNumber(
-                    session.provider,
-                    session.providerNumberId,
-                    session.routedProvider
-                );
-                logger.info('Provider activation finished', {
-                    sessionId,
-                    activationId: session.providerNumberId,
-                    routedProvider: session.routedProvider,
-                    result: finishResult
-                });
-            } catch (finishError) {
-                logger.warn('Provider finish failed (non-critical)', {
-                    sessionId,
-                    activationId: session.providerNumberId,
-                    routedProvider: session.routedProvider,
-                    error: finishError.message
-                });
-            }
-        }
-
-        if (session.cost > 0 && session.mode === 'CHEAP') {
-            try {
-                await Transaction.create({
-                    txId: generateId(),
-                    userId: session.userId,
-                    type: 'OTP_PURCHASE',
-                    amount: -session.cost,
-                    currency: 'USD',
-                    status: 'COMPLETED',
-                    metadata: {
-                        sessionId,
-                        service: session.service,
-                        mode: session.mode,
-                        number: session.number,
-                        provider: session.provider,
-                        routedProvider: session.routedProvider,
-                        providerNumberId: session.providerNumberId,
-                        operator: session.operator || 'any',
-                        otpDeliveredAt: new Date()
-                    }
-                });
-            } catch (txError) {
-                logger.error('Transaction record failed', { sessionId, error: txError.message });
-            }
-        }
-
-        this._cleanupSession(sessionId);
-
-        // ═══════════════════════════════════════════════════════════
-        //  AUTO-DELIVERY: Send OTP to user via Telegram immediately
-        // ═══════════════════════════════════════════════════════════
-        try {
-            await this._autoDeliverOTPToUser(session, otp);
-        } catch (autoDeliverError) {
-            logger.error('Auto-delivery to user failed', { sessionId, error: autoDeliverError.message });
-        }
-
-        // Also notify via notification service if available
-        if (this.notificationService) {
-            try {
-                await this.notificationService.notifyOTPReceived(session.userId, {
-                    sessionId,
-                    service: session.service,
-                    number: session.number,
-                    otp: maskedOtp
-                });
-            } catch (notifyError) {
-                logger.error('OTP received notification failed', { sessionId, error: notifyError.message });
-            }
-        }
-
-        logger.info('OTP delivered', {
-            sessionId,
-            userId: session.userId,
-            duration: this._getDuration(session.startTime),
-            mode: session.mode,
-            cost: session.cost
-        });
-
-        return updated;
     }
 
+    if (session.status === 'RECEIVED') {
+        logger.warn('OTP already delivered', { sessionId });
+        return session;
+    }
+
+    const maskedOtp = this.maskOTP(otp);
+
+    const updated = await Session.findOneAndUpdate(
+        { sessionId, status: { $in: ['WAITING', 'CHECKING'] } },
+        {
+            $set: {
+                status: 'RECEIVED',
+                otpCode: otp,
+                maskedOtp,
+                endTime: new Date()
+            }
+        },
+        { new: true }
+    );
+
+    if (!updated) {
+        logger.warn('Session not in deliverable state', { sessionId, status: session.status });
+        return null;
+    }
+
+    if (session.mode === 'CHEAP' && session.lockTxId) {
+        try {
+            await this.walletService.captureFunds(session.lockTxId, session.userId);
+        } catch (captureError) {
+            logger.error('Fund capture failed', { sessionId, error: captureError.message });
+        }
+    }
+
+    if (session.mode === 'CHEAP' && session.providerNumberId && this.providerManager) {
+        try {
+            const finishResult = await this.providerManager.finishNumber(
+                session.provider,
+                session.providerNumberId,
+                session.routedProvider
+            );
+            logger.info('Provider activation finished', {
+                sessionId,
+                activationId: session.providerNumberId,
+                routedProvider: session.routedProvider,
+                result: finishResult
+            });
+        } catch (finishError) {
+            logger.warn('Provider finish failed (non-critical)', {
+                sessionId,
+                activationId: session.providerNumberId,
+                routedProvider: session.routedProvider,
+                error: finishError.message
+            });
+        }
+    }
+
+    if (session.cost > 0 && session.mode === 'CHEAP') {
+        try {
+            await Transaction.create({
+                txId: generateId(),
+                userId: session.userId,
+                type: 'OTP_PURCHASE',
+                amount: -session.cost,
+                currency: 'USD',
+                status: 'COMPLETED',
+                metadata: {
+                    sessionId,
+                    service: session.service,
+                    mode: session.mode,
+                    number: session.number,
+                    provider: session.provider,
+                    routedProvider: session.routedProvider,
+                    providerNumberId: session.providerNumberId,
+                    operator: session.operator || 'any',
+                    otpDeliveredAt: new Date()
+                }
+            });
+        } catch (txError) {
+            logger.error('Transaction record failed', { sessionId, error: txError.message });
+        }
+    }
+
+    this._cleanupSession(sessionId);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  AUTO-DELIVERY: Send OTP to user via Telegram immediately
+    //  FIXED: Added bot existence check with detailed logging
+    // ═══════════════════════════════════════════════════════════════════════
+    try {
+        logger.debug('Auto-delivery attempt', {
+            sessionId,
+            hasBot: !!this.bot,
+            botType: this.bot?.constructor?.name,
+            botHasTelegram: !!this.bot?.telegram,
+            userId: session.userId
+        });
+
+        if (this.bot && this.bot.telegram) {
+            await this._autoDeliverOTPToUser(session, otp);
+        } else {
+            logger.error('Bot not available for auto-delivery, falling back to notification service', {
+                sessionId,
+                hasBot: !!this.bot,
+                hasTelegram: !!this.bot?.telegram
+            });
+        }
+    } catch (autoDeliverError) {
+        logger.error('Auto-delivery to user failed', { 
+            sessionId, 
+            error: autoDeliverError.message,
+            stack: autoDeliverError.stack
+        });
+    }
+
+    // Also notify via notification service if available
+    if (this.notificationService) {
+        try {
+            await this.notificationService.notifyOTPReceived(session.userId, {
+                sessionId,
+                service: session.service,
+                number: session.number,
+                otp: maskedOtp
+            });
+        } catch (notifyError) {
+            logger.error('OTP received notification failed', { sessionId, error: notifyError.message });
+        }
+    }
+
+    logger.info('OTP delivered', {
+        sessionId,
+        userId: session.userId,
+        duration: this._getDuration(session.startTime),
+        mode: session.mode,
+        cost: session.cost
+    });
+
+    return updated;
+            }
+                
+        
     // ═══════════════════════════════════════════════════════════
     //  AUTO-DELIVERY: Send OTP directly to user's Telegram
     // ═══════════════════════════════════════════════════════════
 async _autoDeliverOTPToUser(session, otp) {
+    // Double-check bot availability
     if (!this.bot) {
-        logger.error('No bot instance available for auto-delivery', { sessionId: session.sessionId });
-        return;
+        logger.error('No bot instance in _autoDeliverOTPToUser', { 
+            sessionId: session.sessionId,
+            thisBot: this.bot,
+            thisKeys: Object.keys(this)
+        });
+        throw new Error('BOT_NOT_AVAILABLE');
+    }
+
+    if (!this.bot.telegram) {
+        logger.error('Bot has no telegram property', { 
+            sessionId: session.sessionId,
+            botType: this.bot.constructor?.name,
+            botKeys: Object.keys(this.bot)
+        });
+        throw new Error('BOT_TELEGRAM_NOT_AVAILABLE');
     }
 
     const message =
@@ -435,33 +471,21 @@ async _autoDeliverOTPToUser(session, otp) {
         `🕐 Delivered: ${new Date().toLocaleTimeString()}\n\n` +
         `⚠️ Do not share this code with anyone.`;
 
-    try {
-        // Use ctx-like send via bot.telegram directly
-        await this.bot.telegram.sendMessage(session.userId, message, {
-            parse_mode: 'HTML',
-            reply_markup: {
-                inline_keyboard: [
-                    [{ text: '🔙 Back to Menu', callback_data: 'menu' }]
-                ]
-            }
-        });
+    await this.bot.telegram.sendMessage(session.userId, message, {
+        parse_mode: 'HTML',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '🔙 Back to Menu', callback_data: 'menu' }]
+            ]
+        }
+    });
 
-        logger.info('OTP auto-delivered to user via Telegram', {
-            sessionId: session.sessionId,
-            userId: session.userId,
-            number: session.number,
-            service: session.service
-        });
-    } catch (error) {
-        logger.error('Auto-delivery send failed', { 
-            sessionId: session.sessionId, 
-            userId: session.userId,
-            error: error.message,
-            code: error.code,
-            description: error.description
-        });
-        // Don't throw — let notification service handle fallback
-    }
+    logger.info('OTP auto-delivered to user via Telegram', {
+        sessionId: session.sessionId,
+        userId: session.userId,
+        number: session.number,
+        service: session.service
+    });
 }
     
 
