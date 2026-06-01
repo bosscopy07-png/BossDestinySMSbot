@@ -497,7 +497,7 @@ class TelegramBot {
         }
     }
 
-    async setupCommands() {
+         async setupCommands() {
         try {
             this.smsProviderManager = new SMSProviderManager();
             await this.smsProviderManager.initialize();
@@ -534,31 +534,69 @@ class TelegramBot {
         console.log('tierIntegrationService exists:', !!this.tierIntegrationService);
         console.log('tierIntegrationService._enabled:', this.tierIntegrationService?._enabled);
         console.log('tierIntegrationService._cheapProvider:', this.tierIntegrationService?._cheapProvider?.name);
-        console.log('tierIntegrationService.isAvailable():', this.tierIntegrationService?.isAvailable());
+        console.log('tierIntegrationService.isAvailable():', this.tierIntegrationService?.isAvailable?.());
         console.log('==================');
 
         // ═══════════════════════════════════════════════════════════════════════
         //  SESSION MANAGER — MUST be created BEFORE OTPCommands
         //  Pass this.bot (full Telegraf instance) for auto OTP delivery
         // ═══════════════════════════════════════════════════════════════════════
-        const RetryEngine = (await import('../services/otp/RetryEngine.js')).default;
-        const SessionManager = (await import('../services/otp/SessionManager.js')).default;
-        
+        let SessionManager, RetryEngine;
+        try {
+            const sessionManagerModule = await import('../services/otp/SessionManager.js');
+            SessionManager = sessionManagerModule.default;
+        } catch (err) {
+            logger.error('Failed to import SessionManager', { error: err.message });
+            // Create a stub so OTPCommands doesn't crash
+            SessionManager = class StubSessionManager {
+                constructor() { logger.warn('Using stub SessionManager'); }
+                async createSession() { throw new Error('SessionManager not available'); }
+            };
+        }
+
+        try {
+            const retryModule = await import('../services/otp/RetryEngine.js');
+            RetryEngine = retryModule.default;
+        } catch (err) {
+            logger.warn('RetryEngine not found, using inline stub', { error: err.message });
+            RetryEngine = class RetryEngine {
+                async execute(fn, options = {}) {
+                    const maxRetries = options.maxRetries || 0;
+                    let lastError;
+                    for (let i = 0; i <= maxRetries; i++) {
+                        try { return await fn(); } 
+                        catch (error) { 
+                            lastError = error; 
+                            if (i < maxRetries) await new Promise(r => setTimeout(r, options.delay || 1000));
+                        }
+                    }
+                    throw lastError;
+                }
+            };
+        }
+
         const retryEngine = new RetryEngine();
-        
+
+        // Build service catalog if tierIntegrationService is available
+        let serviceCatalog = null;
+        if (this.tierIntegrationService?._serviceCatalog) {
+            serviceCatalog = this.tierIntegrationService._serviceCatalog;
+        }
+
         // Pass this.bot (the Telegraf instance) — NOT this.bot.telegram
         this.sessionManager = new SessionManager(
             this.smsProviderManager,
             retryEngine,
             this.walletService,
             this.notificationService,
-            null,        // numberPoolManager — add if you have one
-            null,        // serviceCatalog — add if you have one
-            this.bot     // <-- FULL Telegraf bot instance for auto-delivery
+            null,                    // numberPoolManager — add if you have one
+            serviceCatalog,          // serviceCatalog from tier system
+            this.bot                 // <-- FULL Telegraf bot instance for auto-delivery
         );
         logger.info('Session Manager initialized', { 
             hasBot: !!this.bot,
-            botType: this.bot?.constructor?.name 
+            botType: this.bot?.constructor?.name,
+            hasServiceCatalog: !!serviceCatalog
         });
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -570,17 +608,23 @@ class TelegramBot {
             this.referralService, 
             this.notificationService
         );
-        
-        // Pass sessionManager to OTPCommands so it can create sessions
+
+        // Pass arguments in correct order: bot, walletService, sessionManager, smsProviderManager, tierIntegrationService
         const otpCommands = new OTPCommands(
             this.bot, 
             this.walletService, 
-            this.sessionManager,        // <-- NOW it's properly initialized
-            this.smsProviderManager,
-            this.tierIntegrationService
+            this.sessionManager,           // 3rd = sessionManager (now properly initialized)
+            this.smsProviderManager,         // 4th = smsProviderManager
+            this.tierIntegrationService      // 5th = tierIntegrationService (may be null)
         );
-        
-        const adminCommands = new AdminCommands(this.bot, this.walletService, this.referralService, this.smsProviderManager);
+
+        const adminCommands = new AdminCommands(
+            this.bot, 
+            this.walletService, 
+            this.referralService, 
+            this.smsProviderManager
+        );
+
         const advancedAdmin = new Admin(
             this.bot,
             this.walletService,
@@ -588,12 +632,23 @@ class TelegramBot {
             this.smsProviderManager
         );
 
-        if (this.tierIntegrationService?.isAvailable()) {
-            otpCommands.tierService = this.tierIntegrationService;
-            otpCommands.tierSelector = this.tierIntegrationService._tierSelector;
-            otpCommands.serviceCatalog = this.tierIntegrationService._serviceCatalog;
-            otpCommands.countryCatalog = this.tierIntegrationService._countryCatalog;
-            logger.info('Tier services injected into OTPCommands');
+        // ═══════════════════════════════════════════════════════════════════════
+        //  Inject tier services into OTPCommands if available
+        // ═══════════════════════════════════════════════════════════════════════
+        if (this.tierIntegrationService && typeof this.tierIntegrationService.isAvailable === 'function') {
+            if (this.tierIntegrationService.isAvailable()) {
+                otpCommands.tierService = this.tierIntegrationService;
+                otpCommands.tierSelector = this.tierIntegrationService._tierSelector;
+                otpCommands.serviceCatalog = this.tierIntegrationService._serviceCatalog;
+                otpCommands.countryCatalog = this.tierIntegrationService._countryCatalog;
+                logger.info('Tier services injected into OTPCommands', {
+                    hasTierSelector: !!otpCommands.tierSelector,
+                    hasServiceCatalog: !!otpCommands.serviceCatalog,
+                    hasCountryCatalog: !!otpCommands.countryCatalog
+                });
+            } else {
+                logger.warn('Tier Integration Service available but not enabled');
+            }
         } else {
             logger.warn('Tier system not available, OTPCommands will use legacy flow');
         }
@@ -603,7 +658,7 @@ class TelegramBot {
         this.commandModules.set('admin', adminCommands);
         this.commandModules.set('advancedAdmin', advancedAdmin);
             
-       // ═══════════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
         //  StartVerification — FIXED: Injected with all required services
         // ═══════════════════════════════════════════════════════════════════════
         this.startVerification = new StartVerification(
@@ -742,8 +797,9 @@ class TelegramBot {
                 });
             }
         });
-    }
-
+         }
+                    
+       
         setupTextHandler() {
         this.bot.on(message('text'), async (ctx, next) => {
             try {
