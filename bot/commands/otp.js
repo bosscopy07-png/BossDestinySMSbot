@@ -2778,15 +2778,11 @@ const checkInterval = setInterval(async () => {
 
 🎯 <b>Service:</b> ${status.service}
 ⏱️ <b>Time:</b> ${checkCount * 5}s
-
 ━━━━━━━━━━━━━━━
-
 🔐 <b>OTP CODE</b>
 
 <code>${otpCode}</code>
-
 ━━━━━━━━━━━━━━━
-
 ⚠️ Do not share this code with anyone.
 `.trim();
 
@@ -2803,7 +2799,7 @@ const checkInterval = setInterval(async () => {
                     [
                         {
                             text: '📱 New OTP',
-                            callback_data: 'otp'
+                            callback_data: 'mode_cheap'
                         },
                         {
                             text: '🔙 Menu',
@@ -2815,7 +2811,7 @@ const checkInterval = setInterval(async () => {
 
             await ctx.telegram.sendPhoto(
                 ctx.from.id,
-                IMAGES.otpReceived,
+                IMAGES.otpRequested,
                 {
                     caption,
                     parse_mode: 'HTML',
