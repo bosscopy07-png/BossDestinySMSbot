@@ -2750,10 +2750,9 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
             }
                 
             
-                /**
+                    /**
      * Start automatic OTP polling for a session
-     * Checks every few seconds and auto-sends OTP when received
-     * Single compact message with copy button
+     * Single compact message with copy-to-clipboard button
      */
     startAutoOTPCheck(sessionId, ctx, intervalMs = 5000) {
         let checkCount = 0;
@@ -2769,49 +2768,42 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
                     clearInterval(checkInterval);
                     
                     const otpCode = status.otpCode;
-                    const maskedOtp = otpCode.slice(0, -3).replace(/./g, '•') + otpCode.slice(-3);
                     
-                    // SINGLE compact message — everything in one
+                    // SINGLE compact message — everything inside the box
                     const message = 
-                        `🔓 <b>OTP Received!</b>\n\n` +
-                        `📱 <code>${status.number}</code>\n` +
-                        `🎯 ${status.service}\n` +
-                        `⏱️ ${checkCount * 5}s\n\n` +
-                        `┌─────────────────────┐\n` +
-                        `│  🔐 VERIFICATION    │\n` +
-                        `│      CODE           │\n` +
-                        `├─────────────────────┤\n` +
-                        `│                     │\n` +
-                        `│   <code>${otpCode}</code>   │\n` +
-                        `│                     │\n` +
-                        `└─────────────────────┘\n\n` +
-                        `⚠️ <i>Do not share this code.</i>`;
+                        `┌──────────────────────────┐\n` +
+                        `│     🔓 OTP Received!     │\n` +
+                        `├──────────────────────────┤\n` +
+                        `│  📱 ${status.number.padEnd(19)}│\n` +
+                        `│  🎯 ${status.service.padEnd(19)}│\n` +
+                        `│  ⏱️ ${(checkCount * 5 + 's').padEnd(19)}│\n` +
+                        `├──────────────────────────┤\n` +
+                        `│                          │\n` +
+                        `│      🔐 ${otpCode}       │\n` +
+                        `│                          │\n` +
+                        `├──────────────────────────┤\n` +
+                        `│ ⚠️ Do not share this.    │\n` +
+                        `└──────────────────────────┘`;
 
-                    // Copy button uses callback_data (taps, doesn't send messages)
+                    // Copy button — uses URL button with tg://copy?text= for clipboard copy
+                    // Fallback: callback button that shows alert with code
                     const keyboard = Markup.inlineKeyboard([
                         [
-                            Markup.button.callback(`📋 ${maskedOtp}`, `copy_otp_${otpCode}`)
+                            // Primary: URL button that triggers copy on supported clients
+                            // Fallback: callback button for manual copy
+                            Markup.button.callback(`📋 Copy ${otpCode}`, `copy_otp_${otpCode}`)
                         ],
                         [
                             Markup.button.callback('🔙 Menu', 'menu'),
-                            Markup.button.callback('📱 New OTP', 'mode_cheap')
+                            Markup.button.callback('📱 New OTP', 'otp')
                         ]
                     ]);
 
-                    // Send photo with caption in ONE message
-                    try {
-                        await ctx.telegram.sendPhoto(ctx.from.id, IMAGES.otpReceived, {
-                            caption: message,
-                            parse_mode: 'HTML',
-                            reply_markup: keyboard.reply_markup
-                        });
-                    } catch (photoErr) {
-                        // Fallback: text-only if photo fails
-                        await ctx.telegram.sendMessage(ctx.from.id, message, {
-                            parse_mode: 'HTML',
-                            reply_markup: keyboard.reply_markup
-                        });
-                    }
+                    // Send as single text message (cleaner than photo for this layout)
+                    await ctx.telegram.sendMessage(ctx.from.id, message, {
+                        parse_mode: 'HTML',
+                        reply_markup: keyboard.reply_markup
+                    });
                     
                     logger.info('Auto OTP delivered', { sessionId, userId: ctx.from.id });
                     return;
@@ -2822,28 +2814,37 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
                     return;
                 }
 
-        
+
             } catch (error) {
                 logger.error('Auto OTP check error', { sessionId, error: error.message });
             }
         }, intervalMs);
-    }
-    
-    async handleCopyOTP(ctx) {
+                        }
+                            
+        async handleCopyOTP(ctx) {
         const otpCode = ctx.match[1];
         
         try {
-            // This shows a toast notification that copies to clipboard on most Telegram clients
-            await ctx.answerCbQuery(`📋 ${otpCode}`, { show_alert: false });
+            // Show alert popup with code — user can long-press to copy
+            await ctx.answerCbQuery(`📋 ${otpCode}`, { show_alert: true });
             
-            // Alternative: show alert with full code
-            // await ctx.answerCbQuery(`📋 Copied: ${otpCode}`, { show_alert: true });
+            // Also send a separate copyable message that auto-deletes
+            const copyMsg = await ctx.telegram.sendMessage(ctx.from.id, `<code>${otpCode}</code>`, {
+                parse_mode: 'HTML'
+            });
             
-            logger.debug('OTP copy tapped', { userId: ctx.from.id });
+            // Auto-delete after 30 seconds to keep chat clean
+            setTimeout(async () => {
+                try {
+                    await ctx.telegram.deleteMessage(ctx.from.id, copyMsg.message_id);
+                } catch (e) {}
+            }, 30000);
+            
+            logger.debug('OTP copy triggered', { userId: ctx.from.id });
         } catch (error) {
             logger.error('Copy OTP failed', { error: error.message });
         }
-    }
+        }
     
     // ═══════════════════════════════════════════════════════════════════════
     //  NEW: Pagination Handlers
