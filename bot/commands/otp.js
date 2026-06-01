@@ -2748,161 +2748,103 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
         );
     }
             }
+                
+            
                 /**
      * Start automatic OTP polling for a session
      * Checks every few seconds and auto-sends OTP when received
-     * Enhanced with photo, styled OTP card, and copy button
+     * Single compact message with copy button
      */
     startAutoOTPCheck(sessionId, ctx, intervalMs = 5000) {
         let checkCount = 0;
-        const maxChecks = 36; // 3 minutes (36 * 5s)
+        const maxChecks = 36; // 3 minutes
         
         const checkInterval = setInterval(async () => {
             checkCount++;
             
             try {
-                // Use this.sessionManager (the injected one)
                 const status = await this.sessionManager.checkSessionStatus(sessionId);
                 
                 if (status.status === 'RECEIVED' && status.otpCode) {
                     clearInterval(checkInterval);
                     
-                    // ═══════════════════════════════════════════════════════════════
-                    //  ENHANCED: Auto-send OTP with photo, styled card, and copy button
-                    // ═══════════════════════════════════════════════════════════════
-                    
                     const otpCode = status.otpCode;
                     const maskedOtp = otpCode.slice(0, -3).replace(/./g, '•') + otpCode.slice(-3);
                     
-                    // Main message with styled OTP card
+                    // SINGLE compact message — everything in one
                     const message = 
                         `🔓 <b>OTP Received!</b>\n\n` +
-                        `📱 Number: <code>${status.number}</code>\n` +
-                        `🎯 Service: ${status.service}\n` +
-                        `⏱️ Duration: ${checkCount * 5}s\n\n` +
-                        `<b>Your verification code is ready</b>`;
+                        `📱 <code>${status.number}</code>\n` +
+                        `🎯 ${status.service}\n` +
+                        `⏱️ ${checkCount * 5}s\n\n` +
+                        `┌─────────────────────┐\n` +
+                        `│  🔐 VERIFICATION    │\n` +
+                        `│      CODE           │\n` +
+                        `├─────────────────────┤\n` +
+                        `│                     │\n` +
+                        `│   <code>${otpCode}</code>   │\n` +
+                        `│                     │\n` +
+                        `└─────────────────────┘\n\n` +
+                        `⚠️ <i>Do not share this code.</i>`;
 
-                    // OTP card as separate message for clean layout
-                    const otpCard = 
-                        `╔══════════════════════╗\n` +
-                        `║  🔐 VERIFICATION CODE  ║\n` +
-                        `╠══════════════════════╣\n` +
-                        `║                      ║\n` +
-                        `║    <code>${otpCode}</code>    ║\n` +
-                        `║                      ║\n` +
-                        `╚══════════════════════╝\n\n` +
-                        `⚠️ <i>Do not share this code with anyone.</i>\n` +
-                        `🕐 <i>Delivered: ${new Date().toLocaleTimeString()}</i>`;
-
-                    // Copy button — tapping copies the OTP code
-                    const copyKeyboard = Markup.inlineKeyboard([
+                    // Copy button uses callback_data (taps, doesn't send messages)
+                    const keyboard = Markup.inlineKeyboard([
                         [
-                            Markup.button.callback(`📋 Copy: ${maskedOtp}`, `copy_otp_${otpCode}`)
+                            Markup.button.callback(`📋 ${maskedOtp}`, `copy_otp_${otpCode}`)
                         ],
                         [
-                            Markup.button.callback('🔙 Back to Menu', 'menu'),
-                            Markup.button.callback('📱 Request Another', 'mode_cheap')
+                            Markup.button.callback('🔙 Menu', 'menu'),
+                            Markup.button.callback('📱 New OTP', 'mode_cheap')
                         ]
                     ]);
 
+                    // Send photo with caption in ONE message
                     try {
-                        // Send photo with main message
                         await ctx.telegram.sendPhoto(ctx.from.id, IMAGES.otpReceived, {
                             caption: message,
-                            parse_mode: 'HTML'
+                            parse_mode: 'HTML',
+                            reply_markup: keyboard.reply_markup
                         });
                     } catch (photoErr) {
-                        // Fallback if photo fails
+                        // Fallback: text-only if photo fails
                         await ctx.telegram.sendMessage(ctx.from.id, message, {
-                            parse_mode: 'HTML'
+                            parse_mode: 'HTML',
+                            reply_markup: keyboard.reply_markup
                         });
                     }
-
-                    // Send OTP card as separate message for emphasis
-                    const sentOtpMessage = await ctx.telegram.sendMessage(ctx.from.id, otpCard, {
-                        parse_mode: 'HTML',
-                        reply_markup: copyKeyboard.reply_markup
-                    });
-
-                    // Store for potential edit later
-                    if (sentOtpMessage?.message_id) {
-                        ctx.session.lastOtpAutoMessageId = sentOtpMessage.message_id;
-                    }
                     
-                    logger.info('Auto OTP delivered via polling', { 
-                        sessionId, 
-                        userId: ctx.from.id,
-                        checks: checkCount,
-                        otpLength: otpCode.length
-                    });
+                    logger.info('Auto OTP delivered', { sessionId, userId: ctx.from.id });
                     return;
                 }
 
-                // Stop if session is no longer active
                 if (!['WAITING', 'CHECKING'].includes(status.status)) {
                     clearInterval(checkInterval);
-                    logger.debug('Auto OTP polling stopped (session ended)', { 
-                        sessionId, 
-                        status: status.status 
-                    });
                     return;
                 }
 
-                // Max checks reached (timeout)
-                if (checkCount >= maxChecks) {
-                    clearInterval(checkInterval);
-                    
-                    // Send timeout notification to user
-                    const timeoutMessage = 
-                        `⏱️ <b>OTP Session Expired</b>\n\n` +
-                        `📱 Number: <code>${status.number || 'N/A'}</code>\n` +
-                        `🎯 Service: ${status.service || 'N/A'}\n\n` +
-                        `❌ No OTP was received within the time limit.\n` +
-                        `💰 Your funds have been refunded.\n\n` +
-                        `Try again with a different operator or country.`;
-
-                    await ctx.telegram.sendMessage(ctx.from.id, timeoutMessage, {
-                        parse_mode: 'HTML',
-                        reply_markup: {
-                            inline_keyboard: [
-                                [{ text: '🔄 Try Again', callback_data: 'otp' }],
-                                [{ text: '🔙 Back to Menu', callback_data: 'menu' }]
-                            ]
-                        }
-                    }).catch(() => {});
-                    
-                    logger.info('Auto OTP polling stopped (timeout)', { sessionId });
-                }
-
+        
             } catch (error) {
                 logger.error('Auto OTP check error', { sessionId, error: error.message });
-                // Don't clear interval on error — keep trying
             }
         }, intervalMs);
-                                          }
-        /**
-     * Handle OTP copy button tap
-     * Sends the OTP code in a copy-friendly format
-     */
+    }
+    
     async handleCopyOTP(ctx) {
         const otpCode = ctx.match[1];
-        const userId = ctx.from.id.toString();
         
         try {
-            await ctx.answerCbQuery('✅ Code copied!');
+            // This shows a toast notification that copies to clipboard on most Telegram clients
+            await ctx.answerCbQuery(`📋 ${otpCode}`, { show_alert: false });
             
-            // Send as a plain text message that's easy to copy
-            await ctx.telegram.sendMessage(userId, `\`${otpCode}\``, {
-                parse_mode: 'MarkdownV2'
-            });
+            // Alternative: show alert with full code
+            // await ctx.answerCbQuery(`📋 Copied: ${otpCode}`, { show_alert: true });
             
-            logger.debug('OTP copy button used', { userId, otpLength: otpCode.length });
+            logger.debug('OTP copy tapped', { userId: ctx.from.id });
         } catch (error) {
-            logger.error('Copy OTP failed', { userId, error: error.message });
+            logger.error('Copy OTP failed', { error: error.message });
         }
     }
     
-
     // ═══════════════════════════════════════════════════════════════════════
     //  NEW: Pagination Handlers
     // ═══════════════════════════════════════════════════════════════════════
