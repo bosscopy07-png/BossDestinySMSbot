@@ -497,8 +497,7 @@ class TelegramBot {
         }
     }
 
-
-        async setupCommands() {
+    async setupCommands() {
         try {
             this.smsProviderManager = new SMSProviderManager();
             await this.smsProviderManager.initialize();
@@ -524,23 +523,6 @@ class TelegramBot {
         }
 
         // ═══════════════════════════════════════════════════════════════════════
-        //  SESSION MANAGER — Handles session lifecycle + auto OTP delivery
-        // ═══════════════════════════════════════════════════════════════════════
-        const retryEngine = new RetryEngine(); // replace with your actual import
-        this.sessionManager = new SessionManager(
-            this.smsProviderManager,
-            retryEngine,
-            this.walletService,
-            this.notificationService,
-            null,        // numberPoolManager
-            null,        // serviceCatalog
-            this.bot     // <-- Telegraf bot for auto-delivery
-        );
-        logger.info('Session Manager initialized');
-
-    
-
-        // ═══════════════════════════════════════════════════════════════════════
         //  DEBUG — Check tier system health (REMOVE AFTER FIXING)
         // ═══════════════════════════════════════════════════════════════════════
         console.log('=== TIER DEBUG ===');
@@ -556,7 +538,31 @@ class TelegramBot {
         console.log('==================');
 
         // ═══════════════════════════════════════════════════════════════════════
-        //  COMMAND MODULES
+        //  SESSION MANAGER — MUST be created BEFORE OTPCommands
+        //  Pass this.bot (full Telegraf instance) for auto OTP delivery
+        // ═══════════════════════════════════════════════════════════════════════
+        const RetryEngine = (await import('../services/otp/RetryEngine.js')).default;
+        const SessionManager = (await import('../services/otp/SessionManager.js')).default;
+        
+        const retryEngine = new RetryEngine();
+        
+        // Pass this.bot (the Telegraf instance) — NOT this.bot.telegram
+        this.sessionManager = new SessionManager(
+            this.smsProviderManager,
+            retryEngine,
+            this.walletService,
+            this.notificationService,
+            null,        // numberPoolManager — add if you have one
+            null,        // serviceCatalog — add if you have one
+            this.bot     // <-- FULL Telegraf bot instance for auto-delivery
+        );
+        logger.info('Session Manager initialized', { 
+            hasBot: !!this.bot,
+            botType: this.bot?.constructor?.name 
+        });
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  COMMAND MODULES — Now sessionManager exists and can be passed
         // ═══════════════════════════════════════════════════════════════════════
         const userCommands = new UserCommands(
             this.bot, 
@@ -564,13 +570,16 @@ class TelegramBot {
             this.referralService, 
             this.notificationService
         );
-     const otpCommands = new OTPCommands(
-    this.bot, 
-    this.walletService, 
-    this.smsProviderManager,
-    this.tierIntegrationService,  // tierIntegrationService (or null if unavailable)
-    this.sessionManager           // sessionManager (or null if not yet created)
-); 
+        
+        // Pass sessionManager to OTPCommands so it can create sessions
+        const otpCommands = new OTPCommands(
+            this.bot, 
+            this.walletService, 
+            this.sessionManager,        // <-- NOW it's properly initialized
+            this.smsProviderManager,
+            this.tierIntegrationService
+        );
+        
         const adminCommands = new AdminCommands(this.bot, this.walletService, this.referralService, this.smsProviderManager);
         const advancedAdmin = new Admin(
             this.bot,
