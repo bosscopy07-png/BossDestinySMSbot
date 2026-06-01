@@ -7,6 +7,7 @@
 //   4. Cache TTL: 60 minutes to prevent rate limits
 //   5. Preserves original service name throughout flow
 //   6. Queries ALL providers, returns cheapest price per tier
+//   7. FIXED SCORING: Normalized 0-100 with proper tier logic and weights
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { TIER_CONFIG, getTierOperators, isOperatorInTier, getOperatorTier, getAdjacentOperators, CACHE_TTL } from '../config/tierConfig.js';
@@ -21,6 +22,7 @@ import logger from '../utils/logger.js';
  *   - Cross-operator fallback: if virtual56 fails, tries adjacent operators in same tier
  *   - Cross-provider fallback: queries ALL providers, picks cheapest with stock
  *   - Preserves original service name to prevent INVALID_SERVICE downstream
+ *   - FIXED: Normalized scoring system (0-100) with configurable weights
  */
 class TierOperatorSelector {
     constructor(providers = []) {
@@ -40,8 +42,28 @@ class TierOperatorSelector {
         // Pending request deduplication
         this._pendingSelections = new Map(); // cacheKey -> Promise
 
+        // ═══════════════════════════════════════════════════════════════════════
+        //  FIXED: SCORING WEIGHTS — tunable per business priority
+        //  All scores normalized to 0-100 range
+        // ═══════════════════════════════════════════════════════════════════════
+        this._weights = {
+            price: 0.50,        // 50% — cheapest wins
+            stock: 0.25,        // 25% — reliable stock levels
+            provider: 0.15,     // 15% — prefer primary provider
+            reliability: 0.10   // 10% — historical success rate (placeholder)
+        };
+
+        // Price normalization: what we consider "fair market" for scoring
+        this._priceBaseline = {
+            min: 0.03,          // Below this is suspicious (scam/fake)
+            optimal: 0.15,      // Sweet spot for scoring
+            max: 2.00           // Above this is penalized heavily
+        };
+
         logger.info('TierOperatorSelector initialized', {
             providers: this.providers.map(p => ({ name: p.name, key: p.providerKey })),
+            weights: this._weights,
+            priceBaseline: this._priceBaseline,
             cacheTtl: '60min'
         });
     }
@@ -154,6 +176,9 @@ class TierOperatorSelector {
         }
     }
 
+    /**
+     * FIXED: Core selection logic with normalized scoring and stock threshold enforcement
+     */
     async _doSelectOperator(tierKey, country, service, options) {
         const tier = TIER_CONFIG[tierKey];
         if (!tier) {
@@ -167,8 +192,25 @@ class TierOperatorSelector {
             throw new Error(`NO_NUMBERS: No operators have stock for ${service} in ${country} across all providers`);
         }
 
-        // Step 2: Score and sort all results
-        const scored = providerResults.map(op => ({
+        // ENFORCED: Filter out operators below minimum stock threshold
+        const minStock = tier.minStock || 1;
+        const viableResults = providerResults.filter(op => op.stock >= minStock);
+        
+        if (viableResults.length === 0) {
+            // Fallback: allow below-threshold if nothing else exists
+            logger.warn('No operators meet minStock threshold, using best available', {
+                tier: tierKey,
+                country,
+                service,
+                minStock,
+                bestAvailable: Math.max(...providerResults.map(o => o.stock))
+            });
+        }
+
+        const candidates = viableResults.length > 0 ? viableResults : providerResults;
+
+        // Step 2: Score and sort all results using FIXED normalized scoring
+        const scored = candidates.map(op => ({
             ...op,
             score: this._calculateScore(op, tier.sortPriority, tierKey)
         }));
@@ -176,6 +218,16 @@ class TierOperatorSelector {
         scored.sort((a, b) => b.score - a.score);
 
         const best = scored[0];
+
+        // Sanity check: log if selected operator is suspiciously cheap
+        if (best.price < this._priceBaseline.min) {
+            logger.warn('Selected suspiciously cheap operator', {
+                operator: best.operator,
+                price: best.price,
+                provider: best.providerKey,
+                score: best.score
+            });
+        }
 
         const result = {
             operator: best.operator,
@@ -187,8 +239,9 @@ class TierOperatorSelector {
             providerKey: best.providerKey,
             originalService: service,
             mappedService: best.mappedService,
-            crossProvider: best.crossProvider || false,
-            tier: tierKey
+            crossProvider: best.providerKey !== 'CHEAP_PANEL',
+            tier: tierKey,
+            meetsThreshold: best.stock >= minStock
         };
 
         logger.info('Operator selected', {
@@ -198,7 +251,9 @@ class TierOperatorSelector {
             operator: best.operator,
             price: best.price,
             stock: best.stock,
-            provider: best.providerKey
+            score: best.score,
+            provider: best.providerKey,
+            meetsThreshold: result.meetsThreshold
         });
 
         return result;
@@ -331,32 +386,165 @@ class TierOperatorSelector {
         return [normalized, 'other'];
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  FIXED SCORING SYSTEM — Normalized 0-100 with proper tier logic
+    // ═══════════════════════════════════════════════════════════════════════
+
     /**
-     * Calculate operator score based on tier priority
+     * Calculate normalized score (0-100) for an operator
+     * 
+     * Score = weighted sum of:
+     *   - Price score (0-100): cheaper = higher, with floor/ceiling guards
+     *   - Stock score (0-100): more stock = higher, threshold-aware
+     *   - Provider score (0-100): primary provider bonus
+     *   - Reliability score (0-100): placeholder for historical data
      */
     _calculateScore(op, sortPriority, tierKey) {
-        // Base score: inverse price (cheaper = higher score)
-        let score = 1000 / (op.price + 0.01);
+        const tier = TIER_CONFIG[tierKey];
+        if (!tier) return 0;
+
+        // ── Price Score (0-100) ──────────────────────────────────────────
+        const priceScore = this._calculatePriceScore(op.price, tierKey);
+
+        // ── Stock Score (0-100) ────────────────────────────────────────────
+        const stockScore = this._calculateStockScore(op.stock, tier.minStock || 5);
+
+        // ── Provider Score (0-100) ─────────────────────────────────────────
+        const providerScore = this._calculateProviderScore(op.providerKey);
+
+        // ── Reliability Score (0-100) ────────────────────────────────────
+        const reliabilityScore = this._calculateReliabilityScore(op);
+
+        // ── Tier-specific adjustments ────────────────────────────────────
+        let tierMultiplier = 1.0;
         
-        // Stock bonus (more stock = higher score, capped at 100)
-        score += Math.min(op.stock, 100) * 0.1;
-        
-        // Tier-specific adjustments
         if (tierKey === 'premium') {
-            // Premium: prefer higher-numbered operators (newer = better quality)
-            const opNum = parseInt(op.operator.match(/virtual(\d+)/)?.[1] || '0');
-            score += opNum * 0.5;
+            // Premium: slight preference for mid-range prices (not too cheap)
+            // Too cheap often means low quality/reliability
+            if (op.price < 0.10) tierMultiplier = 0.85;
+            else if (op.price > 0.50) tierMultiplier = 1.10;
         } else if (tierKey === 'budget') {
-            // Budget: strongly prefer cheapest
-            score += (2.0 - op.price) * 10;
+            // Budget: aggressive price preference, but avoid suspiciously cheap
+            if (op.price < this._priceBaseline.min) tierMultiplier = 0.30; // Scam guard
+            else if (op.price < 0.08) tierMultiplier = 1.20;
+        } else if (tierKey === 'standard') {
+            // Standard: balanced, slight preference for moderate prices
+            if (op.price >= 0.10 && op.price <= 0.30) tierMultiplier = 1.05;
         }
-        
-        // Provider bonus: prefer primary provider (5sim)
-        if (op.providerKey === 'CHEAP_PANEL') {
-            score += 5;
+
+        // ── Cross-provider penalty ───────────────────────────────────────
+        // Switching providers adds latency and failure risk
+        let crossProviderPenalty = 1.0;
+        if (op.providerKey !== 'CHEAP_PANEL') {
+            crossProviderPenalty = 0.90; // 10% penalty for non-primary
         }
-        
-        return score;
+
+        // ── Final weighted score ─────────────────────────────────────────
+        const rawScore = (
+            priceScore * this._weights.price +
+            stockScore * this._weights.stock +
+            providerScore * this._weights.provider +
+            reliabilityScore * this._weights.reliability
+        );
+
+        const finalScore = Math.round(rawScore * tierMultiplier * crossProviderPenalty);
+
+        logger.debug('Operator scored', {
+            operator: op.operator,
+            price: op.price,
+            stock: op.stock,
+            provider: op.providerKey,
+            tier: tierKey,
+            priceScore: Math.round(priceScore),
+            stockScore: Math.round(stockScore),
+            providerScore: Math.round(providerScore),
+            reliabilityScore: Math.round(reliabilityScore),
+            tierMultiplier,
+            crossProviderPenalty,
+            finalScore
+        });
+
+        return finalScore;
+    }
+
+    /**
+     * Price score: 0-100, inverse logarithmic scale
+     * 
+     * - $0.03 (min) → 100 points (but flagged as suspicious)
+     * - $0.15 (optimal) → 85 points
+     * - $0.50 → 60 points
+     * - $2.00 (max) → 10 points
+     * - $5.00+ → 0 points
+     */
+    _calculatePriceScore(price, tierKey) {
+        if (price <= 0) return 0;
+        if (price >= 5.00) return 0;
+
+        const { min, optimal, max } = this._priceBaseline;
+
+        // Suspiciously cheap — possible scam/fake numbers
+        if (price < min) {
+            return Math.max(0, 100 * (price / min) * 0.5); // Max 50, scaled down
+        }
+
+        // Normal range: logarithmic decay from optimal
+        if (price <= optimal) {
+            // Between min and optimal: slight decay from 100
+            const ratio = (price - min) / (optimal - min);
+            return Math.round(100 - (ratio * 15)); // 100 → 85
+        }
+
+        if (price <= max) {
+            // Between optimal and max: steeper decay
+            const ratio = (price - optimal) / (max - optimal);
+            return Math.round(85 - (ratio * 75)); // 85 → 10
+        }
+
+        // Above max but below 5.00
+        const ratio = (price - max) / (5.00 - max);
+        return Math.round(10 - (ratio * 10)); // 10 → 0
+    }
+
+    /**
+     * Stock score: 0-100, threshold-aware
+     * 
+     * - Below minStock: 0 (unreliable)
+     * - minStock: 30 points (barely acceptable)
+     * - 10x minStock: 70 points (comfortable)
+     * - 50x minStock: 100 points (very reliable)
+     */
+    _calculateStockScore(stock, minStock) {
+        if (stock < minStock) return 0;
+        if (stock >= minStock * 50) return 100;
+
+        const ratio = (stock - minStock) / (minStock * 49);
+        return Math.round(30 + (ratio * 70)); // 30 → 100
+    }
+
+    /**
+     * Provider score: 0-100
+     * Primary provider (CHEAP_PANEL/5sim) gets full bonus
+     */
+        _calculateProviderScore(providerKey) {
+        const priorityIndex = this._providerPriority.indexOf(providerKey);
+        if (priorityIndex === -1) return 50; // Unknown provider
+        if (priorityIndex === 0) return 100; // Primary
+        return Math.max(0, 100 - (priorityIndex * 25)); // 100, 75, 50, 25
+    }
+
+    /**
+     * Reliability score: placeholder for historical success tracking
+     * TODO: Integrate with actual success-rate tracking
+     */
+    _calculateReliabilityScore(op) {
+        // Placeholder: assume primary provider + high stock = more reliable
+        let score = 70; // Base assumption
+
+        if (op.providerKey === 'CHEAP_PANEL') score += 15;
+        if (op.stock > 20) score += 10;
+        if (op.stock < 5) score -= 20;
+
+        return Math.min(100, Math.max(0, score));
     }
 
     /**
@@ -410,7 +598,7 @@ class TierOperatorSelector {
             return [];
         }
 
-        // Score and sort
+        // Score and sort using FIXED scoring
         const scored = available.map(op => ({
             ...op,
             score: this._calculateScore(op, tier.sortPriority, tierKey)
@@ -426,7 +614,8 @@ class TierOperatorSelector {
             topOperator: scored[0]?.operator,
             topPrice: scored[0]?.price,
             topStock: scored[0]?.stock,
-            topProvider: scored[0]?.providerKey
+            topProvider: scored[0]?.providerKey,
+            topScore: scored[0]?.score
         });
 
         return scored;
@@ -467,10 +656,11 @@ class TierOperatorSelector {
             providers: this.providers.map(p => ({ name: p.name, key: p.providerKey })),
             cacheSize: this._selectionCache.size,
             catalogCacheSize: this._catalogCache.size,
-            pendingSelections: this._pendingSelections.size
+            pendingSelections: this._pendingSelections.size,
+            weights: this._weights,
+            priceBaseline: this._priceBaseline
         };
     }
 }
 
 export default TierOperatorSelector;
-            
