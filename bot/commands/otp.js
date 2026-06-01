@@ -2770,31 +2770,29 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
                     const otpCode = status.otpCode;
                     
                     // Caption with everything inside bold box
-                    const caption = 
-                        `━┅┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉━\n` +
-                        `┃ 🔓 <b>OTP Received!</b>        ┃\n` +
-                        `┣┅┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┅┫\n` +
-                        `┃ 📱 Number <code>${status.number}</code>          ┃\n` +
-                        `┃ 🎯 Service ${status.service}                    ┃\n` +
-                        `┃ ⏱️ Duration ${checkCount * 5}s                              ┃\n` +
-                        `┣┅┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┅┫\n` +
-                        `┃                                  ┃\n` +
-                        `┃      🔐 <b>${otpCode}</b>          ┃\n` +
-                        `┃                                  ┃\n` +
-                        `┣┅┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┅┫\n` +
-                        `┃ ⚠️ Do not share this.            ┃\n` +
-                        `━┅┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉━`;
+                    const caption =
+`🔓 <b>OTP Received!</b>
 
-                    // Code as button — long press to copy
+📱 Number: <code>${status.number}</code>
+🎯 Service: ${status.service}
+⏱️ Duration: ${checkCount * 5}s
+
+🔐 OTP Code
+
+<code>${otpCode}</code>
+
+⚠️ Do not share this code with anyone.`;
+                    
                     const keyboard = Markup.inlineKeyboard([
-                        [
-                            Markup.button.callback(`🔐 ${otpCode}`, `copy_otp_${otpCode}`)
-                        ],
-                        [
-                            Markup.button.callback('🔙 Menu', 'menu'),
-                            Markup.button.callback('📱 New OTP', 'otp')
-                        ]
-                    ]);
+    [
+        Markup.button.copyText(`🔐 ${otpCode}`, otpCode)
+    ],
+    [
+        Markup.button.callback('🔙 Menu', 'menu'),
+        Markup.button.callback('📱 New OTP', 'otp')
+    ]
+]);
+                    
 
                     // Send PHOTO with caption — single message
                     await ctx.telegram.sendPhoto(ctx.from.id, IMAGES.otpReceived, {
