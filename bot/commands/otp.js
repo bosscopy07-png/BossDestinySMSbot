@@ -75,17 +75,25 @@ const KEYBOARDS = {
 //  OTPCommands Class
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// bot/commands/otp.js
 class OTPCommands {
-    constructor(bot, walletService, smsProviderManager, tierIntegrationService = null, sessionManager = null) {
+    constructor(bot, walletService, sessionManager = null, smsProviderManager = null, tierIntegrationService = null) {
         this.bot = bot;
         this.walletService = walletService;
-        this.smsProviderManager = smsProviderManager;
         this.sessionManager = sessionManager;
+        this.smsProviderManager = smsProviderManager;
         
-        // Tier system injection
-        this.tierService = tierIntegrationService;
+        // ═════════════════════════════════════════════════════════════════
+        //  Tier system integration (injected from TelegramBot)
+        // ═════════════════════════════════════════════════════════════════
+        this.tierService = null;
+        this.tierSelector = null;
+        this.serviceCatalog = null;
+        this.countryCatalog = null;
         
-        if (tierIntegrationService) {
+        // Guard: check if tierIntegrationService is valid before using
+        if (tierIntegrationService && typeof tierIntegrationService.isAvailable === 'function') {
+            this.tierService = tierIntegrationService;
             this.tierSelector = tierIntegrationService._tierSelector;
             this.serviceCatalog = tierIntegrationService._serviceCatalog;
             this.countryCatalog = tierIntegrationService._countryCatalog;
@@ -93,36 +101,62 @@ class OTPCommands {
                 available: tierIntegrationService.isAvailable()
             });
         } else {
+            if (tierIntegrationService) {
+                logger.warn('OTPCommands: Invalid tierIntegrationService, using fallback', {
+                    type: typeof tierIntegrationService,
+                    hasIsAvailable: typeof tierIntegrationService?.isAvailable === 'function'
+                });
+            }
+            // Legacy fallback: initialize tier components directly
             this._initTierSystem();
         }
         
+        // Bind all handler methods to ensure `this` context
         this._bindAllHandlers();
+        
         this.setupTextHandlers();
+        
         this.registerCommands();
         
         if (this.walletService?.onDepositNotification) {
             this.walletService.onDepositNotification(this.handleDepositNotification.bind(this));
         }
     }
-    
-        // ─── Legacy Tier System Initialization (fallback) ───────────────────────
+
+    // ─── Legacy Tier System Initialization (fallback) ───────────────────────
     _initTierSystem() {
-    const cheapProvider = this.smsProviderManager?.getProvider('CHEAP_PANEL');
-    
-    if (!cheapProvider) {
-        logger.warn('OTPCommands: No CHEAP_PANEL provider available, tier system disabled');
-        this.serviceCatalog = null;
-        this.tierSelector = null;
-        this.countryCatalog = null;
-        return;
+        const cheapProvider = this.smsProviderManager?.getProvider('CHEAP_PANEL');
+        
+        if (!cheapProvider) {
+            logger.warn('OTPCommands: No CHEAP_PANEL provider available, tier system disabled');
+            this.serviceCatalog = null;
+            this.tierSelector = null;
+            this.countryCatalog = null;
+            return;
+        }
+        
+        // Guard: ServiceCatalog requires a provider
+        try {
+            this.serviceCatalog = new ServiceCatalog(cheapProvider);
+            
+            // Wrap single provider in array for TierOperatorSelector
+            this.tierSelector = new TierOperatorSelector([cheapProvider]);
+            
+            this.countryCatalog = new CountryCatalog(cheapProvider, this.tierSelector);
+            
+            logger.info('OTPCommands: Tier system initialized internally', { 
+                hasProvider: true,
+                providerKey: cheapProvider.providerKey
+            });
+        } catch (error) {
+            logger.error('OTPCommands: Failed to initialize tier system', { error: error.message });
+            this.serviceCatalog = null;
+            this.tierSelector = null;
+            this.countryCatalog = null;
+        }
     }
-    
-    this.serviceCatalog = new ServiceCatalog(cheapProvider);
-    this.tierSelector = new TierOperatorSelector([cheapProvider]);
-    this.countryCatalog = new CountryCatalog(cheapProvider, this.tierSelector);
-    
-    logger.info('OTPCommands: Tier system initialized internally');
-    }
+                }
+
          
         // ─── Auto-bind all handler methods ─────────────────────────────────────
     _bindAllHandlers() {
