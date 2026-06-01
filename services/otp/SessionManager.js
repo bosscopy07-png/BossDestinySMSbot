@@ -410,20 +410,28 @@ class SessionManager {
     //  AUTO-DELIVERY: Send OTP directly to user's Telegram
     // ═══════════════════════════════════════════════════════════
 
+    
     async _autoDeliverOTPToUser(session, otp) {
-        if (!this.bot) {
-            logger.debug('No bot instance available for auto-delivery', { sessionId: session.sessionId });
-            return;
-        }
+    logger.debug('Auto-delivery attempt', { 
+        hasBot: !!this.bot,
+        botType: this.bot?.constructor?.name,
+        userId: session.userId
+    });
+    
+    if (!this.bot) {
+        logger.error('No bot instance available for auto-delivery', { sessionId: session.sessionId });
+        return;
+    }
 
-        const message =
-            `🔓 <b>OTP Received!</b>\n\n` +
-            `📱 Number: <code>${session.number}</code>\n` +
-            `🎯 Service: ${session.service}\n` +
-            `🔢 OTP: <code>${otp}</code>\n` +
-            `🕐 Delivered: ${new Date().toLocaleTimeString()}\n\n` +
-            `⚠️ Do not share this code with anyone.`;
+    const message =
+        `🔓 <b>OTP Received!</b>\n\n` +
+        `📱 Number: <code>${session.number}</code>\n` +
+        `🎯 Service: ${session.service}\n` +
+        `🔢 OTP: <code>${otp}</code>\n` +
+        `🕐 Delivered: ${new Date().toLocaleTimeString()}\n\n` +
+        `⚠️ Do not share this code with anyone.`;
 
+    try {
         await this.bot.telegram.sendMessage(session.userId, message, {
             parse_mode: 'HTML',
             reply_markup: {
@@ -437,7 +445,17 @@ class SessionManager {
             sessionId: session.sessionId,
             userId: session.userId
         });
+    } catch (error) {
+        logger.error('Auto-delivery send failed', { 
+            sessionId: session.sessionId, 
+            userId: session.userId,
+            error: error.message,
+            code: error.code
+        });
+        throw error;
     }
+    }
+    
 
     async handleTimeout(session) {
         const sessionId = session.sessionId || session;
