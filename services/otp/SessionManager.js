@@ -44,14 +44,26 @@ const CreditRestoreConfig = Object.freeze({
 
 class SessionManager {
     constructor(providerManager, retryEngine, walletService, notificationService = null, numberPoolManager = null, serviceCatalog = null, bot = null) {
-        this.providerManager = providerManager;
-        this.retryEngine = retryEngine;
-        this.walletService = walletService;
-        this.notificationService = notificationService;
-        this.numberPoolManager = numberPoolManager;
-        this.serviceCatalog = serviceCatalog;
-        this.bot = bot; // NEW: Telegram bot instance for auto-delivery
-
+    logger.info('SessionManager constructor called', {
+        hasProviderManager: !!providerManager,
+        hasRetryEngine: !!retryEngine,
+        hasWalletService: !!walletService,
+        hasNotificationService: !!notificationService,
+        hasNumberPoolManager: !!numberPoolManager,
+        hasServiceCatalog: !!serviceCatalog,
+        hasBot: !!bot,
+        botType: bot?.constructor?.name,
+        botHasTelegram: !!bot?.telegram
+    });
+    
+    this.providerManager = providerManager;
+    this.retryEngine = retryEngine;
+    this.walletService = walletService;
+    this.notificationService = notificationService;
+    this.numberPoolManager = numberPoolManager;
+    this.serviceCatalog = serviceCatalog;
+    this.bot = bot;  // <-- This MUST be set!
+    
         // In-memory session tracking
         this.activeSessions = new Map();
         this.sessionTimeouts = new Map();
