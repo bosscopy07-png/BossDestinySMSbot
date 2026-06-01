@@ -2791,7 +2791,7 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
                         [
                             // Primary: URL button that triggers copy on supported clients
                             // Fallback: callback button for manual copy
-                            Markup.button.callback(`📋 Copy ${otpCode}`, `copy_otp_${otpCode}`)
+                            Markup.button.callback(`📋 Copy ${otpCode}`, `code>${otpCode}</code>`)
                         ],
                         [
                             Markup.button.callback('🔙 Menu', 'menu'),
