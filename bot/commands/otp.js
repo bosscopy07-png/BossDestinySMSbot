@@ -2750,13 +2750,13 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
             }
                 
             
-                    /**
+    /**
      * Start automatic OTP polling for a session
-     * Single compact message with copy-to-clipboard button
+     * Single photo message with bold box and copyable code button
      */
     startAutoOTPCheck(sessionId, ctx, intervalMs = 5000) {
         let checkCount = 0;
-        const maxChecks = 36; // 3 minutes
+        const maxChecks = 36;
         
         const checkInterval = setInterval(async () => {
             checkCount++;
@@ -2769,29 +2769,26 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
                     
                     const otpCode = status.otpCode;
                     
-                    // SINGLE compact message — everything inside the box
-                    const message = 
-                        `┌──────────────────────────┐\n` +
-                        `│     🔓 OTP Received!     │\n` +
-                        `├──────────────────────────┤\n` +
-                        `│  📱 ${status.number.padEnd(19)}│\n` +
-                        `│  🎯 ${status.service.padEnd(19)}│\n` +
-                        `│  ⏱️ ${(checkCount * 5 + 's').padEnd(19)}│\n` +
-                        `├──────────────────────────┤\n` +
-                        `│                          │\n` +
-                        `│      🔐 ${otpCode}       │\n` +
-                        `│                          │\n` +
-                        `├──────────────────────────┤\n` +
-                        `│ ⚠️ Do not share this.    │\n` +
-                        `└──────────────────────────┘`;
+                    // Caption with everything inside bold box
+                    const caption = 
+                        `━┅┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉━\n` +
+                        `┃ 🔓 <b>OTP Received!</b>        ┃\n` +
+                        `┣┅┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┅┫\n` +
+                        `┃ 📱 Number <code>${status.number}</code>          ┃\n` +
+                        `┃ 🎯 Service ${status.service}                    ┃\n` +
+                        `┃ ⏱️ Duration ${checkCount * 5}s                              ┃\n` +
+                        `┣┅┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┅┫\n` +
+                        `┃                                  ┃\n` +
+                        `┃      🔐 <b>${otpCode}</b>          ┃\n` +
+                        `┃                                  ┃\n` +
+                        `┣┅┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┅┫\n` +
+                        `┃ ⚠️ Do not share this.            ┃\n` +
+                        `━┅┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉┉━`;
 
-                    // Copy button — uses URL button with tg://copy?text= for clipboard copy
-                    // Fallback: callback button that shows alert with code
+                    // Code as button — long press to copy
                     const keyboard = Markup.inlineKeyboard([
                         [
-                            // Primary: URL button that triggers copy on supported clients
-                            // Fallback: callback button for manual copy
-                            Markup.button.callback(`📋 ${otpCode} `, `code>${otpCode}</code>`)
+                            Markup.button.callback(`🔐 ${otpCode}`, `copy_otp_${otpCode}`)
                         ],
                         [
                             Markup.button.callback('🔙 Menu', 'menu'),
@@ -2799,13 +2796,14 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
                         ]
                     ]);
 
-                    // Send as single text message (cleaner than photo for this layout)
-                    await ctx.telegram.sendMessage(ctx.from.id, message, {
+                    // Send PHOTO with caption — single message
+                    await ctx.telegram.sendPhoto(ctx.from.id, IMAGES.otpReceived, {
+                        caption: caption,
                         parse_mode: 'HTML',
                         reply_markup: keyboard.reply_markup
                     });
                     
-                    logger.info('Auto OTP delivered', { sessionId, userId: ctx.from.id });
+                    logger.info('Auto OTP delivered with photo', { sessionId, userId: ctx.from.id });
                     return;
                 }
 
@@ -2814,13 +2812,14 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
                     return;
                 }
 
+                
 
             } catch (error) {
                 logger.error('Auto OTP check error', { sessionId, error: error.message });
             }
         }, intervalMs);
-                        }
-                            
+                                                 }
+    
         async handleCopyOTP(ctx) {
         const otpCode = ctx.match[1];
         
