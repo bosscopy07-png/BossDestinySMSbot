@@ -421,15 +421,7 @@ class SessionManager {
     // ═══════════════════════════════════════════════════════════
     //  AUTO-DELIVERY: Send OTP directly to user's Telegram
     // ═══════════════════════════════════════════════════════════
-
-    
-    async _autoDeliverOTPToUser(session, otp) {
-    logger.debug('Auto-delivery attempt', { 
-        hasBot: !!this.bot,
-        botType: this.bot?.constructor?.name,
-        userId: session.userId
-    });
-    
+async _autoDeliverOTPToUser(session, otp) {
     if (!this.bot) {
         logger.error('No bot instance available for auto-delivery', { sessionId: session.sessionId });
         return;
@@ -444,6 +436,7 @@ class SessionManager {
         `⚠️ Do not share this code with anyone.`;
 
     try {
+        // Use ctx-like send via bot.telegram directly
         await this.bot.telegram.sendMessage(session.userId, message, {
             parse_mode: 'HTML',
             reply_markup: {
@@ -455,18 +448,21 @@ class SessionManager {
 
         logger.info('OTP auto-delivered to user via Telegram', {
             sessionId: session.sessionId,
-            userId: session.userId
+            userId: session.userId,
+            number: session.number,
+            service: session.service
         });
     } catch (error) {
         logger.error('Auto-delivery send failed', { 
             sessionId: session.sessionId, 
             userId: session.userId,
             error: error.message,
-            code: error.code
+            code: error.code,
+            description: error.description
         });
-        throw error;
+        // Don't throw — let notification service handle fallback
     }
-    }
+}
     
 
     async handleTimeout(session) {
