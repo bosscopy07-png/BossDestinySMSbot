@@ -2755,69 +2755,99 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
      * Single photo message with bold box and copyable code button
      */
     startAutoOTPCheck(sessionId, ctx, intervalMs = 5000) {
-        let checkCount = 0;
-        const maxChecks = 36;
-        
-        const checkInterval = setInterval(async () => {
-            checkCount++;
-            
-            try {
-                const status = await this.sessionManager.checkSessionStatus(sessionId);
-                
-                if (status.status === 'RECEIVED' && status.otpCode) {
-                    clearInterval(checkInterval);
-                    
-                    const otpCode = status.otpCode;
-                    
-                    // Caption with everything inside bold box
-                    const caption =
-`🔓 <b>OTP Received!</b>
+let checkCount = 0;
+const maxChecks = 36;
 
-📱 Number: <code>${status.number}</code>
-🎯 Service: ${status.service}
-⏱️ Duration: ${checkCount * 5}s
+const checkInterval = setInterval(async () => {
+    checkCount++;
 
-🔐 OTP Code
+    try {
+        const status = await this.sessionManager.checkSessionStatus(sessionId);
+
+        if (status.status === 'RECEIVED' && status.otpCode) {
+            clearInterval(checkInterval);
+
+            const otpCode = status.otpCode;
+
+            const caption = `
+
+🔓 <b>OTP RECEIVED</b>
+
+📱 <b>Number:</b>
+<code>${status.number}</code>
+
+🎯 <b>Service:</b> ${status.service}
+⏱️ <b>Time:</b> ${checkCount * 5}s
+
+━━━━━━━━━━━━━━━
+
+🔐 <b>OTP CODE</b>
 
 <code>${otpCode}</code>
 
-⚠️ Do not share this code with anyone.`;
-                    
-                    const keyboard = Markup.inlineKeyboard([
-    [
-        Markup.button.copyText(`🔐 ${otpCode}`, otpCode)
-    ],
-    [
-        Markup.button.callback('🔙 Menu', 'menu'),
-        Markup.button.callback('📱 New OTP', 'otp')
-    ]
-]);
-                    
+━━━━━━━━━━━━━━━
 
-                    // Send PHOTO with caption — single message
-                    await ctx.telegram.sendPhoto(ctx.from.id, IMAGES.otpReceived, {
-                        caption: caption,
-                        parse_mode: 'HTML',
-                        reply_markup: keyboard.reply_markup
-                    });
-                    
-                    logger.info('Auto OTP delivered with photo', { sessionId, userId: ctx.from.id });
-                    return;
+⚠️ Do not share this code with anyone.
+`.trim();
+
+            const keyboard = {
+                inline_keyboard: [
+                    [
+                        {
+                            text: `🔐 Copy OTP: ${otpCode}`,
+                            copy_text: {
+                                text: otpCode
+                            }
+                        }
+                    ],
+                    [
+                        {
+                            text: '📱 New OTP',
+                            callback_data: 'otp'
+                        },
+                        {
+                            text: '🔙 Menu',
+                            callback_data: 'menu'
+                        }
+                    ]
+                ]
+            };
+
+            await ctx.telegram.sendPhoto(
+                ctx.from.id,
+                IMAGES.otpReceived,
+                {
+                    caption,
+                    parse_mode: 'HTML',
+                    reply_markup: keyboard
                 }
+            );
 
-                if (!['WAITING', 'CHECKING'].includes(status.status)) {
-                    clearInterval(checkInterval);
-                    return;
-                }
+            logger.info('Auto OTP delivered', {
+                sessionId,
+                userId: ctx.from.id
+            });
 
-                
+            return;
+        }
 
-            } catch (error) {
-                logger.error('Auto OTP check error', { sessionId, error: error.message });
-            }
-        }, intervalMs);
-                                                 }
-    
+        if (!['WAITING', 'CHECKING'].includes(status.status)) {
+            clearInterval(checkInterval);
+            return;
+        }
+
+        
+
+    } catch (error) {
+        logger.error('Auto OTP check error', {
+            sessionId,
+            error: error.message
+        });
+    }
+}, intervalMs);
+
+    }
+           
         async handleCopyOTP(ctx) {
         const otpCode = ctx.match[1];
         
