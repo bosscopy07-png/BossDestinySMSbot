@@ -75,7 +75,6 @@ const KEYBOARDS = {
 //  OTPCommands Class
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// bot/commands/otp.js
 class OTPCommands {
     constructor(bot, walletService, sessionManager = null, smsProviderManager = null, tierIntegrationService = null) {
         this.bot = bot;
@@ -155,7 +154,8 @@ class OTPCommands {
             this.countryCatalog = null;
         }
     }
-                }
+                
+
 
          
         // ─── Auto-bind all handler methods ─────────────────────────────────────
