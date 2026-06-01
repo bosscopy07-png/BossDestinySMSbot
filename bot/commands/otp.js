@@ -172,7 +172,7 @@ class OTPCommands {
             'handleCancelVipSubscription', 'handleConfirmVipCancel',
             'handleHistory', 'handleReferral', 'handleStats', 'handleQuickBuy',
             'handleProviderStatus', 'handleSettings', 'handleToggleNotifications',
-            'handleFaq', 'handleTerms', 'handleOTPHub',
+            'handleFaq', 'handleTerms',  'handleOTPHub',
             'handleWatchAd', 'handleCheckCredits', 'handleFreeServiceSelected',
             'handleFreeCountrySelected', 'handleCheckFree',
             // NEW: Tier system handlers
@@ -422,7 +422,12 @@ registerCommands() {
             ctx.answerCbQuery('❌ Error selecting service').catch(() => {});
         }
     });
-
+    
+   // In OTPCommands.registerCommands() or wherever you register actions
+this.bot.action(/copy_otp_(.+)/, async (ctx) => {
+    await this.handleCopyOTP(ctx);
+});
+                                                                 
     // Service page navigation (Next/Prev)
     this.bot.action(/service_page_(\d+)/, async (ctx) => {
         try {
