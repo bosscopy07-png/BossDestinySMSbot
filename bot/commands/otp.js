@@ -2604,8 +2604,8 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
         const cheapProvider = this.smsProviderManager?.getProvider('CHEAP_PANEL');
         if (!cheapProvider) {
             throw new Error('CHEAP_PROVIDER_NOT_AVAILABLE');
-        }
-
+                                                                   }
+            
         // FIXED: Use the selected operator (could be fallback) for purchase
         const cheapResult = await cheapProvider.getNumber(countryCode, service, selection.operator);
 
@@ -3935,7 +3935,55 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
             await ctx.answerCbQuery('❌ Error checking OTP status');
         }
     }
+// In OTPCommands class, add this method for auto-polling
 
+/**
+ * Start automatic OTP polling for a session
+ * Checks every few seconds and auto-sends OTP when received
+ */
+startAutoOTPCheck(sessionId, ctx, intervalMs = 5000) {
+    const checkInterval = setInterval(async () => {
+        try {
+            // Use this.sessionManager (the injected one with bot)
+            
+            const status = await sessionManager.checkSessionStatus(activeSession.sessionId);
+            
+            if (status.status === 'RECEIVED' && status.otpCode) {
+                clearInterval(checkInterval);
+                
+                // Auto-send OTP message to user
+                const message = 
+                    `🔓 <b>OTP Received!</b>\n\n` +
+                    `📱 Number: <code>${status.number}</code>\n` +
+                    `🎯 Service: ${status.service}\n` +
+                    `🔢 OTP: <code>${status.otpCode}</code>\n` +
+                    `🕐 Delivered: ${new Date().toLocaleTimeString()}\n\n` +
+                    `⚠️ Do not share this code with anyone.`;
+
+                await ctx.telegram.sendMessage(ctx.from.id, message, {
+                    parse_mode: 'HTML',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: '🔙 Back to Menu', callback_data: 'menu' }]
+                        ]
+                    }
+                });
+                
+                logger.info('Auto OTP delivered', { sessionId, userId: ctx.from.id });
+            }
+        } catch (error) {
+            logger.error('Auto OTP check error', { sessionId, error: error.message });
+            clearInterval(checkInterval);
+        }
+    }, intervalMs);
+
+    // Auto-stop after 3 minutes (session timeout)
+    setTimeout(() => {
+        clearInterval(checkInterval);
+        logger.debug('Auto OTP check stopped (timeout)', { sessionId });
+    }, 180000);
+}
+    
     // ═══════════════════════════════════════════════════════════════════════
     //  BUNDLE PURCHASES
     // ═══════════════════════════════════════════════════════════════════════
