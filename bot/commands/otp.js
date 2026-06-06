@@ -1879,7 +1879,7 @@ async handleCheckFree(ctx, sessionId) {
                 return this._handleCheapModeLegacy(ctx);
             }
 
-            const minEntryPrice = TIER_CONFIG.budget.priceMultiplier * 0.05;
+            const minEntryPrice = TIER_CONFIG.budget.priceMultiplier * 0.00;
             if (this._getAvailableBalance(user) < minEntryPrice) {
                 const message = 
                     `💰 <b>Insufficient Balance</b>\n\n` +
@@ -1914,7 +1914,7 @@ async handleCheckFree(ctx, sessionId) {
         const user = ctx.state.user;
         
         try {
-            let displayPrice = config.prices?.cheapOtp || 0.05;
+            let displayPrice = config.prices?.cheapOtp || 0.00;
 
             if (this.smsProviderManager) {
                 try {
