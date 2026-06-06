@@ -86,7 +86,7 @@ class AdCreditSystem {
         
         const result = await AdVerification.deleteMany({
             createdAt: { $lt: cutoff },
-            status: { $in: ['PENDING', 'STARTED'] }
+            status: { $in: ['PENDING', 'STARTED', 'WATCHED'] }
         });
         
         if (result.deletedCount > 0) {
@@ -526,7 +526,6 @@ class AdCreditSystem {
     //  INTERNAL HELPERS
     // ═══════════════════════════════════════════════════════════════════════
 
-    
     async _logTransaction({ userId, type, amount, holdId = null, balanceAfter = null, reason, metadata = {} }) {
         try {
             await CreditTransaction.create({ 
@@ -543,7 +542,7 @@ class AdCreditSystem {
         }
     }
 
-    async _countActiveHolds(userId) {
+        async _countActiveHolds(userId) {
         const holdIds = this.userHoldHistory.get(userId);
         if (!holdIds) return 0;
         let count = 0;
