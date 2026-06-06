@@ -8,14 +8,20 @@ import logger from '../utils/logger.js';
 export default function createServer() {
     const app = express();
     
-    app.use(helmet());
+    app.use(helmet({
+        contentSecurityPolicy: false,  // Allow iframe loading for ad networks
+        crossOriginEmbedderPolicy: false  // Allow cross-origin ad content
+    }));
     app.use(cors());
     
+    // Raw body buffer for ALL requests (needed for webhook signature verification)
     app.use(express.json({ 
+        limit: '10mb',
         verify: (req, res, buf) => { req.rawBody = buf; } 
     }));
     app.use(express.urlencoded({ 
-        extended: true, 
+        extended: true,
+        limit: '10mb', 
         verify: (req, res, buf) => { req.rawBody = buf; } 
     }));
     
@@ -48,4 +54,4 @@ export default function createServer() {
     });
     
     return app;
-    }
+}
