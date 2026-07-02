@@ -50,7 +50,7 @@ export const TIER_CONFIG = {
         description: 'Highest-quality operators. Best success rate.',
         detail: 'Newest, most expensive virtual operators. Highest 5SIM cost = best delivery.',
         // RANGE: virtual51+ (newest, most expensive)
-        operatorRange: { min: 52, max: 999 },
+        operatorRange: { min: 52, max: 63 },
         fallbackWithinTier: true,
         sortPriority: 'quality',    // Prioritize best operators
         priceMultiplier: 1.0,
