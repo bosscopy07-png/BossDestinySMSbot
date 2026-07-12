@@ -37,7 +37,7 @@ export const TIER_CONFIG = {
         description: 'Balanced pricing and reliability.',
         detail: 'Mid-range virtual operators. Recommended for everyday use.',
         // RANGE: virtual26 to virtual50 (mid-range)
-        operatorRange: { min: 26, max: 55 },
+        operatorRange: { min: 26, max: 61 },
         fallbackWithinTier: true,
         sortPriority: 'balanced',   // Balance price vs stock
         priceMultiplier: 1.0,
@@ -50,7 +50,7 @@ export const TIER_CONFIG = {
         description: 'Highest-quality operators. Best success rate.',
         detail: 'Newest, most expensive virtual operators. Highest 5SIM cost = best delivery.',
         // RANGE: virtual51+ (newest, most expensive)
-        operatorRange: { min: 56, max: 999 },
+        operatorRange: { min: 62, max: 999 },
         fallbackWithinTier: true,
         sortPriority: 'quality',    // Prioritize best operators
         priceMultiplier: 1.0,
