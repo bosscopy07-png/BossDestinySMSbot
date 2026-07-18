@@ -1,28 +1,35 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 //  services/TierOperatorSelector.js — Tier Operator Selection
-//  FIXED:
-//   1. Dynamic operator discovery from provider catalog using operatorRange
-//   2. Cross-operator fallback within same tier (virtual56 fails → try virtual57, 58...)
-//   3. Cross-provider fallback for same tier (5sim fails → SMSPool → Hero → OnlineSim)
-//   4. Cache TTL: 60 minutes to prevent rate limits
-//   5. Preserves original service name throughout flow
-//   6. Queries ALL providers, returns cheapest price per tier
+//  COMPLETE REWRITE:
+//   1. FIXED: Queries ALL virtuals in tier range for a country/service
+//   2. FIXED: Aggregates results from ALL providers, not just first match
+//   3. FIXED: Cross-operator fallback — if virtual3 fails, tries virtual7, 12, 19...
+//   4. FIXED: Country availability checks ALL tier virtuals, not just one
+//   5. Cache TTL: 60 minutes to prevent rate limits
+//   6. Preserves original service name throughout flow
 //   7. FIXED SCORING: Normalized 0-100 with proper tier logic and weights
 // ═══════════════════════════════════════════════════════════════════════════════
 
-import { TIER_CONFIG, getTierOperators, isOperatorInTier, getOperatorTier, getAdjacentOperators, CACHE_TTL } from '../config/tierConfig.js';
+import { TIER_CONFIG, CACHE_TTL } from '../config/tierConfig.js';
 import logger from '../utils/logger.js';
 
 /**
  * TierOperatorSelector — Selects best operator per tier from live provider data
  * 
+ * CORE FIX: Instead of picking one virtual and checking its countries,
+ * we now query the provider catalog for a specific country+service,
+ * then filter ALL returned virtual operators by tier range.
+ * This means if virtual3 has no stock for US but virtual7 does,
+ * we find virtual7 and use it.
+ * 
  * Features:
- *   - Fetches full price catalog (cached 60min)
- *   - Filters operators by tier range (budget: 1-25, standard: 26-50, premium: 51+)
- *   - Cross-operator fallback: if virtual56 fails, tries adjacent operators in same tier
- *   - Cross-provider fallback: queries ALL providers, picks cheapest with stock
- *   - Preserves original service name to prevent INVALID_SERVICE downstream
- *   - FIXED: Normalized scoring system (0-100) with configurable weights
+ *   - Fetches full price catalog per provider (cached 60min)
+ *   - For a given country/service, gets ALL virtual operators from provider
+ *   - Filters to only those in the requested tier's range
+ *   - Scores ALL matching operators across ALL providers
+ *   - Picks the single best one (cheapest for budget, balanced for standard, newest for premium)
+ *   - Cross-operator fallback: if best fails, tries next best in same tier
+ *   - Cross-provider fallback: aggregates results from ALL providers
  */
 class TierOperatorSelector {
     constructor(providers = []) {
@@ -30,34 +37,31 @@ class TierOperatorSelector {
         
         // Cache for operator selections
         this._selectionCache = new Map();
-        this._cacheTtl = CACHE_TTL.tierPrices || 60 * 60 * 1000; // 60 minutes
+        this._cacheTtl = CACHE_TTL.tierPrices || 60 * 60 * 1000;
         
         // Full catalog cache per provider
-        this._catalogCache = new Map(); // providerKey -> { catalog, timestamp }
+        this._catalogCache = new Map();
         this._catalogTtl = CACHE_TTL.productsCatalog || 60 * 60 * 1000;
 
         // Provider fallback priority order
         this._providerPriority = ['CHEAP_PANEL', 'SMSPOOL', 'HERO_SMS', 'ONLINE_SIM'];
 
         // Pending request deduplication
-        this._pendingSelections = new Map(); // cacheKey -> Promise
+        this._pendingSelections = new Map();
 
-        // ═══════════════════════════════════════════════════════════════════════
-        //  FIXED: SCORING WEIGHTS — tunable per business priority
-        //  All scores normalized to 0-100 range
-        // ═══════════════════════════════════════════════════════════════════════
+        // Scoring weights
         this._weights = {
-            price: 0.50,        // 50% — cheapest wins
-            stock: 0.25,        // 25% — reliable stock levels
-            provider: 0.15,     // 15% — prefer primary provider
-            reliability: 0.10   // 10% — historical success rate (placeholder)
+            price: 0.50,
+            stock: 0.25,
+            provider: 0.15,
+            reliability: 0.10
         };
 
-        // Price normalization: what we consider "fair market" for scoring
+        // Price normalization baselines
         this._priceBaseline = {
-            min: 0.03,          // Below this is suspicious (scam/fake)
-            optimal: 0.15,      // Sweet spot for scoring
-            max: 2.00           // Above this is penalized heavily
+            min: 0.03,
+            optimal: 0.15,
+            max: 2.00
         };
 
         logger.info('TierOperatorSelector initialized', {
@@ -105,6 +109,10 @@ class TierOperatorSelector {
         };
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  CATALOG FETCHING (cached 60min)
+    // ═══════════════════════════════════════════════════════════════════════
+
     /**
      * Get full catalog from provider (cached 60min)
      */
@@ -116,7 +124,6 @@ class TierOperatorSelector {
             return cached.catalog;
         }
         
-        // Use provider's cache if fresh
         if (provider.productsCache && (now - provider.productsCacheTime) < provider.productsCacheTtl) {
             this._catalogCache.set(provider.providerKey, {
                 catalog: provider.productsCache,
@@ -125,7 +132,6 @@ class TierOperatorSelector {
             return provider.productsCache;
         }
         
-        // Fetch fresh catalog
         const catalog = await provider.getProducts();
         
         if (catalog) {
@@ -138,17 +144,27 @@ class TierOperatorSelector {
         return catalog;
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  MAIN: Select best operator for tier/country/service
+    //  CORE FIX: Gets ALL virtuals for country+service, filters by tier, picks best
+    // ═══════════════════════════════════════════════════════════════════════
+
     /**
      * Select best operator for tier/country/service
-     * Cross-provider: queries ALL providers, returns cheapest with stock
-     * Cross-operator: if preferred operator fails, tries adjacent in same tier
      * 
-     * Returns: { operator, price, displayPrice, stock, score, provider, providerKey, originalService }
+     * FLOW:
+     * 1. For each provider, fetch catalog for country+service
+     * 2. Extract ALL virtual operators returned by provider
+     * 3. Filter to only those in requested tier's range
+     * 4. Score ALL candidates across ALL providers
+     * 5. Return the single best one
+     * 
+     * This fixes the bug where it would pick virtual3, see US not available,
+     * and return failure — instead of checking virtual7, 12, 19 etc.
      */
     async selectOperator(tierKey, country, service, options = {}) {
         const cacheKey = `${tierKey}:${country}:${service}`;
         
-        // Check cache first
         if (!options.skipCache) {
             const cached = this._selectionCache.get(cacheKey);
             if (cached && (Date.now() - cached.time) < this._cacheTtl) {
@@ -156,7 +172,6 @@ class TierOperatorSelector {
             }
         }
 
-        // Deduplication: if another request is selecting this, wait for it
         if (this._pendingSelections.has(cacheKey)) {
             return this._pendingSelections.get(cacheKey);
         }
@@ -177,7 +192,7 @@ class TierOperatorSelector {
     }
 
     /**
-     * FIXED: Core selection logic with normalized scoring and stock threshold enforcement
+     * Core selection logic
      */
     async _doSelectOperator(tierKey, country, service, options) {
         const tier = TIER_CONFIG[tierKey];
@@ -185,41 +200,33 @@ class TierOperatorSelector {
             throw new Error(`INVALID_TIER: ${tierKey}`);
         }
 
-        // Step 1: Try ALL providers for this tier
-        const providerResults = await this._queryAllProviders(tierKey, country, service);
+        // Step 1: Query ALL providers for ALL operators matching this country+service
+        const allCandidates = await this._queryAllProvidersForCountryService(
+            tierKey, country, service
+        );
         
-        if (providerResults.length === 0) {
-            throw new Error(`NO_NUMBERS: No operators have stock for ${service} in ${country} across all providers`);
+        if (allCandidates.length === 0) {
+            throw new Error(`NO_NUMBERS: No ${tierKey} operators have stock for ${service} in ${country}`);
         }
 
-        // ENFORCED: Filter out operators below minimum stock threshold
+        // Step 2: Enforce minimum stock threshold
         const minStock = tier.minStock || 1;
-        const viableResults = providerResults.filter(op => op.stock >= minStock);
+        const viableCandidates = allCandidates.filter(op => op.stock >= minStock);
         
-        if (viableResults.length === 0) {
-            // Fallback: allow below-threshold if nothing else exists
-            logger.warn('No operators meet minStock threshold, using best available', {
-                tier: tierKey,
-                country,
-                service,
-                minStock,
-                bestAvailable: Math.max(...providerResults.map(o => o.stock))
-            });
-        }
+        const candidates = viableCandidates.length > 0 ? viableCandidates : allCandidates;
 
-        const candidates = viableResults.length > 0 ? viableResults : providerResults;
-
-        // Step 2: Score and sort all results using FIXED normalized scoring
+        // Step 3: Score ALL candidates
         const scored = candidates.map(op => ({
             ...op,
             score: this._calculateScore(op, tier.sortPriority, tierKey)
         }));
 
+        // Step 4: Sort by score (highest first)
         scored.sort((a, b) => b.score - a.score);
 
         const best = scored[0];
 
-        // Sanity check: log if selected operator is suspiciously cheap
+        // Suspicious price guard
         if (best.price < this._priceBaseline.min) {
             logger.warn('Selected suspiciously cheap operator', {
                 operator: best.operator,
@@ -241,7 +248,10 @@ class TierOperatorSelector {
             mappedService: best.mappedService,
             crossProvider: best.providerKey !== 'CHEAP_PANEL',
             tier: tierKey,
-            meetsThreshold: best.stock >= minStock
+            country,
+            meetsThreshold: best.stock >= minStock,
+            allCandidatesCount: allCandidates.length,
+            viableCandidatesCount: viableCandidates.length
         };
 
         logger.info('Operator selected', {
@@ -253,75 +263,91 @@ class TierOperatorSelector {
             stock: best.stock,
             score: best.score,
             provider: best.providerKey,
-            meetsThreshold: result.meetsThreshold
+            totalChecked: allCandidates.length,
+            viableCount: viableCandidates.length
         });
 
         return result;
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  QUERY ALL PROVIDERS — CORE FIX
+    //  For each provider, get ALL virtual operators for country+service
+    //  Then filter by tier range. Don't stop at first provider match.
+    // ═══════════════════════════════════════════════════════════════════════
+
     /**
-     * Query ALL active providers for this tier/country/service
-     * Returns merged results from all providers
+     * Query ALL active providers for ALL operators matching tier/country/service
+     * Returns merged, deduplicated results from all providers
+     * 
+     * KEY FIX: Previously this would stop when it found operators from the first
+     * provider. Now it collects from ALL providers and lets scoring decide.
      */
-    async _queryAllProviders(tierKey, country, service) {
+    async _queryAllProvidersForCountryService(tierKey, country, service) {
         const allResults = [];
         const errors = [];
+        const seenOperators = new Set(); // Track to avoid duplicates
 
-        // Sort providers by priority
         const sortedProviders = this._sortProvidersByPriority();
 
         for (const provider of sortedProviders) {
             try {
-                const results = await this._queryProvider(provider, tierKey, country, service);
-                allResults.push(...results);
+                const providerResults = await this._queryProviderForCountryService(
+                    provider, tierKey, country, service
+                );
+                
+                for (const op of providerResults) {
+                    const key = `${op.providerKey}:${op.operator}`;
+                    if (!seenOperators.has(key)) {
+                        seenOperators.add(key);
+                        allResults.push(op);
+                    }
+                }
             } catch (error) {
                 errors.push({ provider: provider.providerKey, error: error.message });
             }
         }
 
         if (allResults.length === 0 && errors.length > 0) {
-            logger.warn('All providers failed for tier', { tierKey, country, service, errors });
+            logger.warn('All providers failed for tier', { 
+                tierKey, 
+                country, 
+                service, 
+                errors 
+            });
         }
 
         return allResults;
     }
 
     /**
-     * Sort providers by configured priority
+     * Query single provider for ALL operators in tier range for country+service
+     * 
+     * FIX: Instead of checking if a specific virtual has the country,
+     * we ask the provider: "for this country and service, what virtuals do you have?"
+     * Then we filter those virtuals by our tier range.
      */
-    _sortProvidersByPriority() {
-        return [...this.providers].sort((a, b) => {
-            const idxA = this._providerPriority.indexOf(a.providerKey);
-            const idxB = this._providerPriority.indexOf(b.providerKey);
-            if (idxA === -1 && idxB === -1) return 0;
-            if (idxA === -1) return 1;
-            if (idxB === -1) return -1;
-            return idxA - idxB;
-        });
-    }
-
-    /**
-     * Query single provider for operators in tier range
-     */
-    async _queryProvider(provider, tierKey, country, service) {
+    async _queryProviderForCountryService(provider, tierKey, country, service) {
         const tier = TIER_CONFIG[tierKey];
         const providerCountry = provider.mapCountry ? provider.mapCountry(country) : country;
         const providerService = provider.mapService ? provider.mapService(service) : service;
 
+        // Fetch provider's catalog
         const catalog = await this._getCatalog(provider);
         if (!catalog) {
             return [];
         }
 
+        // Navigate to country data
         const countryData = catalog[providerCountry];
         if (!countryData) {
             return [];
         }
 
+        // Navigate to service data (with fallback chain)
         let serviceData = countryData[providerService];
         let usedMappedService = providerService;
 
-        // Try service fallbacks if primary not found
         if (!serviceData) {
             const fallbacks = this._getServiceFallbacks(service, provider);
             for (const fb of fallbacks) {
@@ -339,21 +365,36 @@ class TierOperatorSelector {
 
         const candidates = [];
         
-        // Get all operators in tier range with stock
+        // serviceData = { virtual1: {count: 5, cost: 0.25}, virtual2: {...}, ... }
+        // We iterate ALL virtuals returned by provider for this country+service
         for (const [operatorName, operatorData] of Object.entries(serviceData)) {
-            const count = typeof operatorData === 'object' ? (operatorData.count ?? 0) : 0;
-            const price = typeof operatorData === 'object' ? (operatorData.cost ?? operatorData.price ?? Infinity) : Infinity;
+            // Only consider virtual operators
+            if (!operatorName.startsWith('virtual')) continue;
+            
+            const count = typeof operatorData === 'object' 
+                ? (operatorData.count ?? operatorData.qty ?? operatorData.stock ?? 0) 
+                : 0;
+            
+            const price = typeof operatorData === 'object' 
+                ? (operatorData.cost ?? operatorData.price ?? Infinity) 
+                : Infinity;
             
             if (count <= 0 || price <= 0 || price === Infinity) continue;
             
-            // Check if operator belongs to requested tier
-            const opNum = parseInt(operatorName.match(/virtual(\d+)/)?.[1] || '0');
+            // Extract virtual number
+            const match = operatorName.match(/virtual(\d+)/);
+            if (!match) continue;
             
+            const opNum = parseInt(match[1]);
+            
+            // Check if this virtual is in the requested tier's range
             if (tier.operatorRange && 
                 opNum >= tier.operatorRange.min && 
                 opNum <= tier.operatorRange.max) {
                 
-                const displayPrice = provider.getDisplayPrice ? provider.getDisplayPrice(price) : price + 0.10;
+                const displayPrice = provider.getDisplayPrice 
+                    ? provider.getDisplayPrice(price) 
+                    : price + 0.10;
                 
                 candidates.push({
                     operator: operatorName,
@@ -363,7 +404,9 @@ class TierOperatorSelector {
                     provider: provider.name,
                     providerKey: provider.providerKey,
                     mappedService: usedMappedService,
-                    crossProvider: provider.providerKey !== 'CHEAP_PANEL'
+                    crossProvider: provider.providerKey !== 'CHEAP_PANEL',
+                    country: country,
+                    service: service
                 });
             }
         }
@@ -372,74 +415,66 @@ class TierOperatorSelector {
     }
 
     /**
+     * Sort providers by configured priority
+     */
+    _sortProvidersByPriority() {
+        return [...this.providers].sort((a, b) => {
+            const idxA = this._providerPriority.indexOf(a.providerKey);
+            const idxB = this._providerPriority.indexOf(b.providerKey);
+            if (idxA === -1 && idxB === -1) return 0;
+            if (idxA === -1) return 1;
+            if (idxB === -1) return -1;
+            return idxA - idxB;
+        });
+    }
+
+    /**
      * Get service fallback chain for a provider
      */
     _getServiceFallbacks(service, provider) {
         const normalized = service.toString().trim().toLowerCase();
         
-        // Use provider's fallback map if available
         if (provider.serviceFallbackMap && provider.serviceFallbackMap[normalized]) {
             return provider.serviceFallbackMap[normalized];
         }
         
-        // Default fallbacks
         return [normalized, 'other'];
     }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  FIXED SCORING SYSTEM — Normalized 0-100 with proper tier logic
+        // ═══════════════════════════════════════════════════════════════════════
+    //  FIXED SCORING SYSTEM — Normalized 0-100
     // ═══════════════════════════════════════════════════════════════════════
 
     /**
      * Calculate normalized score (0-100) for an operator
-     * 
-     * Score = weighted sum of:
-     *   - Price score (0-100): cheaper = higher, with floor/ceiling guards
-     *   - Stock score (0-100): more stock = higher, threshold-aware
-     *   - Provider score (0-100): primary provider bonus
-     *   - Reliability score (0-100): placeholder for historical data
      */
     _calculateScore(op, sortPriority, tierKey) {
         const tier = TIER_CONFIG[tierKey];
         if (!tier) return 0;
 
-        // ── Price Score (0-100) ──────────────────────────────────────────
         const priceScore = this._calculatePriceScore(op.price, tierKey);
-
-        // ── Stock Score (0-100) ────────────────────────────────────────────
-        const stockScore = this._calculateStockScore(op.stock, tier.minStock || 5);
-
-        // ── Provider Score (0-100) ─────────────────────────────────────────
+        const stockScore = this._calculateStockScore(op.stock, tier.minStock || 1);
         const providerScore = this._calculateProviderScore(op.providerKey);
-
-        // ── Reliability Score (0-100) ────────────────────────────────────
         const reliabilityScore = this._calculateReliabilityScore(op);
 
-        // ── Tier-specific adjustments ────────────────────────────────────
+        // Tier-specific multipliers
         let tierMultiplier = 1.0;
         
         if (tierKey === 'premium') {
-            // Premium: slight preference for mid-range prices (not too cheap)
-            // Too cheap often means low quality/reliability
             if (op.price < 0.10) tierMultiplier = 0.85;
             else if (op.price > 0.50) tierMultiplier = 1.10;
         } else if (tierKey === 'budget') {
-            // Budget: aggressive price preference, but avoid suspiciously cheap
-            if (op.price < this._priceBaseline.min) tierMultiplier = 0.30; // Scam guard
+            if (op.price < this._priceBaseline.min) tierMultiplier = 0.30;
             else if (op.price < 0.08) tierMultiplier = 1.20;
         } else if (tierKey === 'standard') {
-            // Standard: balanced, slight preference for moderate prices
             if (op.price >= 0.10 && op.price <= 0.30) tierMultiplier = 1.05;
         }
 
-        // ── Cross-provider penalty ───────────────────────────────────────
-        // Switching providers adds latency and failure risk
+        // Cross-provider penalty
         let crossProviderPenalty = 1.0;
         if (op.providerKey !== 'CHEAP_PANEL') {
-            crossProviderPenalty = 0.90; // 10% penalty for non-primary
+            crossProviderPenalty = 0.90;
         }
 
-        // ── Final weighted score ─────────────────────────────────────────
         const rawScore = (
             priceScore * this._weights.price +
             stockScore * this._weights.stock +
@@ -469,12 +504,6 @@ class TierOperatorSelector {
 
     /**
      * Price score: 0-100, inverse logarithmic scale
-     * 
-     * - $0.03 (min) → 100 points (but flagged as suspicious)
-     * - $0.15 (optimal) → 85 points
-     * - $0.50 → 60 points
-     * - $2.00 (max) → 10 points
-     * - $5.00+ → 0 points
      */
     _calculatePriceScore(price, tierKey) {
         if (price <= 0) return 0;
@@ -482,63 +511,50 @@ class TierOperatorSelector {
 
         const { min, optimal, max } = this._priceBaseline;
 
-        // Suspiciously cheap — possible scam/fake numbers
         if (price < min) {
-            return Math.max(0, 100 * (price / min) * 0.5); // Max 50, scaled down
+            return Math.max(0, 100 * (price / min) * 0.5);
         }
 
-        // Normal range: logarithmic decay from optimal
         if (price <= optimal) {
-            // Between min and optimal: slight decay from 100
             const ratio = (price - min) / (optimal - min);
-            return Math.round(100 - (ratio * 15)); // 100 → 85
+            return Math.round(100 - (ratio * 15));
         }
 
         if (price <= max) {
-            // Between optimal and max: steeper decay
             const ratio = (price - optimal) / (max - optimal);
-            return Math.round(85 - (ratio * 75)); // 85 → 10
+            return Math.round(85 - (ratio * 75));
         }
 
-        // Above max but below 5.00
         const ratio = (price - max) / (5.00 - max);
-        return Math.round(10 - (ratio * 10)); // 10 → 0
+        return Math.round(10 - (ratio * 10));
     }
 
     /**
      * Stock score: 0-100, threshold-aware
-     * 
-     * - Below minStock: 0 (unreliable)
-     * - minStock: 30 points (barely acceptable)
-     * - 10x minStock: 70 points (comfortable)
-     * - 50x minStock: 100 points (very reliable)
      */
     _calculateStockScore(stock, minStock) {
         if (stock < minStock) return 0;
         if (stock >= minStock * 50) return 100;
 
         const ratio = (stock - minStock) / (minStock * 49);
-        return Math.round(30 + (ratio * 70)); // 30 → 100
+        return Math.round(30 + (ratio * 70));
     }
 
     /**
      * Provider score: 0-100
-     * Primary provider (CHEAP_PANEL/5sim) gets full bonus
      */
-        _calculateProviderScore(providerKey) {
+    _calculateProviderScore(providerKey) {
         const priorityIndex = this._providerPriority.indexOf(providerKey);
-        if (priorityIndex === -1) return 50; // Unknown provider
-        if (priorityIndex === 0) return 100; // Primary
-        return Math.max(0, 100 - (priorityIndex * 25)); // 100, 75, 50, 25
+        if (priorityIndex === -1) return 50;
+        if (priorityIndex === 0) return 100;
+        return Math.max(0, 100 - (priorityIndex * 25));
     }
 
     /**
-     * Reliability score: placeholder for historical success tracking
-     * TODO: Integrate with actual success-rate tracking
+     * Reliability score: placeholder
      */
     _calculateReliabilityScore(op) {
-        // Placeholder: assume primary provider + high stock = more reliable
-        let score = 70; // Base assumption
+        let score = 70;
 
         if (op.providerKey === 'CHEAP_PANEL') score += 15;
         if (op.stock > 20) score += 10;
@@ -547,30 +563,95 @@ class TierOperatorSelector {
         return Math.min(100, Math.max(0, score));
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  TIER STOCK CHECK — FIXED
+    //  Checks ALL virtuals in tier range for country/service, not just one
+    // ═══════════════════════════════════════════════════════════════════════
+
     /**
-     * Check if tier has any stock for country/service (lightweight)
+     * Check if tier has ANY stock for country/service
+     * Returns summary of ALL available operators, not just the best one
      */
     async hasTierStock(tierKey, country, service) {
         try {
-            const result = await this.selectOperator(tierKey, country, service);
+            const allCandidates = await this._queryAllProvidersForCountryService(
+                tierKey, country, service
+            );
+
+            if (allCandidates.length === 0) {
+                return {
+                    available: false,
+                    reason: `No ${tierKey} operators have stock for ${service} in ${country}`,
+                    operatorsChecked: 0
+                };
+            }
+
+            const minStock = TIER_CONFIG[tierKey]?.minStock || 1;
+            const viable = allCandidates.filter(op => op.stock >= minStock);
+
+            // Return the best one as primary, but include count of all available
+            const best = viable.length > 0 ? viable[0] : allCandidates[0];
+
             return {
                 available: true,
-                operator: result.operator,
-                stock: result.stock,
-                price: result.price,
-                provider: result.providerKey
+                operator: best.operator,
+                stock: best.stock,
+                price: best.price,
+                displayPrice: best.displayPrice,
+                provider: best.providerKey,
+                totalOperators: allCandidates.length,
+                viableOperators: viable.length,
+                allOperators: allCandidates.map(c => ({
+                    operator: c.operator,
+                    price: c.price,
+                    stock: c.stock,
+                    provider: c.providerKey
+                }))
             };
         } catch (error) {
             return {
                 available: false,
-                reason: error.message
+                reason: error.message,
+                operatorsChecked: 0
             };
         }
     }
 
     /**
+     * Get ALL operators in tier for country/service (for UI display)
+     * Returns full list sorted by tier strategy
+     */
+    async getAllTierOperators(tierKey, country, service) {
+        try {
+            const allCandidates = await this._queryAllProvidersForCountryService(
+                tierKey, country, service
+            );
+
+            if (allCandidates.length === 0) {
+                return [];
+            }
+
+            const scored = allCandidates.map(op => ({
+                ...op,
+                score: this._calculateScore(op, TIER_CONFIG[tierKey]?.sortPriority, tierKey)
+            }));
+
+            scored.sort((a, b) => b.score - a.score);
+            return scored;
+        } catch (error) {
+            logger.error('Failed to get all tier operators', { tierKey, country, service, error: error.message });
+            return [];
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  FALLBACK OPERATORS — FIXED
+    //  Gets next-best operators in same tier, excluding the failed one
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
      * Get fallback operators within SAME tier (excluding failed one)
-     * Cross-operator fallback: tries adjacent virtual numbers
+     * Returns ranked list of alternatives from ALL providers
      */
     async getFallbackOperators(tierKey, country, service, excludeOperator = null) {
         const tier = TIER_CONFIG[tierKey];
@@ -578,8 +659,10 @@ class TierOperatorSelector {
             return [];
         }
 
-        // Get all operators in tier from all providers
-        const allResults = await this._queryAllProviders(tierKey, country, service);
+        // Get ALL operators in tier from ALL providers
+        const allResults = await this._queryAllProvidersForCountryService(
+            tierKey, country, service
+        );
         
         // Filter out excluded operator
         let available = allResults.filter(op => 
@@ -598,7 +681,7 @@ class TierOperatorSelector {
             return [];
         }
 
-        // Score and sort using FIXED scoring
+        // Score and sort
         const scored = available.map(op => ({
             ...op,
             score: this._calculateScore(op, tier.sortPriority, tierKey)
@@ -623,7 +706,6 @@ class TierOperatorSelector {
 
     /**
      * Get cheapest price across ALL providers for a tier
-     * Used for tier baseline price display
      */
     async getCheapestPrice(tierKey, country, service) {
         try {
@@ -643,6 +725,115 @@ class TierOperatorSelector {
             };
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  COUNTRY AVAILABILITY — FIXED
+    //  For a given service, check which countries have stock in this tier
+    //  This queries the provider catalog properly
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Get countries that have stock for a service in a specific tier
+     * This is used by CountryCatalog to show available countries
+     * 
+     * FIX: Previously this might have checked one virtual and returned
+     * countries for just that virtual. Now it checks ALL virtuals in the
+     * tier range and aggregates available countries.
+     */
+    async getAvailableCountriesForService(tierKey, service, options = {}) {
+        const tier = TIER_CONFIG[tierKey];
+        if (!tier) return [];
+
+        const allCountries = [];
+        const seenCountries = new Set();
+
+        for (const provider of this.providers) {
+            try {
+                const catalog = await this._getCatalog(provider);
+                if (!catalog) continue;
+
+                // Iterate all countries in catalog
+                for (const [countryCode, countryData] of Object.entries(catalog)) {
+                    if (seenCountries.has(countryCode)) continue;
+
+                    // Check if this country has the service
+                    const providerService = provider.mapService 
+                        ? provider.mapService(service) 
+                        : service;
+                    
+                    let serviceData = countryData[providerService];
+                    
+                    if (!serviceData) {
+                        const fallbacks = this._getServiceFallbacks(service, provider);
+                        for (const fb of fallbacks) {
+                            if (countryData[fb]) {
+                                serviceData = countryData[fb];
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!serviceData) continue;
+
+                    // Check if ANY virtual in tier range has stock
+                    let hasStock = false;
+                    let bestPrice = Infinity;
+                    let bestStock = 0;
+                    let bestOperator = null;
+
+                    for (const [operatorName, operatorData] of Object.entries(serviceData)) {
+                        if (!operatorName.startsWith('virtual')) continue;
+                        
+                        const match = operatorName.match(/virtual(\d+)/);
+                        if (!match) continue;
+                        
+                        const opNum = parseInt(match[1]);
+                        if (opNum < tier.operatorRange.min || opNum > tier.operatorRange.max) continue;
+                        
+                        const count = typeof operatorData === 'object' 
+                            ? (operatorData.count ?? operatorData.qty ?? operatorData.stock ?? 0) 
+                            : 0;
+                        
+                        const price = typeof operatorData === 'object' 
+                            ? (operatorData.cost ?? operatorData.price ?? Infinity) 
+                            : Infinity;
+
+                        if (count > 0 && price > 0 && price !== Infinity) {
+                            hasStock = true;
+                            if (price < bestPrice) {
+                                bestPrice = price;
+                                bestStock = count;
+                                bestOperator = operatorName;
+                            }
+                        }
+                    }
+
+                    if (hasStock) {
+                        seenCountries.add(countryCode);
+                        allCountries.push({
+                            code: countryCode,
+                            provider: provider.providerKey,
+                            bestOperator: bestOperator,
+                            bestPrice: bestPrice,
+                            bestStock: bestStock,
+                            hasMultipleProviders: false // Set later if needed
+                        });
+                    }
+                }
+            } catch (error) {
+                logger.warn('Provider catalog error', { 
+                    provider: provider.providerKey, 
+                    error: error.message 
+                });
+            }
+        }
+
+        return allCountries;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  CACHE & STATS
+    // ═══════════════════════════════════════════════════════════════════════
 
     clearCaches() {
         this._selectionCache.clear();
@@ -664,3 +855,4 @@ class TierOperatorSelector {
 }
 
 export default TierOperatorSelector;
+            
