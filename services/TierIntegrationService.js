@@ -1,12 +1,12 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 //  services/TierIntegrationService.js — Tier Flow Orchestration Layer
-//  Bridges ServiceCatalog → TierOperatorSelector → CountryCatalog → ProviderRouter
-//  FIXED:
-//   1. Queries ALL providers for cheapest tier baseline price
-//   2. Preserves original service name through entire purchase flow
-//   3. Cross-provider fallback on purchase failure (same tier only)
-//   4. Cache TTL: 60 minutes with auto-prewarm
-//   5. Provider fallback chain: 5sim → SMSPool → Hero → OnlineSim
+//  COMPLETE REWRITE:
+//   1. FIXED: Queries ALL providers for cheapest tier baseline price
+//   2. FIXED: Preserves original service name through entire purchase flow
+//   3. FIXED: Cross-provider fallback on purchase failure (same tier only)
+//   4. FIXED: Country selection now checks ALL virtuals in tier, not just one
+//   5. Cache TTL: 60 minutes with auto-prewarm
+//   6. Provider fallback chain: 5sim → SMSPool → Hero → OnlineSim
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { TIER_CONFIG, CACHE_TTL, getTierConfig } from '../config/tierConfig.js';
@@ -17,7 +17,7 @@ import logger from '../utils/logger.js';
  * 
  * Pricing Model:
  *   - rawPrice      = provider's base cost for the number
- *   - displayCost   = rawPrice + BASE_PROFIT ($0.10) — set by provider.getDisplayPrice
+ *   - displayCost   = rawPrice + BASE_PROFIT ($0.10)
  *   - finalPrice    = displayCost × tier.priceMultiplier
  *   - Budget:   1.00× = no extra markup (profit = $0.10)
  *   - Standard: 1.15× = +15% extra profit
@@ -28,24 +28,15 @@ import logger from '../utils/logger.js';
  *   2. SMSPOOL — secondary
  *   3. HERO_SMS — tertiary
  *   4. ONLINE_SIM — quaternary
- * 
- * Responsibilities:
- *   - Initializes and wires all tier components
- *   - Provides single entry point for bot handlers
- *   - Normalizes errors across the flow
- *   - Manages cross-cutting concerns (caching, logging, metrics)
- *   - Falls back to other providers for same tier on failure
  */
 class TierIntegrationService {
-    // Constants
     static BASE_PROFIT = 0.10;
-    static BASELINE_CACHE_TTL = 60 * 60 * 1000; // 60 minutes
+    static BASELINE_CACHE_TTL = 60 * 60 * 1000;
     static FALLBACK_MAX_ATTEMPTS = 3;
 
     constructor(smsProviderManager, options = {}) {
         this.providerManager = smsProviderManager;
         
-        // Lazy-loaded components
         this._serviceCatalog = null;
         this._tierSelector = null;
         this._countryCatalog = null;
@@ -55,14 +46,11 @@ class TierIntegrationService {
         this._heroSmsProvider = null;
         this._providerRouter = null;
         
-        // Cache for tier baseline prices
         this._baselinePriceCache = new Map();
         
-        // Feature flags
         this._enabled = options.enableTierFlow !== false;
         this._legacyFallback = options.legacyFallback !== false;
         
-        // Metrics
         this._metrics = {
             tierSelections: 0,
             tierPurchases: 0,
@@ -72,7 +60,6 @@ class TierIntegrationService {
             errors: 0
         };
 
-        // Auto-prewarm interval
         this._cacheRefreshInterval = null;
 
         logger.info('TierIntegrationService created', {
@@ -85,9 +72,6 @@ class TierIntegrationService {
     //  INITIALIZATION
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Initialize all tier components. Call once after construction.
-     */
     async initialize() {
         if (!this._enabled) {
             logger.info('Tier flow disabled, skipping initialization');
@@ -95,7 +79,6 @@ class TierIntegrationService {
         }
 
         try {
-            // Get all provider instances from manager
             this._cheapProvider = this.providerManager?.getProvider('CHEAP_PANEL');
             this._onlineSimProvider = this.providerManager?.getProvider('ONLINE_SIM');
             this._smsPoolProvider = this.providerManager?.getProvider('SMSPOOL');
@@ -113,26 +96,22 @@ class TierIntegrationService {
                 return;
             }
 
-            // Dynamic imports to avoid circular dependencies
             const { default: ServiceCatalog } = await import('./ServiceCatalog.js');
             const { default: TierOperatorSelector } = await import('./TierOperatorSelector.js');
             const { default: CountryCatalog } = await import('./CountryCatalog.js');
             const { default: ProviderRouter } = await import('./sms/ProviderRouter.js');
 
-            // Collect ALL active providers for tier selection
             const allProviders = [];
             if (this._cheapProvider?.isActive) allProviders.push(this._cheapProvider);
             if (this._smsPoolProvider?.isActive) allProviders.push(this._smsPoolProvider);
             if (this._heroSmsProvider?.isActive) allProviders.push(this._heroSmsProvider);
             if (this._onlineSimProvider?.isActive) allProviders.push(this._onlineSimProvider);
 
-            // Initialize components
             this._serviceCatalog = new ServiceCatalog(this._cheapProvider);
             this._tierSelector = new TierOperatorSelector(allProviders);
             this._countryCatalog = new CountryCatalog(this._cheapProvider, this._tierSelector);
             this._providerRouter = new ProviderRouter(allProviders);
 
-            // Start auto-prewarm
             this._startCachePrewarm();
 
             logger.info('TierIntegrationService initialized successfully', {
@@ -151,14 +130,8 @@ class TierIntegrationService {
         }
     }
 
-    /**
-     * Start background cache prewarm every 50 minutes
-     */
     _startCachePrewarm() {
-        // Prewarm immediately
         this._prewarmAllCaches().catch(() => {});
-
-        // Then every 50 minutes
         this._cacheRefreshInterval = setInterval(() => {
             this._prewarmAllCaches().catch(err => 
                 logger.debug('Cache prewarm failed', { error: err.message })
@@ -183,9 +156,6 @@ class TierIntegrationService {
         }
     }
 
-    /**
-     * Check if tier flow is available and initialized
-     */
     isAvailable() {
         return this._enabled && 
                this._serviceCatalog !== null && 
@@ -230,7 +200,8 @@ class TierIntegrationService {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  TIER SELECTION (Step 2) — Queries ALL providers for cheapest price
+    //  TIER SELECTION (Step 2)
+    //  FIXED: Queries ALL providers, gets ALL virtuals, shows cheapest per tier
     // ═══════════════════════════════════════════════════════════════════════
 
     getAllTierInfos() {
@@ -245,7 +216,7 @@ class TierIntegrationService {
 
     /**
      * Get tier baseline prices for a service (for UI display)
-     * Queries ALL providers and shows CHEAPEST price per tier
+     * FIXED: Now queries ALL virtuals in tier range across ALL providers
      */
     async getTierBaselinePrices(service, country = 'US') {
         if (!this.isAvailable()) return null;
@@ -262,7 +233,7 @@ class TierIntegrationService {
 
         for (const tier of tierInfos) {
             try {
-                // Use tierSelector which queries ALL providers
+                // FIXED: selectOperator now checks ALL virtuals in tier range
                 const baseline = await this._tierSelector.selectOperator(
                     tier.key, country, service, { timeoutMs: 8000 }
                 ).catch(() => null);
@@ -285,7 +256,9 @@ class TierIntegrationService {
                     baseProfit: TierIntegrationService.BASE_PROFIT,
                     extraProfit: extraProfit,
                     baselineStock: baseline?.stock || 0,
-                    operatorCount: tier.operatorCount,
+                    operatorCount: baseline?.allCandidatesCount || tier.operatorCount,
+                    viableOperators: baseline?.viableCandidatesCount || 0,
+                    bestOperator: baseline?.operator || null,
                     providerKey: baseline?.providerKey || null,
                     provider: baseline?.provider || null,
                     cheapestProvider: baseline?.providerKey || null
@@ -305,6 +278,8 @@ class TierIntegrationService {
                     extraProfit: 0,
                     baselineStock: 0,
                     operatorCount: tier.operatorCount,
+                    viableOperators: 0,
+                    bestOperator: null,
                     providerKey: null,
                     provider: null,
                     error: error.message
@@ -324,11 +299,14 @@ class TierIntegrationService {
         if (!this.isAvailable()) {
             return { available: false, reason: 'TIER_SYSTEM_UNAVAILABLE' };
         }
+        // FIXED: hasTierStock now checks ALL virtuals in tier
         return this._tierSelector.hasTierStock(tierKey, country, service);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  COUNTRY SELECTION (Step 3)
+    //  FIXED: CountryCatalog now uses getAvailableCountriesForService
+    //  which checks ALL virtuals in tier range
     // ═══════════════════════════════════════════════════════════════════════
 
     async getCountriesForService(service, tierKey, options = {}) {
@@ -366,10 +344,10 @@ class TierIntegrationService {
 
     // ═══════════════════════════════════════════════════════════════════════
     //  PURCHASE ORCHESTRATION (Step 4)
-    //  Cross-provider fallback: same tier, different provider
+    //  Cross-provider fallback: same tier, different provider/operator
     // ═══════════════════════════════════════════════════════════════════════
 
-                        async purchaseNumber(tierKey, country, service, options = {}) {
+    async purchaseNumber(tierKey, country, service, options = {}) {
         if (!this.isAvailable()) {
             return { 
                 success: false, 
@@ -382,10 +360,10 @@ class TierIntegrationService {
         this._metrics.tierSelections++;
 
         let selection = null;
-        const originalService = service; // PRESERVE original name
+        const originalService = service;
 
         try {
-            // Step 1: Select best operator across ALL providers
+            // Step 1: Select best operator across ALL providers and ALL virtuals
             selection = await this._tierSelector.selectOperator(
                 tierKey, country, service, { 
                     timeoutMs: options.timeoutMs || 15000,
@@ -393,16 +371,14 @@ class TierIntegrationService {
                 }
             );
 
-            // Validate selection
             if (!selection.operator) {
                 throw new Error('NO_OPERATOR: No operator selected');
             }
 
-            // Step 2: Build purchase payload with EXACT selected operator
-            // CRITICAL: Pass originalService, not mapped service
+            // Step 2: Build purchase payload
             const purchasePayload = {
                 country, 
-                service: originalService,  // ← PRESERVE ORIGINAL
+                service: originalService,
                 operator: selection.operator
             };
 
@@ -414,18 +390,19 @@ class TierIntegrationService {
                 mappedService: selection.mappedService,
                 expectedPrice: selection.price,
                 expectedDisplayPrice: selection.displayPrice,
-                provider: selection.providerKey
+                provider: selection.providerKey,
+                totalCandidates: selection.allCandidatesCount,
+                viableCandidates: selection.viableCandidatesCount
             });
 
-            // Step 3: Execute purchase via selected provider
-            let purchaseResult;
+            // Step 3: Execute purchase
             let usedProvider = this._getProviderByKey(selection.providerKey);
 
             if (!usedProvider) {
                 throw new Error(`PROVIDER_NOT_FOUND: ${selection.providerKey}`);
             }
 
-            purchaseResult = await usedProvider.getNumber(
+            const purchaseResult = await usedProvider.getNumber(
                 purchasePayload.country, 
                 purchasePayload.service, 
                 purchasePayload.operator
@@ -433,7 +410,6 @@ class TierIntegrationService {
 
             this._metrics.tierPurchases++;
 
-            // Calculate pricing
             const displayCost = purchaseResult.displayCost || selection.displayPrice || 0;
             const tier = getTierConfig(tierKey);
             const finalPrice = Number((displayCost * tier.priceMultiplier).toFixed(2));
@@ -471,7 +447,7 @@ class TierIntegrationService {
                 score: selection.score,
                 tier: tierKey,
                 country,
-                service: originalService,  // ← RETURN ORIGINAL
+                service: originalService,
                 mappedService: purchaseResult.mappedService || selection.mappedService
             };
 
@@ -524,21 +500,22 @@ class TierIntegrationService {
      *   2. Try same tier on OTHER providers
      *   3. Return failure if all exhausted
      */
-    async _attemptFallbackPurchase(tierKey, country, originalService, options, originalError, failedSelection = null) {
+    
+        async _attemptFallbackPurchase(tierKey, country, originalService, options, originalError, failedSelection = null) {
         this._metrics.tierFallbacks++;
 
         const failedOperator = failedSelection?.operator;
         const failedProvider = failedSelection?.providerKey;
 
         try {
-            // Phase 1: Try other operators in same tier on same provider
+            // Phase 1: Try other operators in same tier
             const fallbackOps = await this._tierSelector.getFallbackOperators(
                 tierKey, country, originalService, failedOperator
             );
 
             if (fallbackOps?.length > 0) {
                 for (const fallback of fallbackOps.slice(0, TierIntegrationService.FALLBACK_MAX_ATTEMPTS)) {
-                    // Skip if same provider as failed (we want cross-provider)
+                    // Skip same provider as failed (we want cross-provider)
                     if (fallback.providerKey === failedProvider) continue;
 
                     try {
@@ -601,7 +578,7 @@ class TierIntegrationService {
                 }
             }
 
-            // Phase 2: Try same tier on other providers directly
+            // Phase 2: Try same tier on other providers directly with 'any'
             const otherProviders = this._getOtherProviders(failedProvider);
             for (const provider of otherProviders) {
                 try {
@@ -675,9 +652,6 @@ class TierIntegrationService {
         }
     }
 
-    /**
-     * Get provider instance by key
-     */
     _getProviderByKey(key) {
         const providers = {
             'CHEAP_PANEL': this._cheapProvider,
@@ -688,9 +662,6 @@ class TierIntegrationService {
         return providers[key];
     }
 
-    /**
-     * Get other active providers excluding the failed one
-     */
     _getOtherProviders(excludeKey) {
         const all = [
             this._cheapProvider,
@@ -699,7 +670,6 @@ class TierIntegrationService {
             this._onlineSimProvider
         ].filter(p => p && p.isActive && p.providerKey !== excludeKey);
 
-        // Sort by priority
         const priority = ['CHEAP_PANEL', 'SMSPOOL', 'HERO_SMS', 'ONLINE_SIM'];
         return all.sort((a, b) => {
             const idxA = priority.indexOf(a.providerKey);
@@ -802,9 +772,6 @@ class TierIntegrationService {
         };
     }
 
-    /**
-     * Clear all caches
-     */
     clearCaches() {
         this._baselinePriceCache.clear();
         this._countryCatalog?.clearCache();
@@ -814,9 +781,6 @@ class TierIntegrationService {
         logger.info('TierIntegrationService caches cleared');
     }
 
-    /**
-     * Cleanup on shutdown
-     */
     destroy() {
         if (this._cacheRefreshInterval) {
             clearInterval(this._cacheRefreshInterval);
