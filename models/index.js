@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-//  models/index.js — Centralized Model Registry (FIXED)
+//  models/index.js — Centralized Model Registry (FIXED + Payment Added)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import mongoose from 'mongoose';
@@ -17,7 +17,8 @@ import Settings from './Settings.js';
 import { OrphanSMS } from './OrphanSMS.js';
 import Notification from './Notification.js';
 import AdVerification from './AdVerification.js';
-import CreditTransaction from './CreditTransaction.js';  // ← ADDED
+import CreditTransaction from './CreditTransaction.js';
+import Payment from './Payment.js';  // ← ADDED
 
 const modelRegistry = {
     User,
@@ -32,7 +33,8 @@ const modelRegistry = {
     Settings,
     OrphanSMS,
     Notification,
-    CreditTransaction  // ← ADDED
+    CreditTransaction,
+    Payment  // ← ADDED
 };
 
 function validateModels() {
@@ -52,14 +54,12 @@ async function resetIndexes(model) {
         const collection = model.collection;
         const indexes = await collection.indexes();
         
-        // Drop all indexes except _id_
         for (const idx of indexes) {
             if (idx.name === '_id_') continue;
             logger.warn(`Dropping index ${idx.name} on ${model.modelName}`);
             await collection.dropIndex(idx.name);
         }
         
-        // Recreate from schema
         await model.syncIndexes();
         return { name: model.modelName, status: 'reset' };
     } catch (error) {
@@ -79,7 +79,6 @@ export async function initModels() {
             results.push({ name, status: 'ok' });
             logger.info(`Model ${name} initialized`);
         } catch (error) {
-            // If syncIndexes fails due to conflict, reset all indexes for this collection
             if (error.code === 85 || error.code === 86 || error.codeName?.includes('Conflict')) {
                 logger.warn(`Index conflict on ${name}, resetting indexes...`);
                 const resetResult = await resetIndexes(model);
@@ -124,7 +123,8 @@ export {
     OrphanSMS,
     AdVerification,
     Notification,
-    CreditTransaction  // ← ADDED
+    CreditTransaction,
+    Payment  // ← ADDED
 };
 
 export default modelRegistry;
