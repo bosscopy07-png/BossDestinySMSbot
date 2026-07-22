@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 //  config/env.js — Environment Configuration with Validation
-//  Added: SMSPool, HeroSMS provider configs
+//  Added: Payment provider configs (Paystack)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import dotenv from 'dotenv';
@@ -31,7 +31,6 @@ const envSchema = Joi.object({
     TELNYX_MESSAGING_PROFILE_ID: Joi.string().allow('').optional(),
     
     // ─── CHEAP PROVIDERS ──────────────────────────────────────────────────
-    // 5sim (primary) — REQUIRED
     CHEAP_PANEL_API_KEY: Joi.string().required(),
     CHEAP_PANEL_BASE_URL: Joi.string().uri().required(),
     
@@ -52,6 +51,19 @@ const envSchema = Joi.object({
     BSC_RPC: Joi.string().uri().required(),
     USDT_CONTRACT: Joi.string().pattern(/^0x[a-fA-F0-9]{40}$/).required(),
     BLOCK_CONFIRMATIONS: Joi.number().integer().min(1).default(12),
+    
+    // ─── PAYMENT PROVIDER (Paystack) ──────────────────────────────────────
+    PAYMENT_PROVIDER: Joi.string().valid('paystack', 'flutterwave', 'monnify').default('paystack'),
+    PAYSTACK_SECRET_KEY: Joi.string().allow('').optional(),
+    PAYSTACK_PUBLIC_KEY: Joi.string().allow('').optional(),
+    PAYSTACK_WEBHOOK_SECRET: Joi.string().allow('').optional(),
+    PAYSTACK_CALLBACK_URL: Joi.string().uri().allow('').optional(),
+    
+    // ─── NAIRA DEPOSIT CONFIG ─────────────────────────────────────────────
+    MIN_DEPOSIT_NGN: Joi.number().integer().positive().default(500),
+    NAIRA_FALLBACK_RATE: Joi.number().positive().default(1500),
+    NAIRA_ADMIN_RATE: Joi.number().positive().allow('').optional(),
+    APP_URL: Joi.string().uri().allow('').optional().default('https://api.swiftsms.com'),
     
     // ─── SECURITY ─────────────────────────────────────────────────────────
     JWT_SECRET: Joi.string().min(32).required(),
@@ -130,6 +142,20 @@ export const config = {
         usdtContract: envVars.USDT_CONTRACT,
         blockConfirmations: envVars.BLOCK_CONFIRMATIONS
     },
+    payment: {
+        provider: envVars.PAYMENT_PROVIDER,
+        paystackSecretKey: envVars.PAYSTACK_SECRET_KEY,
+        paystackPublicKey: envVars.PAYSTACK_PUBLIC_KEY,
+        paystackWebhookSecret: envVars.PAYSTACK_WEBHOOK_SECRET,
+        callbackUrl: envVars.PAYSTACK_CALLBACK_URL,
+        minDepositNgn: envVars.MIN_DEPOSIT_NGN,
+        nairaFallbackRate: envVars.NAIRA_FALLBACK_RATE,
+        nairaAdminRate: envVars.NAIRA_ADMIN_RATE || null
+    },
+    app: {
+        url: envVars.APP_URL,
+        env: envVars.NODE_ENV
+    },
     security: {
         jwtSecret: envVars.JWT_SECRET,
         rateLimitWindowMs: envVars.RATE_LIMIT_WINDOW_MS,
@@ -160,4 +186,4 @@ export const config = {
 };
 
 export default config;
-    
+                                         
