@@ -389,6 +389,7 @@ export const POPULAR_SERVICES = [
    'Signal',
    'LinkedIn',
    'WeChat',
+   'Other',
    'Line'
 ];
 
@@ -505,6 +506,7 @@ export const SERVICE_SLUGS = {
    Signal: 'signal',
    LinkedIn: 'linkedin',
    WeChat: 'wechat',
+   Other: 'other',
    Line: 'line'
 };
 
