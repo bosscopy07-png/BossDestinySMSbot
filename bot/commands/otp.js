@@ -2173,7 +2173,7 @@ async handleCheckFree(ctx, sessionId) {
                 'Flipkart': '🛒', 'Snapdeal': '🛒', 'Myntra': '👕', 'Zomato': '🍔',
                 'Swiggy': '🍔', 'Ola': '🚗', 'Grab': '🚗', 'Gojek': '🚗',
                 'Bolt': '🚗', 'Careem': '🚗', 'Pathao': '🚗', 'Foodpanda': '🍔',
-                'Deliveroo': '🍔', 'UberEats': '🍔', 'DoorDash': '🍔', 'Grubhub': '🍔'
+                'Deliveroo': '🍔', 'UberEats': '🍔', 'DoorDash': '🍔', 'Grubhub': '🍔', 'Other': '💧'
             };
 
             for (let i = 0; i < services.length; i += 3) {
@@ -2942,7 +2942,7 @@ const checkInterval = setInterval(async () => {
             'Uber': '🚗', 'Airbnb': '🏠', 'WeChat': '💬', 'Signal': '🔒',
             'LinkedIn': '💼', 'Tinder': '🔥', 'Google': '🔍', 'Microsoft': '🪟',
             'Apple': '🍎', 'Viber': '📞', 'Line': '📱', 'KakaoTalk': '💬',
-            'Imo': '📹', 'Zalo': '💬', 'Badoo': '❤️'
+            'Imo': '📹', 'Zalo': '💬', 'Badoo': '❤️', 'Other': '💧'
         };
 
         // 3 columns
