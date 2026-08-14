@@ -2155,7 +2155,7 @@ async handleCheckFree(ctx, sessionId) {
             const buttons = [];
             const serviceEmojis = {
                 'WhatsApp': '💬', 'Telegram': '✈️', 'Facebook': '👤', 'Instagram': '📸',
-                'Twitter': '🐦', 'TikTok': '🎵', 'Binance': '💰', 'Coinbase': '₿',
+                'Twitter': '🐦', 'TikTok': '🎵', 'Binance': '💰', 'Other': '💧',
                 'Gmail': '📧', 'Outlook': '📨', 'Netflix': '🎬', 'Amazon': '📦',
                 'PayPal': '💳', 'Snapchat': '👻', 'Discord': '🎮', 'Spotify': '🎧',
                 'Uber': '🚗', 'Airbnb': '🏠', 'WeChat': '💬', 'Signal': '🔒',
@@ -2173,7 +2173,7 @@ async handleCheckFree(ctx, sessionId) {
                 'Flipkart': '🛒', 'Snapdeal': '🛒', 'Myntra': '👕', 'Zomato': '🍔',
                 'Swiggy': '🍔', 'Ola': '🚗', 'Grab': '🚗', 'Gojek': '🚗',
                 'Bolt': '🚗', 'Careem': '🚗', 'Pathao': '🚗', 'Foodpanda': '🍔',
-                'Deliveroo': '🍔', 'UberEats': '🍔', 'DoorDash': '🍔', 'Grubhub': '🍔', 'Other': '💧'
+                'Deliveroo': '🍔', 'UberEats': '🍔', 'DoorDash': '🍔', 'Grubhub': '🍔'
             };
 
             for (let i = 0; i < services.length; i += 3) {
