@@ -363,11 +363,14 @@ class TierIntegrationService {
         const originalService = service;
 
         try {
-            // Step 1: Select best operator across ALL providers and ALL virtuals
+            // Step 1: Select best operator across ALL providers and ALL virtuals.
+            // CORE REQUIREMENT #5: purchaseNumber() is, by definition, a purchase-time
+            // call — default to live (uncached) inventory unless the caller explicitly
+            // opts back into the browsing cache.
             selection = await this._tierSelector.selectOperator(
                 tierKey, country, service, { 
                     timeoutMs: options.timeoutMs || 15000,
-                    skipCache: options.skipCache || false
+                    skipCache: options.skipCache !== false
                 }
             );
 
@@ -508,16 +511,25 @@ class TierIntegrationService {
         const failedProvider = failedSelection?.providerKey;
 
         try {
-            // Phase 1: Try other operators in same tier
-            const fallbackOps = await this._tierSelector.getFallbackOperators(
+            // Phase 1: Try other operators in same tier, from ANY provider
+            // (including the SAME provider as the one that just failed).
+            //
+            // CORE REQUIREMENT #4/#8: if virtual8 fails, we must try virtual18
+            // next — and in the common single-provider deployment (only
+            // CHEAP_PANEL/5sim configured), virtual18 IS on the same provider
+            // as virtual8. Previously this loop skipped every candidate on the
+            // same provider as the failed one ("we want cross-provider"), which
+            // meant same-provider fallback never ran at all when only one
+            // provider was active — the single biggest cause of premature
+            // "no free number available" failures. Same-tier alternates are
+            // tried first regardless of provider; true cross-provider fallback
+            // is still covered by Phase 2 below.
+            let fallbackOps = await this._tierSelector.getFallbackOperators(
                 tierKey, country, originalService, failedOperator
             );
 
             if (fallbackOps?.length > 0) {
                 for (const fallback of fallbackOps.slice(0, TierIntegrationService.FALLBACK_MAX_ATTEMPTS)) {
-                    // Skip same provider as failed (we want cross-provider)
-                    if (fallback.providerKey === failedProvider) continue;
-
                     try {
                         const provider = this._getProviderByKey(fallback.providerKey);
                         if (!provider) continue;
@@ -568,6 +580,82 @@ class TierIntegrationService {
 
                     } catch (fallbackError) {
                         logger.warn('Fallback operator failed', {
+                            tier: tierKey,
+                            operator: fallback.operator,
+                            provider: fallback.providerKey,
+                            error: fallbackError.message
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            // Phase 1.5: CORE REQUIREMENT #5 — live inventory can have moved on
+            // since the cached candidate list was built (numbers sell out in
+            // seconds). Before giving up on this tier, force a live refresh and
+            // rebuild the candidate list once, excluding everything we already
+            // tried, then attempt those fresh candidates too.
+            const alreadyTried = new Set([failedOperator, ...(fallbackOps || []).map(f => f.operator)].filter(Boolean));
+
+            const freshOps = await this._tierSelector.getFallbackOperators(
+                tierKey, country, originalService, failedOperator, { forceRefresh: true }
+            );
+            const newFreshOps = (freshOps || []).filter(op => !alreadyTried.has(op.operator));
+
+            if (newFreshOps.length > 0) {
+                logger.info('Live inventory refresh found additional candidates', {
+                    tier: tierKey, country, originalService, count: newFreshOps.length
+                });
+
+                for (const fallback of newFreshOps.slice(0, TierIntegrationService.FALLBACK_MAX_ATTEMPTS)) {
+                    try {
+                        const provider = this._getProviderByKey(fallback.providerKey);
+                        if (!provider) continue;
+
+                        const purchaseResult = await provider.getNumber(
+                            country, originalService, fallback.operator
+                        );
+
+                        this._metrics.tierPurchases++;
+                        this._metrics.crossProviderFallbacks++;
+
+                        const displayCost = purchaseResult.displayCost || fallback.displayPrice || 0;
+                        const tier = getTierConfig(tierKey);
+                        const finalPrice = Number((displayCost * tier.priceMultiplier).toFixed(2));
+                        const extraProfit = Number((finalPrice - displayCost).toFixed(2));
+
+                        logger.info('Live-refresh fallback purchase successful', {
+                            tier: tierKey,
+                            country,
+                            originalService,
+                            failedProvider,
+                            fallbackProvider: fallback.providerKey,
+                            fallbackOperator: fallback.operator
+                        });
+
+                        return {
+                            success: true,
+                            phoneNumber: purchaseResult.phoneNumber,
+                            providerNumberId: purchaseResult.providerNumberId,
+                            operator: fallback.operator,
+                            routedProvider: fallback.providerKey,
+                            price: finalPrice,
+                            displayPrice: finalPrice,
+                            displayCost: displayCost,
+                            rawPrice: purchaseResult.cost || 0,
+                            baseProfit: TierIntegrationService.BASE_PROFIT,
+                            extraProfit: extraProfit,
+                            stock: fallback.stock,
+                            score: fallback.score,
+                            tier: tierKey,
+                            country,
+                            service: originalService,
+                            fallback: true,
+                            crossProvider: fallback.providerKey !== failedProvider
+                        };
+
+                    } catch (fallbackError) {
+                        logger.warn('Live-refresh fallback operator failed', {
                             tier: tierKey,
                             operator: fallback.operator,
                             provider: fallback.providerKey,
@@ -792,3 +880,4 @@ class TierIntegrationService {
 }
 
 export default TierIntegrationService;
+            
