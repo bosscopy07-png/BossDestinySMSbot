@@ -7,6 +7,7 @@
 import axios from 'axios';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
+import { normalizeOperatorData } from '../../utils/providerNormalize.js';
 
 const BASE_PROFIT = 0.10; // Same $0.10 flat profit
 
@@ -279,10 +280,7 @@ class OnlineSimProvider {
                 const serviceData = services[providerService];
                 if (!serviceData) continue;
 
-                const hasStock = Object.values(serviceData).some(opData => {
-                    const count = typeof opData === 'object' ? (opData.count ?? 0) : 0;
-                    return count > 0;
-                });
+                const hasStock = Object.values(serviceData).some(opData => normalizeOperatorData(opData).available);
 
                 if (hasStock) {
                     const isoCode = this.reverseCountryMap[countryCode];
@@ -413,8 +411,7 @@ class OnlineSimProvider {
     //  NUMBER ACQUISITION
     // ═══════════════════════════════════════════════════════════
 
-    
-    async getNumber(country = 'US', service = 'Any', preferredOperator = 'any') {
+async getNumber(country = 'US', service = 'Any', preferredOperator = 'any') {
         const startTime = Date.now();
 
         try {
@@ -796,3 +793,4 @@ class OnlineSimProvider {
 }
 
 export default OnlineSimProvider;
+                
