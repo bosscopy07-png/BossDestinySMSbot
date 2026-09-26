@@ -465,15 +465,27 @@ export const PAGINATION = {
 };
 
 /**
-* Cache TTLs (milliseconds) — INCREASED to prevent rate limits
+* Cache TTLs (milliseconds)
+*
+* CORE REQUIREMENT #6: static configuration and live inventory are cached
+* very differently on purpose:
+*   - Things that don't change during a deployment (service name lists,
+*     provider health snapshots) can stay cached longer.
+*   - Live SMS number inventory (tierPrices, countryStock, productsCatalog)
+*     changes constantly — a 60-minute cache here is what caused the bot to
+*     keep quoting/selling operators that had been empty for the better part
+*     of an hour. These are now short-lived browsing caches only; anything
+*     about to spend the user's money (an actual purchase attempt) bypasses
+*     these entirely via the forceRefresh/skipCache paths in
+*     TierOperatorSelector and CheapPanelProvider.
 */
 export const CACHE_TTL = {
-   tierPrices: 60 * 60 * 1000,        // 60 minutes (was 30 seconds)
-   countryStock: 60 * 60 * 1000,       // 60 minutes
-   serviceList: 60 * 60 * 1000,        // 60 minutes
-   providerHealth: 10 * 60 * 1000,     // 10 minutes
-   productsCatalog: 60 * 60 * 1000,    // 60 minutes
-   balance: 5 * 60 * 1000              // 5 minutes
+   tierPrices: 60 * 1000,              // 60 seconds — live inventory (menu display only)
+   countryStock: 60 * 1000,            // 60 seconds — live inventory (menu display only)
+   serviceList: 60 * 60 * 1000,        // 60 minutes — static: service name catalog
+   providerHealth: 10 * 60 * 1000,     // 10 minutes — static-ish: provider up/down
+   productsCatalog: 60 * 1000,         // 60 seconds — live inventory (menu display only)
+   balance: 5 * 60 * 1000              // 5 minutes — account balance
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -540,4 +552,5 @@ export function applyTierPricing(basePrice, tierKey = 'budget') {
        (basePrice * tier.priceMultiplier).toFixed(2)
    );
        }
-       
+
+   
