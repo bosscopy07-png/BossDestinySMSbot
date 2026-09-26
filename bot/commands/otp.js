@@ -2520,9 +2520,8 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
         }
         }
                             
-                                                                  
-                  
-    async handleTierCountrySelect(ctx, countryCode) {
+
+async handleTierCountrySelect(ctx, countryCode) {
     const userId = ctx.from.id.toString();
     const service = ctx.session?.otpService;
     const tierKey = ctx.session?.selectedTier;
@@ -2599,4 +2598,401 @@ async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
             const message = 
                 `💰 <b>Insufficient Balance</b>\n\n` +
                 `Required: ${formatCurrency(selection.displayPrice)}\n` +
-                `Available: ${formatCurrency(this._get
+                `Available: ${formatCurrency(this._getAvailableBalance(user))}\n\n` +
+                `Price varies by operator quality. Please deposit more.`;
+                
+            return this.sendPhotoWithCaption(
+                ctx, IMAGES.cheapMode, message,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('💳 Deposit', 'deposit')],
+                    [Markup.button.callback('🔙 Back', `tier_${tierKey}`)]
+                ]), 'HTML'
+            );
+        }
+
+        const cheapProvider = this.smsProviderManager?.getProvider('CHEAP_PANEL');
+        if (!cheapProvider) {
+            throw new Error('CHEAP_PROVIDER_NOT_AVAILABLE');
+                                                                   }
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  CORE REQUIREMENT #4/#5: AUTOMATIC IN-REQUEST FALLBACK
+        //  Do not tell the user "no free number" just because the single
+        //  best-scored operator failed at the exact moment of purchase (it may
+        //  have sold out between menu display and button press). Silently try
+        //  a few more eligible operators in the same tier before ever falling
+        //  back to asking the user to pick manually. No balance is touched
+        //  until one of these attempts actually succeeds, so retrying here is
+        //  free of double-charge risk (see SessionManager._handleFinances,
+        //  which only runs once, after a successful getNumber()).
+        // ═══════════════════════════════════════════════════════════════════
+        const MAX_AUTO_FALLBACK_ATTEMPTS = 3;
+        let cheapResult = null;
+        let lastAttemptError = null;
+
+        try {
+            attemptedOperators.push(selection.operator);
+            cheapResult = await cheapProvider.getNumber(countryCode, service, selection.operator);
+        } catch (firstError) {
+            lastAttemptError = firstError;
+            const isRecoverable = /NO_NUMBERS|NOT_AVAILABLE|OUT_OF_STOCK/i.test(firstError.message || '');
+
+            if (isRecoverable) {
+                logger.warn('Primary operator failed at purchase time, attempting automatic fallback', {
+                    userId, tierKey, countryCode, service,
+                    failedOperator: selection.operator,
+                    error: firstError.message
+                });
+
+                // Try a few more cached candidates first, then one live-refreshed
+                // batch, before giving up automatically.
+                for (const forceRefresh of [false, true]) {
+                    if (cheapResult) break;
+
+                    const candidates = await this.tierSelector.getFallbackOperators(
+                        tierKey, countryCode, service, selection.operator, { forceRefresh }
+                    ).catch(() => []);
+
+                    for (const candidate of candidates) {
+                        if (cheapResult || attemptedOperators.includes(candidate.operator)) continue;
+                        if (attemptedOperators.length >= MAX_AUTO_FALLBACK_ATTEMPTS) break;
+
+                        // Re-check balance against this candidate's own price —
+                        // different operators in the tier can be priced differently.
+                        if (this._getAvailableBalance(user) < (candidate.displayPrice ?? candidate.price ?? 0)) {
+                            continue;
+                        }
+
+                        attemptedOperators.push(candidate.operator);
+                        try {
+                            logger.info('Auto-fallback attempting operator', {
+                                userId, tierKey, countryCode, service, operator: candidate.operator
+                            });
+                            cheapResult = await cheapProvider.getNumber(countryCode, service, candidate.operator);
+                            selection = candidate; // so downstream messaging reflects the operator actually purchased
+                        } catch (fallbackErr) {
+                            lastAttemptError = fallbackErr;
+                            if (!/NO_NUMBERS|NOT_AVAILABLE|OUT_OF_STOCK/i.test(fallbackErr.message || '')) {
+                                throw fallbackErr; // non-recoverable — stop retrying, surface immediately
+                            }
+                            logger.warn('Auto-fallback operator also failed', {
+                                userId, operator: candidate.operator, error: fallbackErr.message
+                            });
+                        }
+                    }
+                }
+            }
+
+            if (!cheapResult) {
+                // Automatic fallback exhausted — fall through to the existing
+                // manual "choose alternative operator" UI in the catch block below.
+                throw lastAttemptError || firstError;
+            }
+        }
+
+        try {
+            if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
+        } catch (delErr) {
+            logger.debug('Failed to delete loading message', { error: delErr.message });
+        }
+
+                // FIXED: Pass operator and routedProvider to session
+        const session = await sessionManager.createSessionWithNumber(
+            userId, 
+            'CHEAP', 
+            service, 
+            countryCode,
+            cheapResult.phoneNumber,
+            cheapResult.provider,
+            cheapResult.providerNumberId,
+            cheapResult.displayCost || selection.displayPrice,
+            selection.operator,           // ← FIXED: Pass selected operator
+            selection.providerKey         // ← FIXED: Pass provider key (5sim/smspool/etc)
+        );
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  AUTO-OTP: Start polling immediately after purchase
+        //  This checks every 5 seconds and auto-sends OTP when received
+        // ═══════════════════════════════════════════════════════════════════════
+        if (this.sessionManager && session?.sessionId) {
+            this.startAutoOTPCheck(session.sessionId, ctx, 5000);
+            logger.info('Auto OTP polling started', { 
+                sessionId: session.sessionId, 
+                userId,
+                interval: '5s' 
+            });
+        }
+
+    
+        // FIXED: Store session info for auto-OTP delivery
+        ctx.session.tierOperator = selection.operator;
+        ctx.session.tierKey = tierKey;
+        ctx.session.selectedCountry = countryCode;
+        
+        // FIXED: Clear fallback operator after successful purchase
+        delete ctx.session.fallbackOperator;
+
+        const message = 
+            `📱 <b>OTP Request Started</b>\n\n` +
+            `🌍 Mode: CHEAP (${tierKey.toUpperCase()})\n` +
+            `📱 Number: <code>${session.number}</code>\n` +
+            `🎯 Service: ${service}\n` +
+            `🏢 Operator: <code>${selection.operator}</code>\n` +
+            `⏳ Status: Waiting for OTP...\n` +
+            `💰 Cost: ${formatCurrency(session.cost)}\n` +
+            `⭐ Quality Score: ${selection.score.toFixed(2)}\n` +
+            `⏱ Timeout: ${Math.floor((session.timeoutAt - new Date()) / 1000)}s\n\n` +
+            `⚠️ Funds locked. Will be deducted on delivery.\n` +
+            `Cancel anytime to get full refund.`;
+
+        const keyboard = KEYBOARDS.otpActions(session.sessionId);
+        const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
+
+        // FIXED: Store message info for auto-OTP delivery editing
+        if (sentMessage?.message_id) {
+            ctx.session.lastOtpMessageId = sentMessage.message_id;
+            ctx.session.lastOtpChatId = ctx.chat?.id;
+            
+            await this._scheduleTimeoutNotification(
+                userId, session.sessionId, sentMessage.message_id, session.timeoutAt
+            );
+        }
+
+    } catch (error) {
+        try {
+            if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
+        } catch (delErr) {}
+
+        logger.error('Tier country purchase failed', {
+            userId, tierKey, countryCode, service, error: error.message
+        });
+
+        // FIXED: Clear fallback operator on any error so next attempt starts fresh
+        delete ctx.session.fallbackOperator;
+
+        if (error.message?.includes('NO_NUMBERS') || error.message?.includes('NOT_AVAILABLE') || error.message?.includes('FALLBACK_EXPIRED')) {
+            try {
+                // Exclude the primary failed operator AND every operator the
+                // automatic in-request fallback above already tried (and failed),
+                // so we don't show the user an alternative we already know is empty.
+                const failedOperator = selection?.operator || fallbackOperator;
+                const triedSet = new Set([failedOperator, ...attemptedOperators].filter(Boolean));
+
+                const fallbackOps = (await this.tierSelector.getFallbackOperators(
+                    tierKey, countryCode, service, failedOperator, { forceRefresh: true }
+                )).filter(op => !triedSet.has(op.operator));
+                
+                if (fallbackOps && fallbackOps.length > 0) {
+                    const message = 
+                        `⚠️ <b>Primary Operator Unavailable</b>\n\n` +
+                        `Operator <code>${failedOperator || 'unknown'}</code> ran out of stock.\n\n` +
+                        `Available alternatives in ${tierKey} tier:`;
+
+                    const buttons = fallbackOps.slice(0, 3).map(op => [
+                        Markup.button.callback(
+                            `🏢 ${op.operator} — ${formatCurrency(op.displayPrice || op.price)}`,
+                            `tier_fallback_${op.operator}`
+                        )
+                    ]);
+
+                    buttons.push([Markup.button.callback('🔙 Back to Countries', `tier_${tierKey}`)]);
+                    
+                    return this.sendPhotoWithCaption(ctx, IMAGES.otpFailed, message, Markup.inlineKeyboard(buttons), 'HTML');
+                }
+            } catch (fallbackError) {
+                logger.error('Fallback display failed', { error: fallbackError.message });
+            }
+        }
+
+        const errorMessages = {
+            NO_NUMBERS: '❌ No numbers available for this operator. Try another country or tier.',
+            NO_BALANCE: '💰 Provider balance insufficient. Contact support.',
+            NOT_AVAILABLE: '❌ Service not available in this country for selected tier.',
+            TIMEOUT: '⏱ Operator selection timed out. Please try again.',
+            INSUFFICIENT_BALANCE: '💰 Your balance is too low for this selection.',
+            FALLBACK_EXPIRED: '❌ Selected operator is no longer available. Please try again.'
+        };
+
+        const errorKey = Object.keys(errorMessages).find(key => error.message?.includes(key));
+        const displayMessage = errorMessages[errorKey] || `❌ Error: ${error.message}`;
+
+        await this.sendPhotoWithCaption(
+            ctx, IMAGES.otpFailed, 
+            displayMessage,
+            Markup.inlineKeyboard([
+                [Markup.button.callback('🔄 Retry', `tier_country_${countryCode}`)],
+                [Markup.button.callback('🔙 Back to Countries', `tier_${tierKey}`)],
+                [Markup.button.callback('📞 Support', 'contact_support')]
+            ]), 'HTML'
+        );
+    }
+            }
+                
+            
+    /**
+     * Start automatic OTP polling for a session
+     * Single photo message with bold box and copyable code button
+     */
+    startAutoOTPCheck(sessionId, ctx, intervalMs = 5000) {
+let checkCount = 0;
+const maxChecks = 36;
+
+const checkInterval = setInterval(async () => {
+    checkCount++;
+
+    try {
+        const status = await this.sessionManager.checkSessionStatus(sessionId);
+
+        if (status.status === 'RECEIVED' && status.otpCode) {
+            clearInterval(checkInterval);
+
+            const otpCode = status.otpCode;
+
+            const caption = `
+
+🔓 <b>OTP RECEIVED</b>
+
+📱 <b>Number:</b>
+<code>${status.number}</code>
+
+🎯 <b>Service:</b> ${status.service}
+⏱️ <b>Time:</b> ${checkCount * 5}s
+━━━━━━━━━━━━━━━
+🔐 <b>OTP CODE</b>
+
+<code>${otpCode}</code>
+━━━━━━━━━━━━━━━
+⚠️ Do not share this code with anyone.
+`.trim();
+
+            const keyboard = {
+                inline_keyboard: [
+                    [
+                        {
+                            text: `🔐 Copy OTP: ${otpCode}`,
+                            copy_text: {
+                                text: otpCode
+                            }
+                        }
+                    ],
+                    [
+                        {
+                            text: '📱 New OTP',
+                            callback_data: 'mode_cheap'
+                        },
+                        {
+                            text: '🔙 Menu',
+                            callback_data: 'menu'
+                        }
+                    ]
+                ]
+            };
+
+            await ctx.telegram.sendPhoto(
+                ctx.from.id,
+                IMAGES.otpRequested,
+                {
+                    caption,
+                    parse_mode: 'HTML',
+                    reply_markup: keyboard
+                }
+            );
+
+            logger.info('Auto OTP delivered', {
+                sessionId,
+                userId: ctx.from.id
+            });
+
+            return;
+        }
+
+        if (!['WAITING', 'CHECKING'].includes(status.status)) {
+            clearInterval(checkInterval);
+            return;
+        }
+
+        
+
+    } catch (error) {
+        logger.error('Auto OTP check error', {
+            sessionId,
+            error: error.message
+        });
+    }
+}, intervalMs);
+
+    }
+           
+        async handleCopyOTP(ctx) {
+        const otpCode = ctx.match[1];
+        
+        try {
+            // Show alert popup with code — user can long-press to copy
+            await ctx.answerCbQuery(`📋 ${otpCode}`, { show_alert: true });
+            
+            // Also send a separate copyable message that auto-deletes
+            const copyMsg = await ctx.telegram.sendMessage(ctx.from.id, `<code>${otpCode}</code>`, {
+                parse_mode: 'HTML'
+            });
+            
+            // Auto-delete after 30 seconds to keep chat clean
+            setTimeout(async () => {
+                try {
+                    await ctx.telegram.deleteMessage(ctx.from.id, copyMsg.message_id);
+                } catch (e) {}
+            }, 30000);
+            
+            logger.debug('OTP copy triggered', { userId: ctx.from.id });
+        } catch (error) {
+            logger.error('Copy OTP failed', { error: error.message });
+        }
+        }
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    //  NEW: Pagination Handlers
+    // ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SERVICE PAGE NAVIGATION — Edit existing message
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleTierServicePage(ctx, page) {
+        try {
+            await ctx.answerCbQuery(`Page ${page}`);
+            
+            // Just call showServiceSelection which handles editing
+            await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode, null, page);
+            
+        } catch (error) {
+            logger.error('handleTierServicePage failed', { error: error.message, page });
+            ctx.answerCbQuery('❌ Error loading page').catch(() => {});
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  COUNTRY PAGE NAVIGATION — Edit existing message
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleTierCountryPage(ctx, page) {
+        const service = ctx.session?.otpService;
+        const tierKey = ctx.session?.selectedTier;
+
+        if (!service || !tierKey) {
+            return ctx.answerCbQuery('❌ Session expired', { show_alert: true });
+        }
+
+        try {
+            await ctx.answerCbQuery(`Page ${page}`);
+            await this.showTierCountrySelection(ctx, service, tierKey, page);
+        } catch (error) {
+            logger.error('handleTierCountryPage failed', { error: error.message, page, service, tierKey });
+            ctx.answerCbQuery('❌ Error loading page').catch(() => {});
+        }
+    }
+        
+    // ═══════════════════════════════════════════════════════════════════════
+    //  NEW: Search Handlers
+    //  FIXED: Async calls to searchServices()
+    // ═══════════════════════════════════════════════════════════════════════
+    async handleTierSearchService(ctx, query) {
+        if (!query || query.trim().length < 2) {
+            return ctx.reply('❌ Please enter at least 2 characte
