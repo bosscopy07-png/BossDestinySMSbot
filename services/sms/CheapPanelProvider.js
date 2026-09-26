@@ -11,6 +11,7 @@
 import axios from 'axios';
 import logger from '../../utils/logger.js';
 import config from '../../config/env.js';
+import { normalizeOperatorData, normalizeServiceOperators } from '../../utils/providerNormalize.js';
 
 const BASE_PROFIT = 0.10;
 
@@ -330,10 +331,15 @@ class CheapPanelProvider {
         this._requestQueue = [];
         this._isProcessingQueue = false;
 
-        // ─── CACHE: 60 minutes for products, 5 minutes for balance ───────────────
+        // ─── CACHE: SHORT-LIVED for products (live SMS inventory), 5 min for balance ──
+        // CORE REQUIREMENT #6: Inventory (stock) changes constantly. A 60-minute
+        // cache here is what caused the bot to keep quoting/selling operators that
+        // had gone out of stock long ago. Static data (tier ranges, service maps)
+        // stays cached; live inventory gets a short TTL and purchase-time calls
+        // can force a bypass entirely via getProducts(true).
         this.productsCache = null;
         this.productsCacheTime = 0;
-        this.productsCacheTtl = 60 * 60 * 1000; // 60 minutes
+        this.productsCacheTtl = 60 * 1000; // 60 seconds — browsing/menu cache only
 
         this.balanceCache = null;
         this.balanceCacheTime = 0;
@@ -365,14 +371,16 @@ class CheapPanelProvider {
         // Initial prewarm
         this.prewarmCache().catch(() => {});
         
-        // Refresh every 50 minutes (before 60min expiry)
+        // Refresh just before the (now short) productsCacheTtl expires, so the
+        // browsing/menu cache stays warm without every menu view forcing a live
+        // 5SIM call. Purchase-time checks still force a live refresh separately.
         this._prewarmInterval = setInterval(() => {
             if (this.isActive) {
                 this.prewarmCache().catch(err => 
                     logger.debug('Prewarm failed', { error: err.message })
                 );
             }
-        }, 50 * 60 * 1000);
+        }, Math.max(30 * 1000, this.productsCacheTtl - 10 * 1000));
     }
 
     async prewarmCache() {
@@ -648,14 +656,14 @@ class CheapPanelProvider {
         let cheapestOperator = null;
         let totalStock = 0;
 
-        for (const [operatorName, operatorData] of Object.entries(serviceData)) {
-            const count = typeof operatorData === 'object' ? (operatorData.count ?? 0) : 0;
-            const price = typeof operatorData === 'object' ? (operatorData.cost ?? operatorData.price ?? Infinity) : Infinity;
-            
-            totalStock += count;
-            if (count > 0 && price < minPrice) {
+        // CORE REQUIREMENT #1 & #3: inspect every operator returned for this
+        // country+service (not just the first / not just lowercase fields),
+        // and never let one out-of-stock operator hide another one with stock.
+        for (const { operator, stock, price, available } of normalizeServiceOperators(serviceData)) {
+            totalStock += stock;
+            if (available && price < minPrice) {
                 minPrice = price;
-                cheapestOperator = operatorName;
+                cheapestOperator = operator;
             }
         }
 
@@ -712,10 +720,7 @@ class CheapPanelProvider {
 
                 if (!serviceData) continue;
 
-                const hasStock = Object.values(serviceData).some(opData => {
-                    const count = typeof opData === 'object' ? (opData.count ?? 0) : 0;
-                    return count > 0;
-                });
+                const hasStock = Object.values(serviceData).some(opData => normalizeOperatorData(opData).available);
 
                 if (hasStock) {
                     const isoCode = this.reverseCountryMap[simCountry];
@@ -810,9 +815,12 @@ class CheapPanelProvider {
     //  GET PRODUCTS (60min cache)
     // ═══════════════════════════════════════════════════════════
 
-    async getProducts() {
+    async getProducts(forceRefresh = false) {
         const now = Date.now();
-        if (this.productsCache && (now - this.productsCacheTime) < this.productsCacheTtl) {
+        // CORE REQUIREMENT #5: purchase-time callers pass forceRefresh=true to
+        // bypass the browsing cache entirely and hit the live provider catalog,
+        // since inventory can change between "menu shown" and "buy pressed".
+        if (!forceRefresh && this.productsCache && (now - this.productsCacheTime) < this.productsCacheTtl) {
             return this.productsCache;
         }
 
@@ -840,7 +848,7 @@ class CheapPanelProvider {
     //  CHECK AVAILABILITY (with service fallback)
     // ═══════════════════════════════════════════════════════════
 
-    async checkAvailability(country, service) {
+    async checkAvailability(country, service, forceRefresh = false) {
         try {
             const providerCountry = this.mapCountry(country);
             const providerService = this.mapService(service);
@@ -868,7 +876,7 @@ class CheapPanelProvider {
                 }
                 
                 if (!response) {
-                    const products = await this.getProducts();
+                    const products = await this.getProducts(forceRefresh);
                     if (!products) {
                         return { available: false, error: 'Failed to fetch product catalog' };
                     }
@@ -877,7 +885,7 @@ class CheapPanelProvider {
             }
 
             if (response.status >= 400) {
-                const products = await this.getProducts();
+                const products = await this.getProducts(forceRefresh);
                 if (!products) {
                     return { available: false, error: `Failed to fetch product catalog. HTTP ${response.status}` };
                 }
@@ -921,12 +929,10 @@ class CheapPanelProvider {
 
         const operators = serviceData;
         const operatorNames = Object.keys(operators);
-        
-        const hasStock = operatorNames.some(opName => {
-            const op = operators[opName];
-            const count = typeof op === 'object' ? (op.count ?? 0) : (typeof op === 'number' ? op : 0);
-            return count > 0;
-        });
+
+        // CORE REQUIREMENT #1: a single unavailable operator must never make the
+        // whole lookup unavailable — check every operator's normalized stock.
+        const hasStock = operatorNames.some(opName => normalizeOperatorData(operators[opName]).available);
 
         return { 
             available: hasStock, 
@@ -957,7 +963,11 @@ class CheapPanelProvider {
                 throw new Error('NO_BALANCE: Insufficient 5SIM balance. Fund wallet at 5sim.net');
             }
 
-            const availability = await this.checkAvailability(country, service);
+            // CORE REQUIREMENT #5: this is the purchase-time check, not the menu
+            // browsing check — force a live catalog fetch if we have to fall back
+            // to the cached catalog path, since stock can change between the user
+            // opening the menu and pressing buy.
+            const availability = await this.checkAvailability(country, service, true);
             if (!availability.available) {
                 throw new Error(`NOT_AVAILABLE: ${service} not available in ${country}. ${availability.error || ''}`);
             }
@@ -1321,12 +1331,10 @@ class CheapPanelProvider {
             return { success: false, error: error.message, status: 'ERROR' };
         }
     }
-
-    // ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
     //  FINISH NUMBER (uses queuedRequest)
     // ═══════════════════════════════════════════════════════════
-
-    async finishNumber(activationId) {
+async finishNumber(activationId) {
         try {
             if (!activationId) {
                 return { success: false, error: 'MISSING_ACTIVATION_ID' };
@@ -1500,3 +1508,4 @@ class CheapPanelProvider {
 }
 
 export default CheapPanelProvider;
+            
