@@ -12,6 +12,7 @@
 
 import { TIER_CONFIG, CACHE_TTL } from '../config/tierConfig.js';
 import logger from '../utils/logger.js';
+import { normalizeOperatorData } from '../utils/providerNormalize.js';
 
 /**
  * TierOperatorSelector — Selects best operator per tier from live provider data
@@ -35,13 +36,15 @@ class TierOperatorSelector {
     constructor(providers = []) {
         this.providers = providers.filter(p => p?.isActive);
         
-        // Cache for operator selections
+        // Cache for operator selections — SHORT-LIVED. This is live SMS
+        // inventory (CORE REQUIREMENT #6), not static config, so it must not
+        // be cached for anywhere near as long as tier ranges/service maps are.
         this._selectionCache = new Map();
-        this._cacheTtl = CACHE_TTL.tierPrices || 60 * 60 * 1000;
+        this._cacheTtl = CACHE_TTL.tierPrices || 60 * 1000;
         
-        // Full catalog cache per provider
+        // Full catalog cache per provider — same reasoning as above.
         this._catalogCache = new Map();
-        this._catalogTtl = CACHE_TTL.productsCatalog || 60 * 60 * 1000;
+        this._catalogTtl = CACHE_TTL.productsCatalog || 60 * 1000;
 
         // Provider fallback priority order
         this._providerPriority = ['CHEAP_PANEL', 'SMSPOOL', 'HERO_SMS', 'ONLINE_SIM'];
@@ -68,7 +71,7 @@ class TierOperatorSelector {
             providers: this.providers.map(p => ({ name: p.name, key: p.providerKey })),
             weights: this._weights,
             priceBaseline: this._priceBaseline,
-            cacheTtl: '60min'
+            cacheTtl: `${this._cacheTtl}ms`
         });
     }
 
@@ -114,33 +117,42 @@ class TierOperatorSelector {
     // ═══════════════════════════════════════════════════════════════════════
 
     /**
-     * Get full catalog from provider (cached 60min)
+     * Get full catalog from provider (short-lived cache; see CACHE_TTL.productsCatalog).
+     *
+     * @param {*} provider
+     * @param {boolean} forceRefresh CORE REQUIREMENT #5 — when true (purchase-time
+     *   calls), bypass this selector's own catalog cache AND ask the provider
+     *   itself to bypass its cache, so we read live inventory right before buying.
      */
-    async _getCatalog(provider) {
+    async _getCatalog(provider, forceRefresh = false) {
         const now = Date.now();
-        const cached = this._catalogCache.get(provider.providerKey);
-        
-        if (cached && (now - cached.timestamp) < this._catalogTtl) {
-            return cached.catalog;
+
+        if (!forceRefresh) {
+            const cached = this._catalogCache.get(provider.providerKey);
+            if (cached && (now - cached.timestamp) < this._catalogTtl) {
+                return cached.catalog;
+            }
+
+            if (provider.productsCache && (now - provider.productsCacheTime) < provider.productsCacheTtl) {
+                this._catalogCache.set(provider.providerKey, {
+                    catalog: provider.productsCache,
+                    timestamp: now
+                });
+                return provider.productsCache;
+            }
         }
-        
-        if (provider.productsCache && (now - provider.productsCacheTime) < provider.productsCacheTtl) {
-            this._catalogCache.set(provider.providerKey, {
-                catalog: provider.productsCache,
-                timestamp: now
-            });
-            return provider.productsCache;
-        }
-        
-        const catalog = await provider.getProducts();
-        
+
+        const catalog = typeof provider.getProducts === 'function'
+            ? await provider.getProducts(forceRefresh)
+            : null;
+
         if (catalog) {
             this._catalogCache.set(provider.providerKey, {
                 catalog,
                 timestamp: now
             });
         }
-        
+
         return catalog;
     }
 
@@ -200,9 +212,11 @@ class TierOperatorSelector {
             throw new Error(`INVALID_TIER: ${tierKey}`);
         }
 
-        // Step 1: Query ALL providers for ALL operators matching this country+service
+        // Step 1: Query ALL providers for ALL operators matching this country+service.
+        // options.skipCache (set by purchase-time callers) forces a live re-fetch of
+        // provider inventory rather than reusing the browsing cache (Core Req #5/#6).
         const allCandidates = await this._queryAllProvidersForCountryService(
-            tierKey, country, service
+            tierKey, country, service, !!options.skipCache
         );
         
         if (allCandidates.length === 0) {
@@ -283,7 +297,7 @@ class TierOperatorSelector {
      * KEY FIX: Previously this would stop when it found operators from the first
      * provider. Now it collects from ALL providers and lets scoring decide.
      */
-    async _queryAllProvidersForCountryService(tierKey, country, service) {
+    async _queryAllProvidersForCountryService(tierKey, country, service, forceRefresh = false) {
         const allResults = [];
         const errors = [];
         const seenOperators = new Set(); // Track to avoid duplicates
@@ -293,7 +307,7 @@ class TierOperatorSelector {
         for (const provider of sortedProviders) {
             try {
                 const providerResults = await this._queryProviderForCountryService(
-                    provider, tierKey, country, service
+                    provider, tierKey, country, service, forceRefresh
                 );
                 
                 for (const op of providerResults) {
@@ -327,13 +341,13 @@ class TierOperatorSelector {
      * we ask the provider: "for this country and service, what virtuals do you have?"
      * Then we filter those virtuals by our tier range.
      */
-    async _queryProviderForCountryService(provider, tierKey, country, service) {
+    async _queryProviderForCountryService(provider, tierKey, country, service, forceRefresh = false) {
         const tier = TIER_CONFIG[tierKey];
         const providerCountry = provider.mapCountry ? provider.mapCountry(country) : country;
         const providerService = provider.mapService ? provider.mapService(service) : service;
 
-        // Fetch provider's catalog
-        const catalog = await this._getCatalog(provider);
+        // Fetch provider's catalog (live, un-cached, when forceRefresh is set)
+        const catalog = await this._getCatalog(provider, forceRefresh);
         if (!catalog) {
             return [];
         }
@@ -366,20 +380,20 @@ class TierOperatorSelector {
         const candidates = [];
         
         // serviceData = { virtual1: {count: 5, cost: 0.25}, virtual2: {...}, ... }
-        // We iterate ALL virtuals returned by provider for this country+service
+        // CORE REQUIREMENT #1: we iterate ALL virtuals returned by provider for
+        // this country+service — never stop at the first one, and never let one
+        // out-of-stock operator hide another one with stock in the same tier.
         for (const [operatorName, operatorData] of Object.entries(serviceData)) {
             // Only consider virtual operators
             if (!operatorName.startsWith('virtual')) continue;
-            
-            const count = typeof operatorData === 'object' 
-                ? (operatorData.count ?? operatorData.qty ?? operatorData.stock ?? 0) 
-                : 0;
-            
-            const price = typeof operatorData === 'object' 
-                ? (operatorData.cost ?? operatorData.price ?? Infinity) 
-                : Infinity;
-            
-            if (count <= 0 || price <= 0 || price === Infinity) continue;
+
+            // CORE REQUIREMENT #3: normalize count/qty/Qty/stock and cost/price/Price
+            // in one place instead of re-guessing field names here.
+            const { stock: count, price, available } = normalizeOperatorData(operatorData);
+
+            // CORE REQUIREMENT #2: price existing is not proof of availability —
+            // only actual stock makes an operator a candidate.
+            if (!available) continue;
             
             // Extract virtual number
             const match = operatorName.match(/virtual(\d+)/);
@@ -653,15 +667,17 @@ class TierOperatorSelector {
      * Get fallback operators within SAME tier (excluding failed one)
      * Returns ranked list of alternatives from ALL providers
      */
-    async getFallbackOperators(tierKey, country, service, excludeOperator = null) {
+    async getFallbackOperators(tierKey, country, service, excludeOperator = null, options = {}) {
         const tier = TIER_CONFIG[tierKey];
         if (!tier || !tier.fallbackWithinTier) {
             return [];
         }
 
-        // Get ALL operators in tier from ALL providers
+        // Get ALL operators in tier from ALL providers. During an active purchase
+        // fallback sequence, pass forceRefresh so a stale cache doesn't keep
+        // suggesting an operator that just went out of stock (Core Req #5).
         const allResults = await this._queryAllProvidersForCountryService(
-            tierKey, country, service
+            tierKey, country, service, !!options.forceRefresh
         );
         
         // Filter out excluded operator
@@ -789,16 +805,10 @@ class TierOperatorSelector {
                         
                         const opNum = parseInt(match[1]);
                         if (opNum < tier.operatorRange.min || opNum > tier.operatorRange.max) continue;
-                        
-                        const count = typeof operatorData === 'object' 
-                            ? (operatorData.count ?? operatorData.qty ?? operatorData.stock ?? 0) 
-                            : 0;
-                        
-                        const price = typeof operatorData === 'object' 
-                            ? (operatorData.cost ?? operatorData.price ?? Infinity) 
-                            : Infinity;
 
-                        if (count > 0 && price > 0 && price !== Infinity) {
+                        const { stock: count, price, available } = normalizeOperatorData(operatorData);
+
+                        if (available) {
                             hasStock = true;
                             if (price < bestPrice) {
                                 bestPrice = price;
@@ -855,4 +865,5 @@ class TierOperatorSelector {
 }
 
 export default TierOperatorSelector;
-            
+
+        
