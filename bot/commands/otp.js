@@ -897,4 +897,451 @@ setupTextHandlers() {
     escapeTelegramText(text) {
         if (!text) return '';
         return text
-            .rep
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#x27;')
+            .replace(/\*/g, '\\*')
+            .replace(/_/g, '\\_')
+            .replace(/\[/g, '\\[')
+            .replace(/\]/g, '\\]')
+            .replace(/\(/g, '\\(')
+            .replace(/\)/g, '\\)')
+            .replace(/`/g, '\\`');
+    }
+
+    formatPollStatus(status) {
+        if (status.status === 'POLLING') {
+            return `⏳ *Checking inbox...*\n(${status.message || '...'})`;
+        }
+        if (status.status === 'RECEIVED') {
+            return `🔍 *SMS detected! Processing...*`;
+        }
+        return `⚠️ ${this.escapeTelegramText(status.message || status.error || '...')}`;
+    }
+
+ 
+    async sendPollUpdate(ctx, status) {
+        const message = this.formatPollStatus(status);
+        try {
+            if (ctx.session?.pollMessageId) {
+                try {
+                    await ctx.telegram.editMessageText(
+                        ctx.chat.id,
+                        ctx.session.pollMessageId,
+                        undefined,
+                        message,
+                        { parse_mode: 'Markdown' }
+                    );
+                    return;
+                } catch (editError) {
+                    // Message too old or can't edit, fall through
+                }
+            }
+            const sent = await ctx.reply(message, { parse_mode: 'Markdown' });
+            if (sent?.message_id) {
+                ctx.session = ctx.session || {};
+                ctx.session.pollMessageId = sent.message_id;
+            }
+        } catch (error) {
+            logger.debug('Poll update failed', { error: error.message });
+        }
+    }
+    
+    maskPhone(phone) {
+        if (!phone) return '****';
+        const str = phone.toString();
+        if (str.length < 4) return '****';
+        return str.slice(0, -4).replace(/./g, '*') + str.slice(-4);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SESSION MANAGEMENT HELPERS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async _getActiveSession(userId) {
+        return Session.findOne({ 
+            userId, 
+            status: { $in: ['WAITING', 'CHECKING', 'RECEIVED'] } 
+        }).sort({ createdAt: -1 });
+    }
+
+    async _scheduleTimeoutNotification(userId, sessionId, originalMessageId, timeoutAt) {
+        try {
+            const delayMs = new Date(timeoutAt) - new Date();
+            if (delayMs <= 0) return;
+
+            if (!this._timeoutTimers) this._timeoutTimers = new Map();
+            
+            if (this._timeoutTimers.has(sessionId)) {
+                clearTimeout(this._timeoutTimers.get(sessionId));
+            }
+
+            const timer = setTimeout(async () => {
+                this._timeoutTimers?.delete(sessionId);
+
+                logger.info('Timeout fired, calling SessionManager.handleTimeout', { sessionId, userId });
+
+                try {
+                    const result = await sessionManager.handleTimeout(sessionId);
+
+                    if (!result) {
+                        logger.info('Timeout: session already handled by SessionManager', { sessionId });
+                        return;
+                    }
+
+                    const timeoutMessage =
+                        `⏰ <b>OTP Request Timed Out</b>\n\n` +
+                        `⏱ Your OTP request has expired.\n\n` +
+                        `💰 Any locked funds have been returned to your balance.\n\n` +
+                        `You can request a new OTP with /otp`;
+
+                    await this.bot.telegram.sendMessage(userId, timeoutMessage, {
+                        parse_mode: 'HTML',
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('🔄 Request New OTP', 'menu')],
+                            [Markup.button.callback('📞 Contact Support', 'contact_support')]
+                        ]).reply_markup
+                    });
+
+                } catch (err) {
+                    logger.error('Timeout handling failed', { sessionId, error: err.message });
+                }
+            }, Math.min(delayMs, 2147483647));
+
+            this._timeoutTimers.set(sessionId, timer);
+
+        } catch (error) {
+            logger.error('Failed to schedule timeout', { userId, sessionId, error: error.message });
+        }
+    }
+
+    async handleCancel(ctx, isTimeout = false) {
+        const userId = ctx.from.id.toString();
+
+        try {
+            const activeSession = await Session.findOne({ 
+                userId, 
+                status: { $in: ['WAITING', 'CHECKING'] } 
+            });
+            
+            if (!activeSession && isTimeout) {
+                logger.info('Timeout: no active session to cancel', { userId });
+                return;
+            }
+
+            if (!activeSession && !isTimeout) {
+                const timedOutSession = await Session.findOne({
+                    userId,
+                    status: 'TIMEOUT'
+                }).sort({ endTime: -1 });
+
+                if (timedOutSession) {
+                    return this.sendPhotoWithCaption(ctx, IMAGES.default,
+                        '⏰ This session has already expired.\n\nYou can request a new OTP with /otp',
+                        Markup.inlineKeyboard([
+                            [Markup.button.callback('🔄 Request New OTP', 'menu')],
+                            [Markup.button.callback('📞 Contact Support', 'contact_support')]
+                        ]), 'HTML'
+                    );
+                }
+
+                return this.sendPhotoWithCaption(ctx, IMAGES.default, 
+                    '❌ No active session to cancel.',
+                    KEYBOARDS.backToMenu(), 'HTML'
+                );
+            }
+
+            const sessionId = activeSession.sessionId;
+
+            if (this._timeoutTimers?.has(sessionId)) {
+                clearTimeout(this._timeoutTimers.get(sessionId));
+                this._timeoutTimers.delete(sessionId);
+            }
+
+            if (sessionManager && sessionManager.pollTimers?.has(sessionId)) {
+                clearTimeout(sessionManager.pollTimers.get(sessionId));
+                sessionManager.pollTimers.delete(sessionId);
+            }
+            if (sessionManager && sessionManager.activeSessions?.has(sessionId)) {
+                sessionManager.activeSessions.delete(sessionId);
+            }
+
+            let providerCancelled = false;
+            if (activeSession.mode === 'CHEAP' && activeSession.providerNumberId) {
+                try {
+                    await this.smsProviderManager.cancelCheapNumber(activeSession.providerNumberId);
+                    providerCancelled = true;
+                    logger.info('5SIM cancelled', { sessionId, activationId: activeSession.providerNumberId });
+                } catch (err) {
+                    if (err.response?.data === 'order not found' || err.message?.includes('order not found')) {
+                        providerCancelled = true;
+                        logger.info('5SIM already cancelled', { sessionId });
+                    } else {
+                        logger.warn('5SIM cancel failed', { sessionId, error: err.message });
+                    }
+                }
+            }
+
+            if (activeSession.mode === 'FREE' && activeSession.providerNumberId && this.smsProviderManager) {
+                try {
+                    await this.smsProviderManager.cancelNumber('FREE_PUBLIC', activeSession.providerNumberId);
+                    providerCancelled = true;
+                } catch (err) {
+                    logger.warn('Free provider cancel failed', { sessionId });
+                }
+            }
+
+            let cancelResult;
+            try {
+                cancelResult = await sessionManager.cancelSession(sessionId, userId);
+                logger.info('Session cancelled', { sessionId, releasedAmount: cancelResult?.releasedAmount || 0 });
+            } catch (err) {
+                logger.error('cancelSession failed, forcing cleanup', { sessionId, error: err.message });
+                await Session.updateOne(
+                    { sessionId },
+                    { $set: { status: 'CANCELLED', endTime: new Date(), providerReleased: providerCancelled } }
+                );
+                cancelResult = { releasedAmount: 0 };
+            }
+
+            const refundLine = cancelResult?.releasedAmount > 0
+                ? `💰 Refunded: ${formatCurrency(cancelResult.releasedAmount)}\n`
+                : (activeSession.mode === 'CHEAP' && providerCancelled)
+                    ? `💰 Funds returned to balance\n`
+                    : '';
+
+            let message, keyboard;
+
+            if (isTimeout) {
+                message =
+                    `⏰ <b>OTP Request Timed Out</b>\n\n` +
+                    `📱 Number: <code>${activeSession.number}</code>\n` +
+                    `🎯 Service: ${activeSession.service}\n` +
+                    `⏱ Status: <b>Expired</b>\n\n` +
+                    `${refundLine || '💰 Funds handled'}\n\n` +
+                    `You can request a new OTP with /otp`;
+
+                keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Request New OTP', 'menu')],
+                    [Markup.button.callback('📞 Contact Support', 'contact_support')]
+                ]);
+            } else {
+                message =
+                    `✅ <b>Session Cancelled</b>\n\n` +
+                    `📱 Number: <code>${activeSession.number}</code>\n` +
+                    `🎯 Service: ${activeSession.service}\n` +
+                    refundLine +
+                    `\nAny used credits have been restored.\n` +
+                    `You can start a new request now.`;
+
+                keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 New OTP Request', 'menu')],
+                    [Markup.button.callback('🔙 Main Menu', 'menu')]
+                ]);
+            }
+
+            if (isTimeout) {
+                await this.bot.telegram.sendMessage(userId, message, {
+                    parse_mode: 'HTML',
+                    reply_markup: keyboard.reply_markup
+                });
+            } else {
+                await this.sendPhotoWithCaption(ctx, IMAGES.default, message, keyboard, 'HTML');
+            }
+
+        } catch (error) {
+            logger.error('Cancel failed', { userId, error: error.message });
+            if (!isTimeout) {
+                await this.sendPhotoWithCaption(ctx, IMAGES.default, 
+                    '❌ Failed to cancel session. Please try again.',
+                    KEYBOARDS.backToMenu(), 'HTML'
+                );
+            }
+        }
+    }
+
+
+                      // ═══════════════════════════════════════════════════════════════════════════════
+//  OTPCommands.js — Part 2: Main Menu, My Number, Mode Handlers, Selection
+//  INTEGRATED: Tier-based operator selection system for CHEAP mode
+// ═══════════════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  MAIN MENU & MY NUMBER
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleOTPCommand(ctx) {
+        const user = ctx.state.user;
+        const isVip = this._isVipActive(user);
+        const hasBundle = (user.bundleRemaining || 0) > 0;
+
+        let message = '📱 <b>Request OTP</b>\n\nSelect your preferred mode:';
+        
+        const buttons = [
+            [Markup.button.callback('🆓 FREE', 'mode_free'), Markup.button.callback('💰 CHEAP', 'mode_cheap')]
+        ];
+
+        if (hasBundle || isVip) {
+            buttons.push([
+                Markup.button.callback('📦 Bundle', 'mode_bundle'),
+                Markup.button.callback('👑 VIP', 'mode_vip')
+            ]);
+        } else {
+            buttons.push([
+                Markup.button.callback('📦 Buy Bundle', 'buy_bundle'),
+                Markup.button.callback('👑 Upgrade VIP', 'buy_vip')
+            ]);
+        }
+
+        if (isVip && user.vipPhoneNumber) {
+            buttons.push([Markup.button.callback('📱 View My Number', 'view_my_number')]);
+        }
+
+        buttons.push([Markup.button.callback('🔙 Back to OTP Hub', 'otp_hub')]);
+
+        const keyboard = Markup.inlineKeyboard(buttons);
+        await this.sendPhotoWithCaption(ctx, IMAGES.otpMenu, message, keyboard, 'HTML');
+    }
+             
+    async handleViewMyNumber(ctx) {
+        const user = ctx.state.user;
+        
+        if (!this._isVipActive(user)) {
+            return this.sendPhotoWithCaption(
+                ctx, IMAGES.vipFirst,
+                '❌ <b>Not a VIP User</b>\n\nYou need an active VIP subscription to have a dedicated number.\n\nUpgrade to VIP now?',
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('👑 Upgrade VIP', 'buy_vip')],
+                    [Markup.button.callback('🔙 Back', 'menu')]
+                ]),
+                'HTML'
+            );
+        }
+
+        if (!user.vipPhoneNumber) {
+            const assignment = await this.assignVipNumber(user.userId, 'US');
+            if (!assignment) {
+                return this.sendPhotoWithCaption(
+                    ctx, IMAGES.vipFirst,
+                    '⚠️ <b>Number Assignment Pending</b>\n\nWe\'re assigning your VIP number. Please try again in a moment.',
+                    Markup.inlineKeyboard([
+                        [Markup.button.callback('🔄 Retry', 'view_my_number')],
+                        [Markup.button.callback('🔙 Back', 'menu')]
+                    ]),
+                    'HTML'
+                );
+            }
+            user.vipPhoneNumber = assignment.phoneNumber;
+            user.vipNumberId = assignment.numberId;
+            user.vipProvider = assignment.provider;
+        }
+
+        const daysLeft = this._vipDaysLeft(user);
+        const vipRemaining = this._vipRemaining(user);
+        const bundleRemaining = user.bundleRemaining || 0;
+
+        const message = 
+            `📱 <b>Your VIP Number</b>\n\n` +
+            `📞 <b>Number:</b> <code>${user.vipPhoneNumber}</code>\n` +
+            `🏢 <b>Provider:</b> ${user.vipProvider}\n` +
+            `🌍 <b>Country:</b> ${user.vipNumberCountry || 'US'}\n\n` +
+            `⏰ <b>VIP Status</b>\n` +
+            `• Expires: <code>${user.vipExpiry ? new Date(user.vipExpiry).toLocaleDateString() : 'N/A'}</code>\n` +
+            `• Days Left: <code>${daysLeft}</code> day${daysLeft !== 1 ? 's' : ''}\n` +
+            `• Daily OTPs: <code>${vipRemaining}</code> remaining today\n\n` +
+            `📦 <b>Bundle Credits</b>\n` +
+            `• Available: <code>${bundleRemaining}</code> OTPs\n\n` +
+            `<i>Your number is dedicated to you. Use it for any service.</i>`;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔢 Request OTP', 'request_otp_vip')],
+            [Markup.button.callback('📦 Buy More OTPs', 'buy_bundle_otp')],
+            [Markup.button.callback('❌ Cancel VIP', 'cancel_vip_subscription')],
+            [Markup.button.callback('🔙 Back', 'menu')]
+        ]);
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.myNumber, message, keyboard, 'HTML');
+    }
+    
+    async handleMyNumberCommand(ctx) {
+        return this.handleViewMyNumber(ctx);
+    }
+        // ═══════════════════════════════════════════════════════════════════════
+//  FREE MODE — Check credits, show ad if needed, otherwise proceed
+// ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
+//  FREE MODE — Check credits, show ad if needed, otherwise proceed
+// ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
+//  FREE MODE — Check credits, show ad if needed, otherwise proceed
+// ═══════════════════════════════════════════════════════════════════════
+
+async handleFreeMode(ctx) {
+    const user = ctx.state.user;
+    const userId = String(ctx.from?.id);
+
+    if (!user) {
+        return ctx.reply('⚠️ Session expired. Please send /start to continue.', { parse_mode: 'HTML' });
+    }
+
+    // Check daily limit FIRST
+    if (!this._canUseFree(user)) {
+        return this._showFreeExhausted(ctx, user);
+    }
+
+    const freeProvider = this.smsProviderManager.getProvider('FREE_PUBLIC');
+
+    // Check ad credits
+    if (freeProvider && freeProvider.adSystem) {
+        try {
+            const creditCheck = await freeProvider.canRequestNumber(userId);
+
+            // NO credits → MUST watch ad FIRST
+            if (!creditCheck.allowed && creditCheck.reason === 'INSUFFICIENT_CREDITS') {
+                return this._showAdPrompt(ctx, creditCheck, freeProvider, user);
+            }
+
+            // Any other block
+            if (!creditCheck.allowed) {
+                return this._showFreeExhausted(ctx, user);
+            }
+
+            // FIX: Don't hold credits here — hold them when number is requested
+            // Just mark that user has sufficient credits
+            ctx.session = ctx.session || {};
+            ctx.session.freeCreditsAvailable = creditCheck.credits;
+            ctx.session.freeCreditsDeducted = false; // Not deducted yet
+
+        } catch (creditError) {
+            logger.error('Ad credit check failed', { userId: userId, error: creditError.message });
+            return this._showFreeExhausted(ctx, user);
+        }
+    }
+
+    const remainingFree = this._freeRemaining(user);
+
+    const warningMessage = [
+        '⚠️ <b>Free Mode Notice</b>\n\n',
+        '📵 Free numbers are <b>shared</b> and may be <b>blocked</b> by:\n',
+        '• WhatsApp, Telegram, Google\n',
+        '• Facebook, Instagram, Twitter\n',
+        '• Banks, Binance, PayPal\n\n',
+        '✅ You have <b>' + remainingFree + '</b> free OTPs left today\n\n',
+        '💡 For <b>guaranteed</b> delivery, use:\n',
+        '• 💰 CHEAP — Dynamic pricing\n',
+        '• 📦 BUNDLE — Bulk savings\n',
+        '• 👑 VIP — Unlimited access\n\n',
+        '<i>Free mode is best effort only. No refunds for failed delivery.</i>'
+    ].join('');
+
+    const warningKeyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('✅ I Understand, Proceed', 'confirm_free_mode')],
+        [Markup.button.callback('💰 Switch to CHEAP', 'mode_cheap')],
+        [Markup.button.callback('📦 Buy Bundle', 'buy_bundle')],
+        [Markup.button.callback('👑 Upgrade VIP', 'buy_vip')],
+        [Markup.button.callback('🔙 Back', 'menu')]
+    ]);
+
+    return this.sendPhotoWithCaption(ctx, IMAGES.fre
