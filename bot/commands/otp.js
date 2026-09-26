@@ -1760,4 +1760,378 @@ async handleFreeCountrySelected(ctx) {
                 await User.updateOne({ userId: userId }, { $inc: { freeUsedToday: 1 } });
 
                 const message = [
-                    '📱 <b>Free Number 
+                    '📱 <b>Free Number Assigned</b>\n\n',
+                    '📞 Number: <code>' + result.phoneNumber + '</code>\n',
+                    '🌍 Country: ' + (result.country || countryCode) + '\n',
+                    '🔢 Service: ' + serviceId + '\n\n',
+                    '⏳ Waiting for OTP...\n',
+                    '<i>Free numbers expire in 10 minutes.</i>'
+                ].join('');
+
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Check OTP', 'check_free_' + result.sessionId)],
+                    [Markup.button.callback('❌ Cancel', 'cancel_free_' + result.sessionId)],
+                    [Markup.button.callback('🔙 Menu', 'menu')]
+                ]);
+
+                return this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
+
+            } else {
+                throw new Error(result && result.error ? result.error : 'Failed to get free number');
+            }
+
+        } catch (numberError) {
+            // Release hold on failure
+            if (holdId) {
+                await freeProvider.adSystem.releaseHold(holdId).catch(function() {});
+            }
+            throw numberError;
+        }
+
+    } catch (error) {
+        logger.error('handleFreeCountrySelected error', { userId: userId, countryCode: countryCode, serviceId: serviceId, error: error.message });
+        await ctx.answerCbQuery('❌ Error').catch(function() {});
+
+        const pricing = await getPricing();
+        const formatted = formatPrice(pricing);
+
+        const errorMessage = [
+            '❌ <b>Free Number Error</b>\n\n',
+            'Error: ' + error.message + '\n\n',
+            'Try again or use CHEAP mode for guaranteed delivery.\n\n',
+            '💰 CHEAP: ' + formatted.cheap
+        ].join('');
+
+        const errorKeyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('🔄 Try Again', 'free_country_' + countryCode + '_' + serviceId)],
+            [Markup.button.callback('💰 CHEAP Mode', 'mode_cheap')],
+            [Markup.button.callback('🔙 Menu', 'menu')]
+        ]);
+
+        return this.sendPhotoWithCaption(ctx, IMAGES.otpFailed, errorMessage, errorKeyboard, 'HTML');
+    }
+                                                                 }
+       
+// ═══════════════════════════════════════════════════════════════════════
+//  FREE CHECK NOW — Manual poll for SMS
+// ═══════════════════════════════════════════════════════════════════════
+
+async handleCheckFree(ctx, sessionId) {
+    try {
+        // FIX: Use smsProviderManager.checkFreeSMS(), not freeProvider.checkFreeSMS()
+        // The manager has the unified checkFreeSMS method, not the individual provider
+        const result = await this.smsProviderManager.checkFreeSMS(sessionId);
+
+        if (!result) {
+            return ctx.answerCbQuery('❌ Session not found').catch(function() {});
+        }
+
+        if (result.success && result.otp) {
+            await ctx.answerCbQuery('✅ OTP received! Updating...');
+            
+            // Update the message to show the OTP
+            const message = [
+                '📱 <b>Free Number — OTP Received!</b>\n\n',
+                '🔢 OTP: <code>' + result.otp + '</code>\n\n',
+                '⏳ This number has expired.'
+            ].join('');
+
+            await ctx.editMessageCaption(message, {
+                parse_mode: 'HTML',
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔙 Menu', 'menu')]
+                ]).reply_markup
+            });
+
+        } else if (result.status === 'EXPIRED' || result.status === 'CANCELLED') {
+            await ctx.answerCbQuery('❌ Session expired', { show_alert: true });
+            
+            await ctx.editMessageCaption('❌ <b>Session Expired</b>\n\nThe free number has expired. Please request a new one.', {
+                parse_mode: 'HTML',
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 Get Free OTP', 'mode_free')],
+                    [Markup.button.callback('🔙 Menu', 'menu')]
+                ]).reply_markup
+            });
+
+        } else {
+            await ctx.answerCbQuery('⏳ ' + (result.message || 'Still waiting...'));
+        }
+
+    } catch (error) {
+        logger.error('handleCheckFree error', { sessionId: sessionId, error: error.message });
+        return ctx.answerCbQuery('❌ Check failed').catch(function() {});
+    }
+}
+        
+        
+    // ═══════════════════════════════════════════════════════════════════════
+    //  CHEAP MODE — NEW TIER-BASED FLOW
+    //  Steps: Service Selection → Tier Selection → Country Selection → Auto Purchase
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleCheapMode(ctx) {
+        const user = ctx.state.user;
+        
+        try {
+            if (!this.tierSelector || !this.countryCatalog) {
+                logger.warn('Tier system not available, falling back to legacy CHEAP flow');
+                return this._handleCheapModeLegacy(ctx);
+            }
+
+            const minEntryPrice = TIER_CONFIG.budget.priceMultiplier * 0.00;
+            if (this._getAvailableBalance(user) < minEntryPrice) {
+                const message = 
+                    `💰 <b>Insufficient Balance</b>\n\n` +
+                    `CHEAP mode requires at least ${formatCurrency(minEntryPrice)}.\n` +
+                    `Available: ${formatCurrency(this._getAvailableBalance(user))}\n\n` +
+                    `Please deposit first.`;
+                    
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('💳 Deposit', 'deposit')],
+                    [Markup.button.callback('🔙 Back', 'menu')]
+                ]);
+                
+                return this.sendPhotoWithCaption(ctx, IMAGES.cheapMode, message, keyboard, 'HTML');
+            }
+
+            ctx.session = ctx.session || {};
+            ctx.session.otpMode = 'CHEAP';
+
+            await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
+            
+        } catch (error) {
+            logger.error('handleCheapMode failed', { userId: user.userId, error: error.message });
+            return this._handleCheapModeLegacy(ctx);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  LEGACY CHEAP MODE (Fallback)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async _handleCheapModeLegacy(ctx) {
+        const user = ctx.state.user;
+        
+        try {
+            let displayPrice = config.prices?.cheapOtp || 0.00;
+
+            if (this.smsProviderManager) {
+                try {
+                    const priceInfo = await this.smsProviderManager.getCheapPrice('US', 'Any');
+                    if (priceInfo && priceInfo.displayPrice) {
+                        displayPrice = priceInfo.displayPrice;
+                    }
+                } catch (priceError) {
+                    logger.warn('Failed to get dynamic CHEAP price, using fallback', { 
+                        error: priceError.message 
+                    });
+                }
+            }
+
+            if (this._getAvailableBalance(user) < displayPrice) {
+                const message = 
+                    `💰 <b>Insufficient Balance</b>\n\n` +
+                    `Required: ${formatCurrency(displayPrice)}\n` +
+                    `Available: ${formatCurrency(this._getAvailableBalance(user))}\n\n` +
+                    `Please deposit first.`;
+                    
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('💳 Deposit', 'deposit')],
+                    [Markup.button.callback('🔙 Back', 'menu')]
+                ]);
+                
+                return this.sendPhotoWithCaption(ctx, IMAGES.cheapMode, message, keyboard, 'HTML');
+            }
+
+            ctx.session = ctx.session || {};
+            ctx.session.otpMode = 'CHEAP';
+            ctx.session.cheapDisplayPrice = displayPrice;
+
+            await this._showLegacyServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode, displayPrice);
+            
+        } catch (error) {
+            logger.error('Legacy cheap mode failed', { userId: user.userId, error: error.message });
+            ctx.session = ctx.session || {};
+            ctx.session.otpMode = 'CHEAP';
+            await this._showLegacyServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
+        }
+    }
+
+    async handleBundleMode(ctx) {
+        const user = ctx.state.user;
+        
+        if (!user.bundleRemaining || user.bundleRemaining <= 0) {
+            return this.handleBuyBundle(ctx);
+        }
+
+        if (this._isVipActive(user) && user.vipPhoneNumber) {
+            ctx.session = ctx.session || {};
+            ctx.session.otpMode = 'BUNDLE';
+            ctx.session.useVipNumber = true;
+            return this._showLegacyServiceSelection(ctx, 'BUNDLE (VIP Number)', IMAGES.bundleOther);
+        }
+
+        ctx.session = ctx.session || {};
+        ctx.session.otpMode = 'BUNDLE';
+        ctx.session.useVipNumber = false;
+        await this._showLegacyServiceSelection(ctx, 'BUNDLE', IMAGES.bundleOther);
+    }
+
+    async handleVIPMode(ctx) {
+        const user = ctx.state.user;
+        
+        if (!this._isVipActive(user)) {
+            const message = 
+                `👑 <b>VIP Required</b>\n\n` +
+                `You need an active VIP subscription.\n\n` +
+                `Price: ${formatCurrency(config.prices?.vipSubscription || 5.00)}/month\n` +
+                `✅ 50 OTPs per day\n` +
+                `⚡ Dedicated number\n` +
+                `🚀 Priority routing\n\n` +
+                `Upgrade now?`;
+                
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('👑 Upgrade VIP', 'buy_vip')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]);
+            
+            return this.sendPhotoWithCaption(ctx, IMAGES.vipFirst, message, keyboard, 'HTML');
+        }
+        
+        if (!this._canUseVip(user)) {
+            const message = 
+                '⚠️ <b>VIP Daily Limit Reached</b>\n\n' +
+                `You've used ${config.limits?.vipDaily || 50}/${config.limits?.vipDaily || 50} VIP OTPs today.\n` +
+                'Resets at midnight UTC.\n\n' +
+                'Buy bundle OTPs to continue:';
+            
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('📦 Buy Bundle OTPs', 'buy_bundle_otp')],
+                [Markup.button.callback('🔙 Back', 'menu')]
+            ]);
+            
+            return this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message, keyboard, 'HTML');
+        }
+        
+        if (!user.vipPhoneNumber) {
+            const assignment = await this.assignVipNumber(user.userId, 'US');
+            if (!assignment) {
+                return this.sendPhotoWithCaption(
+                    ctx, IMAGES.vipOther,
+                    '⚠️ <b>Number Assignment Pending</b>\n\nWe\'re setting up your VIP number. Please try again shortly.',
+                    Markup.inlineKeyboard([
+                        [Markup.button.callback('🔄 Retry', 'mode_vip')],
+                        [Markup.button.callback('🔙 Back', 'menu')]
+                    ]),
+                    'HTML'
+                );
+            }
+            user.vipPhoneNumber = assignment.phoneNumber;
+        }
+
+        ctx.session = ctx.session || {};
+        ctx.session.otpMode = 'VIP';
+        ctx.session.useVipNumber = true;
+        await this._showLegacyServiceSelection(ctx, 'VIP', IMAGES.vipOther);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  OTP HUB — Central OTP services screen
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleOTPHub(ctx) {
+        const user = ctx.state.user;
+        const stats = this._getUserStats(user);
+        const isVip = stats.isVip;
+        const hasBundle = stats.bundleRemaining > 0;
+
+        let message = 
+            `📱 <b>OTP Services</b>\n\n` +
+            `👤 <b>Quick Stats:</b>\n` +
+            `💰 Balance: <code>${formatCurrency(stats.balance)}</code>\n` +
+            `🆓 Free Today: <code>${stats.freeRemaining}</code> left\n`;
+        
+        if (isVip) {
+            message += `👑 VIP: <code>${stats.vipRemaining}</code> left (${stats.vipDays} days)\n`;
+        }
+        if (hasBundle) {
+            message += `📦 Bundle: <code>${stats.bundleRemaining}</code> OTPs\n`;
+        }
+        
+        message += `\nChoose an option:`;
+
+        const buttons = [
+            [Markup.button.callback('🆓 FREE OTP', 'mode_free'), Markup.button.callback('💰 CHEAP OTP', 'mode_cheap')]
+        ];
+
+        if (hasBundle || isVip) {
+            buttons.push([
+                Markup.button.callback('📦 Bundle', 'mode_bundle'),
+                Markup.button.callback('👑 VIP', 'mode_vip')
+            ]);
+        } else {
+            buttons.push([
+                Markup.button.callback('📦 Buy Bundle', 'buy_bundle'),
+                Markup.button.callback('👑 Upgrade VIP', 'buy_vip')
+            ]);
+        }
+
+        if (isVip && user.vipPhoneNumber) {
+            buttons.push([Markup.button.callback('📱 My VIP Number', 'view_my_number')]);
+        }
+
+        buttons.push([
+            Markup.button.callback('⚡ Quick Buy', 'quick_buy'),
+            Markup.button.callback('📊 My Stats', 'stats')
+        ]);
+
+        buttons.push([
+            Markup.button.callback('📜 History', 'history'),
+            Markup.button.callback('👥 Referral', 'referral')
+        ]);
+
+        buttons.push([
+            Markup.button.callback('⚙️ Settings', 'settings'),
+            Markup.button.callback('❓ FAQ', 'faq')
+        ]);
+
+        buttons.push([
+            Markup.button.callback('🔌 Status', 'provider_status'),
+            Markup.button.callback('📞 Support', 'contact_support')
+        ]);
+
+        buttons.push([Markup.button.callback('🔙 Back to Main Menu', 'menu')]);
+
+        const keyboard = Markup.inlineKeyboard(buttons);
+        await this.sendPhotoWithCaption(ctx, IMAGES.otpMenu, message, keyboard, 'HTML');
+    }
+    // ═══════════════════════════════════════════════════════════════════════
+    //  NEW: Service Selection with Search, Popular, Pagination
+    //  FIXED: Async calls, shows service names with emojis, no category groups
+    // ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SERVICE SELECTION — Auto-edit with proper fallback
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async showServiceSelection(ctx, mode, imageUrl, displayPrice = null, page = 1) {
+        if (!this.serviceCatalog || mode !== 'CHEAP') {
+            return this._showLegacyServiceSelection(ctx, mode, imageUrl, displayPrice);
+        }
+
+        try {
+            let services = [];
+            let totalPages = 1;
+            let isPopularPage = false;
+
+            if (page === 1) {
+                const popular = await this.serviceCatalog.getPopularServices(15);
+                services = popular;
+                isPopularPage = true;
+                
+                const allServices = await this.serviceCatalog.getServicesPage(1, 1000);
+                const remainingCount = Math.max(0, allServices.pagination.total - 15);
+                totalPages = 1 + Math.ceil(remainingCount / 15);
+            } else {
+                const allPage = page - 1;
+                const allServices = await this.serviceCatalog.getServicesPage(allPage, 15);
