@@ -444,4 +444,457 @@ this.bot.action(/copy_otp_(.+)/, async (ctx) => {
         try {
             await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode, null, 1);
             await ctx.answerCbQuery('📋 Showing all services');
-        } catch (
+        } catch (error) {
+            logger.error('service_browse_all error', { error: error.message });
+        }
+    });
+
+    // ═════════════════════════════════════════════════════════════════
+    //  TIER SELECTION
+    // ═════════════════════════════════════════════════════════════════
+    this.bot.action(/tier_(budget|standard|premium)/, async (ctx) => {
+        try {
+            const tierKey = ctx.match[1];
+            // FIXED: Store in session for search context
+            ctx.session.selectedTier = tierKey;
+            await this.handleTierSelect(ctx, tierKey);
+        } catch (error) {
+            logger.error('tier_select action error', { error: error.message, userId: ctx.from?.id });
+            ctx.answerCbQuery('❌ Error selecting tier').catch(() => {});
+        }
+    });
+
+    // ═════════════════════════════════════════════════════════════════
+    //  COUNTRY SELECTION — NEW TIER FLOW
+    // ═════════════════════════════════════════════════════════════════
+    
+    // Country selection (user taps a country)
+    this.bot.action(/country_select_(.+)/, async (ctx) => {
+        try {
+            const countryCode = ctx.match[1];
+            // FIXED: Store in session for search context
+            ctx.session.selectedCountry = countryCode;
+            await this.handleCountrySelect(ctx, countryCode);
+        } catch (error) {
+            logger.error('country_select action error', { error: error.message, userId: ctx.from?.id });
+            ctx.answerCbQuery('❌ Error selecting country').catch(() => {});
+        }
+    });
+
+    // Country page navigation
+    this.bot.action(/country_page_(\d+)/, async (ctx) => {
+        try {
+            await this.handleTierCountryPage(ctx, parseInt(ctx.match[1]));
+        } catch (error) {
+            logger.error('country_page action error', { error: error.message, userId: ctx.from?.id });
+            ctx.answerCbQuery('❌ Error').catch(() => {});
+        }
+    });
+
+    // Tier country selection (direct from tier flow)
+    this.bot.action(/tier_country_(.+)/, async (ctx) => {
+        try {
+            await this.handleTierCountrySelect(ctx, ctx.match[1]);
+        } catch (error) {
+            logger.error('tier_country action error', { error: error.message, userId: ctx.from?.id });
+            ctx.answerCbQuery('❌ Error selecting country').catch(() => {});
+        }
+    });
+    // Tier fallback operator
+    this.bot.action(/tier_fallback_(.+)/, async (ctx) => {
+        try {
+            const operator = ctx.match[1];
+            const country = ctx.session?.selectedCountry;
+            const service = ctx.session?.otpService;
+            const tierKey = ctx.session?.selectedTier;
+            
+            if (!country || !service || !tierKey) {
+                return ctx.answerCbQuery('❌ Session expired', { show_alert: true });
+            }
+            
+            // Store fallback operator in session
+            ctx.session.fallbackOperator = operator;
+            
+            // FIXED: Call handleTierCountrySelect which will use the fallback operator
+            await this.handleTierCountrySelect(ctx, country);
+        } catch (error) {
+            logger.error('tier_fallback action error', { error: error.message });
+            ctx.answerCbQuery('❌ Error').catch(() => {});
+        }
+    });
+    
+    
+    // Back buttons
+    this.bot.action('tier_back_service', async (ctx) => {
+        try {
+            await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
+            await ctx.answerCbQuery('🔙 Back to services');
+        } catch (error) {
+            logger.error('tier_back_service error', { error: error.message });
+        }
+    });
+
+    this.bot.action('tier_back_tier', async (ctx) => {
+        try {
+            const service = ctx.session?.otpService;
+            if (service) {
+                await this.showTierSelection(ctx, service);
+            } else {
+                await this.showServiceSelection(ctx, 'CHEAP', IMAGES.cheapMode);
+            }
+            await ctx.answerCbQuery('🔙 Back to tiers');
+        } catch (error) {
+            logger.error('tier_back_tier error', { error: error.message });
+        }
+    });
+
+    // ═════════════════════════════════════════════════════════════════
+    //  PURCHASE CONFIRMATIONS
+    // ═════════════════════════════════════════════════════════════════
+    this.bot.action('buy_bundle', this.handleBuyBundle);
+    this.bot.action('confirm_free_mode', this.handleConfirmFreeMode);
+    this.bot.action('buy_vip', this.handleBuyVIP);
+    this.bot.action('confirm_bundle', this.handleConfirmBundle);
+    this.bot.action('confirm_vip', this.handleConfirmVIP);
+    
+    // ═════════════════════════════════════════════════════════════════
+    //  OTP HUB & ACTIONS
+    // ═════════════════════════════════════════════════════════════════
+    this.bot.action('otp_hub', this.handleOTPHub);
+    this.bot.action(/reveal_(.+)/, this.handleRevealOTP);
+    this.bot.action(/check_otp_(.+)/, this.handleCheckOTP);
+    this.bot.action('check_deposit', this.handleCheckDeposit);
+    this.bot.action('cancel_otp', (ctx) => this.handleCancel(ctx));
+    this.bot.action('deposit', this.handleDepositInfo);
+    this.bot.action('menu', this.handleMenu);
+    this.bot.action('contact_support', this.handleContactSupport);
+    this.bot.action('cancel_vip_subscription', this.handleCancelVipSubscription);
+    this.bot.action('confirm_vip_cancel', this.handleConfirmVipCancel);
+            // In registerCommands() or constructor, add
+    this.bot.action(/free_service_(.+)/, this.handleFreeServiceSelected.bind(this));
+    this.bot.action(/free_country_([A-Z]{2})_(.+)/, this.handleFreeCountrySelected.bind(this));
+    
+    // ═════════════════════════════════════════════════════════════════
+    //  UTILITY ACTIONS
+    // ═════════════════════════════════════════════════════════════════
+    this.bot.action('history', this.handleHistory);
+    this.bot.action('referral', this.handleReferral);
+    this.bot.action('stats', this.handleStats);
+    this.bot.action('quick_buy', this.handleQuickBuy);
+    this.bot.action('provider_status', this.handleProviderStatus);
+    this.bot.action('settings', this.handleSettings);
+    this.bot.action('toggle_notifications', this.handleToggleNotifications);
+    this.bot.action('faq', this.handleFaq);
+    this.bot.action('terms', this.handleTerms);
+    
+    // ═════════════════════════════════════════════════════════════════
+    //  FREE MODE ACTIONS (Legacy)
+    // ═════════════════════════════════════════════════════════════════
+
+    this.bot.action(/cancel_free_(.+)/, async (ctx) => {
+        try {
+            await this.handleCancel(ctx);
+        } catch (error) {
+            logger.error('cancel_free action error', { error: error.message, userId: ctx.from?.id });
+            ctx.answerCbQuery('❌ Cancel failed').catch(() => {});
+        }
+    });
+
+    this.bot.action(/check_free_(.+)/, async (ctx) => {
+        try {
+            await this.handleCheckFree(ctx, ctx.match[1]);
+        } catch (error) {
+            logger.error('check_free action error', { error: error.message, userId: ctx.from?.id });
+            ctx.answerCbQuery('❌ Check failed').catch(() => {});
+        }
+    });
+
+    // ═════════════════════════════════════════════════════════════════
+    //  AD CREDIT SYSTEM ACTIONS
+    // ═════════════════════════════════════════════════════════════════
+    this.bot.action(/watch_ad_(.+)/, async (ctx) => {
+        try {
+            await this.handleWatchAd(ctx, ctx.match[1]);
+        } catch (error) {
+            logger.error('watch_ad action error', { error: error.message, userId: ctx.from?.id });
+            ctx.answerCbQuery('❌ Error loading ad').catch(() => {});
+        }
+    });
+
+    this.bot.action('check_credits', async (ctx) => {
+        try {
+            await this.handleCheckCredits(ctx);
+        } catch (error) {
+            logger.error('check_credits action error', { error: error.message, userId: ctx.from?.id });
+            ctx.answerCbQuery('❌ Error checking credits').catch(() => {});
+        }
+    });
+
+    // ═════════════════════════════════════════════════════════════════
+    //  SEARCH PROMPTS — ONLY REGISTERED HERE (removed from setupSearchHandlers)
+    // ═════════════════════════════════════════════════════════════════
+    this.bot.action('service_search_prompt', async (ctx) => {
+        try {
+            ctx.session.awaitingServiceSearch = true;
+            ctx.session.awaitingCountrySearch = false;
+            await ctx.reply('🔍 <b>Search for a service:</b>\n\nType the service name (e.g., "WhatsApp", "Telegram", "Netflix"):', {
+                parse_mode: 'HTML',
+                reply_markup: { force_reply: true, selective: true }
+            });
+            await ctx.answerCbQuery('🔍 Type service name');
+        } catch (error) {
+            logger.error('service_search_prompt error', { error: error.message });
+        }
+    });
+
+    this.bot.action('country_search_prompt', async (ctx) => {
+        try {
+            ctx.session.awaitingCountrySearch = true;
+            ctx.session.awaitingServiceSearch = false;
+            await ctx.reply('🔍 <b>Search for a country:</b>\n\nType country name or ISO code (e.g., "USA", "United Kingdom", "Germany"):', {
+                parse_mode: 'HTML',
+                reply_markup: { force_reply: true, selective: true }
+            });
+            await ctx.answerCbQuery('🔍 Type country name');
+        } catch (error) {
+            logger.error('country_search_prompt error', { error: error.message });
+        }
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  SEARCH TEXT HANDLER — SINGLE INSTANCE, CALLED IN CONSTRUCTOR
+// ═══════════════════════════════════════════════════════════════════════
+setupTextHandlers() {
+    // CRITICAL FIX: Handle force reply text messages
+    this.bot.on('text', async (ctx, next) => {
+        // Skip commands
+        if (ctx.message.text.startsWith('/')) return next();
+        
+        // Handle service search
+  if (ctx.session?.awaitingServiceSearch) {
+    ctx.session.awaitingServiceSearch = false;
+    const query = ctx.message.text.trim();
+    
+    if (!query) {
+        await ctx.reply('❌ Please enter a valid service name.');
+        return;
+    }
+
+    try {
+        const results = await this.tierIntegration?.searchServices(query, 30) 
+            ?? await this.serviceCatalog?.searchServices(query, 30) 
+            ?? [];
+        
+                if (!results || results.length === 0) {
+                    await ctx.reply(`❌ No services found matching "${query}".\n\nTry: WhatsApp, Telegram, Facebook, Instagram, TikTok, etc.`, {
+                        parse_mode: 'HTML',
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('🔍 Search Again', 'service_search_prompt')],
+                            [Markup.button.callback('🔙 Back to Menu', 'menu')]
+                        ]).reply_markup
+                    });
+                    return;
+                }
+
+                // Show search results as inline keyboard
+                const buttons = results.slice(0, 15).map(s => [
+                    Markup.button.callback(
+                        `${s.emoji || '📱'} ${s.name}`,
+                        `service_select_${s.name}`
+                    )
+                ]);
+                
+                buttons.push([Markup.button.callback('🔍 Search Again', 'service_search_prompt')]);
+                buttons.push([Markup.button.callback('🔙 Back to Menu', 'menu')]);
+
+                await ctx.reply(
+                    `🔍 <b>Search Results for "${query}"</b>\n\nFound ${results.length} services:\n<i>Select one:</i>`,
+                    {
+                        parse_mode: 'HTML',
+                        reply_markup: Markup.inlineKeyboard(buttons).reply_markup
+                    }
+                );
+
+            } catch (error) {
+                logger.error('Service search failed', { query, error: error.message });
+                await ctx.reply('❌ Search failed. Please try again.', {
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🔍 Try Again', 'service_search_prompt')],
+                        [Markup.button.callback('🔙 Back', 'menu')]
+                    ]).reply_markup
+                });
+            }
+            return;
+        }
+
+        // Handle country search
+        if (ctx.session?.awaitingCountrySearch) {
+            ctx.session.awaitingCountrySearch = false;
+            const query = ctx.message.text.trim();
+            
+            if (!query) {
+                await ctx.reply('❌ Please enter a valid country name or code.');
+                return;
+            }
+
+            try {
+                // Get current context from session
+                const currentService = ctx.session.otpService || ctx.session.selectedService;
+                const currentTier = ctx.session.selectedTier;
+
+                if (!currentService || !currentTier) {
+                    await ctx.reply('❌ Please select a service and tier first before searching for countries.', {
+                        reply_markup: Markup.inlineKeyboard([
+                            [Markup.button.callback('📱 Select Service', 'mode_cheap')],
+                            [Markup.button.callback('🔙 Main Menu', 'menu')]
+                        ]).reply_markup
+                    });
+                    return;
+                }
+
+                // Show loading
+                const loadingMsg = await ctx.reply(`🔍 Searching countries for "${query}"...`);
+
+                // Call country catalog search
+                const result = await this.countryCatalog.getCountriesForService(
+                    currentService,
+                    currentTier,
+                    {
+                        page: 1,
+                        perPage: 20,
+                        searchQuery: query,
+                        topOnly: false
+                    }
+                );
+
+                // Delete loading message
+                try {
+                    await ctx.deleteMessage(loadingMsg.message_id);
+                } catch (e) {}
+
+                if (!result.countries || result.countries.length === 0) {
+                    await ctx.reply(
+                        `❌ No countries found matching "${query}" for ${currentService}.\n\nTry searching by ISO code (e.g., "US", "UK") or full country name.`,
+                        {
+                            parse_mode: 'HTML',
+                            reply_markup: Markup.inlineKeyboard([
+                                [Markup.button.callback('🔍 Search Again', 'country_search_prompt')],
+                                [Markup.button.callback('🔙 Back to Tiers', 'tier_back_tier')],
+                                [Markup.button.callback('🔙 Main Menu', 'menu')]
+                            ]).reply_markup
+                        }
+                    );
+                    return;
+                }
+
+                // Build results message
+                const tierInfo = this.tierSelector.getTierInfo(currentTier);
+                let message = 
+                    `🌍 <b>Search Results: "${query}"</b>\n` +
+                    `📱 ${currentService} | ${tierInfo.emoji} ${tierInfo.label}\n\n` +
+                    `Found ${result.countries.length} countries:\n\n`;
+
+                const buttons = [];
+                const COLUMNS = 3;
+
+                for (let i = 0; i < result.countries.length; i += COLUMNS) {
+                    const row = result.countries.slice(i, i + COLUMNS).map(country => {
+                        const flag = country.flag || isoToFlag(country.code);
+                        // FIXED: Apply profit margin to display price
+                        const rawPrice = country.displayPrice || country.price;
+                        const displayPrice = rawPrice ? applyProfitMargin(rawPrice) : null;
+                        const priceText = displayPrice 
+                            ? ` $${displayPrice.toFixed(2)}`
+                            : '';
+                        const stockText = country.stock > 0 ? ` ✅` : ' ❌';
+                        
+                        return Markup.button.callback(
+                            `${flag} ${country.code}${priceText}${stockText}`,
+                            `country_select_${country.code}`
+                        );
+                    });
+                    buttons.push(row);
+                }
+
+                buttons.push([Markup.button.callback('🔍 New Search', 'country_search_prompt')]);
+                buttons.push([Markup.button.callback('🔙 Back to Tiers', 'tier_back_tier')]);
+                buttons.push([Markup.button.callback('🔙 Main Menu', 'menu')]);
+
+                await ctx.reply(message, {
+                    parse_mode: 'HTML',
+                    reply_markup: Markup.inlineKeyboard(buttons).reply_markup
+                });
+
+            } catch (error) {
+                logger.error('Country search failed', { query, error: error.message });
+                await ctx.reply('❌ Country search failed. Please try again.', {
+                    reply_markup: Markup.inlineKeyboard([
+                        [Markup.button.callback('🔍 Try Again', 'country_search_prompt')],
+                        [Markup.button.callback('🔙 Back', 'tier_back_tier')]
+                    ]).reply_markup
+                });
+            }
+            return;
+        }
+
+        // Not a search reply, pass to next handler
+        return next();
+    });
+}      
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    //  UTILITY METHODS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async sendPhotoWithCaption(ctx, imageUrl, caption, keyboard = null, parseMode = 'HTML') {
+        try {
+            const payload = { caption: caption.trim(), parse_mode: parseMode };
+            if (keyboard) payload.reply_markup = keyboard.reply_markup;
+            return await ctx.replyWithPhoto(imageUrl, payload);
+        } catch (error) {
+            logger.error('Photo send failed', { error: error.message });
+            return keyboard
+                ? ctx.reply(caption, { parse_mode: parseMode, ...keyboard })
+                : ctx.reply(caption, { parse_mode: parseMode });
+        }
+    }
+    /**
+     * Safely delete a message, ignoring errors.
+     * @private
+     */
+    async _safeDeleteMessage(ctx, message) {
+        if (!message?.message_id) return;
+        try {
+            await ctx.deleteMessage(message.message_id);
+        } catch (err) {
+            logger.debug('Failed to delete message', { error: err.message, messageId: message.message_id });
+        }
+    }
+        
+    async editOrSendPhoto(ctx, imageUrl, caption, keyboard = null, parseMode = 'HTML') {
+        try {
+            if (ctx.callbackQuery?.message?.photo) {
+                await ctx.editMessageMedia(
+                    { type: 'photo', media: imageUrl, caption: caption.trim(), parse_mode: parseMode },
+                    { reply_markup: keyboard?.reply_markup }
+                );
+                return;
+            }
+            if (ctx.callbackQuery?.message) {
+                await ctx.editMessageCaption(caption, {
+                    parse_mode: parseMode,
+                    reply_markup: keyboard?.reply_markup
+                });
+                return;
+            }
+        } catch (editError) {
+            // Fallback to sending new message
+        }
+        return this.sendPhotoWithCaption(ctx, imageUrl, caption, keyboard, parseMode);
+    }
+
+    escapeTelegramText(text) {
+        if (!text) return '';
+        return text
+            .rep
