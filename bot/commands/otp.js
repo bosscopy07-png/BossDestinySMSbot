@@ -4307,4 +4307,455 @@ const checkInterval = setInterval(async () => {
 
             await Transaction.create({
                 txId: `VIP_${Date.now()}_${user.userId}`,
-                             
+                userId: user.userId,
+                type: 'VIP_SUBSCRIPTION',
+                amount: -vipPrice,
+                status: 'COMPLETED',
+                metadata: { expiryDate, source: 'VIP_MENU' },
+                createdAt: new Date()
+            });
+
+            const assignment = await this.assignVipNumber(user.userId, 'US');
+            
+            let numberText = '';
+            if (assignment) {
+                numberText = `\n\n📱 <b>Your VIP Number:</b> <code>${assignment.phoneNumber}</code>\n🏢 Provider: ${assignment.provider}`;
+            } else {
+                numberText = '\n\n⚠️ Your VIP number is being assigned. Use /mynumber to check.';
+            }
+
+            const message = 
+                `👑 <b>VIP Activated!</b>\n\n` +
+                `⏰ Valid until: ${expiryDate.toLocaleDateString()}\n` +
+                `✅ 50 OTPs per day\n` +
+                `⚡ Priority delivery enabled${numberText}\n\n` +
+                `Enjoy premium service!`;
+                
+            await this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message, 
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 My Number', 'view_my_number')],
+                    [Markup.button.callback('🔙 Main Menu', 'menu')]
+                ]), 'HTML'
+            );
+        } catch (error) {
+            logger.error('VIP purchase failed', { userId: user.userId, error: error.message });
+            await this.sendPhotoWithCaption(ctx, IMAGES.otpFailed, 
+                '❌ VIP upgrade failed. Please try again.',
+                KEYBOARDS.supportOrRetry(), 'HTML'
+            );
+        }
+    }
+
+    async handleCancelVipSubscription(ctx) {
+        const user = ctx.state.user;
+        
+        if (!this._isVipActive(user)) {
+            return ctx.answerCbQuery('❌ No active VIP subscription');
+        }
+
+        const message = 
+            `❌ <b>Cancel VIP Subscription?</b>\n\n` +
+            `📞 Your number: <code>${user.vipPhoneNumber || 'N/A'}</code>\n` +
+            `⏰ Expires: <code>${user.vipExpiry ? new Date(user.vipExpiry).toLocaleDateString() : 'N/A'}</code>\n\n` +
+            `⚠️ <b>Warning:</b> Your dedicated number will be released immediately.\n\n` +
+            `Are you sure?`;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Yes, Cancel VIP', 'confirm_vip_cancel')],
+            [Markup.button.callback('❌ No, Keep VIP', 'view_my_number')]
+        ]);
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message, keyboard, 'HTML');
+    }
+
+    async handleConfirmVipCancel(ctx) {
+        const userId = ctx.from.id.toString();
+        const user = ctx.state.user;
+        
+        try {
+            await this.releaseVipNumber(userId);
+            
+            await User.updateOne(
+                { userId },
+                { 
+                    $set: { 
+                        vipExpiry: new Date(0), 
+                        vipDailyUsed: 0,
+                        mode: 'FREE'
+                    } 
+                }
+            );
+
+            const message = 
+                `✅ <b>VIP Cancelled</b>\n\n` +
+                `Your VIP subscription has been cancelled.\n` +
+                `📞 Your dedicated number has been released.\n\n` +
+                `You can still use FREE and CHEAP modes.`;
+                
+            await this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 Request OTP', 'menu')],
+                    [Markup.button.callback('🔙 Main Menu', 'menu')]
+                ]), 'HTML'
+            );
+        } catch (error) {
+            logger.error('VIP cancel failed', { userId, error: error.message });
+            await ctx.answerCbQuery('❌ Failed to cancel VIP');
+        }
+    }
+    // ═══════════════════════════════════════════════════════════════════════
+    //  BUNDLE QUANTITY HANDLERS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleBuyBundleOtp(ctx) {
+        const user = ctx.state.user;
+        const prices = config.prices?.bundleOtp || { 5: 0.50, 10: 0.90, 25: 2.00, 50: 3.50 };
+        
+        let message = `📦 <b>Buy Bundle OTPs</b>\n\nSelect quantity:\n\n`;
+        const buttons = [];
+        
+        for (const [qty, price] of Object.entries(prices)) {
+            message += `• <code>${qty}</code> OTPs — <code>${formatCurrency(price)}</code>\n`;
+            buttons.push([Markup.button.callback(`📦 ${qty} OTPs (${formatCurrency(price)})`, `bundle_qty_${qty}`)]);
+        }
+        
+        message += `\n💰 Your Balance: <code>${formatCurrency(user.balance)}</code>`;
+        
+        buttons.push(
+            [Markup.button.callback('✏️ Custom Amount', 'bundle_qty_custom')],
+            [Markup.button.callback('🔙 Back', 'view_my_number')]
+        );
+        
+        await this.sendPhotoWithCaption(ctx, IMAGES.bundleFirst, message, Markup.inlineKeyboard(buttons), 'HTML');
+    }
+
+    async handleBundleQuantity(ctx, quantity) {
+        const user = ctx.state.user;
+        const prices = config.prices?.bundleOtp || { 5: 0.50, 10: 0.90, 25: 2.00, 50: 3.50 };
+        const price = prices[quantity] || (quantity * 0.10);
+        
+        if (user.balance < price) {
+            return this.sendPhotoWithCaption(
+                ctx, IMAGES.bundleOther,
+                `❌ <b>Insufficient Balance</b>\n\nRequired: <code>${formatCurrency(price)}</code>\nAvailable: <code>${formatCurrency(user.balance)}</code>\n\nDeposit first with /deposit`,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('💳 Deposit', 'deposit')],
+                    [Markup.button.callback('🔙 Back', 'buy_bundle_otp')]
+                ]),
+                'HTML'
+            );
+        }
+
+        ctx.session = ctx.session || {};
+        ctx.session.bundlePurchase = { quantity, price };
+
+        const message = 
+            `📦 <b>Confirm Bundle Purchase</b>\n\n` +
+            `Quantity: <code>${quantity}</code> OTPs\n` +
+            `Price: <code>${formatCurrency(price)}</code>\n` +
+            `Balance After: <code>${formatCurrency(user.balance - price)}</code>\n\n` +
+            `These OTPs never expire and can be used with your VIP number.`;
+
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Confirm Purchase', 'confirm_bundle_purchase')],
+            [Markup.button.callback('❌ Cancel', 'buy_bundle_otp')]
+        ]);
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.bundleOther, message, keyboard, 'HTML');
+    }
+
+    async handleBundleQuantityCustom(ctx) {
+        ctx.session = ctx.session || {};
+        ctx.session.awaitingBundleQuantity = true;
+        
+        await this.sendPhotoWithCaption(
+            ctx, IMAGES.bundleOther,
+            '✏️ <b>Custom Bundle Quantity</b>\n\nSend the number of OTPs you want to purchase:\n\n<i>Minimum: 5 | Price: $0.10 per OTP</i>',
+            Markup.inlineKeyboard([
+                [Markup.button.callback('❌ Cancel', 'buy_bundle_otp')]
+            ]),
+            'HTML'
+        );
+    }
+
+    async handleConfirmBundlePurchase(ctx) {
+        const user = ctx.state.user;
+        const purchase = ctx.session?.bundlePurchase;
+        
+        if (!purchase) {
+            return ctx.answerCbQuery('❌ Session expired. Please start over.');
+        }
+
+        try {
+            await User.updateOne(
+                { userId: user.userId },
+                { $inc: { balance: -purchase.price, bundleRemaining: purchase.quantity } }
+            );
+
+            await Transaction.create({
+                txId: `BUNDLE_${Date.now()}_${user.userId}`,
+                userId: user.userId,
+                type: 'BUNDLE_PURCHASE',
+                amount: -purchase.price,
+                status: 'COMPLETED',
+                metadata: { 
+                    quantity: purchase.quantity, 
+                    pricePerOtp: purchase.price / purchase.quantity,
+                    source: 'BUNDLE_OTP_MENU'
+                },
+                createdAt: new Date()
+            });
+
+            ctx.session.bundlePurchase = null;
+
+            const message = 
+                `✅ <b>Bundle Purchased!</b>\n\n` +
+                `📦 <code>${purchase.quantity}</code> OTPs added\n` +
+                `💰 <code>${formatCurrency(purchase.price)}</code> deducted\n` +
+                `📦 Total Available: <code>${(user.bundleRemaining || 0) + purchase.quantity}</code> OTPs\n\n` +
+                `Use /otp to start requesting.`;
+
+            await this.sendPhotoWithCaption(
+                ctx, IMAGES.bundleOther, message,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 View My Number', 'view_my_number')],
+                    [Markup.button.callback('🔙 Main Menu', 'menu')]
+                ]),
+                'HTML'
+            );
+
+        } catch (error) {
+            logger.error('Bundle purchase failed', { userId: user.userId, error: error.message });
+            await this.sendPhotoWithCaption(
+                ctx, IMAGES.otpFailed,
+                '❌ <b>Purchase Failed</b>\n\nPlease try again or contact support.',
+                KEYBOARDS.supportOrRetry(), 'HTML'
+            );
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  REQUEST OTP VIP (direct from My Number screen)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleRequestOtpVip(ctx) {
+        const user = ctx.state.user;
+        
+        if (!this._isVipActive(user)) {
+            return ctx.answerCbQuery('❌ VIP required');
+        }
+        
+        if (!this._canUseVip(user)) {
+            return ctx.answerCbQuery('❌ Daily limit reached');
+        }
+        
+        if (!user.vipPhoneNumber) {
+            const assignment = await this.assignVipNumber(user.userId, 'US');
+            if (!assignment) {
+                return this.sendPhotoWithCaption(
+                    ctx, IMAGES.vipOther,
+                    '⚠️ <b>Number Assignment Pending</b>\n\nPlease try again shortly.',
+                    Markup.inlineKeyboard([
+                        [Markup.button.callback('🔄 Retry', 'request_otp_vip')],
+                        [Markup.button.callback('🔙 Back', 'view_my_number')]
+                    ]),
+                    'HTML'
+                );
+            }
+            user.vipPhoneNumber = assignment.phoneNumber;
+        }
+
+        ctx.session = ctx.session || {};
+        ctx.session.otpMode = 'VIP';
+        ctx.session.useVipNumber = true;
+        
+        await this.showServiceSelection(ctx, 'VIP', IMAGES.vipOther);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SUPPORT & UTILITY HANDLERS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleContactSupport(ctx) {
+        await ctx.reply(
+            '📞 <b>Contact Support</b>\n\nNeed help? Contact us at @swiftsmssupport_bot\n\nOur team is available 24/7.',
+            { 
+                parse_mode: 'HTML',
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.url('📞 Contact @swiftsmssupport_bot', 'https://t.me/swiftsmssupport_bot')],
+                    [Markup.button.callback('🔙 Back', 'menu')]
+                ]).reply_markup
+            }
+        );
+    }
+
+    async handleRevealOTP(ctx) {
+        const sessionId = ctx.match[1];
+        const userId = ctx.from.id.toString();
+        
+        try {
+            const session = await Session.findOne({ sessionId, userId });
+            if (!session || session.status !== 'RECEIVED') {
+                return ctx.answerCbQuery('❌ OTP not available');
+            }
+            
+            await ctx.answerCbQuery();
+            
+            const message = 
+                `🔓 <b>Full OTP Revealed</b>\n\n` +
+                `📱 Number: <code>${session.number}</code>\n` +
+                `🔢 OTP: <code>${session.otpCode}</code>\n` +
+                `🕐 Delivered: ${session.endTime ? new Date(session.endTime).toLocaleTimeString() : 'N/A'}\n\n` +
+                `⚠️ Do not share this code with anyone.`;
+                
+            await this.sendPhotoWithCaption(ctx, IMAGES.otpReceived, message, null, 'HTML');
+            
+        } catch (error) {
+            await ctx.answerCbQuery('❌ Error revealing OTP');
+        }
+    }
+
+    async handleCheckDeposit(ctx) {
+        const userId = ctx.from.id.toString();
+        
+        try {
+            const result = await this.walletService.checkDeposit(userId);
+            
+            if (!result.found) {
+                const message = 
+                    '⏳ <b>No Deposit Found</b>\n\n' +
+                    'Your deposit hasn\'t been detected yet.\n\n' +
+                    'Make sure you:\n' +
+                    '1️⃣ Sent to the correct address\n' +
+                    '2️⃣ Sent exactly the shown amount\n' +
+                    '3️⃣ Used BSC (BEP-20) network\n\n' +
+                    '⏱ Check again in 1-2 minutes.';
+                
+                return this.sendPhotoWithCaption(
+                    ctx, IMAGES.default, message,
+                    Markup.inlineKeyboard([
+                        [Markup.button.callback('🔄 Check Again', 'check_deposit')],
+                        [Markup.button.callback('🔙 Back', 'menu')]
+                    ]),
+                    'HTML'
+                );
+            }
+            
+            if (result.status === 'CONFIRMING') {
+                const message = 
+                    `⏳ <b>Deposit Confirming</b>\n\n` +
+                    `Amount: ${formatCurrency(result.amount)}\n` +
+                    `Confirmations: ${result.confirmations || 0}/${config.blockchain?.blockConfirmations || 12}\n\n` +
+                    `Please wait for full confirmation.`;
+                return this.sendPhotoWithCaption(ctx, IMAGES.default, message, null, 'HTML');
+            }
+            
+            if (result.status === 'CONFIRMED' || result.status === 'CREDITED') {
+                const message = 
+                    `✅ <b>Deposit Confirmed!</b>\n\n` +
+                    `Amount Credited: ${formatCurrency(result.amount)}\n` +
+                    (result.trackingFee > 0 ? `Tracking Fee: ${formatCurrency(result.trackingFee)}\n` : '') +
+                    `TX Hash: <code>${result.txHash}</code>\n\n` +
+                    `Your balance has been updated.`;
+                return this.sendPhotoWithCaption(ctx, IMAGES.depositConfirmed, message, null, 'HTML');
+            }
+        } catch (error) {
+            logger.error('Check deposit failed', { userId, error: error.message });
+            await this.sendPhotoWithCaption(ctx, IMAGES.default, '❌ Error checking deposit. Please try again.');
+        }
+    }
+
+    async handleDepositInfo(ctx) {
+        const message = 
+            '💳 <b>Deposit Information</b>\n\n' +
+            'Send USDT (BEP-20) to your deposit address.\n\n' +
+            'Your deposit will be credited automatically after confirmation.\n\n' +
+            'Use /check_deposit to check status.';
+        await this.sendPhotoWithCaption(ctx, IMAGES.default, message, null, 'HTML');
+    }
+
+    async handleMenu(ctx) {
+        return this.handleOTPCommand(ctx);
+        }
+
+
+
+            // ═══════════════════════════════════════════════════════════════════════════════
+//  OTPCommands.js — Part 5: NEW FEATURES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  HISTORY — View past OTP sessions
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleHistory(ctx) {
+        const userId = ctx.from.id.toString();
+        
+        try {
+            const sessions = await Session.find({ userId })
+                .sort({ createdAt: -1 })
+                .limit(10)
+                .lean();
+
+            if (!sessions.length) {
+                return this.sendPhotoWithCaption(
+                    ctx, IMAGES.history,
+                    '📜 <b>No History</b>\n\nYou haven\'t requested any OTPs yet.\n\nUse /otp to get started!',
+                    Markup.inlineKeyboard([
+                        [Markup.button.callback('📱 Request OTP', 'menu')],
+                        [Markup.button.callback('🔙 Back', 'menu')]
+                    ]),
+                    'HTML'
+                );
+            }
+
+            let message = '📜 <b>Recent OTP History</b>\n\n';
+            
+            for (const s of sessions) {
+                const statusEmoji = {
+                    RECEIVED: '✅',
+                    TIMEOUT: '⏰',
+                    CANCELLED: '❌',
+                    WAITING: '⏳',
+                    CHECKING: '🔍'
+                }[s.status] || '❓';
+                
+                const date = new Date(s.createdAt).toLocaleDateString();
+                const time = new Date(s.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                
+                message += `${statusEmoji} <b>${s.service}</b> — ${date} ${time}\n`;
+                message += `   📱 ${this.maskPhone(s.number)} | ${s.mode}`;
+                if (s.otpCode) message += ` | 🔢 ${s.otpCode}`;
+                message += '\n\n';
+            }
+
+            await this.sendPhotoWithCaption(
+                ctx, IMAGES.history, message,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 Request OTP', 'menu')],
+                    [Markup.button.callback('🔙 Main Menu', 'menu')]
+                ]),
+                'HTML'
+            );
+        } catch (error) {
+            logger.error('History fetch failed', { userId, error: error.message });
+            await ctx.answerCbQuery('❌ Error loading history');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  REFERRAL — Invite friends, earn credits
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleReferral(ctx) {
+        const user = ctx.state.user;
+        const botUsername = ctx.botInfo?.username || 'SwiftSMSBot';
+        const referralLink = `https://t.me/${botUsername}?start=ref_${user.userId}`;
+        
+        const referralBonus = config.referral?.bonus || 0.50;
+        const referralCount = user.referrals?.length || 0;
+        const referralEarnings = user.referralEarnings || 0;
+
+        const message = 
+            `👥 <b>Referral Program</b>\n\n` +
+            `Invite friends and earn <code>$
