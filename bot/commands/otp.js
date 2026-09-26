@@ -2135,3 +2135,468 @@ async handleCheckFree(ctx, sessionId) {
             } else {
                 const allPage = page - 1;
                 const allServices = await this.serviceCatalog.getServicesPage(allPage, 15);
+                services = allServices.services;
+                const totalAll = allServices.pagination.total;
+                totalPages = 1 + Math.ceil(Math.max(0, totalAll - 15) / 15);
+            }
+
+            const priceText = displayPrice ? `\n💰 Starting from ${formatCurrency(displayPrice)}` : '';
+            let message = `📱 <b>${mode} Mode</b>${priceText}\n\n`;
+            
+            if (isPopularPage) {
+                message += `🔥 <b>Popular Services</b> (Top 15)\n`;
+                message += `<i>Most used worldwide</i>\n\n`;
+            } else {
+                message += `📋 <b>All Services</b> (A-Z) — Page ${page}/${totalPages}\n\n`;
+            }
+            
+            message += `<i>Select a service:</i>`;
+
+            const buttons = [];
+            const serviceEmojis = {
+                'WhatsApp': '💬', 'Telegram': '✈️', 'Facebook': '👤', 'Instagram': '📸',
+                'Twitter': '🐦', 'TikTok': '🎵', 'Binance': '💰', 'Other': '💧',
+                'Gmail': '📧', 'Outlook': '📨', 'Netflix': '🎬', 'Amazon': '📦',
+                'PayPal': '💳', 'Snapchat': '👻', 'Discord': '🎮', 'Spotify': '🎧',
+                'Uber': '🚗', 'Airbnb': '🏠', 'WeChat': '💬', 'Signal': '🔒',
+                'LinkedIn': '💼', 'Tinder': '🔥', 'Google': '🔍', 'Microsoft': '🪟',
+                'Apple': '🍎', 'Viber': '📞', 'Line': '📱', 'KakaoTalk': '💬',
+                'Imo': '📹', 'Zalo': '💬', 'Badoo': '❤️', 'Yahoo': '📧',
+                'Yandex': '🔍', 'Mail.ru': '📧', 'Odnoklassniki': '👥', 'VK': '🔷',
+                'Avito': '📰', 'OLX': '📰', 'Alibaba': '📦', 'Taobao': '📦',
+                'JD': '📦', 'Weibo': '📱', 'QQ': '💬', 'Baidu': '🔍',
+                'DingTalk': '💬', 'Meituan': '🍔', 'Douyin': '🎵', 'Kuaishou': '🎥',
+                'Pinduoduo': '🛒', 'Xiaohongshu': '📕', 'Tantan': '❤️', 'Momo': '💬',
+                'Hepsiburada': '🛒', 'Trendyol': '🛒', 'N11': '🛒', 'Gittigidiyor': '🛒',
+                'Letgo': '📱', 'OfferUp': '📱', 'Mercari': '📦', 'Rakuten': '🛒',
+                'Shopee': '🛒', 'Lazada': '🛒', 'Tokopedia': '🛒', 'Bukalapak': '🛒',
+                'Flipkart': '🛒', 'Snapdeal': '🛒', 'Myntra': '👕', 'Zomato': '🍔',
+                'Swiggy': '🍔', 'Ola': '🚗', 'Grab': '🚗', 'Gojek': '🚗',
+                'Bolt': '🚗', 'Careem': '🚗', 'Pathao': '🚗', 'Foodpanda': '🍔',
+                'Deliveroo': '🍔', 'UberEats': '🍔', 'DoorDash': '🍔', 'Grubhub': '🍔'
+            };
+
+            for (let i = 0; i < services.length; i += 3) {
+                const row = services.slice(i, i + 3).map(s => {
+                    const emoji = serviceEmojis[s.name] || '📱';
+                    const popularMark = s.isGlobalTop ? '🔥' : (s.isPopular ? '⭐' : '');
+                    return Markup.button.callback(
+                        `${emoji} ${s.name}${popularMark}`,
+                        `service_select_${s.name}`
+                    );
+                });
+                buttons.push(row);
+            }
+
+            const navRow = [];
+            if (page > 1) {
+                navRow.push(Markup.button.callback('◀️ Prev', `service_page_${page - 1}`));
+            }
+            navRow.push(Markup.button.callback('🔍 Search', 'service_search_prompt'));
+            if (page < totalPages) {
+                navRow.push(Markup.button.callback('Next ▶️', `service_page_${page + 1}`));
+            }
+            if (navRow.length > 0) buttons.push(navRow);
+
+            if (page === 1 && totalPages > 1) {
+                buttons.push([Markup.button.callback('📋 Browse All A-Z', 'service_page_2')]);
+            }
+            buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
+
+            const keyboard = Markup.inlineKeyboard(buttons);
+
+            const editSuccess = await this._tryEditMessage(ctx, message, keyboard);
+            
+            if (!editSuccess) {
+                await this._fallbackSendMessage(ctx, message, keyboard, imageUrl);
+            }
+
+        } catch (error) {
+            logger.error('showServiceSelection failed', { error: error.message, page, stack: error.stack });
+            ctx.reply('❌ Error loading services. Please try /otp again.').catch(() => {});
+        }
+    }
+
+    
+/**
+ * Try to edit the existing message.
+ * Uses editMessageCaption for photos, editMessageText for text messages.
+ * Returns true if successful, false if should fallback.
+ */
+async _tryEditMessage(ctx, message, keyboard) {
+    try {
+        // Determine if current message has a photo (caption) or is text-only
+        const msg = ctx.callbackQuery?.message || ctx.message;
+        const hasPhoto = msg?.photo && msg.photo.length > 0;
+        
+        const options = {
+            parse_mode: 'HTML',
+            reply_markup: keyboard.reply_markup
+        };
+
+        if (hasPhoto) {
+            await ctx.editMessageCaption(message, options);
+        } else {
+            await ctx.editMessageText(message, options);
+        }
+        
+        return true;
+    } catch (error) {
+        // Expected errors when edit is not possible:
+        // - message not modified (same content)
+        // - message is not a photo (for caption)
+        // - message to edit not found
+        // - message can't be edited
+        const isExpectedError = [
+            'message is not modified',
+            'message to edit not found',
+            'there is no caption in the message',
+            "message can't be edited",
+            'MESSAGE_NOT_MODIFIED',
+            'MESSAGE_ID_INVALID',
+            ' Bad Request: message is not modified'
+        ].some(errMsg => error.message?.includes(errMsg) || error.description?.includes(errMsg));
+
+        if (!isExpectedError) {
+            logger.warn('Unexpected edit error', { error: error.message, userId: ctx.from?.id });
+        }
+        
+        return false;
+    }
+}
+
+/**
+ * Fallback: delete old message and send new one.
+ */
+async _fallbackSendMessage(ctx, message, keyboard, imageUrl) {
+    try {
+        await ctx.deleteMessage();
+    } catch (delErr) {
+        // Message already deleted or can't delete — ignore
+    }
+
+    try {
+        if (imageUrl) {
+            await ctx.replyWithPhoto(imageUrl, {
+                caption: message,
+                parse_mode: 'HTML',
+                reply_markup: keyboard.reply_markup
+            });
+        } else {
+            await ctx.reply(message, {
+                parse_mode: 'HTML',
+                reply_markup: keyboard.reply_markup
+            });
+        }
+    } catch (sendErr) {
+        logger.error('Fallback send failed', { error: sendErr.message, userId: ctx.from?.id });
+        // Last resort
+        await ctx.reply(message, {
+            parse_mode: 'HTML',
+            reply_markup: keyboard.reply_markup
+        }).catch(() => {});
+    }
+}
+
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  LEGACY: Old service selection (all services at once)
+    // ═══════════════════════════════════════════════════════════════════════
+
+        async _showLegacyServiceSelection(ctx, mode, imageUrl, displayPrice = null) {
+        const priceText = displayPrice ? `\n💰 Starting from ${formatCurrency(displayPrice)}` : '';
+        const message = `📱 <b>${mode} Mode</b>${priceText}\n\nChoose the service you need OTP for:`;
+        const buttons = [];
+        
+        // Mode-specific callback prefix
+        const callbackPrefix = mode === 'FREE' ? 'free_service_' :
+                               mode === 'CHEAP' ? 'cheap_service_' :
+                               mode === 'BUNDLE' ? 'bundle_service_' :
+                               mode === 'VIP' ? 'vip_service_' :
+                               'service_';
+        
+        for (let i = 0; i < SERVICES.length; i += 3) {
+            const row = SERVICES.slice(i, i + 3).map(s => 
+                Markup.button.callback(s, `${callbackPrefix}${s}`)
+            );
+            buttons.push(row);
+        }
+        
+        buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
+        await this.sendPhotoWithCaption(ctx, imageUrl, message, Markup.inlineKeyboard(buttons), 'HTML');
+        }
+        
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  NEW: Tier Selection (Step 2 of CHEAP flow)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async showTierSelection(ctx, service) {
+        const tierInfos = this.tierSelector.getAllTierInfos();
+        
+        let message = 
+            `📱 <b>${service}</b>\n\n` +
+            `Choose Number Quality:\n\n`;
+
+        const buttons = [];
+
+        for (const tier of tierInfos) {
+            const emoji = tier.emoji;
+            const label = tier.label;
+            const badge = tier.badge;
+            
+            let priceText = '';
+            try {
+                const baseline = await this.tierSelector.selectOperator(
+                    tier.key, 'US', service, { timeoutMs: 5000 }
+                ).catch(() => null);
+                
+                if (baseline?.displayPrice) {
+                    priceText = ` — from ${formatCurrency(baseline.displayPrice)}`;
+                }
+            } catch (e) {
+                // Ignore price fetch errors
+            }
+
+            const badgeText = badge ? ` [${badge.toUpperCase()}]` : '';
+            
+            message += `${emoji} <b>${label}</b>${badgeText}\n`;
+            message += `   ${tier.description}${priceText}\n\n`;
+
+            buttons.push([Markup.button.callback(
+                `${emoji} ${label}${badgeText}${priceText}`,
+                `tier_${tier.key}`
+            )]);
+        }
+
+        buttons.push([Markup.button.callback('🔙 Back to Services', 'tier_back_service')]);
+
+        await this.sendPhotoWithCaption(ctx, IMAGES.cheapMode, message, Markup.inlineKeyboard(buttons), 'HTML');
+    }
+
+    async handleTierSelect(ctx, tierKey) {
+        const service = ctx.session?.otpService;
+        
+        if (!service) {
+            return ctx.answerCbQuery('❌ Session expired. Start over.', { show_alert: true });
+        }
+
+        const tierInfo = this.tierSelector.getTierInfo(tierKey);
+        if (!tierInfo) {
+            return ctx.answerCbQuery('❌ Invalid tier selected');
+        }
+
+        ctx.session = ctx.session || {};
+        ctx.session.selectedTier = tierKey;
+
+        await ctx.answerCbQuery(`✅ ${tierInfo.label} selected`);
+
+        await this.showTierCountrySelection(ctx, service, tierKey, 1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  NEW: Country Selection with Tier-Aware Live Pricing (Step 3)
+    // ═════
+            
+
+    async showTierCountrySelection(ctx, service, tierKey, page = 1, searchQuery = null) {
+        const tierInfo = this.tierSelector.getTierInfo(tierKey);
+        
+        try {
+            // Try to edit loading message
+            try {
+                await ctx.editMessageCaption(
+                    `🌍 <b>Loading ${tierInfo.emoji} ${tierInfo.label} countries...</b>`,
+                    { parse_mode: 'HTML' }
+                );
+            } catch (e) {
+                // Not a caption message or can't edit
+            }
+
+            const result = await this.countryCatalog.getCountriesForService(
+                service, 
+                tierKey, 
+                { 
+                    page, 
+                    perPage: 12,
+                    searchQuery,
+                    topOnly: false
+                }
+            );
+
+            if (!result.countries || result.countries.length === 0) {
+                const noStockMessage = 
+                    `⚠️ <b>No ${tierInfo.label} Numbers Available</b>\n\n` +
+                    `No ${tierInfo.label.toLowerCase()} numbers available for <b>${service}</b> currently.\n\n` +
+                    `Try:\n` +
+                    `• Another tier\n` +
+                    `• Another service\n` +
+                    `• Search for a specific country`;
+
+                const fallbackButtons = [];
+                const otherTiers = this.tierSelector.getAllTierInfos().filter(t => t.key !== tierKey);
+                for (const t of otherTiers) {
+                    fallbackButtons.push([Markup.button.callback(
+                        `${t.emoji} Try ${t.label}`,
+                        `tier_${t.key}`
+                    )]);
+                }
+                fallbackButtons.push([Markup.button.callback('🔙 Back to Tiers', 'tier_back_tier')]);
+                fallbackButtons.push([Markup.button.callback('🔙 Main Menu', 'menu')]);
+
+                return this.sendPhotoWithCaption(
+                    ctx, IMAGES.otpFailed, noStockMessage, 
+                    Markup.inlineKeyboard(fallbackButtons), 'HTML'
+                );
+            }
+
+            let message = 
+                `🌍 <b>Select Country for ${service}</b>\n` +
+                `${tierInfo.emoji} <b>${tierInfo.label} Tier</b>\n\n`;
+
+            if (searchQuery) {
+                message += `🔍 Search: "${searchQuery}"\n`;
+            }
+
+            message += `Showing ${result.countries.length} countries (cheapest first):\n\n`;
+
+            const buttons = [];
+            const COLUMNS = 3;
+
+            for (let i = 0; i < result.countries.length; i += COLUMNS) {
+                const row = result.countries.slice(i, i + COLUMNS).map(country => {
+                    const flag = country.flag || isoToFlag(country.code);
+                    // FIXED: Apply profit margin to display price
+                    const rawPrice = country.displayPrice || country.price;
+                    const displayPrice = rawPrice ? applyProfitMargin(rawPrice) : null;
+                    const priceText = displayPrice 
+                        ? ` $${displayPrice.toFixed(2)}`
+                        : (country.price ? ` ~$${applyProfitMargin(country.price).toFixed(2)}` : '');
+                        const stockText = country.stock > 0 ? ` ✅` : ' ❌';
+                    
+                    const label = `${flag} ${country.code}${priceText}${stockText}`;
+                    
+                    return Markup.button.callback(label, `country_select_${country.code}`);
+                });
+                buttons.push(row);
+            }
+
+            const navRow = [];
+            if (result.pagination.hasPrev) {
+                navRow.push(Markup.button.callback('◀️ Prev', `country_page_${page - 1}`));
+            }
+            navRow.push(Markup.button.callback('🔍 Search', 'country_search_prompt'));
+            if (result.pagination.hasNext) {
+                navRow.push(Markup.button.callback('Next ▶️', `country_page_${page + 1}`));
+            }
+            if (navRow.length > 0) buttons.push(navRow);
+
+            buttons.push([Markup.button.callback('🔙 Back to Tiers', 'tier_back_tier')]);
+            buttons.push([Markup.button.callback('🔙 Main Menu', 'menu')]);
+
+            const keyboard = Markup.inlineKeyboard(buttons);
+
+            // FIXED: Robust auto-edit
+            const editSuccess = await this._tryEditMessage(ctx, message, keyboard);
+            
+            if (!editSuccess) {
+                await this._fallbackSendMessage(ctx, message, keyboard, IMAGES.countrySelect);
+            }
+
+        } catch (error) {
+            logger.error('Tier country selection failed', { 
+                service, tierKey, page, error: error.message 
+            });
+            
+            return this.sendPhotoWithCaption(
+                ctx, IMAGES.otpFailed,
+                `❌ <b>Error Loading Countries</b>\n\n${error.message}\n\nPlease try again.`,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Retry', `tier_${tierKey}`)],
+                    [Markup.button.callback('🔙 Back', 'tier_back_tier')]
+                ]),
+                'HTML'
+            );
+        }
+        }
+                            
+                                                                  
+                  
+    async handleTierCountrySelect(ctx, countryCode) {
+    const userId = ctx.from.id.toString();
+    const service = ctx.session?.otpService;
+    const tierKey = ctx.session?.selectedTier;
+    
+    // FIXED: Check if user selected a fallback operator from the alternatives list
+    const fallbackOperator = ctx.session?.fallbackOperator;
+
+    if (!service || !tierKey) {
+        return ctx.answerCbQuery('❌ Session expired. Start over.', { show_alert: true });
+    }
+
+    await ctx.answerCbQuery('⏳ Purchasing number...');
+
+    let loadingMsg = null;
+    let selection = null;
+    let attemptedOperators = [];
+    
+    try {
+        loadingMsg = await ctx.reply('⏳ Finding best operator and purchasing number...');
+
+        // FIXED: If fallback operator was selected by user, use it directly
+        // instead of calling selectOperator() again which would return the same failed operator
+        if (fallbackOperator) {
+            logger.info('Using fallback operator from session', {
+                userId,
+                fallbackOperator,
+                tierKey,
+                service,
+                country: countryCode
+            });
+            
+            // Get fallback operators list and find the selected one
+            const fallbackOps = await this.tierSelector.getFallbackOperators(
+                tierKey, countryCode, service, null
+            );
+            
+            selection = fallbackOps.find(op => op.operator === fallbackOperator);
+            
+            if (!selection) {
+                // Fallback operator no longer available, clear and error
+                delete ctx.session.fallbackOperator;
+                throw new Error('FALLBACK_EXPIRED: Selected operator no longer available');
+            }
+        } else {
+            // Normal flow: select best operator from tier.
+            // CORE REQUIREMENT #5: this is a purchase-time selection, not a menu
+            // display — use live (uncached) inventory, since stock can change
+            // between the user opening the country list and pressing buy.
+            selection = await this.tierSelector.selectOperator(tierKey, countryCode, service, {
+                timeoutMs: 15000,
+                skipCache: true
+            });
+        }
+
+        logger.info('Tier operator selected', {
+            userId,
+            tier: tierKey,
+            service,
+            country: countryCode,
+            operator: selection.operator,
+            price: selection.price,
+            displayPrice: selection.displayPrice,
+            stock: selection.stock,
+            score: selection.score,
+            isFallback: !!fallbackOperator
+        });
+
+        const user = ctx.state.user;
+        if (this._getAvailableBalance(user) < selection.displayPrice) {
+            try {
+                if (loadingMsg?.message_id) await ctx.deleteMessage(loadingMsg.message_id);
+            } catch (delErr) {}
+
+            const message = 
+                `💰 <b>Insufficient Balance</b>\n\n` +
+                `Required: ${formatCurrency(selection.displayPrice)}\n` +
+                `Available: ${formatCurrency(this._get
