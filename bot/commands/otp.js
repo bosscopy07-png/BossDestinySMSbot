@@ -2995,4 +2995,515 @@ const checkInterval = setInterval(async () => {
     // ═══════════════════════════════════════════════════════════════════════
     async handleTierSearchService(ctx, query) {
         if (!query || query.trim().length < 2) {
-            return ctx.reply('❌ Please enter at least 2 characte
+            return ctx.reply('❌ Please enter at least 2 characters to search.');
+        }
+
+        const results = await this.serviceCatalog.searchServices(query);
+        
+        if (results.length === 0) {
+            return ctx.reply(
+                `❌ No services found for "${query}"\n\nTry another search term.`,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('🔍 Search Again', 'service_search_prompt')],
+                    [Markup.button.callback('🔙 Back', 'menu')]
+                ])
+            );
+        }
+
+        let message = `🔍 <b>Search Results for "${query}"</b>\n\nFound ${results.length} services:\n\n`;
+        const buttons = [];
+
+        const serviceEmojis = {
+            'WhatsApp': '💬', 'Telegram': '✈️', 'Facebook': '👤', 'Instagram': '📸',
+            'Twitter': '🐦', 'TikTok': '🎵', 'Binance': '💰', 'Coinbase': '₿',
+            'Gmail': '📧', 'Outlook': '📨', 'Netflix': '🎬', 'Amazon': '📦',
+            'PayPal': '💳', 'Snapchat': '👻', 'Discord': '🎮', 'Spotify': '🎧',
+            'Uber': '🚗', 'Airbnb': '🏠', 'WeChat': '💬', 'Signal': '🔒',
+            'LinkedIn': '💼', 'Tinder': '🔥', 'Google': '🔍', 'Microsoft': '🪟',
+            'Apple': '🍎', 'Viber': '📞', 'Line': '📱', 'KakaoTalk': '💬',
+            'Imo': '📹', 'Zalo': '💬', 'Badoo': '❤️', 'Other': '💧'
+        };
+
+        // 3 columns
+        for (let i = 0; i < results.length && i < 15; i += 3) {
+            const row = results.slice(i, i + 3).map(r => {
+                const emoji = serviceEmojis[r.name] || '📱';
+                return Markup.button.callback(
+                    `${emoji} ${r.name}`,
+                    `service_select_${r.name}`
+                );
+            });
+            buttons.push(row);
+        }
+
+        buttons.push([Markup.button.callback('🔍 New Search', 'service_search_prompt')]);
+        buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
+
+        // Try to edit, fallback to reply
+        try {
+            await ctx.editMessageCaption(message, {
+                parse_mode: 'HTML',
+                reply_markup: Markup.inlineKeyboard(buttons).reply_markup
+            });
+        } catch (e) {
+            await ctx.reply(message, {
+                parse_mode: 'HTML',
+                reply_markup: Markup.inlineKeyboard(buttons).reply_markup
+            });
+        }
+                            }
+        
+    
+
+    async handleTierSearchCountry(ctx, query) {
+        const service = ctx.session?.otpService;
+        const tierKey = ctx.session?.selectedTier;
+
+        if (!service || !tierKey) {
+            return ctx.reply('❌ Session expired. Please start over with /otp');
+        }
+
+        // countryCatalog.searchCountries is synchronous (returns array)
+        const matches = this.countryCatalog.searchCountries(query);
+        
+        if (matches.length === 0) {
+            return ctx.reply(
+                `❌ No countries found for "${query}"\n\nTry country name or ISO code (e.g., US, UK).`,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('🔍 Search Again', 'country_search_prompt')],
+                    [Markup.button.callback('🔙 Back', `tier_${tierKey}`)]
+                ])
+            );
+        }
+
+        await this.showTierCountrySelection(ctx, service, tierKey, 1, query);
+    }
+        
+    
+            // ═══════════════════════════════════════════════════════════════════════
+    //  SERVICE & COUNTRY SELECTION
+    //  FIXED: Uses dynamic catalog, no hardcoded SERVICES/COUNTRIES
+    // ═══════════════════════════════════════════════════════════════════════
+          /**
+     * Check if a service exists in dynamic catalog
+     * FIXED: Added type guard to prevent non-string inputs
+     */
+    async hasService(serviceName) {
+        await this._ensureLoaded();
+        
+        // FIXED: Type guard — ensure serviceName is a string
+        if (!serviceName || typeof serviceName !== 'string') {
+            logger.warn('hasService called with invalid type', { 
+                serviceName, 
+                type: typeof serviceName 
+            });
+            return false;
+        }
+        
+        return this._serviceMap.has(serviceName.toLowerCase());
+    }
+        
+            async handleServiceSelect(ctx, serviceName = null) {
+        // FIXED: Ensure serviceName is a string
+        let service = serviceName;
+        
+        if (!service && ctx.message?.text) {
+            service = ctx.message.text.trim();
+        }
+        
+        // Guard against non-string inputs (function, object, number, etc.)
+        if (!service || typeof service !== 'string') {
+            logger.warn('handleServiceSelect: invalid service input', { 
+                service, 
+                type: typeof service,
+                serviceName,
+                match: ctx.match?.[1],
+                matchType: typeof ctx.match
+            });
+            return ctx.answerCbQuery('❌ Invalid service').catch(() => {});
+        }
+        
+        const isValid = await this.serviceCatalog.hasService(service);
+        if (!isValid) {
+            logger.warn('Invalid service selected', { service });
+            return ctx.answerCbQuery('❌ Invalid service').catch(() => {});
+        }
+        
+        ctx.session = ctx.session || {};
+        ctx.session.otpService = service;
+        
+        const mode = ctx.session?.otpMode;
+
+        if (mode === 'CHEAP' && this.tierSelector) {
+            return this.showTierSelection(ctx, service);
+        }
+
+        if (mode === 'CHEAP') {
+            return this._showCheapCountrySelectionLegacy(ctx, service);
+        }
+        
+        // For non-CHEAP modes
+        const message = `🌍 <b>Select Country</b>\n\nChoose number country for <b>${service}</b>:`;
+        
+        const availableCountries = await this.countryCatalog.getCountriesForService(service, 'standard', {
+            topOnly: true,
+            perPage: 20
+        });
+        
+        const buttons = availableCountries.countries.map(c => [
+            Markup.button.callback(
+                `${c.flag} ${c.name}${c.displayPrice ? ` (${formatCurrency(c.displayPrice)})` : ''}`, 
+                `country_select_${c.code}`
+            )
+        ]);
+        
+        buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
+        await this.sendPhotoWithCaption(ctx, IMAGES.countrySelect, message, Markup.inlineKeyboard(buttons), 'HTML');
+            }
+        
+        
+        
+                                                                                                      
+        /**
+     * Legacy country selection with CHEAP provider prices.
+     * FIXED: Uses dynamic country catalog as fallback instead of hardcoded COUNTRIES
+     * 
+     * @param {Object} ctx - Telegraf context
+     * @param {string} service - Service code (e.g., 'wa', 'ig')
+     * @returns {Promise<void>}
+     */
+    async _showCheapCountrySelectionLegacy(ctx, service) {
+        const userId = ctx.from?.id?.toString();
+        if (!userId) {
+            logger.error('Missing user ID in country selection');
+            return ctx.reply('❌ Authentication error. Please try /start').catch(() => {});
+        }
+
+        let loadingMsg = null;
+        
+        try {
+            loadingMsg = await ctx.reply('🌍 Fetching available countries...');
+            
+            if (!this.smsProviderManager) {
+                throw new Error('SMS_PROVIDER_NOT_AVAILABLE');
+            }
+
+            const countriesResult = await this.smsProviderManager.getCheapCountries(service);
+            
+            if (!countriesResult || countriesResult.length === 0) {
+                await this._safeDeleteMessage(ctx, loadingMsg);
+                
+                return this.sendPhotoWithCaption(
+                    ctx, 
+                    IMAGES.otpFailed,
+                    `❌ <b>No Countries Available</b>\n\nNo countries have stock for <b>${service}</b> right now.\n\nTry another service or check back later.`,
+                    Markup.inlineKeyboard([
+                        [Markup.button.callback('🔄 Try Another Service', 'menu')],
+                        [Markup.button.callback('🔙 Back', 'menu')]
+                    ]),
+                    'HTML'
+                );
+            }
+
+            // Fetch prices in parallel with concurrency limit
+            const countriesWithPrices = await this._fetchPricesParallel(
+                countriesResult.slice(0, 20), 
+                service
+            );
+
+            // Sort by display price ascending
+            countriesWithPrices.sort((a, b) => (a.displayPrice ?? Infinity) - (b.displayPrice ?? Infinity));
+
+            await this._safeDeleteMessage(ctx, loadingMsg);
+
+            const message = `🌍 <b>Select Country for ${service}</b>\n\nPrices include service fee. Cheapest shown first:`;
+            const buttons = this._buildCountryButtons(countriesWithPrices);
+            buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
+            
+            await this.sendPhotoWithCaption(
+                ctx, 
+                IMAGES.countrySelect, 
+                message, 
+                Markup.inlineKeyboard(buttons), 
+                'HTML'
+            );
+
+        } catch (error) {
+            await this._safeDeleteMessage(ctx, loadingMsg);
+
+            logger.error('Failed to fetch CHEAP countries', { userId, service, error: error.message });
+            
+            // FIXED: Use dynamic country catalog fallback instead of hardcoded COUNTRIES
+            const fallbackCountries = await this.countryCatalog.getCountriesForService(service, 'standard', {
+                topOnly: true,
+                perPage: 20
+            });
+
+            const message = `🌍 <b>Select Country</b>\n\n⚠️ Live prices unavailable. Showing available countries for <b>${service}</b>:`;
+            
+            const buttons = fallbackCountries.countries.map(c => [
+                Markup.button.callback(
+                    `${c.flag} ${c.name}${c.displayPrice ? ` (${formatCurrency(c.displayPrice)})` : ''}`, 
+                    `country_${c.code}`
+                )
+            ]);
+            
+            buttons.push([Markup.button.callback('🔙 Back', 'menu')]);
+            
+            await this.sendPhotoWithCaption(
+                ctx, 
+                IMAGES.countrySelect, 
+                message, 
+                Markup.inlineKeyboard(buttons), 
+                'HTML'
+            );
+        }
+    }
+        
+
+    /**
+     * Safely delete a message, ignoring errors.
+     * @private
+     */
+    async _safeDeleteMessage(ctx, message) {
+        if (!message?.message_id) return;
+        try {
+            await ctx.deleteMessage(message.message_id);
+        } catch (err) {
+            logger.debug('Failed to delete message', { error: err.message, messageId: message.message_id });
+        }
+    }
+
+    /**
+     * Fetch prices in parallel with error resilience.
+     * @private
+     */
+    async _fetchPricesParallel(countries, service) {
+        const pricePromises = countries.map(async (country) => {
+            try {
+                const priceInfo = await this.smsProviderManager.getCheapPrice(country.code, service);
+                return {
+                    ...country,
+                    simPrice: priceInfo.simPrice,
+                    displayPrice: priceInfo.displayPrice,
+                    stock: priceInfo.stock
+                };
+            } catch (priceErr) {
+                return {
+                    ...country,
+                    simPrice: null,
+                    displayPrice: null,
+                    stock: country.stock || 0
+                };
+            }
+        });
+
+        return Promise.all(pricePromises);
+    }
+
+    /**
+     * Build inline keyboard rows for country selection.
+     * @private
+     */
+    _buildCountryButtons(countriesWithPrices) {
+        const buttons = [];
+        
+        for (let i = 0; i < countriesWithPrices.length; i += 2) {
+            const row = countriesWithPrices.slice(i, i + 2).map(c => {
+                const priceText = c.displayPrice 
+                    ? ` $${c.displayPrice.toFixed(2)}`
+                    : (c.simPrice ? ` ~$${(c.simPrice + 0.20).toFixed(2)}` : '');
+                const stockText = c.stock > 5 ? '' : ` (${c.stock} left)`;
+                
+                return Markup.button.callback(
+                    `${this._getFlag(c.code)} ${c.name}${priceText}${stockText}`,
+                    `country_${c.code}`
+                );
+            });
+            buttons.push(row);
+        }
+
+        return buttons;
+    }
+        
+    /**
+     * Get emoji flag for country code.
+     * FIXED: Uses isoToFlag utility instead of hardcoded map
+     * @private
+     */
+    _getFlag(code) {
+        // Use the same utility as CountryCatalog for consistency
+        if (!code || typeof code !== 'string' || code.length !== 2) return '🌍';
+        const cc = code.toUpperCase();
+        const OFFSET = 127397;
+        try {
+            return (
+                String.fromCodePoint(cc.charCodeAt(0) + OFFSET) +
+                String.fromCodePoint(cc.charCodeAt(1) + OFFSET)
+            );
+        } catch {
+            return '🌍';
+        }
+    }
+        
+    /**
+     * Get popular services, with global top 15 first, then config, then A-Z backfill
+     * FIXED: Prioritizes actually popular services (WhatsApp, Telegram, etc.)
+     */
+    async getPopularServices(minCount = 15) {
+        await this._ensureLoaded();
+
+        if (this._allServices.size === 0) {
+            return [];
+        }
+
+        const result = [];
+        const added = new Set();
+
+        // FIXED: Hardcoded global top 15 most popular services worldwide
+        const GLOBAL_TOP_15 = [
+            'WhatsApp', 'Telegram', 'Facebook', 'Instagram', 'Twitter',
+            'TikTok', 'Gmail', 'Google', 'Netflix', 'Amazon',
+            'PayPal', 'Snapchat', 'Discord', 'Spotify', 'Uber'
+        ];
+
+        // Step 1: Add global top 15 that exist in catalog
+        for (const name of GLOBAL_TOP_15) {
+            const normalized = name.toLowerCase();
+            if (this._serviceMap.has(normalized)) {
+                const displayName = this._serviceMap.get(normalized);
+                if (!added.has(displayName)) {
+                    result.push({
+                        name: displayName,
+                        category: this._getServiceCategory(displayName),
+                        isPopular: true,
+                        isGlobalTop: true
+                    });
+                    added.add(displayName);
+                }
+            }
+        }
+
+        // Step 2: Add from POPULAR_SERVICES config (excluding already added)
+        for (const name of POPULAR_SERVICES) {
+            if (added.size >= minCount) break;
+            const normalized = name.toLowerCase();
+            if (this._serviceMap.has(normalized)) {
+                const displayName = this._serviceMap.get(normalized);
+                if (!added.has(displayName)) {
+                    result.push({
+                        name: displayName,
+                        category: this._getServiceCategory(displayName),
+                        isPopular: true,
+                        isGlobalTop: false
+                    });
+                    added.add(displayName);
+                }
+            }
+        }
+
+        // Step 3: Backfill from catalog A-Z until minCount reached
+        const needed = minCount - result.length;
+        if (needed > 0) {
+            const remaining = Array.from(this._allServices)
+                .filter(s => !added.has(s))
+                .sort((a, b) => a.localeCompare(b)); // A-Z sort
+
+            for (const name of remaining.slice(0, needed)) {
+                result.push({
+                    name,
+                    category: this._getServiceCategory(name),
+                    isPopular: false,
+                    isGlobalTop: false
+                });
+                added.add(name);
+            }
+        }
+
+        logger.debug('Popular services', {
+            globalTop: result.filter(s => s.isGlobalTop).length,
+            configPopular: result.filter(s => s.isPopular && !s.isGlobalTop).length,
+            backfill: result.filter(s => !s.isPopular).length,
+            total: result.length
+        });
+
+        return result;
+    }
+        
+                            
+// ═══════════════════════════════════════════════════════════════════════════════
+//  OTPCommands.js — Part 3: Core Purchase Logic, Polling, Check OTP, Cancel
+//  INTEGRATED: Tier-based operator selection for CHEAP mode
+// ═══════════════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  COUNTRY SELECTED — ACQUIRE NUMBER (CORE LOGIC)
+    // ═══════════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════
+    //  COUNTRY SELECTED — ACQUIRE NUMBER (CORE LOGIC)
+    //  MERGED: Handles both tier-based and legacy flows
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleCountrySelect(ctx, countryCode = null) {
+        const country = countryCode || ctx.match?.[1];
+        const userId = ctx.from?.id?.toString();
+        const mode = ctx.session?.otpMode;
+        const service = ctx.session?.otpService;
+        const useVipNumber = ctx.session?.useVipNumber;
+
+        // ── Validation ──
+        if (!country) {
+            return ctx.answerCbQuery('❌ Invalid country').catch(() => {});
+        }
+
+        if (!mode || !service) {
+            return this.sendPhotoWithCaption(ctx, IMAGES.default, 
+                '❌ Session expired. Please start over with /otp',
+                KEYBOARDS.backToMenu(), 'HTML'
+            );
+        }
+
+        // Validate country exists in dynamic catalog
+        const hasCountry = this.countryCatalog?.hasCountry(country);
+        if (!hasCountry && mode === 'CHEAP' && this.tierSelector) {
+            return ctx.answerCbQuery('🌍 Invalid country selected. Please try again.', { show_alert: true });
+        }
+
+        // ── Route to tier-based flow if applicable ──
+        if (mode === 'CHEAP' && this.tierSelector && ctx.session?.selectedTier) {
+            return this.handleTierCountrySelect(ctx, country);
+        }
+
+        // ── Check existing session ──
+        const existingSession = await this._getActiveSession(userId);
+        if (existingSession && existingSession.status !== 'RECEIVED') {
+            return this.sendPhotoWithCaption(
+                ctx, IMAGES.otpFailed,
+                '⏳ <b>Active Session Exists</b>\n\nYou already have an active OTP request.\n\nCancel it first to start a new one.',
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('🔍 Check Status', `check_otp_${existingSession.sessionId}`)],
+                    [Markup.button.callback('❌ Cancel Session', 'cancel_otp')],
+                    [Markup.button.callback('🔙 Back', 'menu')]
+                ]),
+                'HTML'
+            );
+        }
+
+        let loadingMsg = null;
+        
+        try {
+            loadingMsg = await ctx.reply('⏳ Assigning number...');
+
+            // ═════════════════════════════════════════════════════════════════
+            //  VIP/BUNDLE with VIP number — uses NumberPool ONLY
+            // ═════════════════════════════════════════════════════════════════
+            if (useVipNumber && this._isVipActive(ctx.state.user) && ctx.state.user.vipPhoneNumber) {
+                const user = ctx.state.user;
+                
+                if (mode === 'VIP') {
+                    await User.updateOne({ userId }, { $inc: { vipDailyUsed: 1 } });
+                } else if (mode === 'BUNDLE') {
+                    await User.updateOne({ userId }, { $inc: { bundleRemaining: -1 } });
+                }
+
+   
