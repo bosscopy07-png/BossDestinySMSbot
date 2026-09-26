@@ -3881,3 +3881,430 @@ const checkInterval = setInterval(async () => {
                 `⏳ <b>Waiting for SMS...</b>\n\n` +
                 `Session: <code>${dbSessionId.slice(-8)}</code>\n` +
                 `Elapsed: 0s\n` +
+                `Timeout: 10m\n\n` +
+                `<i>Checking every 5 seconds...</i>`
+            );
+
+            while (Date.now() - startTime < maxDuration) {
+                await new Promise(resolve => setTimeout(resolve, pollInterval));
+
+                try {
+                    const result = await this.smsProviderManager.checkFreeSMS(freeSessionId);
+
+                    if (result.success && result.otp) {
+                        await deletePollMessage();
+
+                        await Session.updateOne(
+                            { sessionId: dbSessionId },
+                            {
+                                $set: {
+                                    status: 'RECEIVED',
+                                    otpCode: result.otp,
+                                    endTime: new Date(),
+                                    fullText: result.fullText || null
+                                }
+                            }
+                        );
+
+                        await User.updateOne(
+                            { userId },
+                            { $inc: { totalOtps: 1, freeUsedToday: 1 } }
+                        );
+
+                        const message = 
+                            `🔓 <b>OTP Received!</b>\n\n` +
+                            `📱 Number: <code>${result.number || ctx.session?.number || 'N/A'}</code>\n` +
+                            `🎯 Service: ${result.service || ctx.session?.service || 'N/A'}\n` +
+                            `🔢 OTP: <code>${result.otp}</code>\n` +
+                            `⏱ Delivery: ${formatElapsed(Date.now() - startTime)}\n\n` +
+                            `⚠️ Do not share this code with anyone.`;
+
+                        await this.bot.telegram.sendMessage(userId, message, {
+                            parse_mode: 'HTML',
+                            reply_markup: Markup.inlineKeyboard([
+                                [Markup.button.callback('🔙 Back to Menu', 'menu')],
+                                [Markup.button.callback('📱 Request Another', 'mode_free')]
+                            ]).reply_markup
+                        });
+
+                        if (ctx.session) {
+                            delete ctx.session.freeSessionId;
+                            delete ctx.session.providerNumberId;
+                            delete ctx.session.number;
+                            delete ctx.session.service;
+                            delete ctx.session.selectedService;
+                            delete ctx.session.selectedCountry;
+                            delete ctx.session.freeCreditsDeducted;
+                        }
+
+                        return;
+                    }
+
+                    if (result.status === 'EXPIRED' || result.status === 'CANCELLED') {
+                        await deletePollMessage();
+
+                        await Session.updateOne(
+                            { sessionId: dbSessionId },
+                            { $set: { status: result.status, endTime: new Date() } }
+                        );
+
+                        const message = 
+                            `❌ <b>Session ${result.status}</b>\n\n` +
+                            `The number is no longer active.\n\n` +
+                            `You can request a new free OTP or try paid options:`;
+
+                        await this.bot.telegram.sendMessage(userId, message, {
+                            parse_mode: 'HTML',
+                            reply_markup: Markup.inlineKeyboard([
+                                [Markup.button.callback('🔄 Retry Free', 'mode_free')],
+                                [Markup.button.callback('💰 Try CHEAP', 'mode_cheap')],
+                                [Markup.button.callback('👑 Try VIP', 'buy_vip')],
+                                [Markup.button.callback('🔙 Menu', 'menu')]
+                            ]).reply_markup
+                        });
+
+                        if (ctx.session) {
+                            delete ctx.session.freeSessionId;
+                            delete ctx.session.providerNumberId;
+                            delete ctx.session.number;
+                            delete ctx.session.service;
+                            delete ctx.session.selectedService;
+                            delete ctx.session.selectedCountry;
+                            delete ctx.session.freeCreditsDeducted;
+                        }
+
+                        return;
+                    }
+
+                    const elapsed = Date.now() - startTime;
+                    const remaining = Math.max(0, maxDuration - elapsed);
+                    
+                    await updatePollMessage(
+                        `⏳ <b>Waiting for SMS...</b>\n\n` +
+                        `Session: <code>${dbSessionId.slice(-8)}</code>\n` +
+                        `Elapsed: ${formatElapsed(elapsed)}\n` +
+                        `Remaining: ${formatElapsed(remaining)}\n\n` +
+                        `<i>Checking every 5 seconds...</i>`
+                    );
+
+                } catch (pollError) {
+                    logger.error('Free poll iteration error', { 
+                        userId, 
+                        freeSessionId, 
+                        error: pollError.message 
+                    });
+                }
+            }
+
+            await deletePollMessage();
+
+            logger.info('Free tier timeout', { userId, sessionId: dbSessionId });
+
+            try {
+                await this.smsProviderManager.cancelNumber('FREE_PUBLIC', freeSessionId);
+            } catch (e) {}
+
+            await Session.updateOne(
+                { sessionId: dbSessionId },
+                { $set: { status: 'TIMEOUT', endTime: new Date() } }
+            );
+
+            const message = 
+                `⏰ <b>Free OTP Timed Out</b>\n\n` +
+                `No SMS received within 10 minutes.\n\n` +
+                `💡 Try again or use paid options for better reliability:`;
+
+            await this.bot.telegram.sendMessage(userId, message, {
+                parse_mode: 'HTML',
+                reply_markup: Markup.inlineKeyboard([
+                    [Markup.button.callback('🔄 Retry Free', 'mode_free')],
+                    [Markup.button.callback('💰 Try CHEAP', 'mode_cheap')],
+                    [Markup.button.callback('👑 Try VIP', 'buy_vip')],
+                    [Markup.button.callback('🔙 Menu', 'menu')]
+                ]).reply_markup
+            });
+
+            if (ctx.session) {
+                delete ctx.session.freeSessionId;
+                delete ctx.session.providerNumberId;
+                delete ctx.session.number;
+                delete ctx.session.service;
+                delete ctx.session.selectedService;
+                delete ctx.session.selectedCountry;
+                delete ctx.session.freeCreditsDeducted;
+            }
+
+        } catch (error) {
+            logger.error('Free polling failed', { userId, dbSessionId, error: error.message });
+            await deletePollMessage();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  CHECK OTP
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleCheckOTP(ctx) {
+        const userId = ctx.from.id.toString();
+        const matchId = ctx.match[1];
+        
+        try {
+            let query = { 
+                userId, 
+                status: { $in: ['WAITING', 'CHECKING', 'RECEIVED'] } 
+            };
+            
+            if (!matchId.startsWith('vip_')) {
+                query = { sessionId: matchId, userId };
+            }
+            
+            const activeSession = await Session.findOne(query).sort({ createdAt: -1 });
+
+            if (!activeSession) {
+                return ctx.answerCbQuery('❌ No active OTP session found');
+            }
+
+            if (activeSession.status === 'RECEIVED' && activeSession.otpCode) {
+                await ctx.answerCbQuery('✅ OTP received!');
+                
+                const message = 
+                    `🔓 <b>OTP Received!</b>\n\n` +
+                    `📱 Number: <code>${activeSession.number}</code>\n` +
+                    `🎯 Service: ${activeSession.service}\n` +
+                    `🔢 OTP: <code>${activeSession.otpCode}</code>\n` +
+                    `🕐 Delivered: ${activeSession.endTime ? new Date(activeSession.endTime).toLocaleTimeString() : 'Just now'}\n\n` +
+                    `⚠️ Do not share this code with anyone.`;
+
+                await this.sendPhotoWithCaption(
+                    ctx, IMAGES.otpReceived, message,
+                    Markup.inlineKeyboard([
+                        [Markup.button.callback('🔙 Back to Menu', 'menu')],
+                        [Markup.button.callback('📱 Request Another', 'menu')]
+                    ]),
+                    'HTML'
+                );
+                return;
+            }
+
+            const status = await sessionManager.checkSessionStatus(activeSession.sessionId);
+            
+            if (status.status === 'RECEIVED' && status.otpCode) {
+                await Session.updateOne(
+                    { sessionId: activeSession.sessionId },
+                    { $set: { status: 'RECEIVED', otpCode: status.otpCode, endTime: new Date() } }
+                );
+
+                await User.updateOne({ userId }, { $inc: { totalOtps: 1 } });
+
+                await ctx.answerCbQuery('✅ OTP received!');
+                
+                const message = 
+                    `🔓 <b>OTP Received!</b>\n\n` +
+                    `📱 Number: <code>${activeSession.number}</code>\n` +
+                    `🎯 Service: ${activeSession.service}\n` +
+                    `🔢 OTP: <code>${status.otpCode}</code>\n\n` +
+                    `⚠️ Do not share this code with anyone.`;
+
+                await this.sendPhotoWithCaption(
+                    ctx, IMAGES.otpReceived, message,
+                    Markup.inlineKeyboard([
+                        [Markup.button.callback('🔙 Back to Menu', 'menu')]
+                    ]),
+                    'HTML'
+                );
+                return;
+            }
+
+            const timeLeft = activeSession.timeoutAt 
+                ? Math.max(0, Math.floor((new Date(activeSession.timeoutAt) - new Date()) / 1000)) 
+                : 0;
+            
+            await ctx.answerCbQuery(`⏳ Still waiting... ${timeLeft}s left`);
+            
+            const costText = activeSession.mode === 'FREE' ? 'FREE' : 
+                            activeSession.mode === 'BUNDLE' ? 'BUNDLE (1 credit used)' : 
+                            activeSession.mode === 'VIP' ? 'VIP (daily quota)' :
+                            formatCurrency(activeSession.cost);
+
+            const updatedMessage = 
+                `📱 <b>OTP Request In Progress</b>\n\n` +
+                `🌍 Mode: ${activeSession.mode}\n` +
+                `📱 Number: <code>${activeSession.number}</code>\n` +
+                `🎯 Service: ${activeSession.service}\n` +
+                `⏳ Status: <b>Still waiting...</b>\n` +
+                `💰 Cost: ${costText}\n` +
+                `⏱ Time Left: <code>${timeLeft}s</code>\n\n` +
+                `🔍 Last checked: ${new Date().toLocaleTimeString()}`;
+
+            const keyboard = Markup.inlineKeyboard([
+                [Markup.button.callback('🔍 Check Again', `check_otp_${activeSession.sessionId}`)],
+                [Markup.button.callback('❌ Cancel', 'cancel_otp')]
+            ]);
+
+            try {
+                await this.editOrSendPhoto(ctx, IMAGES.otpRequested, updatedMessage, keyboard, 'HTML');
+            } catch (editError) {
+                await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, updatedMessage, keyboard, 'HTML');
+            }
+
+        } catch (error) {
+            logger.error('Check OTP failed', { userId, error: error.message });
+            await ctx.answerCbQuery('❌ Error checking OTP status');
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  BUNDLE PURCHASES
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleBuyBundle(ctx) {
+        const user = ctx.state.user;
+        const bundlePrice = config.prices?.bundlePrice || 5.00;
+        const bundleCount = config.prices?.bundleOtpCount || 100;
+        
+        const message = 
+            `📦 <b>Buy OTP Bundle</b>\n\n` +
+            `💰 Price: ${formatCurrency(bundlePrice)}\n` +
+            `📦 Includes: ${bundleCount} OTPs\n` +
+            `✅ Never expires\n` +
+            `💡 Best value for regular users\n\n` +
+            `Your Balance: ${formatCurrency(user.balance)}`;
+            
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Confirm Purchase', 'confirm_bundle')],
+            [Markup.button.callback('❌ Cancel', 'menu')]
+        ]);
+        
+        await this.sendPhotoWithCaption(ctx, IMAGES.bundleFirst, message, keyboard, 'HTML');
+    }
+
+    async handleConfirmBundle(ctx) {
+        const user = ctx.state.user;
+        const bundlePrice = config.prices?.bundlePrice || 5.00;
+        const bundleCount = config.prices?.bundleOtpCount || 100;
+        
+        if (user.balance < bundlePrice) {
+            const message = 
+                `❌ <b>Insufficient Balance</b>\n\n` +
+                `Required: ${formatCurrency(bundlePrice)}\n` +
+                `Available: ${formatCurrency(user.balance)}\n\n` +
+                `Deposit first with /deposit`;
+            return this.sendPhotoWithCaption(ctx, IMAGES.bundleOther, message, null, 'HTML');
+        }
+        
+        try {
+            await User.updateOne(
+                { userId: user.userId }, 
+                { $inc: { balance: -bundlePrice, bundleRemaining: bundleCount } }
+            );
+            
+            await Transaction.create({
+                txId: `BUNDLE_MAIN_${Date.now()}_${user.userId}`,
+                userId: user.userId,
+                type: 'BUNDLE_PURCHASE',
+                amount: -bundlePrice,
+                status: 'COMPLETED',
+                metadata: { 
+                    quantity: bundleCount, 
+                    pricePerOtp: bundlePrice / bundleCount,
+                    source: 'MAIN_BUNDLE_MENU'
+                },
+                createdAt: new Date()
+            });
+            
+            const message = 
+                `✅ <b>Bundle Purchased!</b>\n\n` +
+                `📦 ${bundleCount} OTPs added\n` +
+                `💰 ${formatCurrency(bundlePrice)} deducted\n` +
+                `📦 Total Available: ${(user.bundleRemaining || 0) + bundleCount} OTPs\n\n` +
+                `Use /otp to start requesting.`;
+                
+            await this.sendPhotoWithCaption(ctx, IMAGES.bundleOther, message, 
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('📱 Request OTP', 'menu')],
+                    [Markup.button.callback('🔙 Main Menu', 'menu')]
+                ]), 'HTML'
+            );
+        } catch (error) {
+            logger.error('Bundle purchase failed', { userId: user.userId, error: error.message });
+            await this.sendPhotoWithCaption(ctx, IMAGES.otpFailed, 
+                '❌ Purchase failed. Please try again.',
+                KEYBOARDS.supportOrRetry(), 'HTML'
+            );
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  VIP PURCHASES
+    // ═══════════════════════════════════════════════════════════════════════
+
+    async handleBuyVIP(ctx) {
+        const user = ctx.state.user;
+        const vipPrice = config.prices?.vipSubscription || 5.00;
+        const currentVip = this._isVipActive(user);
+        
+        let message = 
+            `👑 <b>Upgrade to VIP</b>\n\n`;
+            
+        if (currentVip) {
+            message += 
+                `✅ You already have VIP active!\n` +
+                `⏰ Expires: ${new Date(user.vipExpiry).toLocaleDateString()}\n` +
+                `📞 Number: ${user.vipPhoneNumber || 'Assigning...'}\n\n` +
+                `Extend your subscription?`;
+        } else {
+            message += 
+                `💰 Price: ${formatCurrency(vipPrice)}/month\n` +
+                `✅ 50 OTPs per day\n` +
+                `📞 Dedicated phone number\n` +
+                `⚡ Priority routing\n` +
+                `🚀 Fastest delivery\n\n` +
+                `Your Balance: ${formatCurrency(user.balance)}`;
+        }
+            
+        const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback(currentVip ? '⏰ Extend VIP' : '✅ Confirm Upgrade', 'confirm_vip')],
+            [Markup.button.callback('❌ Cancel', 'menu')]
+        ]);
+        
+        await this.sendPhotoWithCaption(ctx, IMAGES.vipFirst, message, keyboard, 'HTML');
+    }
+
+    async handleConfirmVIP(ctx) {
+        const user = ctx.state.user;
+        const vipPrice = config.prices?.vipSubscription || 5.00;
+        
+        if (user.balance < vipPrice) {
+            const message = 
+                `❌ <b>Insufficient Balance</b>\n\n` +
+                `Required: ${formatCurrency(vipPrice)}\n` +
+                `Available: ${formatCurrency(user.balance)}\n\n` +
+                `Deposit first with /deposit`;
+            return this.sendPhotoWithCaption(ctx, IMAGES.vipOther, message, 
+                KEYBOARDS.depositOrBack(), 'HTML'
+            );
+        }
+        
+        const expiryDate = new Date();
+        if (this._isVipActive(user) && user.vipExpiry) {
+            expiryDate.setTime(new Date(user.vipExpiry).getTime());
+        }
+        expiryDate.setMonth(expiryDate.getMonth() + 1);
+        
+        try {
+            await User.updateOne(
+                { userId: user.userId },
+                {
+                    $inc: { balance: -vipPrice },
+                    $set: { 
+                        mode: 'VIP', 
+                        vipExpiry: expiryDate, 
+                        vipDailyUsed: 0, 
+                        vipDailyReset: new Date() 
+                    }
+                }
+            );
+
+            await Transaction.create({
+                txId: `VIP_${Date.now()}_${user.userId}`,
+                             
