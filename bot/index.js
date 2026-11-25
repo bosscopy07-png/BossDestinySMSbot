@@ -357,6 +357,7 @@ class TelegramBot {
             }
         }));
 
+    
         // ═══════════════════════════════════════════════════════════════════════
         //  START INTERCEPTOR — FIXED: Proper regex for all /start variants
         //  Matches: /start, /start@botname, /start REFCODE, /start@botname REFCODE
@@ -631,8 +632,7 @@ class TelegramBot {
             this.referralService,
             this.smsProviderManager
         );
-
-        // ═══════════════════════════════════════════════════════════════════════
+                // ═══════════════════════════════════════════════════════════════════════
         //  Inject tier services into OTPCommands if available
         // ═══════════════════════════════════════════════════════════════════════
         if (this.tierIntegrationService && typeof this.tierIntegrationService.isAvailable === 'function') {
@@ -677,6 +677,55 @@ class TelegramBot {
             this.tierFlowMiddleware = new TierFlowMiddleware(this.tierIntegrationService, otpCommands);
             this.tierFlowMiddleware.register(this.bot);
             logger.info('Tier Flow Middleware registered');
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  OTHERS (generic number rental) + Buy Again + My Orders
+        //  Isolated in try/catch: a failure here can never take down existing flows.
+        // ═══════════════════════════════════════════════════════════════════════
+        try {
+            const { createOthersService } = await import('../services/others/index.js');
+            const { default: BuyAgainService } = await import('../services/otp/BuyAgainService.js');
+            const { default: OrderHistoryService } = await import('../services/otp/OrderHistoryService.js');
+            const { default: OthersCommands } = await import('./commands/others.js');
+            const { default: OrderHistoryCommands } = await import('./commands/orderHistory.js');
+            const { Session: SessionModel, User: UserModel } = await import('../models/index.js');
+
+            const others = createOthersService({ walletService: this.walletService });
+            const buyAgain = new BuyAgainService({
+                sessionModel: SessionModel, userModel: UserModel, sessionManager: this.sessionManager,
+                smsProviderManager: this.smsProviderManager, othersManager: others.manager
+            });
+            const history = new OrderHistoryService({ sessionModel: SessionModel, othersStore: others.store, buyAgain });
+            const othersCommands = new OthersCommands(this.bot, { manager: others.manager, buyAgain, userModel: UserModel, walletService: this.walletService });
+            const orderCommands = new OrderHistoryCommands(this.bot, { history, buyAgain, userModel: UserModel });
+
+            others.manager.setNotifier((userId, activation, event) => othersCommands.notify(userId, activation, event));
+            othersCommands.register();
+            orderCommands.register();
+            others.polling.start();
+
+            try {
+                const { default: AdminTools } = await import('./commands/adminTools.js');
+                const models = await import('../models/index.js');
+                const adminTools = new AdminTools(this.bot, {
+                    isAdmin: (id) => this.isAdmin(id), walletService: this.walletService,
+                    models: { User: models.User, Session: models.Session, Transaction: models.Transaction, Payment: models.Payment, OthersActivation: models.OthersActivation, AdminLog: models.AdminLog }
+                });
+                adminTools.register();
+                this.commandModules.set('adminTools', adminTools);
+            } catch (e) { logger.error('Admin tools failed to load', { error: e.message }); }
+
+            this.othersService = others;
+            this.othersPolling = others.polling;
+            this.buyAgainService = buyAgain;
+            this.orderHistoryService = history;
+            this.commandModules.set('others', othersCommands);
+            this.commandModules.set('orders', orderCommands);
+            if (this.sessionManager) this.sessionManager.buyAgainService = buyAgain; // used for the timeout "Buy Again" prompt
+            logger.info('OTHERS, Buy Again and My Orders initialised', { providerConfigured: others.provider.isConfigured });
+        } catch (err) {
+            logger.error('Failed to initialise OTHERS / Buy Again / My Orders', { error: err.message, stack: err.stack });
         }
 
         this.freeNumberController = new FreeNumberController(this.bot);
@@ -808,6 +857,12 @@ class TelegramBot {
                 if (isAdmin) {
                     const advancedAdmin = this.commandModules.get('advancedAdmin');
                     const adminCommands = this.commandModules.get('admin');
+
+                    const adminTools = this.commandModules.get('adminTools');
+                    if (adminTools) {
+                        const consumed = await adminTools.handleTextInput(ctx);
+                        if (consumed) return;
+                    }
 
                     if (advancedAdmin) {
                         const handled = await advancedAdmin.handleTextInput(ctx);
@@ -973,6 +1028,7 @@ class TelegramBot {
         logger.info('Shutting down (' + signal + ')');
 
         try {
+            try { this.othersPolling?.stop(); } catch (_) {}
             this.bot.stop(signal);
         } catch (e) {
             logger.warn('Error stopping bot', { error: e.message });
@@ -1025,34 +1081,4 @@ class TelegramBot {
     logMetrics() {
         const uptime = (Date.now() - this.metrics.startTime) / 1000;
         logger.info('Bot metrics', {
-            uptime: `${Math.floor(uptime / 60)}m`,
-            requestsHandled: this.metrics.requestsHandled,
-            requestsFailed: this.metrics.requestsFailed,
-            avgResponseTime: `${Math.round(this.metrics.avgResponseTime)}ms`,
-            activeUsers: this.metrics.activeUsers.size
-        });
-    }
-
-    getHealth() {
-        return {
-            status: this.isShuttingDown ? 'shutting_down' : this.isReady ? 'healthy' : 'starting',
-            uptime: process.uptime(),
-            memory: process.memoryUsage(),
-            metrics: {
-                requests: this.metrics.requestsHandled,
-                failed: this.metrics.requestsFailed,
-                avgResponseTime: Math.round(this.metrics.avgResponseTime),
-                activeUsers: this.metrics.activeUsers.size
-            },
-            walletReady: this.walletService?.isReady || false,
-            walletScanMode: this.walletService?.scanMode || 'unknown',
-            walletRpcType: this.walletService?.currentProviderType || 'none',
-            smsProviderReady: !!this.smsProviderManager?.isInitialized,
-            tierIntegrationReady: !!this.tierIntegrationService?.isInitialized,
-            freeTierReady: !!this.freeNumberController?.provider?.isActive,
-            timestamp: new Date().toISOString()
-        };
-    }
-}
-
-export default TelegramBot;
+            uptime: `${Math.floor(uptime / 60
