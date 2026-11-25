@@ -440,7 +440,7 @@ class SessionManager {
             }
                 
         
-    // ═══════════════════════════════════════════════════════════
+      // ═══════════════════════════════════════════════════════════
     //  AUTO-DELIVERY: Send OTP directly to user's Telegram
     // ═══════════════════════════════════════════════════════════
 async _autoDeliverOTPToUser(session, otp) {
@@ -548,6 +548,8 @@ async _autoDeliverOTPToUser(session, otp) {
         await Session.markTimeout(sessionId);
         this._cleanupSession(sessionId);
 
+        await this._sendTimeoutPrompt(session);
+
         if (this.notificationService) {
             try {
                 await this.notificationService.notifyTimeout(session.userId, {
@@ -570,6 +572,20 @@ async _autoDeliverOTPToUser(session, otp) {
         });
 
         return { retried: false };
+    }
+
+    /** Tell the user the number timed out and offer 🔄 Buy Again / My Orders / Menu. Never throws. */
+    async _sendTimeoutPrompt(session) {
+        try {
+            if (!this.bot?.telegram) return;
+            const { timeoutPromptView } = await import('../../bot/commands/othersView.js');
+            const fresh = await Session.findOne({ sessionId: session.sessionId }).lean();
+            const canRebuy = this.buyAgainService ? this.buyAgainService.isSessionEligible(fresh) : false;
+            const v = timeoutPromptView({ sessionId: session.sessionId, service: session.service, canRebuy });
+            await this.bot.telegram.sendMessage(session.userId, v.text, { parse_mode: 'HTML', reply_markup: v.reply_markup });
+        } catch (e) {
+            logger.warn('Timeout prompt failed', { sessionId: session.sessionId, error: e.message });
+        }
     }
 
     async handleProviderFailure(session, providerStatus) {
@@ -748,7 +764,6 @@ async _autoDeliverOTPToUser(session, otp) {
 
         return session;
     }
-
     // ═══════════════════════════════════════════════════════════
     //  INTERNAL - Finances
     // ═══════════════════════════════════════════════════════════
@@ -1090,3 +1105,4 @@ async _autoDeliverOTPToUser(session, otp) {
 }
 
 export default SessionManager;
+    
