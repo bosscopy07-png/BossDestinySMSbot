@@ -415,11 +415,9 @@ class StartVerification {
             await ctx.reply('⛔ <b>Access Revoked</b>\n\nRe-join channels and tap /start.', { parse_mode: 'HTML' });
             return false;
         } catch (err) {
-            logger.error('[StartVerification] Reverify failed — revoking', { userId, error: err.message });
-            ctx.session.joinVerified = false;
-            delete ctx.session.joinVerifiedAt;
-            await ctx.reply('⛔ <b>Verification Error</b>\n\nTry /start later.', { parse_mode: 'HTML' }).catch(() => {});
-            return false;
+            // Fail OPEN on our own/transient errors: a verified user must not lose access because Telegram hiccuped.
+            logger.error('[StartVerification] Reverify errored — keeping existing access', { userId, error: err.message });
+            return true;
         }
     }
 
@@ -436,22 +434,27 @@ class StartVerification {
     //  MEMBERSHIP CHECK
     // ═══════════════════════════════════════════════════════
 
+    
     async _checkMembership(userId) {
         const results = await Promise.allSettled(
             MANDATORY_CHANNELS.map(async (channel) => {
+                const attempt = () => this.bot.telegram.getChatMember(channel.id, userId);
                 try {
-                    const member = await this.bot.telegram.getChatMember(channel.id, userId);
+                    let member;
+                    try { member = await attempt(); }
+                    catch (firstErr) { await new Promise(r => setTimeout(r, 600)); member = await attempt(); } // one retry (429 / network blips)
                     const status = member.status;
-                    return { channel: channel.id, joined: ['member', 'administrator', 'creator'].includes(status), status };
+                    return { channel: channel.id, joined: ['member', 'administrator', 'creator', 'restricted'].includes(status) && !(status === 'restricted' && member.is_member === false), status };
                 } catch (err) {
-                    logger.warn('[StartVerification] getChatMember failed', { channel: channel.id, userId, error: err.message });
-                    return { channel: channel.id, joined: false, status: 'error', error: err.message };
+                    // INCONCLUSIVE (API error): never treat as "user left" — that wrongly locked out legitimate users.
+                    logger.warn('[StartVerification] getChatMember inconclusive; allowing', { channel: channel.id, userId, error: err.message });
+                    return { channel: channel.id, joined: false, inconclusive: true, status: 'error', error: err.message };
                 }
             })
         );
 
         const memberships = results.map(r => r.status === 'fulfilled' ? r.value : { channel: 'unknown', joined: false, status: 'error' });
-        const allJoined = memberships.every(m => m.joined);
+        const allJoined = memberships.every(m => m.joined || m.inconclusive);
         return { allJoined, memberships };
     }
 
