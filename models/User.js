@@ -36,6 +36,7 @@ freeUsedToday: {
     balance: { type: Number, default: 0 },
     lockedBalance: { type: Number, default: 0 },
     totalDeposited: { type: Number, default: 0 },
+    processedPaymentRefs: { type: [String], default: [], select: false },
     totalSpent: { type: Number, default: 0 },
     bundleRemaining: { type: Number, default: 0 },
     vipExpiry: { type: Date, default: null },
@@ -51,6 +52,12 @@ freeUsedToday: {
     isBlacklisted: { type: Boolean, default: false },
     blacklistReason: { type: String, default: null },
     blacklistDate: { type: Date, default: null },
+    blacklistedBy: { type: String, default: null },          // admin id, or 'SYSTEM'
+    blacklistSource: { type: String, enum: ['ADMIN', 'AUTO', null], default: null },
+    blacklistExpiresAt: { type: Date, default: null },       // set => temporary restriction that auto-expires
+    blacklistEvidence: { type: mongoose.Schema.Types.Mixed, default: null },
+    blockedBot: { type: Boolean, default: false },
+    restrictionHistory: { type: [{ action: String, reason: String, by: String, source: String, at: Date, _id: false }], default: [], select: false },
     referralCode: { type: String, unique: true, sparse: true },
     referredBy: { type: String, default: null, index: true },
     referralCount: { type: Number, default: 0 },
@@ -148,4 +155,5 @@ userSchema.pre('save', function(next) {
 const User = mongoose.model('User', userSchema);
 
 export default User;
+
     
