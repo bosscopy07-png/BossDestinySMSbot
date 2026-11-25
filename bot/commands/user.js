@@ -1570,5 +1570,8 @@ async handleToggleNotifications(ctx) {
             [Markup.button.callback('🔢 Request OTP', 'request_otp')],
             [Markup.button.callback('🔙 Back', 'menu')]
         ]), 'HTML');
-             }
-                                                  
+    }
+}
+
+export default UserCommands;
+
