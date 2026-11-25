@@ -9,6 +9,7 @@ import mongoose from 'mongoose';
 import Payment from '../../models/Payment.js';
 import { User, Transaction } from '../../models/index.js';
 import config from '../../config/env.js';
+import { verifyHmacSha512 } from '../../utils/webhookSignature.js';
 import logger from '../../utils/logger.js';
 import exchangeRateService from './exchangeRate.service.js';
 import { generateId } from '../../utils/helpers.js';
@@ -133,7 +134,7 @@ class PaymentService {
                 amount: payment.amountNaira * 100,
                 reference: payment.reference,
                 currency: 'NGN',
-                callback_url: config.payment?.callbackUrl || `${config.app?.url}/api/webhooks/payment/callback`,
+                callback_url: config.payment?.callbackUrl || `${config.app?.url}/webhooks/payment/callback`,
                 metadata: {
                     userId: payment.userId,
                     paymentId: payment.paymentId,
@@ -241,172 +242,209 @@ class PaymentService {
     }
 
     /**
-     * Verify webhook signature
+     * Verify webhook signature against the RAW request body (Paystack signs the
+     * exact bytes it sent; re-serialising parsed JSON can change the bytes and
+     * cause valid webhooks to be rejected). Fails closed if no secret is set.
      */
-    verifyWebhookSignature(payload, signature) {
-        if (!this.webhookSecret && !this.secretKey) {
-            logger.warn('No webhook secret configured, skipping signature verification');
-            return true;
-        }
-
+    verifyWebhookSignature(rawBody, signature) {
         const secret = this.webhookSecret || this.secretKey;
-        const hash = crypto
-            .createHmac('sha512', secret)
-            .update(JSON.stringify(payload))
-            .digest('hex');
-
-        const isValid = hash === signature;
-        
-        if (!isValid) {
-            logger.warn('Webhook signature verification failed', {
-                expected: hash,
-                received: signature
-            });
+        if (!secret) {
+            logger.error('No Paystack secret configured; rejecting webhook');
+            return false;
         }
+        if (!signature || !rawBody) return false;
 
+        const isValid = verifyHmacSha512(rawBody, signature, secret);
+        if (!isValid) logger.warn('Webhook signature verification failed');
         return isValid;
     }
 
     /**
-     * Process successful payment — IDEMPOTENT
-     * This is the ONLY function that credits user balance
+     * Process successful payment - IDEMPOTENT, no replica-set dependency.
+     *
+     * Safety model:
+     *  1. Claim the payment (PENDING -> PROCESSING) atomically. A stale
+     *     PROCESSING claim (crashed worker) can be re-claimed.
+     *  2. Credit the wallet with ONE single-document update guarded by
+     *     `processedPaymentRefs: { $ne: reference }`, so the credit can be
+     *     applied at most once even if two workers race or a retry happens
+     *     after a crash. This works on standalone MongoDB.
+     *  3. Upsert the ledger Transaction by deterministic txId.
+     *  4. Mark the payment SUCCESS.
+     * On failure the payment stays PROCESSING (never silently reset), and the
+     * reconciliation job retries it.
      */
     async processSuccessfulPayment(paymentData) {
         const { reference, providerTransactionId, amountPaid, paidAt } = paymentData;
-        
         logger.info('Processing successful payment', { reference, providerTransactionId });
 
-        // ATOMIC: Use findOneAndUpdate to prevent double-processing
+        const staleBefore = new Date(Date.now() - 2 * 60 * 1000);
         const payment = await Payment.findOneAndUpdate(
             {
                 reference,
-                status: 'PENDING'
+                $or: [
+                    { status: 'PENDING' },
+                    { status: 'PROCESSING', 'metadata.processingAt': { $lt: staleBefore } }
+                ]
             },
             {
                 $set: {
-                    status: 'SUCCESS',
+                    status: 'PROCESSING',
                     providerTransactionId,
-                    paidAt: paidAt ? new Date(paidAt) : new Date(),
-                    'metadata.amountPaid': amountPaid,
-                    'metadata.processedAt': new Date(),
+                    'metadata.processingAt': new Date(),
                     updatedAt: new Date()
                 }
             },
-            {
-                new: true
-            }
+            { new: true }
         );
 
         if (!payment) {
-            logger.info('Payment already processed or not found', { reference });
-            const existingPayment = await Payment.findOne({ reference });
-            if (existingPayment && existingPayment.status === 'SUCCESS') {
-                return { alreadyProcessed: true, payment: existingPayment };
-            }
-            return { alreadyProcessed: true, payment: null };
+            const existing = await Payment.findOne({ reference });
+            logger.info('Payment already processed, in progress or not found', {
+                reference, status: existing?.status
+            });
+            return { alreadyProcessed: true, payment: existing || null };
         }
-
-        // Start MongoDB session for atomic operations
-        const session = await mongoose.startSession();
-        let transactionResult = null;
 
         try {
-            await session.withTransaction(async () => {
-                // 1. Credit user balance
-                const userUpdate = await User.findOneAndUpdate(
-                    { userId: payment.userId },
-                    {
-                        $inc: {
-                            balance: payment.amountUsd,
-                            totalDeposited: payment.amountUsd
-                        }
-                    },
-                    { session, new: true }
-                );
-
-                if (!userUpdate) {
-                    throw new Error('USER_UPDATE_FAILED');
-                }
-
-                // 2. Create transaction record
-                transactionResult = await Transaction.create([{
-                    txId: `NGN_DEP_${generateId()}_${Date.now()}`,
-                    userId: payment.userId,
-                    type: 'NAIRA_DEPOSIT',
-                    amount: payment.amountUsd,
-                    currency: 'USD',
-                    status: 'COMPLETED',
-                    metadata: {
-                        provider: payment.provider,
-                        paymentReference: payment.reference,
-                        providerTransactionId,
-                        amountNaira: payment.amountNaira,
-                        exchangeRate: payment.exchangeRate,
-                        amountUsd: payment.amountUsd,
-                        amountPaid,
-                        paidAt: paidAt ? new Date(paidAt) : new Date()
-                    },
-                    createdAt: new Date()
-                }], { session });
-
-                logger.info('Payment processed successfully', {
-                    reference,
-                    userId: payment.userId,
-                    amountUsd: payment.amountUsd,
-                    amountNaira: payment.amountNaira
-                });
-            });
-
-            // 3. Process referral reward (outside transaction)
-            try {
-                if (global.referralService) {
-                    await global.referralService.processReferralDeposit(payment.userId, payment.amountUsd);
-                    logger.info('Referral reward processed', { userId: payment.userId });
-                }
-            } catch (refError) {
-                logger.error('Referral processing failed (non-critical)', { 
-                    userId: payment.userId, 
-                    error: refError.message 
+            // Credit what was actually paid (provider-verified), not blindly the quoted amount.
+            const paidNgn = Number(amountPaid);
+            let creditUsd = payment.amountUsd;
+            if (Number.isFinite(paidNgn) && paidNgn > 0 && Math.abs(paidNgn - payment.amountNaira) > 1) {
+                creditUsd = Math.round((paidNgn / payment.exchangeRate) * 10000) / 10000;
+                logger.warn('Paid amount differs from quoted amount; crediting paid amount', {
+                    reference, quoted: payment.amountNaira, paid: paidNgn, creditUsd
                 });
             }
+            if (!(creditUsd > 0)) throw new Error('INVALID_CREDIT_AMOUNT');
 
-            // 4. Notify user
-            try {
-                if (global.notificationService) {
-                    await global.notificationService.sendPaymentSuccess(payment.userId, payment);
+            // Single atomic, idempotent credit
+            const credited = await User.updateOne(
+                { userId: payment.userId, processedPaymentRefs: { $ne: reference } },
+                {
+                    $inc: { balance: creditUsd, totalDeposited: creditUsd },
+                    $push: { processedPaymentRefs: { $each: [reference], $slice: -500 } }
                 }
-            } catch (notifError) {
-                logger.error('Notification failed (non-critical)', { 
-                    userId: payment.userId, 
-                    error: notifError.message 
-                });
-            }
-
-            return { success: true, payment, transaction: transactionResult?.[0] };
-        } catch (error) {
-            logger.error('Payment processing failed', { 
-                reference, 
-                error: error.message,
-                stack: error.stack 
-            });
-
-            await Payment.updateOne(
-                { reference },
-                { $set: { status: 'PENDING', 'metadata.processError': error.message } }
             );
 
+            if (credited.matchedCount === 0) {
+                const u = await User.findOne({ userId: payment.userId }).select('_id').lean();
+                if (!u) throw new Error('USER_NOT_FOUND');
+                logger.warn('Reference already credited; skipping duplicate credit', { reference });
+            }
+
+            await Transaction.updateOne(
+                { txId: `NGN_DEP_${reference}` },
+                {
+                    $setOnInsert: {
+                        txId: `NGN_DEP_${reference}`,
+                        userId: payment.userId,
+                        type: 'NAIRA_DEPOSIT',
+                        amount: creditUsd,
+                        currency: 'USD',
+                        status: 'COMPLETED',
+                        metadata: {
+                            provider: payment.provider,
+                            paymentReference: reference,
+                            providerTransactionId,
+                            amountNaira: payment.amountNaira,
+                            exchangeRate: payment.exchangeRate,
+                            amountUsd: creditUsd,
+                            amountPaid,
+                            paidAt: paidAt ? new Date(paidAt) : new Date(),
+                            creditedNow: credited.matchedCount > 0,
+                            source: 'automatic'
+                        },
+                        createdAt: new Date()
+                    }
+                },
+                { upsert: true }
+            );
+
+            const done = await Payment.findOneAndUpdate(
+                { reference },
+                {
+                    $set: {
+                        status: 'SUCCESS',
+                        paidAt: paidAt ? new Date(paidAt) : new Date(),
+                        'metadata.amountPaid': amountPaid,
+                        'metadata.creditedUsd': creditUsd,
+                        'metadata.processedAt': new Date(),
+                        updatedAt: new Date()
+                    }
+                },
+                { new: true }
+            );
+
+            if (credited.matchedCount > 0) {
+                try {
+                    if (global.referralService) {
+                        await global.referralService.processReferralDeposit(payment.userId, creditUsd);
+                    }
+                } catch (refError) {
+                    logger.error('Referral processing failed (non-critical)', { userId: payment.userId, error: refError.message });
+                }
+                try {
+                    if (global.notificationService) {
+                        await global.notificationService.sendPaymentSuccess(payment.userId, done);
+                    }
+                } catch (notifError) {
+                    logger.error('Notification failed (non-critical)', { userId: payment.userId, error: notifError.message });
+                }
+            }
+
+            return { success: true, payment: done, alreadyCredited: credited.matchedCount === 0 };
+        } catch (error) {
+            logger.error('Payment processing failed; will be retried by reconciliation', {
+                reference, error: error.message
+            });
+            await Payment.updateOne(
+                { reference },
+                { $set: { 'metadata.processError': error.message, 'metadata.processErrorAt': new Date() } }
+            );
             throw error;
-        } finally {
-            await session.endSession();
         }
+    }
+
+    /**
+     * Reconcile payments that are still PENDING/PROCESSING by asking Paystack.
+     * Called by cron so a missed/late webhook never needs a manual credit.
+     */
+    async reconcilePendingPayments({ minAgeMs = 60 * 1000, maxAgeHours = 24, limit = 50 } = {}) {
+        const now = Date.now();
+        const candidates = await Payment.find({
+            status: { $in: ['PENDING', 'PROCESSING'] },
+            createdAt: { $lt: new Date(now - minAgeMs), $gt: new Date(now - maxAgeHours * 3600 * 1000) }
+        }).sort({ createdAt: 1 }).limit(limit);
+
+        let credited = 0, failed = 0;
+        for (const p of candidates) {
+            try {
+                const v = await this.verifyPayment(p.reference);
+                if (v.success && v.currency === 'NGN') {
+                    await this.processSuccessfulPayment({
+                        reference: p.reference,
+                        providerTransactionId: v.transactionId,
+                        amountPaid: v.amountPaid,
+                        paidAt: v.paidAt
+                    });
+                    credited++;
+                }
+            } catch (e) {
+                failed++;
+                logger.warn('Reconcile failed for payment', { reference: p.reference, error: e.message });
+            }
+        }
+        if (candidates.length) logger.info('Payment reconciliation done', { checked: candidates.length, credited, failed });
+        return { checked: candidates.length, credited, failed };
     }
 
     /**
      * Handle webhook event
      */
-    async handleWebhook(payload, signature) {
-        // 1. Verify signature
-        if (!this.verifyWebhookSignature(payload, signature)) {
+    async handleWebhook(payload, signature, rawBody) {
+        // 1. Verify signature against raw bytes
+        if (!this.verifyWebhookSignature(rawBody, signature)) {
             throw new Error('INVALID_SIGNATURE');
         }
 
@@ -465,6 +503,7 @@ class PaymentService {
     /**
      * Check payment status manually
      */
+    
     async checkPaymentStatus(reference) {
         logger.info('Manual payment status check', { reference });
 
