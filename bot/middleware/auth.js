@@ -86,10 +86,22 @@ export const requireAuth = async (ctx, next) => {
         logger.info('New user registered', { userId, username: ctx.from?.username });
     }
 
-    await User.updateOne({ userId }, { lastActive: new Date() });
+    // Interacting proves the user has NOT blocked the bot (clears stale broadcast flag)
+    await User.updateOne({ userId }, { $set: { lastActive: new Date() }, ...(user.blockedBot ? { $set: { lastActive: new Date(), blockedBot: false } } : {}) });
+
+    // Temporary restrictions expire automatically and the lift is recorded
+    if (user.isBlacklisted && user.blacklistExpiresAt && new Date(user.blacklistExpiresAt) <= new Date()) {
+        await User.updateOne({ userId }, {
+            $set: { isBlacklisted: false, blacklistReason: null, blacklistDate: null, blacklistExpiresAt: null, blacklistSource: null },
+            $push: { restrictionHistory: { action: 'AUTO_EXPIRED', reason: user.blacklistReason, by: 'SYSTEM', source: 'AUTO', at: new Date() } }
+        });
+        user.isBlacklisted = false;
+        logger.info('Temporary restriction expired', { userId });
+    }
 
     if (user.isBlacklisted) {
-        return ctx.reply('🚫 Your account has been suspended. Contact support.').catch(() => {});
+        const until = user.blacklistExpiresAt ? `\nRestriction ends: ${new Date(user.blacklistExpiresAt).toISOString().slice(0, 16).replace('T', ' ')} UTC` : '';
+        return ctx.reply(`🚫 Your account is restricted.${until}\nReference: ${String(userId).slice(-4)}-${user.blacklistDate ? new Date(user.blacklistDate).getTime().toString(36) : 'N/A'}\nContact support to review it. Your balance is safe.`).catch(() => {});
     }
 
     ctx.state.user = user;
@@ -150,3 +162,4 @@ export const requireBalance = (minAmount) => {
         return next();
     };
 };
+    
