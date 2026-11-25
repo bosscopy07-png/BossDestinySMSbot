@@ -515,7 +515,7 @@ class WalletService {
 // Deposit System, Atomic Event Processing & User Lookup
 // ═══════════════════════════════════════════════════════════════════════════════
 
-    // ═══════════════════════════════════════════════════════════
+     // ═══════════════════════════════════════════════════════════
     //  DEPOSIT SYSTEM — MODIFIED TO TRIGGER ACTIVE MODE
     // ═══════════════════════════════════════════════════════════
 
@@ -1009,7 +1009,8 @@ class WalletService {
             throw error;
         }
             }
-        // ═══════════════════════════════════════════════════════════════════════════════
+
+     // ═══════════════════════════════════════════════════════════════════════════════
 // services/wallet/index.js — Part 3/3
 // Referral System, Fund Management, Admin Balance Operations & Lifecycle
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1088,39 +1089,41 @@ class WalletService {
                 throw new Error('INVALID_AMOUNT: Amount must be positive');
             }
 
-            const user = await User.findOne({ userId });
-            if (!user) {
-                throw new Error('USER_NOT_FOUND');
-            }
-
-            const availableBalance = (user.balance || 0) - (user.lockedBalance || 0);
-            if (availableBalance < amount) {
-                throw new Error('INSUFFICIENT_FUNDS');
-            }
-
-            await Transaction.create({
-                txId,
-                userId,
-                type: 'LOCK',
-                amount: -amount,
-                currency: 'USD',
-                status: 'PENDING',
-                metadata: { 
-                    purpose, 
-                    lockedAt: new Date(),
-                    originalBalance: user.balance,
-                    originalLockedBalance: user.lockedBalance
-                }
-            });
-
-            const updateResult = await User.updateOne(
-                { userId },
-                { $inc: { lockedBalance: amount } }
+            // ATOMIC: check available balance and lock in ONE conditional update,
+            // so concurrent purchases can never overdraw the wallet.
+            const locked = await User.findOneAndUpdate(
+                {
+                    userId,
+                    $expr: { $gte: [{ $subtract: [{ $ifNull: ['$balance', 0] }, { $ifNull: ['$lockedBalance', 0] }] }, amount] }
+                },
+                { $inc: { lockedBalance: amount } },
+                { new: false }
             );
 
-            if (updateResult.matchedCount === 0) {
-                await Transaction.deleteOne({ txId });
-                throw new Error('USER_UPDATE_FAILED');
+            if (!locked) {
+                const exists = await User.exists({ userId });
+                throw new Error(exists ? 'INSUFFICIENT_FUNDS' : 'USER_NOT_FOUND');
+            }
+
+            try {
+                await Transaction.create({
+                    txId,
+                    userId,
+                    type: 'LOCK',
+                    amount: -amount,
+                    currency: 'USD',
+                    status: 'PENDING',
+                    metadata: {
+                        purpose,
+                        lockedAt: new Date(),
+                        originalBalance: locked.balance,
+                        originalLockedBalance: locked.lockedBalance
+                    }
+                });
+            } catch (txErr) {
+                // Roll the lock back so a failed ledger write never strands funds
+                await User.updateOne({ userId }, { $inc: { lockedBalance: -amount } });
+                throw txErr;
             }
 
             logger.info('Funds locked', { userId, amount, purpose, txId });
@@ -1143,6 +1146,22 @@ class WalletService {
             const amount = Math.abs(tx.amount);
             if (amount <= 0) {
                 throw new Error('INVALID_AMOUNT');
+            }
+
+            // ATOMIC CLAIM: two concurrent captures can never both proceed (stale claims expire after 2 min)
+            const claimed = await Transaction.findOneAndUpdate(
+                {
+                    txId, userId, status: 'PENDING',
+                    $or: [
+                        { 'metadata.captureClaimedAt': { $exists: false } },
+                        { 'metadata.captureClaimedAt': { $lt: new Date(Date.now() - 120000) } }
+                    ]
+                },
+                { $set: { 'metadata.captureClaimedAt': new Date() } },
+                { new: true }
+            );
+            if (!claimed) {
+                throw new Error('INVALID_TRANSACTION: capture already in progress or completed');
             }
 
             const user = await User.findOne({ userId });
@@ -1189,6 +1208,7 @@ class WalletService {
             return true;
 
         } catch (error) {
+            await Transaction.updateOne({ txId, userId, status: 'PENDING' }, { $unset: { 'metadata.captureClaimedAt': 1 } }).catch(() => {});
             logger.error('Failed to capture funds', { txId, userId, error: error.message });
             throw error;
         }
@@ -1218,6 +1238,22 @@ class WalletService {
             const amount = Math.abs(tx.amount);
             if (amount <= 0) {
                 throw new Error('INVALID_AMOUNT');
+            }
+
+            // ATOMIC CLAIM: a lock can be released only once, even under concurrent calls
+            const claimed = await Transaction.findOneAndUpdate(
+                {
+                    txId, userId, status: 'PENDING',
+                    $or: [
+                        { 'metadata.releaseClaimedAt': { $exists: false } },
+                        { 'metadata.releaseClaimedAt': { $lt: new Date(Date.now() - 120000) } }
+                    ]
+                },
+                { $set: { 'metadata.releaseClaimedAt': new Date() } },
+                { new: true }
+            );
+            if (!claimed) {
+                return { success: false, error: 'TRANSACTION_NOT_PENDING', currentStatus: 'IN_PROGRESS', alreadyReleased: true };
             }
 
             const user = await User.findOne({ userId });
@@ -1295,6 +1331,7 @@ class WalletService {
             };
 
         } catch (error) {
+            await Transaction.updateOne({ txId, userId, status: 'PENDING' }, { $unset: { 'metadata.releaseClaimedAt': 1 } }).catch(() => {});
             logger.error('Failed to release funds', { 
                 txId, 
                 userId, 
@@ -1309,59 +1346,61 @@ class WalletService {
     //  ADMIN BALANCE OPERATIONS
     // ═══════════════════════════════════════════════════════════
 
-    async addBalance(userId, amount, adminId, reason) {
-        const txId = generateId();
+    /** Is this admin id allowed to move money? Telegram ids must be in ADMIN_ID; API identities (non-numeric) are authorised upstream. */
+    _isAuthorizedAdmin(adminId) {
+        const id = String(adminId ?? '').trim();
+        if (!id) return false;
+        if (!/^\d+$/.test(id)) return true;
+        const list = String(process.env.ADMIN_ID || config.bot?.adminId || '').split(',').map(x => x.trim()).filter(Boolean);
+        return list.includes(id);
+    }
 
-        if (isNaN(amount) || amount <= 0) {
-            throw new Error('INVALID_AMOUNT');
-        }
+    /**
+     * Manual credit. Requires an authorised admin + reason, is idempotent via `opts.idempotencyKey`
+     * (a repeated call returns the SAME txId and never credits twice), writes an audit log and
+     * never deletes ledger rows (failures are marked FAILED so they stay traceable).
+     */
+    async addBalance(userId, amount, adminId, reason, opts = {}) {
+        amount = Number(amount);
+        if (!Number.isFinite(amount) || amount <= 0) throw new Error('INVALID_AMOUNT');
+        if (!this._isAuthorizedAdmin(adminId)) throw new Error('UNAUTHORIZED_ADMIN');
+        if (!String(reason || '').trim()) throw new Error('REASON_REQUIRED');
+
+        const txId = opts.idempotencyKey ? `ADM_${String(opts.idempotencyKey).slice(0, 80)}` : generateId();
 
         const user = await User.findOne({ userId }).select('_id userId');
-        if (!user) {
-            throw new Error('USER_NOT_FOUND');
-        }
-
-        let txCreated = false;
+        if (!user) throw new Error('USER_NOT_FOUND');
 
         try {
             await Transaction.create({
-                txId,
-                userId,
-                type: 'ADMIN_ADD',
-                amount,
-                currency: 'USD',
-                status: 'COMPLETED',
-                processedBy: adminId,
-                metadata: { reason, isCredit: true }
+                txId, userId, type: 'ADMIN_ADD', amount, currency: 'USD', status: 'PENDING', processedBy: String(adminId),
+                metadata: { reason, isCredit: true, manualCredit: true, adminId: String(adminId), ref: opts.reference || null }
             });
-            txCreated = true;
-
-            const userUpdate = await User.updateOne(
-                { userId },
-                { $inc: { balance: amount } }
-            );
-
-            if (userUpdate.matchedCount === 0) {
-                throw new Error('USER_UPDATE_FAILED');
+        } catch (e) {
+            if (e.code === 11000 || /E11000/.test(e.message || '')) {
+                logger.warn('Duplicate manual credit ignored', { txId, userId, adminId });
+                return txId; // idempotent: same request, same transaction, no second credit
             }
+            throw e;
+        }
 
-            logger.info('Balance added by admin', { userId, amount, adminId, reason, txId });
-
-            return txId;
-
+        try {
+            const upd = await User.updateOne({ userId }, { $inc: { balance: amount } });
+            if (upd.matchedCount === 0) throw new Error('USER_UPDATE_FAILED');
+            await Transaction.updateOne({ txId }, { $set: { status: 'COMPLETED' } });
         } catch (error) {
-            if (txCreated) {
-                try {
-                    await Transaction.deleteOne({ txId });
-                    logger.warn('Rolled back orphaned transaction', { txId, reason: error.message });
-                } catch (rollbackError) {
-                    logger.error('Failed to rollback transaction', { txId, error: rollbackError.message });
-                }
-            }
-
-            logger.error('Failed to add balance', { userId, amount, adminId, error: error.message });
+            await Transaction.updateOne({ txId }, { $set: { status: 'FAILED', 'metadata.error': error.message } }).catch(() => {});
+            logger.error('Failed to add balance', { userId, amount, adminId, error: error.message, txId });
             throw error;
         }
+
+        try {
+            const { AdminLog } = await import('../../models/index.js');
+            await AdminLog.create({ adminId: String(adminId), action: 'MANUAL_CREDIT', targetUserId: userId, details: { amount, reason, txId } });
+        } catch (e) { logger.warn('Audit log for manual credit failed', { txId, error: e.message }); }
+
+        logger.info('Balance added by admin', { userId, amount, adminId, reason, txId });
+        return txId;
     }
 
     async deductBalance(userId, amount, adminId, reason) {
@@ -1503,11 +1542,4 @@ class WalletService {
         this.provider = null;
         this.lightProvider = null;
         this.lightFallbackProvider = null;
-        this.premiumProvider = null;
-        this.isReady = false;
-        logger.info('Wallet service disconnected');
-    }
-}
-
-export default WalletService;
-        
+        this.premiumProvider = nul
