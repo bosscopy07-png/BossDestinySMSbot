@@ -16,22 +16,16 @@ class WebhookController {
         });
 
         try {
-            // Acknowledge immediately to prevent timeout retries
-            res.status(200).json({ received: true });
-
-            // Process asynchronously
-            const result = await paymentService.handleWebhook(req.body, signature);
-            
-            logger.info('Webhook processed', { 
-                reference: req.body?.data?.reference,
-                result 
-            });
+            // Verify BEFORE acknowledging: bad signature -> 401, processing
+            // failure -> 500 so Paystack retries instead of the credit being lost.
+            const result = await paymentService.handleWebhook(req.body, signature, req.rawBody);
+            logger.info('Webhook processed', { reference: req.body?.data?.reference, result: { ...result, payment: undefined } });
+            return res.status(200).json({ received: true });
         } catch (error) {
-            logger.error('Webhook processing failed', { 
-                error: error.message,
-                reference: req.body?.data?.reference 
-            });
-            // Already responded with 200, just log the error
+            logger.error('Webhook processing failed', { error: error.message, reference: req.body?.data?.reference });
+            if (error.message === 'INVALID_SIGNATURE') return res.status(401).json({ error: 'invalid signature' });
+            if (error.message === 'PAYMENT_NOT_FOUND') return res.status(200).json({ received: true, ignored: true });
+            return res.status(500).json({ error: 'processing failed' });
         }
     }
 
@@ -44,3 +38,4 @@ class WebhookController {
 }
 
 export default new WebhookController();
+                
