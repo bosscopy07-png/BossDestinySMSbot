@@ -1,4 +1,4 @@
-// ═══════════════════════════════════════════════════════════════════════════════
+to// ═══════════════════════════════════════════════════════════════════════════════
 // services/wallet/index.js — WalletService Full Implementation
 // Part 1/3 — Imports, Constructor, RPC Configuration & Initialization
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1542,4 +1542,11 @@ class WalletService {
         this.provider = null;
         this.lightProvider = null;
         this.lightFallbackProvider = null;
-        this.premiumProvider = nul
+        this.premiumProvider = null;
+        this.isReady = false;
+        logger.info('Wallet service disconnected');
+    }
+}
+
+export default WalletService;
+
