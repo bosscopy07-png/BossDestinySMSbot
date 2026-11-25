@@ -1,6 +1,7 @@
 import cron from 'node-cron';
 import { User, Session } from '../models/index.js';
 import PaymentService from '../services/payment/index.js';
+import naira from '../services/payment/paymentService.js';
 import logger from '../utils/logger.js';
 
 class CronJobs {
@@ -19,6 +20,14 @@ class CronJobs {
                 } catch (error) {
                     logger.error('Deposit scan cron failed', { error: error.message });
                 }
+            })
+        );
+
+        // Reconcile Naira (Paystack) payments so missed webhooks auto-credit
+        this.jobs.push(
+            cron.schedule('* * * * *', async () => {
+                try { await naira.reconcilePendingPayments(); }
+                catch (error) { logger.error('Payment reconcile cron failed', { error: error.message }); }
             })
         );
 
@@ -111,4 +120,5 @@ class CronJobs {
 
 export default CronJobs;
 
- 
+
+                                
