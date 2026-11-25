@@ -10,6 +10,8 @@ import mongoose from 'mongoose';
 export const TRANSACTION_TYPES = Object.freeze({
     DEPOSIT: 'DEPOSIT',
     DEPOSIT_CONFIRMING: 'DEPOSIT_CONFIRMING',
+    NAIRA_DEPOSIT: 'NAIRA_DEPOSIT',
+    OTHERS_PURCHASE: 'OTHERS_PURCHASE',  // Paystack deposits (was missing -> ledger write failed)
     LOCK: 'LOCK',                    // ← NEW: Fund lock reservation
     CAPTURE: 'CAPTURE',              // ← NEW: Fund capture (actual deduction)
     OTP_PURCHASE: 'OTP_PURCHASE',    // ← NEW: Generic OTP purchase (replaces CHEAP_OTP)
@@ -61,6 +63,7 @@ export const ADMIN_TYPES = Object.freeze([
  */
 export const CREDIT_TYPES = Object.freeze([
     TRANSACTION_TYPES.DEPOSIT,
+    TRANSACTION_TYPES.NAIRA_DEPOSIT,
     TRANSACTION_TYPES.ADMIN_ADD,
     TRANSACTION_TYPES.REFERRAL_REWARD
 ]);
@@ -535,4 +538,5 @@ transactionSchema.statics.getRecent = async function(page = 1, limit = 50, filte
 const Transaction = mongoose.model('Transaction', transactionSchema);
 
 export default Transaction;
-                    
+
+        
