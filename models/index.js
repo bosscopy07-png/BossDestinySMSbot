@@ -13,6 +13,7 @@ import NumberModel from './Number.js';
 import Referral from './Referral.js';
 import ApiKey from './ApiKey.js';
 import AdminLog from './AdminLog.js';
+import OthersActivation from './OthersActivation.js';
 import Settings from './Settings.js';
 import { OrphanSMS } from './OrphanSMS.js';
 import Notification from './Notification.js';
@@ -30,6 +31,7 @@ const modelRegistry = {
     ApiKey,
     AdVerification,
     AdminLog,
+    OthersActivation,
     Settings,
     OrphanSMS,
     Notification,
@@ -128,3 +130,4 @@ export {
 };
 
 export default modelRegistry;
+            
