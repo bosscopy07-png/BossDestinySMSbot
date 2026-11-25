@@ -945,7 +945,7 @@ class TelegramBot {
             }
         });
         }
-    // ═══════════════════════════════════════════════════════════════════════════════
+                   // ═══════════════════════════════════════════════════════════════════════════════
 // bot/index.js (TelegramBot.js) — Part 3/3
 // Launch Sequence, Deposit Scanner, Metrics & Graceful Shutdown
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1081,4 +1081,35 @@ class TelegramBot {
     logMetrics() {
         const uptime = (Date.now() - this.metrics.startTime) / 1000;
         logger.info('Bot metrics', {
-            uptime: `${Math.floor(uptime / 60
+            uptime: `${Math.floor(uptime / 60)}m`,
+            requestsHandled: this.metrics.requestsHandled,
+            requestsFailed: this.metrics.requestsFailed,
+            avgResponseTime: `${Math.round(this.metrics.avgResponseTime)}ms`,
+            activeUsers: this.metrics.activeUsers.size
+        });
+    }
+
+    getHealth() {
+        return {
+            status: this.isShuttingDown ? 'shutting_down' : this.isReady ? 'healthy' : 'starting',
+            uptime: process.uptime(),
+            memory: process.memoryUsage(),
+            metrics: {
+                requests: this.metrics.requestsHandled,
+                failed: this.metrics.requestsFailed,
+                avgResponseTime: Math.round(this.metrics.avgResponseTime),
+                activeUsers: this.metrics.activeUsers.size
+            },
+            walletReady: this.walletService?.isReady || false,
+            walletScanMode: this.walletService?.scanMode || 'unknown',
+            walletRpcType: this.walletService?.currentProviderType || 'none',
+            smsProviderReady: !!this.smsProviderManager?.isInitialized,
+            tierIntegrationReady: !!this.tierIntegrationService?.isInitialized,
+            freeTierReady: !!this.freeNumberController?.provider?.isActive,
+            timestamp: new Date().toISOString()
+        };
+    }
+}
+
+export default TelegramBot;
+            
