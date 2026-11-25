@@ -94,6 +94,13 @@ const sessionSchema = new mongoose.Schema({
         default: null
     },
     
+    // Buy Again linkage (additive, backward compatible)
+    rebuyOf: { type: String, default: null, index: true },
+    rebuyClaimedAt: { type: Date, default: null },
+    rebuyClaimedBy: { type: String, default: null },
+    operator: { type: String, default: 'any' },
+    routedProvider: { type: String, default: null },
+
     // Retry
     retryCount: {
         type: Number,
@@ -398,4 +405,5 @@ sessionSchema.statics.hasActive = async function(userId) {
 const Session = mongoose.model('Session', sessionSchema);
 
 export default Session;
-                                  
+
+        
