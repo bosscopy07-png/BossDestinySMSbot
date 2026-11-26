@@ -153,5 +153,10 @@ export function newSessionView(s) {
 export function timeoutPromptView({ sessionId, service, canRebuy }) {
     const text = `⌛ <b>No code arrived for ${h(service)}</b>\n\nThe number expired and your balance was not charged.`;
     return { text, reply_markup: { inline_keyboard: rows([canRebuy ? btn('🔄 Buy Again', `bas:${sessionId}`) : null], NAV) } };
-                           }
-            
+}
+
+/** Normal OTP session: code received (same look as OTHERS). */
+export function sessionReceivedView(s, otp) {
+    const text = `✅ <b>Code received</b>\n\n📱 ${h(s.service)} · ${h(s.country || '')}\n📞 Number: <code>${h(s.number)}</code>\n🔑 Code: <code>${h(otp)}</code>\n💵 Charged: ${usd(s.cost)}\n\n⚠️ Never share this code with anyone.`;
+    return { text, reply_markup: { inline_keyboard: rows([{ text: '📋 Copy Code', copy_text: { text: String(otp) } }, { text: '📋 Copy Number', copy_text: { text: String(s.number) } }], [btn('🔄 Buy Again', `bas:${s.sessionId}`), NAV[0]], [NAV[1]]) } };
+}
