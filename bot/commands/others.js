@@ -2,6 +2,7 @@
 // All state-changing callbacks verify ownership through the manager (queries are scoped by userId).
 import logger from '../../utils/logger.js';
 import { show, safeAnswer } from './_show.js';
+import { editOrSend, ping } from '../ui/anchor.js';
 import { countriesView, offersView, confirmView, activationView, buyAgainConfirmView, failureView } from './othersView.js';
 
 const T = '[a-z0-9_\\-]{1,32}', ID = '[0-9a-f\\-]{36}';
@@ -14,7 +15,6 @@ export default class OthersCommands {
 
     register() {
         const b = this.bot;
-        b.command('others', (ctx) => this.menu(ctx, 0));
         b.action('others_menu', (ctx) => this.menu(ctx, 0));
         b.action(/^ocp:(\d{1,3})$/, (ctx) => this.menu(ctx, +ctx.match[1]));
         b.action(new RegExp(`^oc:(${T})$`), (ctx) => this.offers(ctx, ctx.match[1]));
@@ -168,8 +168,9 @@ export default class OthersCommands {
     /** Called by the manager's notifier when an SMS arrives or an activation expires. */
     async notify(userId, a, event) {
         const view = activationView(a, { canRebuy: this.buyAgain.isOthersEligible(a), refund: a._refund });
-        const head = event === 'OTP' ? '🔔 <b>Your code has arrived!</b>\n\n' : event === 'EXPIRED' ? '🔔 <b>Your number expired without an SMS.</b>\n\n' : '';
-        await this.bot.telegram.sendMessage(userId, head + view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
+        // Edit the user's current screen in place (no new message); optional OTP_PING=true adds a self-deleting nudge.
+        await editOrSend(this.bot.telegram, userId, { text: view.text, reply_markup: view.reply_markup });
+        if (event === 'OTP') await ping(this.bot.telegram, userId);
     }
-          }
-                                                       
+                }
+                       
