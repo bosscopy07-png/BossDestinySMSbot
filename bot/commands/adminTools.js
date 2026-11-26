@@ -25,6 +25,9 @@ export default class AdminTools {
         a('at_menu', this.menu);
         a('at_cancel', async (ctx) => { delete ctx.session?.atAwait; return this.menu(ctx); });
         a(/^at_in:(user|find|credit|restrict|unrestrict)$/, (ctx) => this.startInput(ctx, ctx.match[1]));
+        a(/^at_hp:(\d{1,3})$/, (ctx) => this.history(ctx, +ctx.match[1]));
+        a(/^at_h:([SO]):([A-Za-z0-9_\-]{1,48})$/, (ctx) => this.historyDetail(ctx, ctx.match[1], ctx.match[2]));
+        a(/^at_uc:(\d{3,20})$/, (ctx) => this.userCard(ctx, ctx.match[1]));
         a('at_credits', (ctx) => this.report(ctx, 'at_credits', () => this.creditsReport()));
         a('at_refunds', (ctx) => this.report(ctx, 'at_refunds', () => this.refundsReport()));
         a('at_unres', (ctx) => this.report(ctx, 'at_unres', () => this.unresolvedReport()));
@@ -47,6 +50,7 @@ export default class AdminTools {
         await show(ctx, {
             text: '🔎 <b>Admin Investigation</b>\n\nLookup users, trace payments/activations, review refunds and manual credits.',
             reply_markup: { inline_keyboard: [
+                [b('🕘 Recent Activity', 'at_hp:0')],
                 [b('👤 User Lookup', 'at_in:user'), b('🔎 Find Record', 'at_in:find')],
                 [b('🛠 Manual Credits', 'at_credits'), b('💸 Refunds', 'at_refunds')],
                 [b('⚠️ Unresolved', 'at_unres'), b('❌ Failed', 'at_failed')],
@@ -173,6 +177,52 @@ export default class AdminTools {
         }
     }
 
+    // ───────────── recent activity (all users) ─────────────
+    async history(ctx, page = 0) {
+        const per = 8, need = (page + 1) * per;
+        const { Session, OthersActivation } = this.m;
+        const [ss, os, sc, oc] = await Promise.all([
+            Session.find({}).sort({ startTime: -1 }).limit(need).lean(),
+            OthersActivation.find({}).sort({ createdAt: -1 }).limit(need).lean(),
+            Session.estimatedDocumentCount(), OthersActivation.estimatedDocumentCount()
+        ]);
+        const rows = [
+            ...ss.map(x => ({ k: 'S', id: x.sessionId, at: x.startTime || x.createdAt, user: x.userId, label: `${x.service || '?'} · ${x.country || ''}`, status: x.status, price: x.cost, num: x.number })),
+            ...os.map(x => ({ k: 'O', id: x.activationId, at: x.createdAt, user: x.userId, label: `OTHERS · ${x.countryName || x.country}`, status: x.status, price: x.priceUsd, num: x.phone }))
+        ].sort((p, q) => new Date(q.at) - new Date(p.at));
+        const total = sc + oc, pages = Math.max(1, Math.ceil(total / per));
+        const slice = rows.slice(page * per, page * per + per);
+        const icon = { RECEIVED: '✅', WAITING: '⏳', CHECKING: '⏳', ACTIVE: '⏳', PURCHASING: '⏳', TIMEOUT: '⌛', EXPIRED: '⌛', CANCELLED: '🚫', FAILED: '❌' };
+        const text = `🕘 <b>Recent activity</b> (page ${page + 1}/${pages})\n\n` + (slice.map((r, i) => `${i + 1}. ${icon[r.status] || '•'} <b>${h(r.label)}</b> · ${usd(r.price)}\n   👤 <code>${r.user}</code> · <code>${h(r.num || '—')}</code> · ${dt(r.at)}`).join('\n') || '<i>Nothing yet.</i>');
+        const open = slice.map((r, i) => b(`${i + 1}. Open`, `at_h:${r.k}:${r.id}`)).filter(x => x.callback_data.length <= 64);
+        const orows = []; for (let i = 0; i < open.length; i += 4) orows.push(open.slice(i, i + 4));
+        const nav = []; if (page > 0) nav.push(b('◀️ Newer', `at_hp:${page - 1}`)); if (page < pages - 1) nav.push(b('Older ▶️', `at_hp:${page + 1}`));
+        await show(ctx, this._wrap(text.slice(0, 3900), [...orows, nav, [b('🔄 Refresh', `at_hp:${page}`)]]));
+    }
+
+    async historyDetail(ctx, kind, id) {
+        const { Session, OthersActivation, User } = this.m;
+        const x = kind === 'S' ? await Session.findOne({ sessionId: id }).lean() : await OthersActivation.findOne({ activationId: id }).lean();
+        if (!x) return show(ctx, this._wrap('❌ Record not found.', [[b('◀️ Recent', 'at_hp:0')]]));
+        const u = await User.findOne({ userId: x.userId }).select('username firstName balance lockedBalance isBlacklisted').lean();
+        const lines = kind === 'S' ? [
+            `📨 <b>${h(x.service)}</b> · ${h(x.country || '')} · mode ${h(x.mode || '')}`,
+            `📞 <code>${h(x.number || '—')}</code>   Status: <b>${h(x.status)}</b>`,
+            `💵 ${usd(x.cost)}   Provider: ${h(x.provider || '-')}${x.routedProvider ? ' → ' + h(x.routedProvider) : ''}   Ref: <code>${h(x.providerNumberId || '-')}</code>`,
+            `🔑 OTP: ${x.otpCode ? `<code>${h(x.otpCode)}</code>` : '—'}`,
+            `🕒 Started ${dt(x.startTime)} · Ended ${dt(x.endTime)}`, x.rebuyOf ? `🔄 Buy Again of <code>${h(x.rebuyOf)}</code>` : ''
+        ] : [
+            `📱 <b>OTHERS</b> · ${h(x.countryName || x.country)} · ${h(x.operator)}`,
+            `📞 <code>${h(x.phone || '—')}</code>   Status: <b>${h(x.status)}</b>${x.failureReason ? ' (' + h(x.failureReason) + ')' : ''}`,
+            `💵 Price ${usd(x.priceUsd)} · provider cost ${usd(x.providerCost)}   Ref: <code>${h(x.providerId || '-')}</code>`,
+            `🔑 OTP: ${x.otpCode ? `<code>${h(x.otpCode)}</code>` : '—'}${x.messages?.length ? `\n💬 <pre>${h(x.messages[x.messages.length - 1].text)}</pre>` : ''}`,
+            `💸 Capture: ${h(x.capture?.status || '-')} · Refund: ${h(x.refund?.status || '-')}${x.refund?.reason ? ' (' + h(x.refund.reason) + ')' : ''}${x.ambiguous ? ' · ⚠️ ambiguous provider timeout' : ''}`,
+            `🕒 Created ${dt(x.createdAt)} · Expires ${dt(x.expiresAt)} · Ended ${dt(x.endedAt)}`, x.rebuyOf ? `🔄 Buy Again of <code>${h(x.rebuyOf)}</code>` : ''
+        ];
+        const user = u ? `👤 <b>${h(u.firstName || '')}</b> @${h(u.username || '-')} <code>${x.userId}</code>\n   Balance ${usd(u.balance)} · Locked ${usd(u.lockedBalance)}${u.isBlacklisted ? ' · 🚫 restricted' : ''}` : `👤 <code>${x.userId}</code> (user record missing)`;
+        await show(ctx, this._wrap([...lines, '', user].filter(l => l !== '').join('\n').slice(0, 3900), [[b('👤 Open User', `at_uc:${x.userId}`)], [b('◀️ Recent', 'at_hp:0')]]));
+    }
+
     // ───────────── reports (read-only) ─────────────
     async _findUser(q) {
         q = String(q || '').trim(); if (!q) return null;
@@ -288,4 +338,5 @@ export default class AdminTools {
         out.push(`5SIM OTHERS: ${okO}/${ot} OTP · ` + op.map(x => `${x._id.s}${x._id.r ? '(' + h(x._id.r) + ')' : ''}:${x.n}`).join(' '));
         return out;
     }
-              }
+            }
+            
