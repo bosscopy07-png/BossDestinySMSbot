@@ -4,6 +4,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { Telegraf, session as telegrafSession } from 'telegraf';
+import { autoEdit } from './middleware/autoEdit.js';
 import { message } from 'telegraf/filters';
 import config from '../config/env.js';
 import logger from '../utils/logger.js';
@@ -332,6 +333,9 @@ class TelegramBot {
             })
         }));
 
+        // One-screen UX: replies made while handling a tap/typed input edit the current message in place
+        this.bot.use(autoEdit());
+
         this.bot.use(async (ctx, next) => {
             const startTime = Date.now();
             const effectiveUserId = this._getEffectiveUserId(ctx);
@@ -357,7 +361,6 @@ class TelegramBot {
             }
         }));
 
-    
         // ═══════════════════════════════════════════════════════════════════════
         //  START INTERCEPTOR — FIXED: Proper regex for all /start variants
         //  Matches: /start, /start@botname, /start REFCODE, /start@botname REFCODE
@@ -498,7 +501,7 @@ class TelegramBot {
         }
     }
 
-         async setupCommands() {
+     async setupCommands() {
         try {
             this.smsProviderManager = new SMSProviderManager();
             await this.smsProviderManager.initialize();
@@ -632,7 +635,8 @@ class TelegramBot {
             this.referralService,
             this.smsProviderManager
         );
-                // ═══════════════════════════════════════════════════════════════════════
+
+        // ═══════════════════════════════════════════════════════════════════════
         //  Inject tier services into OTPCommands if available
         // ═══════════════════════════════════════════════════════════════════════
         if (this.tierIntegrationService && typeof this.tierIntegrationService.isAvailable === 'function') {
@@ -848,8 +852,7 @@ class TelegramBot {
         });
          }
                     
-       
-        setupTextHandler() {
+       setupTextHandler() {
         this.bot.on(message('text'), async (ctx, next) => {
             try {
                 const isAdmin = this.isEffectiveAdmin(ctx);
@@ -945,7 +948,7 @@ class TelegramBot {
             }
         });
         }
-                   // ═══════════════════════════════════════════════════════════════════════════════
+     // ═══════════════════════════════════════════════════════════════════════════════
 // bot/index.js (TelegramBot.js) — Part 3/3
 // Launch Sequence, Deposit Scanner, Metrics & Graceful Shutdown
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1112,4 +1115,3 @@ class TelegramBot {
 }
 
 export default TelegramBot;
-            
