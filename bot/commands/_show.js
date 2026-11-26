@@ -14,4 +14,3 @@ export async function show(ctx, { text, reply_markup }) {
     try { await ctx.reply(text, opts); } catch (e) { logger.error('show() failed', { error: e.message }); }
 }
 export const safeAnswer = (ctx, t) => ctx.answerCbQuery(t).catch(() => {});
-      
