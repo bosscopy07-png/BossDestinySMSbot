@@ -501,7 +501,7 @@ class TelegramBot {
         }
     }
 
-     async setupCommands() {
+        async setupCommands() {
         try {
             this.smsProviderManager = new SMSProviderManager();
             await this.smsProviderManager.initialize();
@@ -704,6 +704,13 @@ class TelegramBot {
             const othersCommands = new OthersCommands(this.bot, { manager: others.manager, buyAgain, userModel: UserModel, walletService: this.walletService });
             const orderCommands = new OrderHistoryCommands(this.bot, { history, buyAgain, userModel: UserModel });
 
+            // 🎁 Rewards wallet (1% cashback, transfer to main wallet)
+            const { getCashbackService } = await import('../services/rewards/CashbackService.js');
+            const { default: RewardsCommands } = await import('./commands/rewards.js');
+            const rewardsCommands = new RewardsCommands(this.bot, { cashback: await getCashbackService() });
+            rewardsCommands.register();
+            this.commandModules.set('rewards', rewardsCommands);
+
             others.manager.setNotifier((userId, activation, event) => othersCommands.notify(userId, activation, event));
             othersCommands.register();
             orderCommands.register();
@@ -852,7 +859,9 @@ class TelegramBot {
         });
          }
                     
-       setupTextHandler() {
+       
+        
+        setupTextHandler() {
         this.bot.on(message('text'), async (ctx, next) => {
             try {
                 const isAdmin = this.isEffectiveAdmin(ctx);
@@ -948,7 +957,7 @@ class TelegramBot {
             }
         });
         }
-     // ═══════════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════════
 // bot/index.js (TelegramBot.js) — Part 3/3
 // Launch Sequence, Deposit Scanner, Metrics & Graceful Shutdown
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1115,3 +1124,4 @@ class TelegramBot {
 }
 
 export default TelegramBot;
+            
