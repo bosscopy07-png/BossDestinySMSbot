@@ -428,6 +428,7 @@ this.bot.action(/copy_otp_(.+)/, async (ctx) => {
     // ═════════════════════════════════════════════════════════════════
     //  OTP HUB & ACTIONS
     // ═════════════════════════════════════════════════════════════════
+    
     this.bot.action('otp_hub', this.handleOTPHub);
     this.bot.action(/reveal_(.+)/, this.handleRevealOTP);
     this.bot.action(/check_otp_(.+)/, this.handleCheckOTP);
@@ -815,8 +816,8 @@ setupTextHandlers() {
         const str = phone.toString();
         if (str.length < 4) return '****';
         return str.slice(0, -4).replace(/./g, '*') + str.slice(-4);
-    }
-
+                }
+                
     // ═══════════════════════════════════════════════════════════════════════
     //  SESSION MANAGEMENT HELPERS
     // ═══════════════════════════════════════════════════════════════════════
@@ -863,7 +864,7 @@ setupTextHandlers() {
         }
     }
 
-  async handleCancel(ctx, isTimeout = false) {
+    async handleCancel(ctx, isTimeout = false) {
         const userId = ctx.from.id.toString();
 
         try {
@@ -1103,7 +1104,7 @@ setupTextHandlers() {
 
         buttons.push([
             Markup.button.callback('📜 History', 'history'),
-            Markup.button.callback('👥 Referral', 'referral')
+            Markup.button.callback('🎁 Rewards', 'referral')
         ]);
 
         buttons.push([
@@ -1147,3 +1148,4 @@ Object.assign(OTPCommands.prototype, freeMethods, tierMethods, purchaseMethods, 
 export default OTPCommands;
 
 
+                                             
