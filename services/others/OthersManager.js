@@ -11,10 +11,10 @@ const POPULAR = ['usa', 'england', 'canada', 'germany', 'france', 'netherlands',
 
 export class OthersManager {
     constructor({ store, provider, wallet, pricing = new OthersPricing(), refund = null, notifier = null,
-        now = () => new Date(), maxActive = parseInt(process.env.OTHERS_MAX_ACTIVE || '3', 10) } = {}) {
+        now = () => new Date(), timeoutMin = parseInt(process.env.OTHERS_TIMEOUT_MIN || '10', 10), maxActive = parseInt(process.env.OTHERS_MAX_ACTIVE || '3', 10) } = {}) {
         this.store = store; this.provider = provider; this.wallet = wallet; this.pricing = pricing;
         this.refunds = refund || new OthersRefund({ store, wallet, now });
-        this.notifier = notifier; this.now = now; this.maxActive = maxActive;
+        this.notifier = notifier; this.now = now; this.maxActive = maxActive; this.timeoutMin = timeoutMin;
         this._cache = new Map(); this._names = null; this._namesAt = 0;
     }
 
@@ -107,7 +107,10 @@ export class OthersManager {
 
         // 5. activate. If we cannot persist, undo at the provider and release the funds.
         try {
-            const expiresAt = bought.expiresAt || new Date(this.now().getTime() + 20 * 60000);
+            // Our own deadline is SHORTER than the provider's (5sim keeps numbers ~20-30 min): the user can still cancel any time,
+            // and we cancel + refund ourselves at OTHERS_TIMEOUT_MIN (default 10) so the provider never expires first.
+            const ownDeadline = new Date(this.now().getTime() + this.timeoutMin * 60000);
+            const expiresAt = bought.expiresAt && bought.expiresAt < ownDeadline ? bought.expiresAt : ownDeadline;
             const active = await this.store.transition(act.activationId, [S.PURCHASING], {
                 status: S.ACTIVE, providerId: bought.providerId, phone: bought.phone, providerCost: bought.cost,
                 operator: bought.operator || operator, expiresAt, nextPollAt: new Date(this.now().getTime() + 3000), lastProviderStatus: bought.status
@@ -224,4 +227,4 @@ export class OthersManager {
     }
 }
 export default OthersManager;
-          
+        
