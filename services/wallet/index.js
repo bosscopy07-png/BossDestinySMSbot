@@ -515,7 +515,7 @@ class WalletService {
 // Deposit System, Atomic Event Processing & User Lookup
 // ═══════════════════════════════════════════════════════════════════════════════
 
-     // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
     //  DEPOSIT SYSTEM — MODIFIED TO TRIGGER ACTIVE MODE
     // ═══════════════════════════════════════════════════════════
 
@@ -892,6 +892,7 @@ class WalletService {
         return retryableMessages.some(msg => error.message?.includes(msg));
     }
 
+
     async checkDeposit(userId) {
         await this.ensureReady();
         
@@ -1009,8 +1010,7 @@ class WalletService {
             throw error;
         }
             }
-
-     // ═══════════════════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════════════════════
 // services/wallet/index.js — Part 3/3
 // Referral System, Fund Management, Admin Balance Operations & Lifecycle
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1203,6 +1203,12 @@ class WalletService {
                 throw new Error('USER_UPDATE_FAILED');
             }
 
+            // 1% cashback -> REWARDS wallet (never the main balance). Non-critical: a failure must not undo the purchase.
+            try {
+                const { getCashbackService } = await import('../rewards/CashbackService.js');
+                await (await getCashbackService()).credit({ userId, amount, sourceTxId: txId });
+            } catch (cbErr) { logger.warn('Cashback credit failed (non-critical)', { txId, error: cbErr.message }); }
+
             logger.info('Funds captured', { userId, amount, txId });
 
             return true;
@@ -1345,8 +1351,7 @@ class WalletService {
     // ═══════════════════════════════════════════════════════════
     //  ADMIN BALANCE OPERATIONS
     // ═══════════════════════════════════════════════════════════
-
-    /** Is this admin id allowed to move money? Telegram ids must be in ADMIN_ID; API identities (non-numeric) are authorised upstream. */
+/** Is this admin id allowed to move money? Telegram ids must be in ADMIN_ID; API identities (non-numeric) are authorised upstream. */
     _isAuthorizedAdmin(adminId) {
         const id = String(adminId ?? '').trim();
         if (!id) return false;
@@ -1550,3 +1555,4 @@ class WalletService {
 
 export default WalletService;
 
+                
