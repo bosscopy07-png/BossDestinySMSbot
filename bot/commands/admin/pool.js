@@ -25,7 +25,7 @@ async handleOrphanReview(ctx) {
             return ctx.answerCbQuery?.('Please wait...').catch(() => {});
         }
 
-        const { OrphanSMS } = await import('../../models/index.js');
+        const { OrphanSMS } = await import('../../../models/index.js');
 
         // Get counts
         const [unreviewedCount, totalCount, recentOrphans] = await Promise.all([
@@ -101,7 +101,7 @@ async handleOrphanReview(ctx) {
  */
 async handleOrphanMarkAll(ctx) {
     try {
-        const { OrphanSMS } = await import('../../models/index.js');
+        const { OrphanSMS } = await import('../../../models/index.js');
 
         const result = await OrphanSMS.updateMany(
             { reviewed: false },
@@ -130,7 +130,7 @@ async handleOrphanMarkAll(ctx) {
  */
 async handleOrphanExport(ctx) {
     try {
-        const { OrphanSMS } = await import('../../models/index.js');
+        const { OrphanSMS } = await import('../../../models/index.js');
 
         const orphans = await OrphanSMS.find()
             .sort({ receivedAt: -1 })
@@ -197,7 +197,7 @@ async processOrphanSearch(ctx, phoneNumber) {
     try {
         const cleanPhone = phoneNumber.replace(/\D/g, '');
         
-        const { OrphanSMS } = await import('../../models/index.js');
+        const { OrphanSMS } = await import('../../../models/index.js');
 
         const matches = await OrphanSMS.find({
             $or: [
@@ -415,7 +415,7 @@ Select provider to see available countries and prices:
      * Step 2: Provider selected — fetch available countries + prices
      */
     
-                                async handlePoolProviderSelect(ctx, provider) {
+async handlePoolProviderSelect(ctx, provider) {
         ctx.session = ctx.session || {};
         ctx.session.poolPurchase = { preferredProvider: provider };
         this._setAdminState(ctx, 'AWAITING_POOL_COUNTRY', { provider });
@@ -1108,3 +1108,4 @@ ${num.retiredAt ? `<b>Retired At:</b> <code>${new Date(num.retiredAt).toLocaleDa
 };
 
 export default poolMethods;
+                                                   
