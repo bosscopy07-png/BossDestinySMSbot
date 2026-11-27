@@ -124,8 +124,9 @@ async handleBuyBundle(ctx) {
                 { $inc: { balance: -bundlePrice, bundleRemaining: bundleCount } }
             );
             
+            const _purchaseTxId = `BUNDLE_MAIN_${Date.now()}_${user.userId}`;
             await Transaction.create({
-                txId: `BUNDLE_MAIN_${Date.now()}_${user.userId}`,
+                txId: _purchaseTxId,
                 userId: user.userId,
                 type: 'BUNDLE_PURCHASE',
                 amount: -bundlePrice,
@@ -137,6 +138,7 @@ async handleBuyBundle(ctx) {
                 },
                 createdAt: new Date()
             });
+            await (await (await import('../../../services/rewards/CashbackService.js')).getCashbackService()).credit({ userId: user.userId, amount: bundlePrice, sourceTxId: _purchaseTxId }).catch(() => {});
             
             const message = 
                 `✅ <b>Bundle Purchased!</b>\n\n` +
@@ -232,8 +234,9 @@ async handleBuyVIP(ctx) {
                 }
             );
 
+            const _purchaseTxId = `VIP_${Date.now()}_${user.userId}`;
             await Transaction.create({
-                txId: `VIP_${Date.now()}_${user.userId}`,
+                txId: _purchaseTxId,
                 userId: user.userId,
                 type: 'VIP_SUBSCRIPTION',
                 amount: -vipPrice,
@@ -241,6 +244,7 @@ async handleBuyVIP(ctx) {
                 metadata: { expiryDate, source: 'VIP_MENU' },
                 createdAt: new Date()
             });
+            await (await (await import('../../../services/rewards/CashbackService.js')).getCashbackService()).credit({ userId: user.userId, amount: vipPrice, sourceTxId: _purchaseTxId }).catch(() => {});
 
             const assignment = await this.assignVipNumber(user.userId, 'US');
             
@@ -421,8 +425,9 @@ async handleBuyBundleOtp(ctx) {
                 { $inc: { balance: -purchase.price, bundleRemaining: purchase.quantity } }
             );
 
+            const _purchaseTxId = `BUNDLE_${Date.now()}_${user.userId}`;
             await Transaction.create({
-                txId: `BUNDLE_${Date.now()}_${user.userId}`,
+                txId: _purchaseTxId,
                 userId: user.userId,
                 type: 'BUNDLE_PURCHASE',
                 amount: -purchase.price,
@@ -434,6 +439,7 @@ async handleBuyBundleOtp(ctx) {
                 },
                 createdAt: new Date()
             });
+            await (await (await import('../../../services/rewards/CashbackService.js')).getCashbackService()).credit({ userId: user.userId, amount: purchase.price, sourceTxId: _purchaseTxId }).catch(() => {});
 
             ctx.session.bundlePurchase = null;
 
@@ -469,7 +475,7 @@ async handleBuyBundleOtp(ctx) {
 
     
 
-async handleRequestOtpVip(ctx) {
+    async handleRequestOtpVip(ctx) {
         const user = ctx.state.user;
         
         if (!this._isVipActive(user)) {
