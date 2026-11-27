@@ -52,3 +52,4 @@ export async function ping(telegram, chatId, text = '🔔 Code received') {
     try { const m = await telegram.sendMessage(chatId, text, { disable_notification: false }); setTimeout(() => telegram.deleteMessage(chatId, m.message_id).catch(() => {}), 6000); } catch (_) {}
 }
 export { stripHtml, notModified };
+    
