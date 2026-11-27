@@ -8,12 +8,13 @@ import logger from '../../utils/logger.js';
 import { User, Referral } from '../../models/index.js';
 import { generateId } from '../../utils/helpers.js';
 
+import { BOT_IMAGE_URL } from '../../utils/botImage.js';
 const MANDATORY_CHANNELS = [
     { id: '@Swiftsmscommunity', name: 'SwiftSMS Community', url: 'https://t.me/Swiftsmscommunity' },
     { id: '@swiftsmstech', name: 'SwiftSMS Tech', url: 'https://t.me/swiftsmstech' }
 ];
 
-const WELCOME_IMAGE_URL = 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231499/file_000000006c1c724685bb402218b7c208_ste2ky.png';
+const WELCOME_IMAGE_URL = BOT_IMAGE_URL;
 
 const VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
 const CAPTCHA_MAX_ATTEMPTS = 3;
@@ -513,4 +514,4 @@ class StartVerification {
 }
 
 export default StartVerification;
-        
+                
