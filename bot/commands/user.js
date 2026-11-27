@@ -445,8 +445,7 @@ async handleMenu(ctx) {
         [Markup.button.callback('📜 History', 'history'), Markup.button.callback('📊 Stats', 'stats')],
         [Markup.button.callback('🎁 Referral', 'referral'), Markup.button.callback('⚙️ Settings', 'settings')],
         [Markup.button.callback('💰 Balance', 'balance'), Markup.button.callback('🎧 Support', 'support')],
-        [Markup.button.callback('❓ Help', 'help'), Markup.button.callback('📱 OTP Services', 'otp_hub')],
-        [Markup.button.callback('📱 OTHERS', 'others_menu'), Markup.button.callback('📦 My Orders', 'my_orders')]
+        [Markup.button.callback('❓ Help', 'help'), Markup.button.callback('📱 OTP Services', 'otp_hub')]
     ]);
 
     try {
@@ -800,8 +799,9 @@ async handleDepositQR(ctx) {
             logger.error('Fallback failed', { userId, error: e.message });
         }
     }
-         }
-    async handleShareAddress(ctx) {
+}
+
+async handleShareAddress(ctx) {
     const address = ctx.match[1];
     await ctx.answerCbQuery('📤 Address ready!');
     await ctx.reply(
@@ -870,9 +870,8 @@ async handleCheckDeposit(ctx) {
         await ctx.answerCbQuery('❌ Check failed');
         await ctx.reply('❌ Error checking deposit. Try again later.');
     }
-}
-
-// ═══════════════════════════════════════════════════════════
+                                    }
+    // ═══════════════════════════════════════════════════════════
 //  NAIRA DEPOSIT FLOW — NEW
 // ═══════════════════════════════════════════════════════════
 async handleNairaDepositStart(ctx) {
@@ -1121,7 +1120,9 @@ async handleNairaCancel(ctx) {
     } catch (error) {
         logger.error('Cancel deposit error', { error: error.message });
     }
-                                               }// ═══════════════════════════════════════════════════════════
+}
+
+// ═══════════════════════════════════════════════════════════
 //  HANDLE HISTORY
 // ═══════════════════════════════════════════════════════════
 async handleHistory(ctx) {
@@ -1234,8 +1235,7 @@ async handleShareReferral(ctx) {
         { parse_mode: 'HTML' }
     );
 }
-
-// ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
 //  HANDLE STATS
 // ═══════════════════════════════════════════════════════════
 async handleStats(ctx) {
@@ -1575,3 +1575,4 @@ async handleToggleNotifications(ctx) {
 
 export default UserCommands;
 
+                                                                                            
