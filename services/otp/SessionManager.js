@@ -440,7 +440,7 @@ class SessionManager {
             }
                 
         
-      // ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
     //  AUTO-DELIVERY: Send OTP directly to user's Telegram
     // ═══════════════════════════════════════════════════════════
 async _autoDeliverOTPToUser(session, otp) {
@@ -463,22 +463,12 @@ async _autoDeliverOTPToUser(session, otp) {
         throw new Error('BOT_TELEGRAM_NOT_AVAILABLE');
     }
 
-    const message =
-        `🔓 <b>OTP Received!</b>\n\n` +
-        `📱 Number: <code>${session.number}</code>\n` +
-        `🎯 Service: ${session.service}\n` +
-        `🔢 OTP: <code>${otp}</code>\n` +
-        `🕐 Delivered: ${new Date().toLocaleTimeString()}\n\n` +
-        `⚠️ Do not share this code with anyone.`;
-
-    await this.bot.telegram.sendMessage(session.userId, message, {
-        parse_mode: 'HTML',
-        reply_markup: {
-            inline_keyboard: [
-                [{ text: '🔙 Back to Menu', callback_data: 'menu' }]
-            ]
-        }
-    });
+    // Same screen style as OTHERS, delivered by EDITING the user's current screen (no new message)
+    const { sessionReceivedView } = await import('../../bot/commands/othersView.js');
+    const { editOrSend, ping } = await import('../../bot/ui/anchor.js');
+    const view = sessionReceivedView(session, otp);
+    await editOrSend(this.bot.telegram, session.userId, { text: view.text, reply_markup: view.reply_markup });
+    await ping(this.bot.telegram, session.userId);
 
     logger.info('OTP auto-delivered to user via Telegram', {
         sessionId: session.sessionId,
@@ -575,14 +565,15 @@ async _autoDeliverOTPToUser(session, otp) {
     }
 
     /** Tell the user the number timed out and offer 🔄 Buy Again / My Orders / Menu. Never throws. */
-    async _sendTimeoutPrompt(session) {
+     async _sendTimeoutPrompt(session) {
         try {
             if (!this.bot?.telegram) return;
             const { timeoutPromptView } = await import('../../bot/commands/othersView.js');
             const fresh = await Session.findOne({ sessionId: session.sessionId }).lean();
             const canRebuy = this.buyAgainService ? this.buyAgainService.isSessionEligible(fresh) : false;
             const v = timeoutPromptView({ sessionId: session.sessionId, service: session.service, canRebuy });
-            await this.bot.telegram.sendMessage(session.userId, v.text, { parse_mode: 'HTML', reply_markup: v.reply_markup });
+            const { editOrSend } = await import('../../bot/ui/anchor.js');
+            await editOrSend(this.bot.telegram, session.userId, { text: v.text, reply_markup: v.reply_markup });
         } catch (e) {
             logger.warn('Timeout prompt failed', { sessionId: session.sessionId, error: e.message });
         }
@@ -764,6 +755,7 @@ async _autoDeliverOTPToUser(session, otp) {
 
         return session;
     }
+
     // ═══════════════════════════════════════════════════════════
     //  INTERNAL - Finances
     // ═══════════════════════════════════════════════════════════
@@ -921,8 +913,7 @@ async _autoDeliverOTPToUser(session, otp) {
         if (!check) throw new Error('INVALID_MODE');
 
         await check();
-    }
-
+            }
     // ═══════════════════════════════════════════════════════════
     //  INTERNAL - Monitoring
     // ═══════════════════════════════════════════════════════════
@@ -1105,4 +1096,3 @@ async _autoDeliverOTPToUser(session, otp) {
 }
 
 export default SessionManager;
-    
