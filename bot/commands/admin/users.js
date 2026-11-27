@@ -491,8 +491,7 @@ Send the number of days to grant:
         }
     },
 
-    
-async executeGiveVip(ctx, userId, days) {
+  async executeGiveVip(ctx, userId, days) {
         try {
             const expiry = new Date();
             expiry.setDate(expiry.getDate() + days);
@@ -536,9 +535,12 @@ Enjoy premium benefits!
             await this.replyError(ctx, '❌ <b>Failed to grant VIP.</b>');
         }
     },
-// ═══════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════
     //  USER DETAIL INLINE (FIXED — was cut off at Lifetime Value)
     // ═══════════════════════════════════════════════════════════
+
+    
 async showUserDetailInline(ctx, userId) {
         try {
             const user = await User.findOne({ userId }).lean();
@@ -863,8 +865,7 @@ Your balance has been updated.
         ctx.session.awaitingDeductBalance = targetId;
         await this.replySuccess(ctx, `💰 <b>Deduct Balance</b>\n\nSend the amount to deduct from user <code>${targetId}</code>:\n\n<i>Reply with a number (e.g., 5.00)</i>`);
     },
-
-    // ═══════════════════════════════════════════════════════════
+              // ═══════════════════════════════════════════════════════════
     //  BLACKLIST / BAN / WHITELIST / MESSAGE USER
     // ═══════════════════════════════════════════════════════════
 
