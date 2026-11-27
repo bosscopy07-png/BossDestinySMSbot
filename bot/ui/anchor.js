@@ -46,10 +46,17 @@ export async function editOrSend(telegram, chatId, { text, reply_markup, parse_m
     } catch (e) { return { error: e.message }; }
 }
 
-/** Optional audible nudge: a tiny message that deletes itself (edits don't make a notification sound). */
-export async function ping(telegram, chatId, text = '🔔 Code received') {
-    if (process.env.OTP_PING !== 'true') return;
-    try { const m = await telegram.sendMessage(chatId, text, { disable_notification: false }); setTimeout(() => telegram.deleteMessage(chatId, m.message_id).catch(() => {}), 6000); } catch (_) {}
+/**
+ * Audible nudge: edits make no notification sound, so when a code arrives we also send a tiny message that
+ * deletes itself (default 6 s). ON by default; set OTP_PING=false to disable.
+ */
+export async function ping(telegram, chatId, text = '🔔 Your code has arrived', ttlMs = 6000) {
+    if (String(process.env.OTP_PING ?? 'true').toLowerCase() === 'false') return false;
+    try {
+        const m = await telegram.sendMessage(chatId, text, { disable_notification: false });
+        const t = setTimeout(() => telegram.deleteMessage(chatId, m.message_id).catch(() => {}), ttlMs);
+        t.unref?.();
+        return true;
+    } catch (_) { return false; }
 }
 export { stripHtml, notModified };
-    
