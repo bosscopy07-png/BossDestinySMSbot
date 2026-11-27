@@ -1,6 +1,7 @@
 // bot/commands/othersView.js — pure view builders (text + inline keyboard) for OTHERS / Buy Again / My Orders.
 // No I/O so every screen can be unit-tested. Callback data is validated to fit Telegram's 64-byte limit.
 import { escapeHtml as h } from '../../services/others/constants.js';
+import { computeCashback, fmt4 } from '../../services/rewards/cashbackMath.js';
 
 export const cb = (data) => (Buffer.byteLength(data) <= 64 ? data : null);
 const btn = (text, data) => { const d = cb(data); return d ? { text, callback_data: d } : null; };
@@ -155,8 +156,36 @@ export function timeoutPromptView({ sessionId, service, canRebuy }) {
     return { text, reply_markup: { inline_keyboard: rows([canRebuy ? btn('🔄 Buy Again', `bas:${sessionId}`) : null], NAV) } };
 }
 
+/** Number ready screen for every normal OTP mode (CHEAP / BUNDLE / VIP / FREE) — same professional layout as OTHERS. */
+export function sessionStartedText({ mode, number, service, price = null, priceLabel = null, timeoutAt = null, note = null, extra = [], now = new Date() }) {
+    const left = timeoutAt ? minutesLeft(timeoutAt, now) : null;
+    const cash = price && Number(price) > 0 ? computeCashback(price) : 0;
+    return `📱 <b>Number ready</b>\n\n` +
+        `📞 Number: <code>${h(number)}</code>\n` +
+        `🎯 Service: <b>${h(service)}</b>\n` +
+        `💵 Price: <b>${price != null ? usd(price) : h(priceLabel || '—')}</b>\n` +
+        `🏷 Mode: ${h(mode)}\n` +
+        extra.map(x => `${x}\n`).join('') +
+        `📡 Status: <b>⏳ Waiting for SMS</b>\n` +
+        (left != null ? `⏱ Expires in about <b>${left} min</b>\n` : '') +
+        (cash > 0 ? `🎁 You'll earn <b>${fmt4(cash)}</b> cashback when the code arrives\n` : '') +
+        (note ? `\n<i>${h(note)}</i>` : '');
+}
+
 /** Normal OTP session: code received (same look as OTHERS). */
 export function sessionReceivedView(s, otp) {
-    const text = `✅ <b>Code received</b>\n\n📱 ${h(s.service)} · ${h(s.country || '')}\n📞 Number: <code>${h(s.number)}</code>\n🔑 Code: <code>${h(otp)}</code>\n💵 Charged: ${usd(s.cost)}\n\n⚠️ Never share this code with anyone.`;
-    return { text, reply_markup: { inline_keyboard: rows([{ text: '📋 Copy Code', copy_text: { text: String(otp) } }, { text: '📋 Copy Number', copy_text: { text: String(s.number) } }], [btn('🔄 Buy Again', `bas:${s.sessionId}`), NAV[0]], [NAV[1]]) } };
+    const paid = s.mode === 'CHEAP' && Number(s.cost) > 0;
+    const cash = paid ? computeCashback(s.cost) : 0;
+    const secs = s.startTime ? Math.max(0, Math.round((Date.now() - new Date(s.startTime).getTime()) / 1000)) : null;
+    const text = `✅ <b>Code received</b>\n\n` +
+        `📱 ${h(s.service)}${s.country ? ' · ' + h(s.country) : ''}\n` +
+        `📞 Number: <code>${h(s.number)}</code>\n` +
+        `🔑 Code: <code>${h(otp)}</code>\n` +
+        `💵 ${paid ? 'Charged' : 'Price'}: ${paid ? usd(s.cost) : (s.mode === 'FREE' ? 'Free' : s.mode === 'VIP' ? 'VIP quota' : s.mode === 'BUNDLE' ? '1 bundle credit' : usd(s.cost))}\n` +
+        (secs != null ? `⏱ Received in ${secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`}\n` : '') +
+        (cash > 0 ? `🎁 Cashback: <b>+${fmt4(cash)}</b> added to your Rewards wallet\n` : '') +
+        `\n⚠️ Never share this code with anyone.`;
+    const copy = [{ text: '📋 Copy Code', copy_text: { text: String(otp) } }, { text: '📋 Copy Number', copy_text: { text: String(s.number) } }];
+    const second = s.mode === 'CHEAP' ? [btn('🔄 Buy Again', `bas:${s.sessionId}`), NAV[0]] : [NAV[0], NAV[1]];
+    return { text, reply_markup: { inline_keyboard: rows(copy, second, s.mode === 'CHEAP' ? [btn('🎁 Rewards', 'rewards_wallet'), NAV[1]] : []) } };
 }
