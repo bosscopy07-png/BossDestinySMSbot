@@ -1,5 +1,6 @@
 // bot/commands/otp/purchase.js — Country selection → number purchase, OTP check/reveal, my number, quick buy
 // Mixed into OTPCommands.prototype by bot/commands/otp.js (bodies unchanged: `this` is the OTPCommands instance).
+import { sessionStartedText } from '../othersView.js';
 import { Markup } from 'telegraf';
 import { Session, User, Number as NumberModel, Transaction } from '../../../models/index.js';
 import { formatCurrency, maskOTP } from '../../../utils/helpers.js';
@@ -157,14 +158,7 @@ async handleCountrySelect(ctx, countryCode = null) {
 
                 const costText = mode === 'VIP' ? 'VIP (daily quota)' : 'BUNDLE (1 credit)';
 
-                const message = 
-                    `📱 <b>OTP Request Started</b>\n\n` +
-                    `🌍 Mode: ${mode}\n` +
-                    `📱 Number: <code>${user.vipPhoneNumber}</code>\n` +
-                    `🎯 Service: ${service}\n` +
-                    `⏳ Status: Waiting for OTP...\n` +
-                    `💰 Cost: ${costText}\n\n` +
-                    `⚠️ Your dedicated VIP number. OTP will arrive shortly.`;
+                const message = sessionStartedText({ mode, number: user.vipPhoneNumber, service, priceLabel: costText, note: 'Your dedicated VIP number. Your code will arrive shortly.' });
 
                 const keyboard = KEYBOARDS.otpActions(`vip_${userId}_${Date.now()}`);
                 
@@ -220,15 +214,7 @@ async handleCountrySelect(ctx, countryCode = null) {
                     bundleResult.providerNumberId || bundleResult.numberId
                 );
 
-                const message = 
-                    `📱 <b>OTP Request Started</b>\n\n` +
-                    `🌍 Mode: BUNDLE\n` +
-                    `📱 Number: <code>${session.number}</code>\n` +
-                    `🎯 Service: ${service}\n` +
-                    `⏳ Status: Waiting for OTP...\n` +
-                    `💰 Cost: BUNDLE (1 credit used)\n` +
-                    `⏱ Timeout: ${Math.floor((session.timeoutAt - new Date()) / 1000)}s\n\n` +
-                    `⚠️ Bundle credit used. No additional charge.`;
+                const message = sessionStartedText({ mode: 'BUNDLE', number: session.number, service, priceLabel: '1 bundle credit', timeoutAt: session.timeoutAt, note: 'Bundle credit used. No additional charge.' });
 
                 const keyboard = KEYBOARDS.otpActions(session.sessionId, session.number);
                 const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
@@ -261,15 +247,7 @@ async handleCountrySelect(ctx, countryCode = null) {
                     freeResult.sessionId
                 );
 
-                const message = 
-                    `📱 <b>OTP Request Started</b>\n\n` +
-                    `🌍 Mode: FREE\n` +
-                    `📱 Number: <code>${session.number}</code>\n` +
-                    `🎯 Service: ${service}\n` +
-                    `⏳ Status: Waiting for OTP...\n` +
-                    `💰 Cost: FREE\n` +
-                    `⏱ Timeout: ${Math.floor((session.timeoutAt - new Date()) / 1000)}s\n\n` +
-                    `⚠️ Shared number. OTP not guaranteed.`;
+                const message = sessionStartedText({ mode: 'FREE', number: session.number, service, priceLabel: 'Free', timeoutAt: session.timeoutAt, note: 'Shared number — delivery is not guaranteed.' });
 
                 const keyboard = KEYBOARDS.otpActions(session.sessionId, session.number);
                 const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
@@ -346,16 +324,7 @@ async handleCountrySelect(ctx, countryCode = null) {
                     cheapResult.displayCost || cheapResult.cost
                 );
 
-                const message = 
-                    `📱 <b>OTP Request Started</b>\n\n` +
-                    `🌍 Mode: CHEAP\n` +
-                    `📱 Number: <code>${session.number}</code>\n` +
-                    `🎯 Service: ${service}\n` +
-                    `⏳ Status: Waiting for OTP...\n` +
-                    `💰 Cost: ${formatCurrency(session.cost)}\n` +
-                    `⏱ Timeout: ${Math.floor((session.timeoutAt - new Date()) / 1000)}s\n\n` +
-                    `⚠️ Funds locked. Will be deducted on delivery.\n` +
-                    `Cancel anytime to get full refund.`;
+                const message = sessionStartedText({ mode: 'CHEAP', number: session.number, service, price: session.cost, timeoutAt: session.timeoutAt, note: 'Your balance is reserved and only charged when your code arrives. Cancel any time for a full refund.' });
 
                 const keyboard = KEYBOARDS.otpActions(session.sessionId, session.number);
                 const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
@@ -391,15 +360,7 @@ async handleCountrySelect(ctx, countryCode = null) {
                     vipResult.providerNumberId || vipResult.numberId
                 );
 
-                const message = 
-                    `📱 <b>OTP Request Started</b>\n\n` +
-                    `🌍 Mode: VIP\n` +
-                    `📱 Number: <code>${session.number}</code>\n` +
-                    `🎯 Service: ${service}\n` +
-                    `⏳ Status: Waiting for OTP...\n` +
-                    `💰 Cost: VIP (daily quota)\n` +
-                    `⏱ Timeout: ${Math.floor((session.timeoutAt - new Date()) / 1000)}s\n\n` +
-                    `⚠️ Priority delivery enabled.`;
+                const message = sessionStartedText({ mode: 'VIP', number: session.number, service, priceLabel: 'VIP (daily quota)', timeoutAt: session.timeoutAt, note: 'Priority delivery enabled.' });
 
                 const keyboard = KEYBOARDS.otpActions(session.sessionId, session.number);
                 const sentMessage = await this.sendPhotoWithCaption(ctx, IMAGES.otpRequested, message, keyboard, 'HTML');
@@ -428,7 +389,7 @@ async handleCountrySelect(ctx, countryCode = null) {
                 await User.updateOne({ userId }, { $inc: { vipDailyUsed: -1 } }).catch(() => {});
             }
 
-            const errorMessages = {
+             const errorMessages = {
                 ACTIVE_SESSION_EXISTS: '⏳ You already have an active session. Use /cancel first.',
                 INSUFFICIENT_BALANCE: '💰 Insufficient balance. Deposit first with /deposit',
                 FREE_LIMIT_REACHED: '🆓 Free limit reached for today.',
@@ -651,3 +612,4 @@ async handleQuickBuy(ctx) {
 };
 
 export default purchaseMethods;
+  
