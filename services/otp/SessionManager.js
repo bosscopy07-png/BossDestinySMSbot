@@ -79,8 +79,9 @@ class SessionManager {
             },
             timeouts: {
                 FREE: 120,
-                CHEAP: 180,
-                BUNDLE: 180,
+                // 10 minutes by default (was 3). Our deadline stays well below the provider's hold time; users can cancel any time.
+                CHEAP: parseInt(process.env.OTP_TIMEOUT_SECONDS || '600', 10),
+                BUNDLE: parseInt(process.env.OTP_TIMEOUT_SECONDS || '600', 10),
                 VIP: 60
             },
             maxRetries: {
@@ -565,7 +566,7 @@ async _autoDeliverOTPToUser(session, otp) {
     }
 
     /** Tell the user the number timed out and offer 🔄 Buy Again / My Orders / Menu. Never throws. */
-     async _sendTimeoutPrompt(session) {
+    async _sendTimeoutPrompt(session) {
         try {
             if (!this.bot?.telegram) return;
             const { timeoutPromptView } = await import('../../bot/commands/othersView.js');
@@ -869,9 +870,8 @@ async _autoDeliverOTPToUser(session, otp) {
                 error: error.message
             });
         }
-    }
-
-    // ═══════════════════════════════════════════════════════════
+                                              }
+                     // ═══════════════════════════════════════════════════════════
     //  INTERNAL - Validation
     // ═══════════════════════════════════════════════════════════
 
@@ -913,7 +913,8 @@ async _autoDeliverOTPToUser(session, otp) {
         if (!check) throw new Error('INVALID_MODE');
 
         await check();
-            }
+    }
+
     // ═══════════════════════════════════════════════════════════
     //  INTERNAL - Monitoring
     // ═══════════════════════════════════════════════════════════
@@ -1096,3 +1097,4 @@ async _autoDeliverOTPToUser(session, otp) {
 }
 
 export default SessionManager;
+            
