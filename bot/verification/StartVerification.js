@@ -434,7 +434,6 @@ class StartVerification {
     //  MEMBERSHIP CHECK
     // ═══════════════════════════════════════════════════════
 
-    
     async _checkMembership(userId) {
         const results = await Promise.allSettled(
             MANDATORY_CHANNELS.map(async (channel) => {
@@ -514,3 +513,4 @@ class StartVerification {
 }
 
 export default StartVerification;
+        
