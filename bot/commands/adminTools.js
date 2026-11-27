@@ -245,6 +245,7 @@ export default class AdminTools {
             `📅 Joined ${dt(u.createdAt)} · Active ${dt(u.lastActive)} · Bot blocked: ${u.blockedBot ? 'yes' : 'no'}`,
             `🚦 Restricted: <b>${u.isBlacklisted ? 'YES' : 'no'}</b>` + (u.isBlacklisted ? `\n   Reason: ${h(u.blacklistReason || 'N/A')}\n   By: ${h(u.blacklistedBy || 'unknown')} (${h(u.blacklistSource || '?')}) since ${dt(u.blacklistDate)}\n   Expires: ${u.blacklistExpiresAt ? dt(u.blacklistExpiresAt) : 'never'}` : ''),
             hist.length ? `📜 History:\n` + hist.map(x => `   ${dt(x.at)} ${h(x.action)} by ${h(x.by)} — ${h(x.reason || '')}`).join('\n') : '',
+            `🎁 Rewards wallet: ${usd(u.cashbackBalance)} · earned ${usd(u.cashbackEarned)} · moved to main ${usd(u.cashbackTransferred)}`,
             `📦 Sessions: ${sc} · OTHERS: ${oc}`,
             `🧾 Recent transactions:\n` + (txs.map(t => `   <code>${h(t.txId)}</code> ${h(t.type)} ${usd(t.amount)} ${h(t.status)} ${dt(t.createdAt)}`).join('\n') || '   —'),
             others.length ? `📱 Recent OTHERS:\n` + others.map(o => `   <code>${o.activationId.slice(0, 8)}</code> ${h(o.country)} ${h(o.status)} ${usd(o.priceUsd)}${o.failureReason ? ' · ' + h(o.failureReason) : ''}`).join('\n') : ''
@@ -338,5 +339,5 @@ export default class AdminTools {
         out.push(`5SIM OTHERS: ${okO}/${ot} OTP · ` + op.map(x => `${x._id.s}${x._id.r ? '(' + h(x._id.r) + ')' : ''}:${x.n}`).join(' '));
         return out;
     }
-            }
-            
+                                                                                                                                                                                                                                                                        }
+                                                                                                           
