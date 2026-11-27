@@ -121,6 +121,7 @@ export {
     Referral,
     ApiKey,
     AdminLog,
+    OthersActivation,
     Settings,
     OrphanSMS,
     AdVerification,
@@ -130,4 +131,3 @@ export {
 };
 
 export default modelRegistry;
-            
