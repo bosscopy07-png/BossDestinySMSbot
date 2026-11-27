@@ -14,21 +14,22 @@ import logger from '../../utils/logger.js';
 import paymentService from '../../services/payment/paymentService.js';
 import exchangeRateService from '../../services/payment/exchangeRate.service.js';
 
+import { BOT_IMAGE_URL } from '../../utils/botImage.js';
 // ═══════════════════════════════════════════════════════════
 //  IMAGE ASSETS
 // ═══════════════════════════════════════════════════════════
 
 const IMAGES = Object.freeze({
-    welcome: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231506/file_0000000091ec71f4aab72fba467f0816_rgeuyd.png',
-    mainMenu: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231491/file_0000000046a87246a25fc17f6f9e23ad_a92mlc.png',
-    deposit: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777235826/file_000000001c0c720aa51ae407e6741ca5_steie1.png',
-    depositConfirmed: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231494/file_00000000f5e0720a9dcc0b876fd6cd16_ctv3ww.png',
-    referral: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231491/file_00000000270c71f4ba15ce962f19608a_s2vezb.png',
-    stats: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777235813/file_00000000bd6872438ea7ffa6d8e24a9b_aedrwq.png',
-    balance: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777235815/file_000000006c547246894f39172e0e16f9_xjcbxj.png',
-    history: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777235813/file_000000009d2c71f48ff0e002646b16ec_yil08l.png',
-    support: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777235819/file_000000001a2c71f4874aa9f7f5bfe40e_vxehy2.png',
-    default: 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777235807/file_000000002930724688cd84d89728bc31_gfgpbk.png'
+    welcome: BOT_IMAGE_URL,
+    mainMenu: BOT_IMAGE_URL,
+    deposit: BOT_IMAGE_URL,
+    depositConfirmed: BOT_IMAGE_URL,
+    referral: BOT_IMAGE_URL,
+    stats: BOT_IMAGE_URL,
+    balance: BOT_IMAGE_URL,
+    history: BOT_IMAGE_URL,
+    support: BOT_IMAGE_URL,
+    default: BOT_IMAGE_URL
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -341,7 +342,7 @@ class UserCommands {
             [Markup.button.callback('🆓 FREE OTP', 'mode_free'), Markup.button.callback('💵 CHEAP OTP', 'mode_cheap')],
             [Markup.button.callback('📦 Buy Bundle', 'mode_bundle'), Markup.button.callback('👑 Upgrade VIP', 'mode_vip')],
             [Markup.button.callback('💳 Deposit', 'deposit'), Markup.button.callback('📊 My Stats', 'stats')],
-            [Markup.button.callback('🎁 Referral', 'referral'), Markup.button.callback('⚙️ Settings', 'settings')],
+            [Markup.button.callback('🎁 Rewards', 'referral'), Markup.button.callback('⚙️ Settings', 'settings')],
             [Markup.button.callback('💰 Check Balance', 'balance'), Markup.button.callback('🎧 Customer Service', 'support')]
         ]);
 
@@ -443,7 +444,7 @@ async handleMenu(ctx) {
     const keyboard = Markup.inlineKeyboard([
         [Markup.button.callback('🔢 Request OTP', 'request_otp'), Markup.button.callback('💳 Deposit', 'deposit')],
         [Markup.button.callback('📜 History', 'history'), Markup.button.callback('📊 Stats', 'stats')],
-        [Markup.button.callback('🎁 Referral', 'referral'), Markup.button.callback('⚙️ Settings', 'settings')],
+        [Markup.button.callback('🎁 Rewards', 'referral'), Markup.button.callback('⚙️ Settings', 'settings')],
         [Markup.button.callback('💰 Balance', 'balance'), Markup.button.callback('🎧 Support', 'support')],
         [Markup.button.callback('❓ Help', 'help'), Markup.button.callback('📱 OTP Services', 'otp_hub')]
     ]);
@@ -870,8 +871,9 @@ async handleCheckDeposit(ctx) {
         await ctx.answerCbQuery('❌ Check failed');
         await ctx.reply('❌ Error checking deposit. Try again later.');
     }
-                                    }
-    // ═══════════════════════════════════════════════════════════
+}
+
+// ═══════════════════════════════════════════════════════════
 //  NAIRA DEPOSIT FLOW — NEW
 // ═══════════════════════════════════════════════════════════
 async handleNairaDepositStart(ctx) {
@@ -1121,8 +1123,7 @@ async handleNairaCancel(ctx) {
         logger.error('Cancel deposit error', { error: error.message });
     }
 }
-
-// ═══════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
 //  HANDLE HISTORY
 // ═══════════════════════════════════════════════════════════
 async handleHistory(ctx) {
@@ -1212,9 +1213,11 @@ async handleReferral(ctx) {
         '• Referrals: <code>' + (user.referralCount || 0) + '</code>\n' +
         '• Total Earnings: <code>' + formatCurrency(user.referralEarnings || 0) + '</code>\n' +
         '• Pending Approval: <code>' + formatCurrency(user.referralRewardsPending || 0) + '</code>\n\n' +
+        '🎁 <b>Rewards wallet (1% cashback):</b> <code>$' + (Math.round((user.cashbackBalance || 0) * 10000) / 10000).toFixed(4) + '</code>\n\n' +
         '🔗 <b>Your Link:</b>\n<code>' + referralLink + '</code>';
 
     const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('💰 Rewards Wallet', 'rewards_wallet')],
         [Markup.button.callback('📤 Share Link', 'share_' + user.referralCode)],
         [Markup.button.callback('🔙 Back', 'menu')]
     ]);
@@ -1235,7 +1238,8 @@ async handleShareReferral(ctx) {
         { parse_mode: 'HTML' }
     );
 }
-    // ═══════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════
 //  HANDLE STATS
 // ═══════════════════════════════════════════════════════════
 async handleStats(ctx) {
@@ -1575,4 +1579,3 @@ async handleToggleNotifications(ctx) {
 
 export default UserCommands;
 
-                                                                                            
