@@ -43,7 +43,8 @@ export const rateLimit = (options = {}) => {
     const {
         window = 60, // seconds
         max = 10,    // max requests
-        keyPrefix = 'ratelimit'
+        keyPrefix = 'ratelimit',
+        onLimitExceeded = null
     } = options;
 
     return async (ctx, next) => {
@@ -55,17 +56,21 @@ export const rateLimit = (options = {}) => {
         try {
             const current = await redis.incr(key);
             
+            // Always (re)assert a TTL on first hit OR when the key has none, so a crash between INCR and EXPIRE can't lock a user out forever
             if (current === 1) {
+                await redis.expire(key, window);
+            } else if (typeof redis.ttl === 'function' && (await redis.ttl(key)) < 0) {
                 await redis.expire(key, window);
             }
 
             if (current > max) {
                 logger.warn('Rate limit exceeded', { userId, current, max });
-                return ctx.reply(`
-⏳ Too many requests.
-
-Please wait ${window} seconds before trying again.
-                `);
+                if (ctx.callbackQuery) { await ctx.answerCbQuery('⏳ Slow down a little').catch(() => {}); return; }
+                if (current === max + 1) { // reply once per window, not on every extra tap
+                    if (onLimitExceeded) return onLimitExceeded(ctx);
+                    return ctx.reply(`⏳ Too many requests. Please wait a moment and try again.`);
+                }
+                return;
             }
 
             return next();
