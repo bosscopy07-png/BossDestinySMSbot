@@ -1,8 +1,9 @@
-// bot/commands/admin/constants.js — shared constants for the admin command modules
+
+import { BOT_IMAGE_URL } from '../../../utils/botImage.js';// bot/commands/admin/constants.js — shared constants for the admin command modules
 
 // ─── Image URLs ───
-export const IMG_SUCCESS = 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231499/file_000000006c1c724685bb402218b7c208_ste2ky.png';
-export const IMG_ERROR = 'https://res.cloudinary.com/dbn8lffbs/image/upload/v1777231497/file_0000000034547246812a74392b500be0_gelms4.png';
+export const IMG_SUCCESS = BOT_IMAGE_URL;
+export const IMG_ERROR = BOT_IMAGE_URL;
 
 // ─── Transaction type constants ───
 export const TX_TYPES = Object.freeze({
@@ -52,3 +53,4 @@ export const NUMBER_STATUS = Object.freeze({
     RETIRED: 'RETIRED',
     EXPIRED: 'EXPIRED'
 });
+    
