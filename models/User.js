@@ -36,6 +36,10 @@ freeUsedToday: {
     balance: { type: Number, default: 0 },
     lockedBalance: { type: Number, default: 0 },
     totalDeposited: { type: Number, default: 0 },
+    cashbackBalance: { type: Number, default: 0, min: 0 },       // rewards wallet (1% cashback) - NOT spendable until transferred
+    cashbackEarned: { type: Number, default: 0 },
+    cashbackTransferred: { type: Number, default: 0 },
+    cashbackRefs: { type: [String], default: [], select: false },
     processedPaymentRefs: { type: [String], default: [], select: false },
     totalSpent: { type: Number, default: 0 },
     bundleRemaining: { type: Number, default: 0 },
@@ -156,4 +160,4 @@ const User = mongoose.model('User', userSchema);
 
 export default User;
 
-    
+        
